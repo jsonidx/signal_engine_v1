@@ -1,0 +1,32 @@
+# ============================================================
+# PERSONAL WATCHLIST
+# ============================================================
+# Add tickers you want to track across all scans.
+# One ticker per line. Lines starting with # are ignored.
+# This file is used by both midweek_scan.py and catalyst_screener.py
+#
+# Update this after each weekly review with any new
+# candidates from the catalyst screener.
+# ============================================================
+
+# Current catalyst candidates (from 2026-03-15 scan)
+PATH
+GME
+BBAI
+NVAX
+NIO
+
+# HIGH PRIORITY — Active catalyst setups
+GME
+AI
+AFRM
+COIN
+PATH
+DOGE-USD
+ 
+# WATCH — Monitor for trigger
+IEP
+BA
+RBLX
+XYZ
+ETH-USD
