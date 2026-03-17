@@ -1,0 +1,282 @@
+========================================
+  Signal Engine Run: 2026-03-15 19:19:07
+========================================
+
+[STEP 1] Running signal_engine.py...
+[                       0%                       ][*                      3%                       ]  2 of 70 completed[**                     4%                       ]  3 of 70 completed[***                    6%                       ]  4 of 70 completed[***                    7%                       ]  5 of 70 completed[****                   9%                       ]  6 of 70 completed[*****                 10%                       ]  7 of 70 completed[*****                 11%                       ]  8 of 70 completed[******                13%                       ]  9 of 70 completed[*******               14%                       ]  10 of 70 completed[********              16%                       ]  11 of 70 completed[********              17%                       ]  12 of 70 completed[*********             19%                       ]  13 of 70 completed[**********            20%                       ]  14 of 70 completed[**********            21%                       ]  15 of 70 completed[***********           23%                       ]  16 of 70 completed[***********           23%                       ]  16 of 70 completed[************          26%                       ]  18 of 70 completed[*************         27%                       ]  19 of 70 completed[**************        29%                       ]  20 of 70 completed[**************        30%                       ]  21 of 70 completed[***************       31%                       ]  22 of 70 completed[****************      33%                       ]  23 of 70 completed[****************      34%                       ]  24 of 70 completed[*****************     36%                       ]  25 of 70 completed[******************    37%                       ]  26 of 70 completed[*******************   39%                       ]  27 of 70 completed[*******************   40%                       ]  28 of 70 completed[********************  41%                       ]  29 of 70 completed[********************* 43%                       ]  30 of 70 completed[********************* 44%                       ]  31 of 70 completed[**********************46%                       ]  32 of 70 completed[**********************47%                       ]  33 of 70 completed[**********************49%                       ]  34 of 70 completed[**********************50%                       ]  35 of 70 completed[**********************51%                       ]  36 of 70 completed[**********************53%                       ]  37 of 70 completed[**********************54%*                      ]  38 of 70 completed[**********************56%**                     ]  39 of 70 completed[**********************57%**                     ]  40 of 70 completed[**********************59%***                    ]  41 of 70 completed[**********************60%****                   ]  42 of 70 completed[**********************61%****                   ]  43 of 70 completed[**********************63%*****                  ]  44 of 70 completed[**********************64%******                 ]  45 of 70 completed[**********************66%*******                ]  46 of 70 completed[**********************67%*******                ]  47 of 70 completed[**********************69%********               ]  48 of 70 completed[**********************70%*********              ]  49 of 70 completed[**********************71%*********              ]  50 of 70 completed[**********************73%**********             ]  51 of 70 completed[**********************74%***********            ]  52 of 70 completed[**********************76%***********            ]  53 of 70 completed[**********************77%************           ]  54 of 70 completed[**********************79%*************          ]  55 of 70 completed[**********************80%*************          ]  56 of 70 completed[**********************81%**************         ]  57 of 70 completed[**********************83%***************        ]  58 of 70 completed[**********************84%***************        ]  59 of 70 completed[**********************86%****************       ]  60 of 70 completed[**********************87%*****************      ]  61 of 70 completed[**********************89%******************     ]  62 of 70 completed[**********************90%******************     ]  63 of 70 completed[**********************91%*******************    ]  64 of 70 completed[**********************93%********************   ]  65 of 70 completed[**********************94%********************   ]  66 of 70 completed[**********************96%*********************  ]  67 of 70 completed[**********************97%********************** ]  68 of 70 completed[**********************99%***********************]  69 of 70 completed[*********************100%***********************]  70 of 70 completed
+[                       0%                       ][*****                 10%                       ]  2 of 20 completed$SUI-USD: possibly delisted; no price data found  (1d 2025-02-08 19:19:09.273439 -> 2026-03-15 19:19:09.273439)
+[*******               15%                       ]  3 of 20 completed[**********            20%                       ]  4 of 20 completed[************          25%                       ]  5 of 20 completed[**************        30%                       ]  6 of 20 completed[*****************     35%                       ]  7 of 20 completed[*******************   40%                       ]  8 of 20 completed[**********************45%                       ]  9 of 20 completed[**********************50%                       ]  10 of 20 completed[**********************55%*                      ]  11 of 20 completed[**********************60%****                   ]  12 of 20 completed[**********************65%******                 ]  13 of 20 completed[**********************70%*********              ]  14 of 20 completed[**********************75%***********            ]  15 of 20 completed[**********************80%*************          ]  16 of 20 completed[**********************85%****************       ]  17 of 20 completed[**********************90%******************     ]  18 of 20 completed[**********************95%*********************  ]  19 of 20 completed[*********************100%***********************]  20 of 20 completed
+
+1 Failed download:
+['SUI-USD']: possibly delisted; no price data found  (1d 2025-02-08 19:19:09.273439 -> 2026-03-15 19:19:09.273439)
+
+████████████████████████████████████████████████████████████
+  WEEKLY SIGNAL ENGINE — Run Date: 2026-03-15
+  Portfolio: €50,000 | Equity: 65% | Crypto: 25% | Cash: 10%
+████████████████████████████████████████████████████████████
+
+
+████████████████████████████████████████████████████████████
+  MODULE 1: EQUITY MULTI-FACTOR SCREENER
+████████████████████████████████████████████████████████████
+  Universe: 70 tickers
+
+============================================================
+  Fetching equity universe: 70 tickers
+  Window: 2025-02-08 → 2026-03-15
+============================================================
+  [OK] 70 tickers loaded, 282 trading days
+
+  Computing multi-factor signals...
+
+────────────────────────────────────────────────────────────
+  📊 EQUITY MULTI-FACTOR SCREENER
+────────────────────────────────────────────────────────────
+
+  TOP 20 RANKED STOCKS (by composite Z-score):
+
+  Rank  Ticker     Composite   Mom12-1    Mom6-1 MeanRev5d   VolQual   RiskAdj
+  ────────────────────────────────────────────────────────────────────────────
+  1     CAT            1.748     3.000     2.797    -0.033    -0.650     1.610
+  2     ASML           1.269     2.471     2.290    -0.247    -1.369     1.258
+  3     JNJ            1.161     1.081     1.202    -0.381     1.261     2.735
+  4     INTC           1.065     2.413     3.000    -0.653    -3.000     1.124
+  5     GOOGL          1.055     2.075     0.476    -0.098     0.747     0.909
+  6     MRK            0.904     0.520     1.788    -0.114     0.517     2.028
+  7     RTX            0.734     1.019     0.674     0.045     0.393     1.182
+  8     NEE            0.725     0.573     1.019    -0.786     0.975     1.948
+  9     NOVN.SW        0.642     0.266     0.799    -0.458     1.164     1.888
+  10    AZN            0.610     0.663     0.925     0.301     0.234     0.752
+  11    ROG.SW         0.568     0.094     1.201    -0.341     0.906     1.401
+  12    WMT            0.565     1.134     0.758    -1.077     0.437     0.750
+  13    GS             0.549     1.277     0.103     1.380    -0.395    -0.438
+  14    AMGN           0.468     0.056     1.111     0.385    -0.040     1.165
+  15    GE             0.461     1.021    -0.144     1.672    -0.518    -0.267
+  16    AVGO           0.440     1.689    -0.835     1.645    -0.896    -0.646
+  17    BA             0.363     0.488     0.041     1.610     0.139    -0.524
+  18    UPS            0.347    -0.357     1.473     0.346     0.282     0.552
+  19    TTE            0.336     0.269     0.706    -1.493     0.501     1.664
+  20    DE             0.328     0.260     0.792     0.643    -0.603     0.481
+
+  BOTTOM 5 (AVOID / UNDERWEIGHT):
+
+  66    ACN           -0.836
+  67    SAP           -1.061
+  68    CRM           -1.168
+  69    NVO           -1.320
+  70    UNH           -1.415
+
+  RECOMMENDED POSITION SIZES (Quarter-Kelly, €32,500 equity allocation):
+
+  Ticker       Weight%         EUR   AnnVol%     Cost€
+  ────────────────────────────────────────────────────
+  JNJ              2.6%        863      16.0%      2.59
+  NOVN.SW          2.5%        811      17.0%      2.43
+  NEE              2.2%        727      19.0%      2.18
+  ROG.SW           2.1%        700      19.7%      2.10
+  GOOGL            2.0%        646      21.4%      1.94
+  MRK              1.8%        580      23.8%      1.74
+  WMT              1.7%        561      24.6%      1.68
+  RTX              1.7%        550      25.1%      1.65
+  AZN              1.6%        516      26.7%      1.55
+
+  Total allocated: €5,954 | Total est. costs: €17.86
+
+
+████████████████████████████████████████████████████████████
+  MODULE 2: CRYPTO TREND / MOMENTUM
+████████████████████████████████████████████████████████████
+
+============================================================
+  Fetching crypto universe: 20 tickers
+  Window: 2025-02-08 → 2026-03-15
+============================================================
+  [WARN] Dropped 4 tickers (insufficient data): APT-USD, MATIC-USD, UNI-USD, SUI-USD
+  [OK] 16 tickers loaded, 401 trading days
+
+  Computing trend/momentum signals...
+
+────────────────────────────────────────────────────────────
+  🪙 CRYPTO TREND / MOMENTUM SIGNALS
+────────────────────────────────────────────────────────────
+
+  Rank  Ticker             Price   Signal   Trend     Mom    RSI    Vol%    VolRegAction          
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  1     NEAR-USD    $       1.34    0.185    0.33  0.0575   60.3   88.6%      HIGH  HOLD            
+  2     AVAX-USD    $       9.78   -0.182   -0.33  0.0176   56.7   56.9%    NORMAL  REDUCE          
+  3     BTC-USD     $  71,710.46   -0.189   -0.33  0.0128   55.2   40.5%    NORMAL  REDUCE          
+  4     BNB-USD     $     661.87   -0.195   -0.33  0.0090   55.1   37.8%    NORMAL  REDUCE          
+  5     ETH-USD     $   2,107.67   -0.208   -0.33  0.0005   53.5   53.8%    NORMAL  REDUCE          
+  6     LINK-USD    $       9.20   -0.218   -0.33 -0.0065   52.8   55.2%    NORMAL  REDUCE          
+  7     LTC-USD     $      55.22   -0.225   -0.33 -0.0113   50.2   44.1%    NORMAL  REDUCE          
+  8     SOL-USD     $      88.55   -0.228   -0.33 -0.0132   51.8   54.5%    NORMAL  REDUCE          
+  9     XRP-USD     $       1.42   -0.239   -0.33 -0.0208   50.5   42.5%    NORMAL  REDUCE          
+  10    INJ-USD     $       3.08   -0.251   -0.33 -0.0282   47.7   67.7%    NORMAL  REDUCE          
+  11    DOT-USD     $       1.42   -0.290   -1.00 -0.0697   44.5   99.1%      HIGH  REDUCE          
+  12    ARB-USD     $       0.00   -0.325   -1.00  0.0003   14.5    0.1%    NORMAL  SELL / NO POSITION
+  13    ATOM-USD    $       1.85   -0.516   -1.00 -0.0275   44.7   47.7%    NORMAL  SELL / NO POSITION
+  14    ADA-USD     $       0.26   -0.552   -1.00 -0.0515   46.2   63.0%    NORMAL  SELL / NO POSITION
+  15    OP-USD      $       0.13   -0.619   -1.00 -0.0961   39.7   74.2%    NORMAL  SELL / NO POSITION
+  16    FIL-USD     $       0.89   -0.649   -1.00 -0.1157   40.9   74.7%    NORMAL  SELL / NO POSITION
+  ⚠️  HIGH VOL (2 assets): NEAR-USD, DOT-USD — HALF SIZE
+
+════════════════════════════════════════════════════════════
+  📋 PORTFOLIO SUMMARY
+════════════════════════════════════════════════════════════
+
+  NAV:             €      50,000
+  Equity exposure: €       5,954  (11.9%)
+  Crypto exposure: €           0  (0.0%)
+  Cash:            €      44,046  (88.1%)
+
+  Est. rebalance cost: €17.86 (3.6 bps of NAV)
+
+  RISK CHECKS:
+  ✓ Equity positions: 9 (max 15)
+  ✓ Crypto positions: 0 (max 5)
+  ✓ Max equity position within limits
+  ✓ Cash buffer adequate
+
+  📁 CSV files exported to ./signals_output/:
+     → ./signals_output/equity_signals_20260315.csv
+     → ./signals_output/crypto_signals_20260315.csv
+     → ./signals_output/equity_positions_20260315.csv
+
+████████████████████████████████████████████████████████████
+  ✅ SIGNAL GENERATION COMPLETE
+  ⚠️  THIS IS NOT INVESTMENT ADVICE. ALL SIGNALS ARE
+     INFORMATIONAL. REVIEW BEFORE ACTING.
+████████████████████████████████████████████████████████████
+
+[STEP 1] Exit code: 0
+
+[STEP 2] Running paper_trader.py --record...
+
+────────────────────────────────────────────────────────────
+  📸 RECORDING PAPER TRADE SNAPSHOT — 2026-03-15
+────────────────────────────────────────────────────────────
+  [WARN] Snapshot already exists for 2026-03-15.
+  To re-record, first run: python3 paper_trader.py --delete-today
+[STEP 2] Exit code: 0
+
+[STEP 3] Running catalyst_screener.py --social...
+
+████████████████████████████████████████████████████████████
+  CATALYST SCREENER v1.0
+  Universe: 66 tickers | Date: 2026-03-15
+████████████████████████████████████████████████████████████
+
+  Scanning Reddit (7-day window, 6 subs, 3 feeds each)...
+  Scanning: NVDA     (1/66)  Scanning: NET      (2/66)  Scanning: AMC      (3/66)  Scanning: ASTS     (4/66)  Scanning: GOOGL    (5/66)  Scanning: BB       (6/66)  Scanning: SNOW     (7/66)  Scanning: LILM     (8/66)  Scanning: ROKU     (9/66)  Scanning: SAVA     (10/66)  Scanning: RKLB     (11/66)  Scanning: CLOV     (12/66)  Scanning: SNAP     (13/66)  Scanning: U        (14/66)  Scanning: ABNB     (15/66)  Scanning: JOBY     (16/66)  Scanning: TSLA     (17/66)  Scanning: HUBS     (18/66)  Scanning: UPST     (19/66)  Scanning: QUBT     (20/66)  Scanning: RIVN     (21/66)  Scanning: MRNA     (22/66)  Scanning: BNTX     (23/66)  Scanning: WISH     (24/66)$WISH: possibly delisted; no price data found  (period=6mo) (Yahoo error = "No data found, symbol may be delisted")
+  Scanning: AI       (25/66)  Scanning: RBLX     (26/66)  Scanning: CRWD     (27/66)  Scanning: LUNR     (28/66)  Scanning: SQ       (29/66)$SQ: possibly delisted; no price data found  (period=6mo) (Yahoo error = "No data found, symbol may be delisted")
+  Scanning: BILL     (30/66)  Scanning: HOOD     (31/66)  Scanning: DDOG     (32/66)  Scanning: ATOS     (33/66)  Scanning: PATH     (34/66)  Scanning: RGTI     (35/66)  Scanning: DKNG     (36/66)  Scanning: ZS       (37/66)  Scanning: MSFT     (38/66)  Scanning: RIOT     (39/66)  Scanning: NVAX     (40/66)  Scanning: ON       (41/66)  Scanning: PLTR     (42/66)  Scanning: GME      (43/66)  Scanning: AAPL     (44/66)  Scanning: AMZN     (45/66)  Scanning: CFLT     (46/66)  Scanning: BBAI     (47/66)  Scanning: MARA     (48/66)  Scanning: PINS     (49/66)  Scanning: COIN     (50/66)  Scanning: IONQ     (51/66)  Scanning: AMD      (52/66)  Scanning: META     (53/66)  Scanning: CRM      (54/66)  Scanning: SHOP     (55/66)  Scanning: BBBY     (56/66)  Scanning: SKLZ     (57/66)  Scanning: ARM      (58/66)  Scanning: AFRM     (59/66)  Scanning: NIO      (60/66)  Scanning: MRVL     (61/66)  Scanning: NFLX     (62/66)  Scanning: SMCI     (63/66)  Scanning: SOUN     (64/66)  Scanning: LCID     (65/66)  Scanning: SOFI     (66/66)  Scanning complete: 63 tickers analyzed                    
+
+────────────────────────────────────────────────────────────
+  🔍 TOP 20 CATALYST CANDIDATES
+────────────────────────────────────────────────────────────
+
+  Rank Ticker       Price    MktCap  Short% VolRatio Squeeze  Volume VolComp Options   Tech Social   TOTAL
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1    PATH    $    11.58     $6.2B    27%     1.6x     2/9     5/7     2/6     5/6    3/7    2/5 🟡   48%
+  2    AI      $     8.91     $1.3B    33%     0.6x     3/9     2/7     0/6     5/6    2/7    4/5 🟡   40%
+  3    GME     $    23.53    $10.5B    16%     1.1x     2/9     2/7     3/6     5/6    3/7    0/5 🟡   38%
+  4    NIO     $     5.86    $14.8B     8%     1.7x     1/9     5/7     0/6     4/6    4/7    0/5 🟡   35%
+  5    BBAI    $     3.94     $1.9B    28%     0.9x     2/9     1/7     4/6     5/6    2/7    0/5 🟡   35%
+  6    NVAX    $    10.23     $1.7B    31%     0.8x     4/9     3/7     0/6     3/6    4/7    0/5 🟡   35%
+  7    LUNR    $    17.60     $2.5B    22%     1.0x     2/9     2/7     3/6     3/6    3/7    1/5 🟡   35%
+  8    TSLA    $   391.20  $1468.0B     2%     1.1x     0/9     1/7     4/6     3/6    2/7    3/5      32%
+  9    ASTS    $    86.34    $33.0B    18%     0.8x     1/9     2/7     3/6     2/6    2/7    3/5      32%
+  10   SKLZ    $     3.25      $50M    17%     0.8x     4/9     1/7     3/6     3/6    2/7    0/5      32%
+  11   MARA    $     9.32     $3.5B    39%     1.0x     2/9     2/7     1/6     4/6    4/7    0/5      32%
+  12   RIVN    $    14.86    $18.4B    13%     1.0x     2/9     2/7     3/6     3/6    3/7    0/5      32%
+  13   NET     $   212.45    $74.8B     3%     0.8x     0/9     4/7     0/6     1/6    4/7    4/5      32%
+  14   RKLB    $    68.41    $38.8B     4%     1.0x     0/9     3/7     4/6     3/6    2/7    0/5      30%
+  15   MRVL    $    87.86    $76.7B     4%     1.2x     0/9     3/7     0/6     2/6    6/7    1/5      30%
+  16   NVDA    $   180.25  $4381.0B     1%     0.9x     0/9     1/7     0/6     3/6    2/7    5/5      28%
+  17   AMD     $   193.39   $315.3B     2%     0.8x     0/9     0/7     3/6     2/6    3/7    3/5      28%
+  18   MRNA    $    52.56    $20.8B    22%     0.8x     3/9     2/7     0/6     3/6    3/7    0/5      28%
+  19   RGTI    $    16.17     $5.4B    14%     0.9x     1/9     2/7     4/6     2/6    2/7    0/5      28%
+  20   SAVA    $     1.99     $115M    15%     1.5x     4/9     0/7     0/6     5/6    2/7    0/5      28%
+
+────────────────────────────────────────────────────────────
+  📋 DETAILED FLAGS — TOP 5
+────────────────────────────────────────────────────────────
+
+  PATH — Composite: 48%
+    • HIGH short interest: 27%
+    • Above-avg volume: 1.6x
+    • OBV rising with price — accumulation pattern
+    • Strong up-volume dominance: 2.5x
+    • Tight Bollinger squeeze: 15th percentile
+    • HEAVY call buying: C/P ratio 3.0
+    • Call OI dominates: 156,858 vs 33,946 puts
+    • Unusual OTM call activity detected
+    • RSI in sweet spot: 48 (room to run)
+    • Early recovery: 16% off 52-week low
+    • Some social activity: 7 mentions (7d), weighted 3.7
+    • Active weekday discussion: 4 weekday posts (57%)
+    • Mentioned across 3 subreddits — organic spread
+
+  AI — Composite: 40%
+    • HIGH short interest: 33%
+    • Elevated days to cover: 4.8
+    • Strong up-volume dominance: 2.9x
+    • HEAVY call buying: C/P ratio 18.3
+    • Call OI dominates: 59,866 vs 12,554 puts
+    • Unusual OTM call activity detected
+    • RSI recovering from oversold: 39
+    • Early recovery: 12% off 52-week low
+    • 🔥 HIGH social buzz: 71 mentions (7d), weighted score 36.0
+    • Active weekday discussion: 53 weekday posts (75%)
+    • Mentioned across 6 subreddits — organic spread
+
+  GME — Composite: 38%
+    • Elevated short interest: 16%
+    • Elevated days to cover: 7.9
+    • OBV rising but price flat — hidden accumulation
+    • Up-volume dominant: 1.3x
+    • EXTREME vol compression: BB width 1th percentile
+    • HEAVY call buying: C/P ratio 3.7
+    • Call OI dominates: 174,796 vs 51,850 puts
+    • Unusual OTM call activity detected
+    • RSI in sweet spot: 46 (room to run)
+    • Early recovery: 18% off 52-week low
+
+  NIO — Composite: 35%
+    • Rising volume 1.7x with positive price
+    • Above-avg volume: 1.7x
+    • OBV rising with price — accumulation pattern
+    • Strong up-volume dominance: 2.3x
+    • HEAVY call buying: C/P ratio 4.0
+    • Unusual OTM call activity detected
+    • Bullish EMA stack: price > 9 > 21 > 50
+    • MACD positive and above signal line
+    • Early recovery: 32% off 52-week low
+
+  BBAI — Composite: 35%
+    • HIGH short interest: 28%
+    • OBV rising but price flat — hidden accumulation
+    • EXTREME vol compression: BB width 0th percentile
+    • Below-avg ATR: 16th percentile
+    • HEAVY call buying: C/P ratio 3.3
+    • Call OI dominates: 313,717 vs 70,852 puts
+    • Unusual OTM call activity detected
+    • RSI in sweet spot: 42 (room to run)
+
+  📁 Exported to: ./signals_output/catalyst_screen_20260315.csv
+
+████████████████████████████████████████████████████████████
+  ⚠️  THESE ARE SETUP CONDITIONS, NOT BUY SIGNALS.
+  Most setups fail. Size positions accordingly.
+  Max 1-2% of NAV per speculative position.
+  THIS IS NOT INVESTMENT ADVICE.
+████████████████████████████████████████████████████████████
+
+[STEP 3] Exit code: 0
+
+========================================
+  COMPLETE: 2026-03-15 19:21:41
+  signal_engine: 0
+  paper_trader:  0
+  catalyst:      0
+========================================
