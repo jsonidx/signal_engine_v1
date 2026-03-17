@@ -55,6 +55,12 @@ try:
 except ImportError:
     OUTPUT_DIR = "./signals_output"
 
+try:
+    from polymarket_screener import PolymarketScreener
+    _POLYMARKET_AVAILABLE = True
+except ImportError:
+    _POLYMARKET_AVAILABLE = False
+
 
 # ==============================================================================
 # UNIVERSES
@@ -510,7 +516,71 @@ def score_technical_setup(data: dict) -> dict:
 
 
 # ==============================================================================
-# SECTION 3: SOCIAL SENTIMENT (Reddit)
+# SECTION 3: POLYMARKET SIGNAL
+# ==============================================================================
+
+def score_polymarket_signal(ticker: str, poly_signals: Dict[str, list]) -> dict:
+    """
+    Polymarket prediction market score for a ticker.
+
+    Uses pre-fetched signals (dict keyed by ticker) to avoid one API call
+    per stock. The best-matching market's signal_score (0–1) drives the
+    catalyst score (0–5 scale, same as social).
+
+    Scoring:
+      signal_score >= 0.70  → 3 pts  (strong consensus + liquid market)
+      signal_score >= 0.50  → 2 pts  (moderate consensus)
+      signal_score >= 0.30  → 1 pt   (weak / thin market)
+      bullish trend bonus   → +1 pt  (crowd moving in bullish direction)
+      multiple markets      → +1 pt  (corroborating signals)
+    """
+    score = 0
+    flags = []
+
+    signals = poly_signals.get(ticker, [])
+    if not signals:
+        return {"score": 0, "max": 5, "flags": []}
+
+    # Best signal by score
+    best = signals[0]
+    sig_score = best.get("signal_score", 0)
+    prediction = best.get("prediction", 0.5)
+    trend = best.get("trend", "unknown")
+    question = best.get("question", "")[:70]
+    dtr = best.get("days_to_resolution")
+
+    # Base score from signal strength
+    if sig_score >= 0.70:
+        score += 3
+        flags.append(f"Strong Polymarket signal ({sig_score:.2f}): {question}")
+    elif sig_score >= 0.50:
+        score += 2
+        flags.append(f"Moderate Polymarket signal ({sig_score:.2f}): {question}")
+    elif sig_score >= 0.30:
+        score += 1
+        flags.append(f"Weak Polymarket signal ({sig_score:.2f}): {question}")
+
+    # Trend bonus
+    if trend == "bullish":
+        score += 1
+        flags.append(f"Polymarket crowd turning bullish (pred={prediction:.0%})")
+    elif trend == "bearish":
+        flags.append(f"⚠️ Polymarket crowd bearish (pred={prediction:.0%})")
+
+    # Multiple corroborating markets
+    if len(signals) >= 2:
+        score += 1
+        flags.append(f"{len(signals)} Polymarket markets active for this ticker")
+
+    # Imminent resolution context
+    if dtr is not None and dtr <= 14:
+        flags.append(f"Resolves in {dtr} days — near-term catalyst confirmed")
+
+    return {"score": min(score, 5), "max": 5, "flags": flags}
+
+
+# ==============================================================================
+# SECTION 3B: SOCIAL SENTIMENT (Reddit)
 # ==============================================================================
 
 def scan_reddit_mentions(tickers: List[str]) -> Dict[str, dict]:
@@ -687,7 +757,11 @@ def score_social_momentum(ticker: str, mentions: dict) -> dict:
 # SECTION 4: COMPOSITE SCORING & REPORTING
 # ==============================================================================
 
-def screen_universe(tickers: List[str], include_social: bool = False) -> pd.DataFrame:
+def screen_universe(
+    tickers: List[str],
+    include_social: bool = False,
+    include_polymarket: bool = False,
+) -> pd.DataFrame:
     """Run all screens on a universe of tickers."""
 
     print(f"\n{'█' * 60}")
@@ -699,6 +773,22 @@ def screen_universe(tickers: List[str], include_social: bool = False) -> pd.Data
     social_data = {}
     if include_social:
         social_data = scan_reddit_mentions(tickers)
+
+    # Polymarket data (if requested and available)
+    poly_data: Dict[str, list] = {}
+    if include_polymarket:
+        if _POLYMARKET_AVAILABLE:
+            try:
+                pm = PolymarketScreener()
+                for ticker in tickers:
+                    sigs = pm.screen_ticker(ticker)
+                    if sigs:
+                        poly_data[ticker] = sigs
+                print(f"  Polymarket: {sum(len(v) for v in poly_data.values())} signals across {len(poly_data)} tickers")
+            except Exception as e:
+                print(f"  [WARN] Polymarket fetch failed: {e}")
+        else:
+            print("  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
 
     results = []
     total = len(tickers)
@@ -721,17 +811,24 @@ def screen_universe(tickers: List[str], include_social: bool = False) -> pd.Data
         if include_social:
             social = score_social_momentum(ticker, social_data)
 
+        polymarket = {"score": 0, "max": 5, "flags": []}
+        if include_polymarket:
+            polymarket = score_polymarket_signal(ticker, poly_data)
+
         # Composite score (weighted)
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
-                        options["max"] + technical["max"] + social["max"])
+                        options["max"] + technical["max"] + social["max"] +
+                        polymarket["max"])
         raw_total = (squeeze["score"] + volume["score"] + vol_squeeze["score"] +
-                     options["score"] + technical["score"] + social["score"])
+                     options["score"] + technical["score"] + social["score"] +
+                     polymarket["score"])
 
         composite = raw_total / max_possible * 100 if max_possible > 0 else 0
 
         # All flags combined
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
-                     options["flags"] + technical["flags"] + social["flags"])
+                     options["flags"] + technical["flags"] + social["flags"] +
+                     polymarket["flags"])
 
         results.append({
             "ticker": ticker,
@@ -745,6 +842,7 @@ def screen_universe(tickers: List[str], include_social: bool = False) -> pd.Data
             "options_score": options["score"],
             "technical_score": technical["score"],
             "social_score": social["score"],
+            "polymarket_score": polymarket["score"],
             "composite": round(composite, 1),
             "flags": all_flags,
             "n_flags": len(all_flags),
@@ -771,10 +869,14 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
     print(f"  🔍 TOP {min(top_n, len(df))} CATALYST CANDIDATES")
     print(f"{'─' * 60}")
 
+    has_poly = "polymarket_score" in df.columns and df["polymarket_score"].sum() > 0
+
     print(f"\n  {'Rank':<5}{'Ticker':<8}{'Price':>10}{'MktCap':>10}"
           f"{'Short%':>8}{'VolRatio':>9}{'Squeeze':>8}{'Volume':>8}"
-          f"{'VolComp':>8}{'Options':>8}{'Tech':>7}{'Social':>7}{'TOTAL':>8}")
-    print(f"  {'─' * 104}")
+          f"{'VolComp':>8}{'Options':>8}{'Tech':>7}{'Social':>7}"
+          + (f"{'Poly':>6}" if has_poly else "")
+          + f"{'TOTAL':>8}")
+    print(f"  {'─' * (104 + (6 if has_poly else 0))}")
 
     for i, (_, row) in enumerate(df.head(top_n).iterrows()):
         # Highlight tier
@@ -787,18 +889,21 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
 
         mkt = f"${row['mkt_cap_m']/1000:.1f}B" if row["mkt_cap_m"] > 1000 else f"${row['mkt_cap_m']:.0f}M"
 
-        print(f"  {i+1:<5}{row['ticker']:<8}"
-              f"${row['price']:>9.2f}"
-              f"{mkt:>10}"
-              f"{row['short_pct']:>7.0%}"
-              f"{row['vol_ratio']:>8.1f}x"
-              f"{row['squeeze_score']:>6}/9"
-              f"{row['volume_score']:>6}/7"
-              f"{row['vol_compress']:>6}/6"
-              f"{row['options_score']:>6}/6"
-              f"{row['technical_score']:>5}/7"
-              f"{row['social_score']:>5}/5"
-              f" {tier}{row['composite']:>5.0f}%")
+        line = (f"  {i+1:<5}{row['ticker']:<8}"
+                f"${row['price']:>9.2f}"
+                f"{mkt:>10}"
+                f"{row['short_pct']:>7.0%}"
+                f"{row['vol_ratio']:>8.1f}x"
+                f"{row['squeeze_score']:>6}/9"
+                f"{row['volume_score']:>6}/7"
+                f"{row['vol_compress']:>6}/6"
+                f"{row['options_score']:>6}/6"
+                f"{row['technical_score']:>5}/7"
+                f"{row['social_score']:>5}/5")
+        if has_poly:
+            line += f"{row['polymarket_score']:>4}/5"
+        line += f" {tier}{row['composite']:>5.0f}%"
+        print(line)
 
     # Detail on top 5
     print(f"\n{'─' * 60}")
@@ -811,7 +916,7 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
             print(f"    • {flag}")
 
 
-def deep_dive(ticker: str, include_social: bool = False):
+def deep_dive(ticker: str, include_social: bool = False, include_polymarket: bool = False):
     """Single-stock deep analysis."""
     print(f"\n{'█' * 60}")
     print(f"  DEEP DIVE: {ticker}")
@@ -851,6 +956,27 @@ def deep_dive(ticker: str, include_social: bool = False):
         for flag in social["flags"]:
             print(f"    • {flag}")
 
+    if include_polymarket:
+        if _POLYMARKET_AVAILABLE:
+            try:
+                pm = PolymarketScreener()
+                sigs = pm.screen_ticker(ticker)
+                poly = score_polymarket_signal(ticker, {ticker: sigs})
+                print(f"\n  POLYMARKET SIGNAL: {poly['score']}/{poly['max']}")
+                for flag in poly["flags"]:
+                    print(f"    • {flag}")
+                if sigs:
+                    print(f"\n  Top Polymarket markets for {ticker}:")
+                    for s in sigs[:3]:
+                        print(f"    [{s['signal_score']:.2f}] {s['question'][:70]}")
+                        print(f"           Prediction: {s['prediction']:.0%} | "
+                              f"Vol24h: ${s['volume_24h']:,.0f} | "
+                              f"Resolves: {s.get('time_to_resolution', '?')}")
+            except Exception as e:
+                print(f"\n  [WARN] Polymarket fetch failed: {e}")
+        else:
+            print("\n  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
+
 
 # ==============================================================================
 # SECTION 5: MAIN
@@ -862,11 +988,12 @@ def main():
                         default="all", help="Which universe to scan")
     parser.add_argument("--ticker", type=str, help="Single stock deep dive")
     parser.add_argument("--social", action="store_true", help="Include Reddit scan")
+    parser.add_argument("--polymarket", action="store_true", help="Include Polymarket prediction market signals")
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
     args = parser.parse_args()
 
     if args.ticker:
-        deep_dive(args.ticker.upper(), include_social=args.social)
+        deep_dive(args.ticker.upper(), include_social=args.social, include_polymarket=args.polymarket)
         return
 
     # Build universe
@@ -879,7 +1006,7 @@ def main():
     else:
         universe = list(set(SMALL_CAP_UNIVERSE + MEME_UNIVERSE + LARGE_CAP_WATCH))
 
-    results = screen_universe(universe, include_social=args.social)
+    results = screen_universe(universe, include_social=args.social, include_polymarket=args.polymarket)
 
     if not results.empty:
         print_results(results, top_n=args.top)
