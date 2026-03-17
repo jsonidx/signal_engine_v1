@@ -151,3 +151,39 @@ CONSOLE_PRINT = True
 # ============================================================
 DATA_LOOKBACK_DAYS = 400        # ~18 months of history for signal calc
 YAHOO_FINANCE_TIMEOUT = 30      # Seconds before timeout per ticker
+
+# ============================================================
+# POLYMARKET PREDICTION MARKET PARAMETERS
+# ============================================================
+POLYMARKET_PARAMS = {
+    # API
+    "api_base_url": "https://gamma-api.polymarket.com",
+    "cache_file": "polymarket_cache.json",
+    "cache_ttl_hours": 1,           # Cache market listings for 1 hour
+    "max_markets_fetch": 500,       # Max markets per refresh (5 pages × 100)
+    "page_size": 100,               # Markets per API page
+    "request_timeout": 15,          # Seconds per API call
+    "request_delay": 0.5,           # Seconds between paginated calls
+
+    # Signal inclusion thresholds
+    "min_volume_24h": 500,          # Min 24h USD volume to include
+    "min_liquidity": 500,           # Min liquidity (USD) to include
+    "min_days_to_resolution": 1,    # Skip markets resolving today
+    "max_days_to_resolution": 180,  # Skip markets >6 months out
+
+    # Signal scoring thresholds
+    "strong_consensus_high": 0.70,  # Probability >= this → strong Yes signal
+    "strong_consensus_low": 0.30,   # Probability <= this → strong No signal
+    "moderate_consensus_high": 0.60,
+    "moderate_consensus_low": 0.40,
+
+    # Volume tiers for confidence
+    "volume_high": 50_000,          # ≥ $50k 24h volume = high confidence
+    "volume_medium": 10_000,        # ≥ $10k
+    "volume_low": 1_000,            # ≥ $1k
+
+    # Liquidity tiers
+    "liquidity_high": 100_000,      # ≥ $100k liquidity
+    "liquidity_medium": 10_000,
+    "liquidity_low": 1_000,
+}
