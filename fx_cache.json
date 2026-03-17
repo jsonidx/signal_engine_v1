@@ -1,27 +1,27 @@
 {
   "CHF": {
-    "rate": 0.9034,
+    "rate": 0.9068,
     "source": "ECB (Frankfurter batch)",
-    "timestamp": "2026-03-15T20:41:05.351491"
+    "timestamp": "2026-03-17T22:45:42.042109"
   },
   "GBP": {
-    "rate": 0.86503,
+    "rate": 0.8643,
     "source": "ECB (Frankfurter batch)",
-    "timestamp": "2026-03-15T20:41:05.351506"
+    "timestamp": "2026-03-17T22:45:42.042117"
   },
   "JPY": {
-    "rate": 182.85,
+    "rate": 183.29,
     "source": "ECB (Frankfurter batch)",
-    "timestamp": "2026-03-15T20:41:05.351509"
+    "timestamp": "2026-03-17T22:45:42.042118"
   },
   "SEK": {
-    "rate": 10.7545,
+    "rate": 10.7055,
     "source": "ECB (Frankfurter batch)",
-    "timestamp": "2026-03-15T20:41:05.351510"
+    "timestamp": "2026-03-17T22:45:42.042119"
   },
   "USD": {
-    "rate": 1.1476,
+    "rate": 1.1531,
     "source": "ECB (Frankfurter batch)",
-    "timestamp": "2026-03-15T20:41:05.351512"
+    "timestamp": "2026-03-17T22:45:42.042120"
   }
 }

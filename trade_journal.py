@@ -18,6 +18,7 @@ USAGE:
     python3 trade_journal.py --zones                 # Show buy/sell zones
     python3 trade_journal.py --buy GME 23.50 500     # Log: bought GME at €23.50, €500
     python3 trade_journal.py --sell GME 28.00         # Log: sold GME at €28.00
+    python3 trade_journal.py --sell GME 28.00 500      # Log: sold GME at €28.00, override size €500
     python3 trade_journal.py --status                 # Open positions + P&L
     python3 trade_journal.py --history                # All trades with outcomes
     python3 trade_journal.py --report                 # Full weekly report section
@@ -360,7 +361,7 @@ def log_buy(conn, ticker: str, price: float, size_eur: float, notes: str = ""):
     return trade_id
 
 
-def log_sell(conn, ticker: str, price: float, notes: str = ""):
+def log_sell(conn, ticker: str, price: float, size_eur: float = None, notes: str = ""):
     """Log a sell trade and close the open buy."""
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -379,6 +380,10 @@ def log_sell(conn, ticker: str, price: float, notes: str = ""):
         return
 
     buy_id, buy_price, buy_size, buy_shares, buy_date = buy
+    # If size_eur override provided, recalculate shares; otherwise use buy's shares
+    if size_eur is not None:
+        buy_shares = size_eur / buy_price if buy_price > 0 else buy_shares
+        buy_size = size_eur
     pnl_pct = (price / buy_price - 1)
     pnl_eur = buy_size * pnl_pct
     days_held = (datetime.strptime(today, "%Y-%m-%d") -
@@ -774,8 +779,8 @@ def main():
     parser.add_argument("--zones", action="store_true", help="Show buy/sell zones")
     parser.add_argument("--buy", nargs=3, metavar=("TICKER", "PRICE", "SIZE_EUR"),
                         help="Log a buy: --buy GME 23.50 500")
-    parser.add_argument("--sell", nargs=2, metavar=("TICKER", "PRICE"),
-                        help="Log a sell: --sell GME 28.00")
+    parser.add_argument("--sell", nargs="+", metavar=("TICKER", "PRICE"),
+                        help="Log a sell: --sell GME 28.00 [SIZE_EUR]")
     parser.add_argument("--status", action="store_true", help="Open positions + P&L")
     parser.add_argument("--history", action="store_true", help="Closed trade history")
     parser.add_argument("--report", action="store_true", help="Weekly report section")
@@ -790,8 +795,14 @@ def main():
         ticker, price, size = args.buy
         log_buy(conn, ticker.upper(), float(price), float(size), args.notes)
     elif args.sell:
-        ticker, price = args.sell
-        log_sell(conn, ticker.upper(), float(price), args.notes)
+        if len(args.sell) == 3:
+            ticker, price, size = args.sell
+            log_sell(conn, ticker.upper(), float(price), float(size), args.notes)
+        elif len(args.sell) == 2:
+            ticker, price = args.sell
+            log_sell(conn, ticker.upper(), float(price), None, args.notes)
+        else:
+            parser.error("--sell requires TICKER PRICE [SIZE_EUR]")
     elif args.status:
         show_status(conn)
     elif args.history:

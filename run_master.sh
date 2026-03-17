@@ -6,17 +6,17 @@
 # drag & drop into Claude for analysis.
 #
 # USAGE:
-#   cd ~/projects/signal_engine_v1
+#   cd ~/Documents/GitHub/signal_engine_v1
 #   source venv/bin/activate
 #   bash run_master.sh
 #
 # OUTPUT:
-#   ~/projects/signal_engine_v1/signal_reports/signal_report_YYYYMMDD.txt
+#   ~/Documents/GitHub/signal_engine_v1/signal_reports/signal_report_YYYYMMDD.txt
 #
 # TIME: ~5-8 minutes (SEC parsing is the slow part)
 # ============================================================
 
-PROJECT_DIR="$HOME/projects/signal_engine_v1"
+PROJECT_DIR="$HOME/Documents/GitHub/signal_engine_v1"
 VENV="$PROJECT_DIR/venv/bin/activate"
 DATE=$(date +%Y%m%d)
 TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
@@ -116,7 +116,7 @@ echo "  ✅ MASTER REPORT COMPLETE"
 echo "  📄 File: $REPORT"
 echo "  📋 Size: $(wc -l < "$REPORT") lines"
 echo ""
-echo "  → Drag ~/projects/signal_engine_v1/signal_reports/signal_report_${DATE}.txt into Claude"
+echo "  → Drag $REPORT into Claude"
 echo ""
 
 # macOS notification
