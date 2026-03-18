@@ -189,26 +189,32 @@ def _collect_technical_signals(ticker: str) -> dict:
 def _collect_fundamental_signals(ticker: str) -> dict:
     """Pull fundamental data from fundamental_analysis module if available."""
     try:
-        from fundamental_analysis import fetch_fundamentals, score_fundamentals
-        raw = fetch_fundamentals(ticker)
-        if raw is None:
+        from fundamental_analysis import analyze_ticker
+        result = analyze_ticker(ticker)
+        if result is None:
             return {}
-        scores = score_fundamentals(raw)
-        composite = scores.get("composite_score", 0)
+        scores = result.get("scores", {})
+        composite = result.get("composite", 0)
+        raw_analyst_rating = result.get("analyst_rating")
+        target_mean = result.get("target_mean")
+        price = result.get("price")
+        analyst_upside = None
+        if target_mean and price and price > 0:
+            analyst_upside = round((target_mean / price - 1) * 100, 1)
         return {
             "fundamental_score_pct": round(composite, 1),
             "valuation_score": scores.get("valuation", 0),
             "growth_score": scores.get("growth", 0),
             "quality_score": scores.get("quality", 0),
-            "pe_ratio": raw.get("pe_trailing"),
-            "forward_pe": raw.get("pe_forward"),
-            "revenue_growth_yoy": raw.get("revenue_growth_yoy"),
-            "eps_growth_yoy": raw.get("eps_growth_yoy"),
-            "gross_margin": raw.get("gross_margin"),
-            "next_earnings_days": raw.get("earnings_days_away"),
-            "analyst_rating": raw.get("analyst_rating"),
-            "analyst_price_target": raw.get("analyst_price_target"),
-            "analyst_upside_pct": raw.get("analyst_upside_pct"),
+            "pe_ratio": result.get("pe_trailing"),
+            "forward_pe": result.get("pe_forward"),
+            "revenue_growth_yoy": result.get("revenue_growth_yoy"),
+            "eps_growth_yoy": result.get("earnings_growth_yoy"),
+            "gross_margin": None,  # not returned by analyze_ticker
+            "next_earnings_days": None,  # not returned by analyze_ticker
+            "analyst_rating": raw_analyst_rating,
+            "analyst_price_target": target_mean,
+            "analyst_upside_pct": analyst_upside,
         }
     except Exception:
         return {}

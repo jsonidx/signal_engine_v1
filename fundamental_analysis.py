@@ -57,11 +57,30 @@ except ImportError:
 # SECTION 1: DATA COLLECTION
 # ==============================================================================
 
-def fetch_fundamentals(ticker: str) -> Optional[dict]:
+def fetch_fundamentals(ticker: str, use_cache: bool = True) -> Optional[dict]:
     """
     Pull all fundamental data for a ticker from yfinance.
     Returns None if the ticker is invalid or has no data.
+
+    Results are cached in fundamentals_cache.db for DEFAULT_TTL_DAYS (30 days)
+    to avoid redundant yfinance calls for quarterly-changing data.
+    Pass use_cache=False to force a fresh fetch (e.g. after an earnings release).
     """
+    if use_cache:
+        try:
+            from fundamentals_cache import get_cached, save_to_cache as _save
+            cached = get_cached(ticker)
+            if cached is not None:
+                return cached
+        except ImportError:
+            _save = None
+    else:
+        _save = None
+        try:
+            from fundamentals_cache import save_to_cache as _save
+        except ImportError:
+            pass
+
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
@@ -132,6 +151,16 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
                 raw["eps_history"] = []
         except Exception:
             raw["eps_history"] = []
+
+        # Save to cache for future runs
+        try:
+            if _save is not None:
+                _save(ticker, raw)
+            else:
+                from fundamentals_cache import save_to_cache
+                save_to_cache(ticker, raw)
+        except Exception:
+            pass
 
         return raw
 
@@ -454,9 +483,9 @@ def score_analyst_consensus(raw: dict) -> dict:
 # SECTION 3: COMPOSITE + REPORTING
 # ==============================================================================
 
-def analyze_ticker(ticker: str) -> Optional[dict]:
+def analyze_ticker(ticker: str, use_cache: bool = True) -> Optional[dict]:
     """Run full fundamental analysis on one ticker. Returns result dict or None."""
-    raw = fetch_fundamentals(ticker)
+    raw = fetch_fundamentals(ticker, use_cache=use_cache)
     if raw is None:
         return None
 
@@ -617,7 +646,28 @@ def main():
                         help="Comma-separated list of tickers")
     parser.add_argument("--top", type=int, default=None,
                         help="Show only top N results")
+    parser.add_argument("--refresh-cache", action="store_true",
+                        help="Force re-fetch from yfinance, ignoring cached data")
+    parser.add_argument("--cache-status", action="store_true",
+                        help="Show what is currently cached and exit")
     args = parser.parse_args()
+
+    if args.cache_status:
+        try:
+            from fundamentals_cache import cache_status, DEFAULT_TTL_DAYS
+            rows = cache_status()
+            if not rows:
+                print("  Fundamentals cache is empty.")
+            else:
+                print(f"\n  {'TICKER':<8}  {'FETCHED':<19}  {'AGE':>6}  STATUS")
+                print("  " + "-" * 50)
+                for r in rows:
+                    status = "EXPIRED" if r["expired"] else "fresh"
+                    print(f"  {r['ticker']:<8}  {r['fetched_at']:<19}  {r['age_days']:>5.1f}d  {status}")
+                print(f"\n  {len(rows)} tickers cached  |  TTL = {DEFAULT_TTL_DAYS} days\n")
+        except ImportError:
+            print("  fundamentals_cache module not found.")
+        return
 
     print(f"\n{'█' * 60}")
     print(f"  FUNDAMENTAL ANALYSIS v1.0")
@@ -647,10 +697,14 @@ def main():
 
     print(f"\n  Analyzing {len(tickers)} ticker(s)...")
 
+    use_cache = not args.refresh_cache
+    if args.refresh_cache:
+        print("  Cache refresh requested — fetching live data from yfinance.\n")
+
     results = []
     for i, ticker in enumerate(tickers):
         print(f"\r  Fetching: {ticker:<8} ({i+1}/{len(tickers)})", end="", flush=True)
-        result = analyze_ticker(ticker)
+        result = analyze_ticker(ticker, use_cache=use_cache)
         if result:
             results.append(result)
         time.sleep(0.3)  # Be gentle with yfinance

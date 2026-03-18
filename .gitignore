@@ -20,5 +20,8 @@ signal_reports/
 *.json
 polymarket_cache.json
 
+# Local cache databases (generated, not committed)
+*.db
+
 # OS
 .DS_Store
