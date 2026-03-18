@@ -258,8 +258,15 @@ def show_zones(tickers: list = None):
         watchlist_path = "./watchlist.txt"
         if os.path.exists(watchlist_path):
             with open(watchlist_path) as f:
-                tickers = [l.strip().upper() for l in f
-                           if l.strip() and not l.startswith("#")]
+                tickers = []
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ticker = line.split("#")[0].strip().upper()
+                    if ticker:
+                        tickers.append(ticker)
+                tickers = list(dict.fromkeys(tickers))
         else:
             print("  No watchlist.txt found. Pass --ticker or create watchlist.txt")
             return
@@ -674,8 +681,15 @@ def generate_report_section(conn) -> str:
     tickers = []
     if os.path.exists(watchlist_path):
         with open(watchlist_path) as f:
-            tickers = [l.strip().upper() for l in f
-                       if l.strip() and not l.startswith("#") and not l.endswith("-USD")]
+            tickers = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ticker = line.split("#")[0].strip().upper()
+                if ticker and not ticker.endswith("-USD"):
+                    tickers.append(ticker)
+            tickers = list(dict.fromkeys(tickers))
 
     if tickers:
         lines.append("### Buy/Sell Zones (Catalyst Watchlist)")

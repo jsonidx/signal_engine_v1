@@ -56,7 +56,7 @@ CRYPTO_TICKERS = [
     "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
     "ADA-USD", "AVAX-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
     "ATOM-USD", "UNI-USD", "LTC-USD", "NEAR-USD", "APT-USD",
-    "ARB-USD", "OP-USD", "FIL-USD", "INJ-USD", "SUI-USD",
+    "ARB-USD", "OP-USD", "FIL-USD", "INJ-USD",
 ]
 
 # ============================================================

@@ -61,20 +61,20 @@ FORWARD_WINDOWS = [5, 10, 15, 20]  # 1, 2, 3, 4 weeks
 # Universes
 CATALYST_UNIVERSE = [
     # Classic meme / squeeze stocks
-    "GME", "AMC", "BB", "KOSS", "BBBY",
+    "GME", "AMC", "BB", "KOSS",
     # Current watchlist
     "PATH", "AFRM", "COIN", "BBAI", "NVAX",
     "AI", "MARA", "RIOT", "SMCI", "IONQ", "RGTI",
     # High short interest names
     "CVNA", "UPST", "BYND", "FUBO", "CLOV",
-    "SKLZ", "WISH", "SOFI", "PLTR", "RIVN",
+    "SKLZ", "SOFI", "PLTR", "RIVN",
     "LCID", "NIO", "LUNR", "RKLB", "ASTS",
     # Large caps with catalyst history
     "TSLA", "NVDA", "AMD", "NFLX",
 ]
 
 MEME_ONLY = [
-    "GME", "AMC", "BB", "KOSS", "BBBY",
+    "GME", "AMC", "BB", "KOSS",
     "MARA", "RIOT", "COIN", "SOFI", "PLTR",
     "RIVN", "LCID", "NIO", "IONQ", "RGTI",
 ]

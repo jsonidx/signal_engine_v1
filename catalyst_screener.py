@@ -61,6 +61,12 @@ try:
 except ImportError:
     _POLYMARKET_AVAILABLE = False
 
+try:
+    from congress_trades import score_congress_signal, get_all_trades
+    _CONGRESS_AVAILABLE = True
+except ImportError:
+    _CONGRESS_AVAILABLE = False
+
 
 # ==============================================================================
 # UNIVERSES
@@ -69,7 +75,7 @@ except ImportError:
 # Small/mid cap with historically high retail interest and short activity
 SMALL_CAP_UNIVERSE = [
     # Meme / retail favorites
-    "GME", "AMC", "BB", "BBBY", "CLOV", "WISH", "SOFI", "PLTR", "RIVN",
+    "GME", "AMC", "BB", "CLOV", "SOFI", "PLTR", "RIVN",
     "LCID", "NIO", "MARA", "RIOT", "COIN", "HOOD", "DKNG", "SKLZ",
     # Biotech (binary event plays)
     "MRNA", "BNTX", "NVAX", "SAVA", "ATOS",
@@ -761,6 +767,7 @@ def screen_universe(
     tickers: List[str],
     include_social: bool = False,
     include_polymarket: bool = False,
+    include_congress: bool = False,
 ) -> pd.DataFrame:
     """Run all screens on a universe of tickers."""
 
@@ -790,6 +797,19 @@ def screen_universe(
         else:
             print("  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
 
+    # Congress trades — fetch all trades once, reuse per ticker (avoids repeated API calls)
+    congress_all_trades: list = []
+    if include_congress:
+        if _CONGRESS_AVAILABLE:
+            try:
+                print(f"  Fetching congressional trades (House + Senate)...")
+                congress_all_trades = get_all_trades(days_back=90)
+                print(f"  Congress: {len(congress_all_trades)} trades loaded")
+            except Exception as e:
+                print(f"  [WARN] Congress trades fetch failed: {e}")
+        else:
+            print("  [WARN] congress_trades.py not found — skipping congressional signals")
+
     results = []
     total = len(tickers)
 
@@ -815,20 +835,30 @@ def screen_universe(
         if include_polymarket:
             polymarket = score_polymarket_signal(ticker, poly_data)
 
-        # Composite score (weighted)
+        congress = {"score": 0, "max": 5, "flags": []}
+        if include_congress and _CONGRESS_AVAILABLE and congress_all_trades:
+            try:
+                # score_congress_signal fetches internally but we pass pre-fetched trades
+                # via a targeted filter to avoid re-fetching the full dataset
+                ticker_trades = [t for t in congress_all_trades if t["ticker"] == ticker]
+                if ticker_trades:
+                    congress = score_congress_signal(ticker, days_back=90)
+            except Exception:
+                pass
+
+        # Composite score
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
                         options["max"] + technical["max"] + social["max"] +
-                        polymarket["max"])
+                        polymarket["max"] + congress["max"])
         raw_total = (squeeze["score"] + volume["score"] + vol_squeeze["score"] +
                      options["score"] + technical["score"] + social["score"] +
-                     polymarket["score"])
+                     polymarket["score"] + congress["score"])
 
         composite = raw_total / max_possible * 100 if max_possible > 0 else 0
 
-        # All flags combined
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
                      options["flags"] + technical["flags"] + social["flags"] +
-                     polymarket["flags"])
+                     polymarket["flags"] + congress["flags"])
 
         results.append({
             "ticker": ticker,
@@ -843,6 +873,7 @@ def screen_universe(
             "technical_score": technical["score"],
             "social_score": social["score"],
             "polymarket_score": polymarket["score"],
+            "congress_score": congress["score"],
             "composite": round(composite, 1),
             "flags": all_flags,
             "n_flags": len(all_flags),
@@ -870,16 +901,17 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
     print(f"{'─' * 60}")
 
     has_poly = "polymarket_score" in df.columns and df["polymarket_score"].sum() > 0
+    has_congress = "congress_score" in df.columns and df["congress_score"].sum() > 0
 
     print(f"\n  {'Rank':<5}{'Ticker':<8}{'Price':>10}{'MktCap':>10}"
           f"{'Short%':>8}{'VolRatio':>9}{'Squeeze':>8}{'Volume':>8}"
           f"{'VolComp':>8}{'Options':>8}{'Tech':>7}{'Social':>7}"
           + (f"{'Poly':>6}" if has_poly else "")
+          + (f"{'Cong':>6}" if has_congress else "")
           + f"{'TOTAL':>8}")
-    print(f"  {'─' * (104 + (6 if has_poly else 0))}")
+    print(f"  {'─' * (104 + (6 if has_poly else 0) + (6 if has_congress else 0))}")
 
     for i, (_, row) in enumerate(df.head(top_n).iterrows()):
-        # Highlight tier
         if row["composite"] >= 50:
             tier = "🔥"
         elif row["composite"] >= 35:
@@ -902,6 +934,8 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
                 f"{row['social_score']:>5}/5")
         if has_poly:
             line += f"{row['polymarket_score']:>4}/5"
+        if has_congress:
+            line += f"{row['congress_score']:>4}/5"
         line += f" {tier}{row['composite']:>5.0f}%"
         print(line)
 
@@ -916,7 +950,8 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
             print(f"    • {flag}")
 
 
-def deep_dive(ticker: str, include_social: bool = False, include_polymarket: bool = False):
+def deep_dive(ticker: str, include_social: bool = False, include_polymarket: bool = False,
+              include_congress: bool = False):
     """Single-stock deep analysis."""
     print(f"\n{'█' * 60}")
     print(f"  DEEP DIVE: {ticker}")
@@ -977,9 +1012,265 @@ def deep_dive(ticker: str, include_social: bool = False, include_polymarket: boo
         else:
             print("\n  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
 
+    if include_congress:
+        if _CONGRESS_AVAILABLE:
+            try:
+                congress = score_congress_signal(ticker)
+                print(f"\n  CONGRESSIONAL TRADES: {congress['score']}/{congress['max']}")
+                for flag in congress["flags"]:
+                    print(f"    • {flag}")
+                if not congress["flags"]:
+                    print(f"    No congressional trades found for {ticker} in last 90 days.")
+            except Exception as e:
+                print(f"\n  [WARN] Congress trades fetch failed: {e}")
+        else:
+            print("\n  [WARN] congress_trades.py not found — skipping congressional signals")
+
 
 # ==============================================================================
-# SECTION 5: MAIN
+# SECTION 5: WATCHLIST MANAGEMENT
+# ==============================================================================
+
+WATCHLIST_PATH = "./watchlist.txt"
+WATCHLIST_HISTORY_PATH = "./watchlist_history.json"
+AUTO_ADD_THRESHOLD = 40.0  # composite % to auto-add new tickers to watchlist
+
+
+def _read_all_watchlist_tickers(path: str) -> Tuple[set, set]:
+    """
+    Parse watchlist.txt and return:
+      - all_tickers:    every ticker currently in the file (deduplicated)
+      - manual_tickers: tickers in the "MANUALLY ADDED" section
+    Handles both the old free-form format and the new tiered/annotated format.
+    """
+    if not os.path.exists(path):
+        return set(), set()
+
+    all_tickers: set = set()
+    manual_tickers: set = set()
+    in_manual_section = False
+
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                upper = line.upper()
+                if "MANUALLY ADDED" in upper:
+                    in_manual_section = True
+                elif any(kw in upper for kw in ("TIER 1", "TIER 2", "TIER 3",
+                                                 "HOT", "WATCH", "MONITOR")):
+                    in_manual_section = False
+                continue
+            # Strip inline comment, normalise
+            ticker = line.split("#")[0].strip().upper()
+            if ticker:
+                all_tickers.add(ticker)
+                if in_manual_section:
+                    manual_tickers.add(ticker)
+
+    return all_tickers, manual_tickers
+
+
+def _load_watchlist_history(path: str) -> dict:
+    """Load watchlist_history.json; return {} if missing or corrupt."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_watchlist_history(history: dict, path: str):
+    with open(path, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def _rank_annotation(ticker: str, history: dict) -> Tuple[str, str]:
+    """
+    Returns (arrow_str, note_str) for a ticker based on its history.
+    arrow_str: '↑3', '↓1', '→'
+    note_str:  ' 🔥 deep dive candidate' if 2+ consecutive rank rises, else ''
+    """
+    entries = history.get(ticker, [])
+    if not entries:
+        return "NEW", ""
+
+    delta = entries[-1].get("delta", 0)
+    if delta > 0:
+        arrow = f"↑{delta}"
+    elif delta < 0:
+        arrow = f"↓{abs(delta)}"
+    else:
+        arrow = "→"
+
+    # Count consecutive rank rises (positive delta) from the tail
+    consec_rises = 0
+    for e in reversed(entries):
+        if e.get("delta", 0) > 0:
+            consec_rises += 1
+        else:
+            break
+
+    note = " 🔥 deep dive candidate" if consec_rises >= 2 else ""
+    return arrow, note
+
+
+def _format_ticker_line(ticker: str, composite: float,
+                        history: dict, is_new: bool) -> str:
+    """Build a single annotated watchlist line."""
+    arrow, note = _rank_annotation(ticker, history)
+
+    entries = history.get(ticker, [])
+    rank_move = ""
+    if len(entries) >= 2:
+        prev = entries[-2]["rank"]
+        curr = entries[-1]["rank"]
+        if prev != curr:
+            rank_move = f" | rank {prev}→{curr}"
+
+    new_tag = " [NEW]" if is_new else ""
+    return f"{ticker:<10} # {arrow:<5} {composite:.0f}%{rank_move}{note}{new_tag}"
+
+
+def update_watchlist(
+    results_df: pd.DataFrame,
+    watchlist_path: str = WATCHLIST_PATH,
+    history_path: str = WATCHLIST_HISTORY_PATH,
+    auto_add_threshold: float = AUTO_ADD_THRESHOLD,
+):
+    """
+    Merge screener results into watchlist.txt and append to watchlist_history.json.
+
+    Rules:
+    - Existing watchlist tickers always stay (never deleted)
+    - Screener top picks above threshold get auto-added
+    - Tickers re-ranked each run by composite score; delta vs last run shown inline
+    - Tickers not scanned this run fall into MANUALLY ADDED section
+    - History is append-only
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Current watchlist state
+    existing, manual = _read_all_watchlist_tickers(watchlist_path)
+    history = _load_watchlist_history(history_path)
+
+    # Build screener results map
+    screened: Dict[str, float] = {}
+    if not results_df.empty:
+        for _, row in results_df.iterrows():
+            screened[row["ticker"]] = float(row["composite"])
+
+    # Auto-add new high-scorers not yet on watchlist
+    new_auto_adds = {
+        t for t, c in screened.items()
+        if t not in existing and c >= auto_add_threshold
+    }
+
+    all_tracked = existing | new_auto_adds
+
+    # Ranked list: only tickers we have screener data for
+    scanned_tracked = {t: screened[t] for t in all_tracked if t in screened}
+    ranked = sorted(scanned_tracked.items(), key=lambda x: x[1], reverse=True)
+
+    # Previous rank lookup
+    prev_ranks: Dict[str, int] = {
+        t: entries[-1]["rank"]
+        for t, entries in history.items()
+        if entries
+    }
+
+    # Update history for every scanned ticker
+    for new_rank, (ticker, composite) in enumerate(ranked, start=1):
+        prev_rank = prev_ranks.get(ticker)
+        delta = (prev_rank - new_rank) if prev_rank is not None else 0
+        history.setdefault(ticker, []).append({
+            "date": today,
+            "composite": round(composite, 1),
+            "rank": new_rank,
+            "delta": delta,
+        })
+
+    _save_watchlist_history(history, history_path)
+
+    # Tickers on watchlist that weren't scanned → go to MANUALLY ADDED section
+    scanned_set = {t for t, _ in ranked}
+    unscanned = all_tracked - scanned_set
+
+    # Tier buckets
+    tier1 = [(t, c) for t, c in ranked if c >= 50]
+    tier2 = [(t, c) for t, c in ranked if 30 <= c < 50]
+    tier3 = [(t, c) for t, c in ranked if c < 30]
+
+    # Write new watchlist.txt
+    lines = [
+        "# ============================================================",
+        f"# WATCHLIST — Auto-updated {today}",
+        "# Sorted by catalyst composite score (highest priority first)",
+        "# ↑/↓ = rank change vs last scan  |  → = stable  |  NEW = first appearance",
+        "# 🔥 = deep dive candidate (2+ consecutive rank rises)",
+        "# ============================================================",
+        "",
+    ]
+
+    def section(header, tickers):
+        if not tickers:
+            return
+        lines.append(header)
+        for t, c in tickers:
+            lines.append(_format_ticker_line(t, c, history, t in new_auto_adds))
+        lines.append("")
+
+    section("# ── TIER 1: HOT (≥50%) ─────────────────────────────────────", tier1)
+    section("# ── TIER 2: WATCH (30–49%) ─────────────────────────────────", tier2)
+    section("# ── TIER 3: MONITOR (<30%) ─────────────────────────────────", tier3)
+
+    if unscanned:
+        lines.append("# ── MANUALLY ADDED / NOT YET SCREENED ──────────────────────")
+        for ticker in sorted(unscanned):
+            entries = history.get(ticker, [])
+            if entries:
+                last = entries[-1]
+                lines.append(
+                    f"{ticker:<10} # last seen {last['date']}: {last['composite']:.0f}%"
+                )
+            else:
+                lines.append(ticker)
+        lines.append("")
+
+    with open(watchlist_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    # Console summary
+    risers = [(t, history[t][-1]["delta"]) for t in scanned_set
+              if history.get(t) and history[t][-1]["delta"] > 0]
+    fallers = [(t, history[t][-1]["delta"]) for t in scanned_set
+               if history.get(t) and history[t][-1]["delta"] < 0]
+    deep_dive_flags = [
+        t for t in scanned_set
+        if sum(1 for e in (history.get(t) or [])[-2:] if e.get("delta", 0) > 0) >= 2
+    ]
+
+    print(f"\n  {'─' * 50}")
+    print(f"  📋 WATCHLIST UPDATED — {today}")
+    print(f"  {'─' * 50}")
+    print(f"  Tracked : {len(all_tracked)} tickers  |  New auto-adds: {len(new_auto_adds)}")
+    if risers:
+        top = sorted(risers, key=lambda x: x[1], reverse=True)[:5]
+        print(f"  Rising  : {', '.join(f'{t}(↑{d})' for t, d in top)}")
+    if fallers:
+        top = sorted(fallers, key=lambda x: x[1])[:5]
+        print(f"  Falling : {', '.join(f'{t}(↓{abs(d)})' for t, d in top)}")
+    if deep_dive_flags:
+        print(f"  🔥 Deep dive: {', '.join(deep_dive_flags)}")
+    print(f"  Files   : {watchlist_path}  |  {history_path}")
+
+
+# ==============================================================================
+# SECTION 6: MAIN
 # ==============================================================================
 
 def main():
@@ -989,11 +1280,16 @@ def main():
     parser.add_argument("--ticker", type=str, help="Single stock deep dive")
     parser.add_argument("--social", action="store_true", help="Include Reddit scan")
     parser.add_argument("--polymarket", action="store_true", help="Include Polymarket prediction market signals")
+    parser.add_argument("--congress", action="store_true",
+                        help="Include congressional trading signals (House + Senate STOCK Act)")
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
+    parser.add_argument("--update-watchlist", action="store_true",
+                        help="After screening, re-rank watchlist.txt and append history")
     args = parser.parse_args()
 
     if args.ticker:
-        deep_dive(args.ticker.upper(), include_social=args.social, include_polymarket=args.polymarket)
+        deep_dive(args.ticker.upper(), include_social=args.social,
+                  include_polymarket=args.polymarket, include_congress=args.congress)
         return
 
     # Build universe
@@ -1006,18 +1302,23 @@ def main():
     else:
         universe = list(set(SMALL_CAP_UNIVERSE + MEME_UNIVERSE + LARGE_CAP_WATCH))
 
-    results = screen_universe(universe, include_social=args.social, include_polymarket=args.polymarket)
+    results = screen_universe(universe, include_social=args.social,
+                              include_polymarket=args.polymarket, include_congress=args.congress)
 
     if not results.empty:
         print_results(results, top_n=args.top)
 
-        # Export
+        # Export CSV
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         date_str = datetime.now().strftime("%Y%m%d")
         path = os.path.join(OUTPUT_DIR, f"catalyst_screen_{date_str}.csv")
         export = results.drop(columns=["flags"])
         export.to_csv(path, index=False)
         print(f"\n  📁 Exported to: {path}")
+
+        # Update watchlist
+        if args.update_watchlist:
+            update_watchlist(results)
 
     print(f"\n{'█' * 60}")
     print(f"  ⚠️  THESE ARE SETUP CONDITIONS, NOT BUY SIGNALS.")

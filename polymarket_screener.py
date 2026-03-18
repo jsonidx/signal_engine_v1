@@ -150,6 +150,75 @@ TICKER_KEYWORDS: Dict[str, List[str]] = {
     "MSTR":  ["microstrategy", "michael saylor"],
 }
 
+# ==============================================================================
+# RELEVANCE FILTERS
+# ==============================================================================
+
+# Tags assigned by Polymarket that are never relevant to equity/crypto trading.
+# Markets with ANY of these tags are dropped unconditionally.
+BLOCKED_TAGS = {
+    "sports", "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball",
+    "baseball", "hockey", "tennis", "golf", "formula-1", "f1", "ufc", "mma",
+    "boxing", "olympics", "esports", "gaming", "entertainment", "celebrity",
+    "awards", "oscars", "grammy", "emmys", "music", "film", "movies", "tv",
+    "reality-tv", "pop-culture",
+}
+
+# Keywords in the question text that signal a sports/entertainment market.
+# If the question contains ANY of these phrases, the market is dropped.
+BLOCKED_QUESTION_KEYWORDS = [
+    "nba finals", "nba champion", "super bowl", "world series", "stanley cup",
+    "world cup", "champions league", "premier league", "nfl champion",
+    "oscars", "academy award", "grammy award", "emmy award", "golden globe",
+    "american idol", "survivor ", "bachelor ", "big brother",
+    "win the match", "win the game", "win the tournament", "win the series",
+    "beat the ", "defeat the ",          # sports result framing
+    "most goals", "most points", "top scorer",
+    " mvp ", "rookie of the year",
+]
+
+# Political markets are only relevant when they affect markets directly.
+# A political question passes the filter only if it ALSO contains one of these.
+POLITICAL_MARKET_KEYWORDS = [
+    "tariff", "tariffs", "trade war", "sanction", "rate cut", "rate hike",
+    "interest rate", "fed ", "fomc", "inflation", "gdp", "recession",
+    "stimulus", "tax", "deficit", "debt ceiling", "crypto", "bitcoin",
+    "regulation", "sec ", "antitrust", "ban ", "approve", "approval",
+    "ipo", "merger", "acquisition", "price", "market", "economy", "economic",
+    "stock", "equity", "bond", "dollar", "usd", "currency", "oil", "energy",
+]
+
+# Tags that indicate a political market (requires secondary keyword check above)
+POLITICAL_TAGS = {
+    "politics", "election", "elections", "government", "congress",
+    "senate", "president", "democrat", "republican", "vote", "policy",
+}
+
+
+def _is_relevant_market(market: dict) -> bool:
+    """
+    Return False for sports, entertainment, and off-topic political markets.
+    Political markets pass only if they contain financial/market keywords.
+    """
+    tags = set(market.get("tags", []))
+    question = market.get("question", "").lower()
+
+    # Hard block: sports/entertainment tags
+    if tags & BLOCKED_TAGS:
+        return False
+
+    # Hard block: sports/entertainment keywords in question
+    if any(kw in question for kw in BLOCKED_QUESTION_KEYWORDS):
+        return False
+
+    # Soft block: political markets need a financial relevance anchor
+    if tags & POLITICAL_TAGS:
+        if not any(kw in question for kw in POLITICAL_MARKET_KEYWORDS):
+            return False
+
+    return True
+
+
 # Maps catalyst type → relevant search keywords for un-tickered catalysts
 CATALYST_TYPE_KEYWORDS: Dict[str, List[str]] = {
     "earnings":    ["earnings", "beat", "eps", "revenue", "quarterly results"],
@@ -639,6 +708,10 @@ def extract_signal(
     Returns None if the market doesn't meet minimum quality thresholds
     (insufficient volume, already resolved, bad data, etc.).
     """
+    # Relevance gate: drop sports, entertainment, off-topic politics
+    if not _is_relevant_market(market):
+        return None
+
     vol_24h   = market.get("volume_24h", 0.0)
     liquidity = market.get("liquidity", 0.0)
     dtr       = market.get("days_to_resolution")

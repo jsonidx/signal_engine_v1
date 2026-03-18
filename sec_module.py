@@ -207,7 +207,7 @@ def get_insider_detail_from_search(ticker: str, days_back: int = 180) -> dict:
 
     data = _sec_request(url)
     if not data:
-        return {"ticker": ticker, "total_filings": 0, "transactions": []}
+        return {"ticker": ticker, "total_filings": 0, "unique_filers": 0, "filers": {}, "transactions": []}
 
     total = data.get("hits", {}).get("total", {}).get("value", 0)
     hits = data.get("hits", {}).get("hits", [])
@@ -504,8 +504,15 @@ def scan_watchlist_insiders():
         return
 
     with open(watchlist_path) as f:
-        tickers = [l.strip().upper() for l in f
-                   if l.strip() and not l.startswith("#") and not l.endswith("-USD")]
+        tickers = []
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            ticker = line.split("#")[0].strip().upper()
+            if ticker and not ticker.endswith("-USD"):
+                tickers.append(ticker)
+        tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
 
     print(f"\n{'█' * 60}")
     print(f"  SEC INSIDER SCAN — {len(tickers)} tickers")
