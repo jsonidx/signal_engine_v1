@@ -220,6 +220,15 @@ def _collect_fundamental_signals(ticker: str) -> dict:
         return {}
 
 
+def _collect_cross_asset_signals(ticker: str) -> dict:
+    """Cross-asset divergence signal (Bottom/Top Finder logic)."""
+    try:
+        from cross_asset_divergence import get_cross_asset_signal
+        return get_cross_asset_signal(ticker)
+    except Exception:
+        return {}
+
+
 def _collect_options_signals(ticker: str) -> dict:
     """Pull options flow data from options_flow module."""
     try:
@@ -293,6 +302,13 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         print("done")
 
     if verbose:
+        print(f"  [{ticker}]   → cross-asset divergence...", end=" ", flush=True)
+    cadiv = _collect_cross_asset_signals(ticker)
+    signals["cross_asset"] = cadiv
+    if verbose:
+        print("done")
+
+    if verbose:
         print(f"  [{ticker}]   → options flow...", end=" ", flush=True)
     opts = _collect_options_signals(ticker)
     signals["options_flow"] = opts
@@ -356,11 +372,12 @@ Output MUST be in JSON format with this exact structure:
 def _build_prompt(signals: dict) -> str:
     """Build the analysis prompt from collected signals."""
     ticker = signals["ticker"]
-    tech = signals.get("technical", {})
-    fund = signals.get("fundamentals", {})
-    opts = signals.get("options_flow", {})
-    cong = signals.get("congress", {})
-    poly = signals.get("polymarket", {})
+    tech   = signals.get("technical", {})
+    cadiv  = signals.get("cross_asset", {})
+    fund   = signals.get("fundamentals", {})
+    opts   = signals.get("options_flow", {})
+    cong   = signals.get("congress", {})
+    poly   = signals.get("polymarket", {})
 
     prompt_parts = [
         f"Analyze {ticker} using the following signal data collected on {datetime.now().strftime('%Y-%m-%d')}.",
@@ -383,6 +400,17 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Technical data: unavailable")
+
+    prompt_parts += ["", "## CROSS-ASSET DIVERGENCE (vs RSP / HYG / DXY)"]
+    if cadiv:
+        prompt_parts += [
+            f"Signal:         {cadiv.get('signal', 'N/A')}",
+            f"Bottom line:    {cadiv.get('bot_line', 'N/A')} (MA={cadiv.get('bot_line_ma', 'N/A')}, spike={cadiv.get('bot_diff', 'N/A')}x) | trigger={cadiv.get('bot_trigger', False)}",
+            f"Top line:       {cadiv.get('top_line', 'N/A')} (MA={cadiv.get('top_line_ma', 'N/A')}, spike={cadiv.get('top_diff', 'N/A')}x) | trigger={cadiv.get('top_trigger', False)}",
+            f"Interpretation: {cadiv.get('interpretation', 'N/A')}",
+        ]
+    else:
+        prompt_parts.append("Cross-asset divergence: unavailable")
 
     prompt_parts += ["", "## OPTIONS FLOW"]
     if opts:
