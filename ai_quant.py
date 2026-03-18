@@ -48,6 +48,7 @@ IMPORTANT: This is NOT investment advice. Claude is analyzing the same
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 import warnings
@@ -70,6 +71,172 @@ except ImportError:
     PORTFOLIO_NAV = 50_000
     CRYPTO_ALLOCATION = 0.25
     EQUITY_ALLOCATION = 0.65
+
+
+# ==============================================================================
+# SECTION 0: RESULT CACHE (SQLite)
+# ==============================================================================
+
+_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_quant_cache.db")
+
+
+def _init_db() -> sqlite3.Connection:
+    """Open (and if needed, create) the cache database."""
+    conn = sqlite3.connect(_DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS thesis_cache (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker        TEXT    NOT NULL,
+            date          TEXT    NOT NULL,
+            direction     TEXT,
+            conviction    INTEGER,
+            time_horizon  TEXT,
+            entry_low     REAL,
+            entry_high    REAL,
+            stop_loss     REAL,
+            target_1      REAL,
+            target_2      REAL,
+            position_size_pct REAL,
+            thesis        TEXT,
+            data_quality  TEXT,
+            notes         TEXT,
+            catalysts_json TEXT,
+            risks_json    TEXT,
+            raw_response  TEXT,
+            signals_json  TEXT,
+            created_at    TEXT,
+            UNIQUE(ticker, date)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
+    """
+    Return today's cached thesis for ticker, or None if not found.
+    date defaults to today (YYYY-MM-DD).
+    """
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    try:
+        conn = _init_db()
+        row = conn.execute(
+            "SELECT * FROM thesis_cache WHERE ticker=? AND date=?",
+            (ticker.upper(), date),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        cols = [
+            "id", "ticker", "date", "direction", "conviction", "time_horizon",
+            "entry_low", "entry_high", "stop_loss", "target_1", "target_2",
+            "position_size_pct", "thesis", "data_quality", "notes",
+            "catalysts_json", "risks_json", "raw_response", "signals_json", "created_at",
+        ]
+        d = dict(zip(cols, row))
+        # Expand JSON fields back to lists/dicts
+        d["catalysts"]     = json.loads(d.pop("catalysts_json") or "[]")
+        d["risks"]         = json.loads(d.pop("risks_json")     or "[]")
+        d["raw_response"]  = d.get("raw_response", "")
+        d["signals"]       = json.loads(d.pop("signals_json")   or "{}")
+        return d
+    except Exception:
+        return None
+
+
+def save_thesis(thesis: dict) -> None:
+    """Upsert a thesis result into the cache for today."""
+    try:
+        date = datetime.now().strftime("%Y-%m-%d")
+        conn = _init_db()
+        conn.execute("""
+            INSERT INTO thesis_cache
+                (ticker, date, direction, conviction, time_horizon,
+                 entry_low, entry_high, stop_loss, target_1, target_2,
+                 position_size_pct, thesis, data_quality, notes,
+                 catalysts_json, risks_json, raw_response, signals_json, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(ticker, date) DO UPDATE SET
+                direction=excluded.direction,
+                conviction=excluded.conviction,
+                time_horizon=excluded.time_horizon,
+                entry_low=excluded.entry_low,
+                entry_high=excluded.entry_high,
+                stop_loss=excluded.stop_loss,
+                target_1=excluded.target_1,
+                target_2=excluded.target_2,
+                position_size_pct=excluded.position_size_pct,
+                thesis=excluded.thesis,
+                data_quality=excluded.data_quality,
+                notes=excluded.notes,
+                catalysts_json=excluded.catalysts_json,
+                risks_json=excluded.risks_json,
+                raw_response=excluded.raw_response,
+                signals_json=excluded.signals_json,
+                created_at=excluded.created_at
+        """, (
+            thesis.get("ticker", "").upper(),
+            date,
+            thesis.get("direction"),
+            thesis.get("conviction"),
+            thesis.get("time_horizon"),
+            thesis.get("entry_low"),
+            thesis.get("entry_high"),
+            thesis.get("stop_loss"),
+            thesis.get("target_1"),
+            thesis.get("target_2"),
+            thesis.get("position_size_pct"),
+            thesis.get("thesis"),
+            thesis.get("data_quality"),
+            thesis.get("notes"),
+            json.dumps(thesis.get("catalysts") or []),
+            json.dumps(thesis.get("risks") or []),
+            thesis.get("raw_response", ""),
+            json.dumps(thesis.get("signals") or {}),
+            datetime.now().isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"  [cache] WARNING: Could not save to cache: {e}")
+
+
+def print_cache_table(days: int = 7) -> None:
+    """Print cached theses from the last N days."""
+    try:
+        conn = _init_db()
+        rows = conn.execute("""
+            SELECT ticker, date, direction, conviction, time_horizon,
+                   entry_low, target_1, stop_loss, thesis
+            FROM thesis_cache
+            ORDER BY date DESC, conviction DESC
+            LIMIT 200
+        """).fetchall()
+        conn.close()
+    except Exception as e:
+        print(f"  [cache] ERROR: {e}")
+        return
+
+    if not rows:
+        print("  Cache is empty.")
+        return
+
+    print()
+    print("AI QUANT CACHE")
+    print("=" * 90)
+    print(f"  {'DATE':<12} {'TICKER':<8} {'DIR':<7} {'CONV':>5}  {'ENTRY':>8}  {'TARGET':>8}  THESIS")
+    print("  " + "-" * 84)
+    for date, ticker, direction, conviction, horizon, entry, target, stop, thesis_text in [
+        (r[1], r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in rows
+    ]:
+        icon = DIRECTION_ICON.get(direction or "NEUTRAL", "◯")
+        entry_s  = f"${entry:.2f}"  if entry  else "   N/A"
+        target_s = f"${target:.2f}" if target else "   N/A"
+        short_thesis = (thesis_text or "")[:50]
+        print(f"  {date:<12} {ticker:<8} {icon} {(direction or '?'):<5} "
+              f"{(conviction or 0):>5}  {entry_s:>8}  {target_s:>8}  {short_thesis}")
+    print()
 
 
 # ==============================================================================
@@ -1022,12 +1189,23 @@ def update_watchlist_from_screen(
 # SECTION 5: ANALYSIS PIPELINE
 # ==============================================================================
 
-def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False) -> Optional[dict]:
+def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
+                   use_cache: bool = True) -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
     Returns parsed thesis dict, or None on failure.
+    Checks SQLite cache first (today's date); skips API call if hit.
+    Pass use_cache=False to force a fresh analysis.
     """
     ticker = ticker.upper().strip()
+
+    # --- Cache check ---
+    if use_cache:
+        cached = get_cached_thesis(ticker)
+        if cached:
+            print(f"\n  [{ticker}] Using cached result from today — skipping API call.")
+            return cached
+
     print(f"\n  Analyzing {ticker}...")
 
     # Collect signals
@@ -1062,16 +1240,20 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False)
     thesis["signals"] = signals
     thesis["raw_response"] = raw
 
+    # --- Save to cache ---
+    save_thesis(thesis)
+
     return thesis
 
 
 def analyze_tickers(tickers: List[str], verbose: bool = False,
-                    raw_output: bool = False) -> List[dict]:
+                    raw_output: bool = False, use_cache: bool = True) -> List[dict]:
     """Analyze multiple tickers, returning sorted by conviction."""
     results = []
     for i, ticker in enumerate(tickers, 1):
         print(f"\n[{i}/{len(tickers)}] {ticker}")
-        result = analyze_ticker(ticker, verbose=verbose, raw_output=raw_output)
+        result = analyze_ticker(ticker, verbose=verbose, raw_output=raw_output,
+                                use_cache=use_cache)
         if result:
             results.append(result)
         time.sleep(1)  # Brief pause between API calls
@@ -1331,7 +1513,22 @@ def main():
     parser.add_argument("--report", type=str, help="Analyze existing signal report file")
     parser.add_argument("--raw", action="store_true", help="Show raw Claude response")
     parser.add_argument("--verbose", action="store_true", help="Show collection progress")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Force fresh analysis, ignoring today's cached results")
+    parser.add_argument("--cache-show", action="store_true",
+                        help="Show recent cached results and exit")
     args = parser.parse_args()
+    use_cache = not args.no_cache
+
+    # --cache-show: print cache table and exit
+    if args.cache_show:
+        print()
+        print("================================================================")
+        print("  AI QUANT ANALYST — POWERED BY CLAUDE OPUS 4.6")
+        print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print("================================================================")
+        print_cache_table()
+        return
 
     print()
     print("================================================================")
@@ -1386,6 +1583,14 @@ def main():
             for i, r in enumerate(top_candidates, 1):
                 ticker = r["ticker"]
                 print(f"\n[{i}/{len(top_candidates)}] {ticker}")
+                # Check cache first
+                if use_cache:
+                    cached = get_cached_thesis(ticker)
+                    if cached:
+                        print(f"  [{ticker}] Using cached result from today — skipping API call.")
+                        cached["screen"] = r["screen"]
+                        results.append(cached)
+                        continue
                 prompt = _build_prompt(r["signals"])
                 raw    = _call_claude(prompt, verbose=args.verbose)
                 if raw is None:
@@ -1398,6 +1603,7 @@ def main():
                     thesis["signals"]      = r["signals"]
                     thesis["raw_response"] = raw
                     thesis["screen"]       = r["screen"]
+                    save_thesis(thesis)
                     results.append(thesis)
                 time.sleep(1)
 
@@ -1425,7 +1631,8 @@ def main():
 
     elif args.ticker:
         result = analyze_ticker(
-            args.ticker.upper(), verbose=args.verbose, raw_output=args.raw
+            args.ticker.upper(), verbose=args.verbose, raw_output=args.raw,
+            use_cache=use_cache,
         )
         if result:
             print_thesis(result)
@@ -1433,7 +1640,8 @@ def main():
     elif args.tickers:
         tickers = [t.upper() for t in args.tickers]
         print(f"  Analyzing {len(tickers)} tickers...")
-        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw)
+        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw,
+                                  use_cache=use_cache)
         print_full_report(results)
 
     elif args.tier1_only:
@@ -1442,7 +1650,8 @@ def main():
             print("  No TIER 1 tickers found in watchlist.txt")
             sys.exit(1)
         print(f"  Analyzing {len(tickers)} TIER 1 tickers: {', '.join(tickers)}")
-        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw)
+        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw,
+                                  use_cache=use_cache)
         print_full_report(results)
 
     elif args.watchlist:
@@ -1451,7 +1660,8 @@ def main():
             print("  No TIER 1/TIER 2 tickers found in watchlist.txt")
             sys.exit(1)
         print(f"  Analyzing {len(tickers)} watchlist tickers: {', '.join(tickers)}")
-        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw)
+        results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw,
+                                  use_cache=use_cache)
         print_full_report(results)
 
     else:
@@ -1468,6 +1678,8 @@ def main():
         print("    python3 ai_quant.py --screen --min-score 12 --top 3")
         print("    python3 ai_quant.py --watchlist")
         print("    python3 ai_quant.py --report signal_reports/signal_report_20260318.txt")
+        print("    python3 ai_quant.py --ticker COIN --no-cache     # force fresh analysis")
+        print("    python3 ai_quant.py --cache-show                 # view cached results")
         print()
 
 
