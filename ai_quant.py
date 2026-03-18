@@ -153,11 +153,12 @@ def _collect_technical_signals(ticker: str) -> dict:
         vol_20d_avg = float(volume.iloc[-21:-1].mean())
         vol_ratio = vol_5d_avg / vol_20d_avg if vol_20d_avg > 0 else 1.0
 
-        # 52w range
-        high_52w = float(close.rolling(252).max().iloc[-1])
-        low_52w = float(close.rolling(252).min().iloc[-1])
+        # 52w range — fall back to full available history if < 252 bars
+        window_52w = min(252, len(close))
+        high_52w = float(close.iloc[-window_52w:].max())
+        low_52w  = float(close.iloc[-window_52w:].min())
         pct_from_high = (price - high_52w) / high_52w * 100 if high_52w > 0 else 0
-        pct_from_low = (price - low_52w) / low_52w * 100 if low_52w > 0 else 0
+        pct_from_low  = (price - low_52w)  / low_52w  * 100 if low_52w  > 0 else 0
 
         # Trend assessment
         above_ma200 = price > ma200
