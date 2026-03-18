@@ -295,6 +295,41 @@ def _collect_polymarket_signals(ticker: str) -> dict:
         return {}
 
 
+def _collect_sec_signals(ticker: str) -> dict:
+    """SEC EDGAR: insider buying (Form 4), activist stakes (13D/G), material events (8-K)."""
+    try:
+        from sec_module import score_sec_signals
+        return score_sec_signals(ticker)
+    except Exception:
+        return {}
+
+
+def _collect_catalyst_signals(ticker: str) -> dict:
+    """Catalyst setup: short squeeze conditions, volatility compression, float/ownership data."""
+    try:
+        from catalyst_screener import get_stock_data, score_short_squeeze, score_volatility_squeeze
+        data = get_stock_data(ticker)
+        if not data:
+            return {}
+        squeeze = score_short_squeeze(data)
+        vol_compress = score_volatility_squeeze(data)
+        return {
+            "short_pct_float": data.get("short_pct_float"),
+            "days_to_cover": data.get("short_ratio_dtc"),
+            "float_shares": data.get("float_shares"),
+            "inst_ownership": data.get("inst_ownership"),
+            "insider_ownership": data.get("insider_ownership"),
+            "short_squeeze_score": squeeze.get("score", 0),
+            "short_squeeze_max": squeeze.get("max", 0),
+            "short_squeeze_flags": squeeze.get("flags", []),
+            "vol_compression_score": vol_compress.get("score", 0),
+            "vol_compression_max": vol_compress.get("max", 0),
+            "vol_compression_flags": vol_compress.get("flags", []),
+        }
+    except Exception:
+        return {}
+
+
 def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     """
     Collect all available signals for a ticker.
@@ -362,6 +397,20 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     if verbose:
         print("done")
 
+    if verbose:
+        print(f"  [{ticker}]   → SEC filings...", end=" ", flush=True)
+    sec = _collect_sec_signals(ticker)
+    signals["sec"] = sec
+    if verbose:
+        print("done")
+
+    if verbose:
+        print(f"  [{ticker}]   → catalyst setup...", end=" ", flush=True)
+    catalyst = _collect_catalyst_signals(ticker)
+    signals["catalyst"] = catalyst
+    if verbose:
+        print("done")
+
     return signals
 
 
@@ -404,15 +453,17 @@ Output MUST be in JSON format with this exact structure:
 
 def _build_prompt(signals: dict) -> str:
     """Build the analysis prompt from collected signals."""
-    ticker = signals["ticker"]
-    tech   = signals.get("technical", {})
-    vp     = signals.get("volume_profile", {})
-    cadiv  = signals.get("cross_asset", {})
-    fund   = signals.get("fundamentals", {})
-    opts   = signals.get("options_flow", {})
-    mp     = signals.get("max_pain", {})
-    cong   = signals.get("congress", {})
-    poly   = signals.get("polymarket", {})
+    ticker   = signals["ticker"]
+    tech     = signals.get("technical", {})
+    vp       = signals.get("volume_profile", {})
+    cadiv    = signals.get("cross_asset", {})
+    fund     = signals.get("fundamentals", {})
+    opts     = signals.get("options_flow", {})
+    mp       = signals.get("max_pain", {})
+    cong     = signals.get("congress", {})
+    poly     = signals.get("polymarket", {})
+    sec      = signals.get("sec", {})
+    catalyst = signals.get("catalyst", {})
 
     prompt_parts = [
         f"Analyze {ticker} using the following signal data collected on {datetime.now().strftime('%Y-%m-%d')}.",
@@ -485,6 +536,25 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Options data: unavailable (possibly crypto or thin options)")
 
+    prompt_parts += ["", "## CATALYST SETUP (Short Squeeze / Volatility Compression)"]
+    if catalyst:
+        float_m = catalyst.get("float_shares", 0)
+        float_str = f"{float_m/1e6:.1f}M" if float_m and float_m > 0 else "N/A"
+        prompt_parts += [
+            f"Short % of float: {catalyst.get('short_pct_float', 'N/A'):.1%}" if isinstance(catalyst.get('short_pct_float'), float) else f"Short % of float: {catalyst.get('short_pct_float', 'N/A')}",
+            f"Days to cover (DTC): {catalyst.get('days_to_cover', 'N/A')}",
+            f"Float: {float_str}  |  Institutional ownership: {catalyst.get('inst_ownership', 'N/A'):.1%}" if isinstance(catalyst.get('inst_ownership'), float) else f"Float: {float_str}",
+            f"Insider ownership: {catalyst.get('insider_ownership', 'N/A'):.1%}" if isinstance(catalyst.get('insider_ownership'), float) else f"Insider ownership: {catalyst.get('insider_ownership', 'N/A')}",
+            f"Short squeeze score: {catalyst.get('short_squeeze_score', 'N/A')}/{catalyst.get('short_squeeze_max', 'N/A')}",
+        ]
+        for flag in catalyst.get("short_squeeze_flags", []):
+            prompt_parts.append(f"  • {flag}")
+        prompt_parts.append(f"Volatility compression score: {catalyst.get('vol_compression_score', 'N/A')}/{catalyst.get('vol_compression_max', 'N/A')}")
+        for flag in catalyst.get("vol_compression_flags", []):
+            prompt_parts.append(f"  • {flag}")
+    else:
+        prompt_parts.append("Catalyst setup data: unavailable")
+
     prompt_parts += ["", "## FUNDAMENTAL SIGNALS"]
     if fund:
         prompt_parts += [
@@ -549,6 +619,18 @@ def _build_prompt(signals: dict) -> str:
                     )
     else:
         prompt_parts.append("Congressional trade data: none / unavailable")
+
+    prompt_parts += ["", "## SEC FILINGS (Insider / Activist / Institutional)"]
+    if sec:
+        prompt_parts += [
+            f"SEC signal score: {sec.get('score', 'N/A')}/{sec.get('max', 'N/A')}",
+        ]
+        for flag in sec.get("flags", []):
+            prompt_parts.append(f"  • {flag}")
+        if not sec.get("flags"):
+            prompt_parts.append("  No notable SEC filings detected")
+    else:
+        prompt_parts.append("SEC data: unavailable")
 
     prompt_parts += ["", "## POLYMARKET PREDICTION MARKETS"]
     if poly:
@@ -668,7 +750,276 @@ def _parse_response(raw: str) -> Optional[dict]:
 
 
 # ==============================================================================
-# SECTION 4: ANALYSIS PIPELINE
+# SECTION 4: PRE-SCREENER (signal scoring, no Claude API cost)
+# ==============================================================================
+
+def _pre_screen_score(signals: dict) -> dict:
+    """
+    Score a ticker's collected signals without calling Claude.
+    Returns {score, max, flags, grade} for ranking candidates.
+
+    Scoring breakdown (max = 25):
+      Technical   0-10  — trend, momentum, volume
+      Fundamental 0-5   — valuation, growth, analyst
+      Catalyst    0-5   — short squeeze, vol compression, congress
+      SEC         0-3   — insider buying, activist stakes
+      Options     0-2   — bullish flow
+    """
+    score = 0
+    flags = []
+
+    tech = signals.get("technical", {})
+    fund = signals.get("fundamentals", {})
+    cat  = signals.get("catalyst", {})
+    cong = signals.get("congress", {})
+    sec  = signals.get("sec", {})
+    opts = signals.get("options_flow", {})
+
+    # ── Technical (max 10) ────────────────────────────────────────────────────
+    if tech:
+        if tech.get("above_ma200"):
+            score += 2; flags.append("Above 200MA")
+        if tech.get("above_ma50"):
+            score += 1; flags.append("Above 50MA")
+        if tech.get("above_ma20"):
+            score += 1; flags.append("Above 20MA")
+
+        rsi = tech.get("rsi_14", 50)
+        if 40 <= rsi <= 68:
+            score += 2; flags.append(f"RSI healthy ({rsi})")
+        elif rsi > 68:
+            flags.append(f"RSI overbought ({rsi})")
+
+        if (tech.get("momentum_1m_pct") or 0) > 0:
+            score += 1; flags.append("1M momentum positive")
+        if (tech.get("momentum_3m_pct") or 0) > 0:
+            score += 1; flags.append("3M momentum positive")
+        if (tech.get("volume_ratio_5d_vs_20d") or 0) >= 1.1:
+            score += 1; flags.append("Volume expanding")
+        if (tech.get("pct_from_52w_low") or 0) > 15:
+            score += 1; flags.append("Strong off 52w low")
+
+    # ── Fundamental (max 5) ───────────────────────────────────────────────────
+    if fund:
+        if (fund.get("fundamental_score_pct") or 0) >= 60:
+            score += 2; flags.append(f"Strong fundamentals ({fund['fundamental_score_pct']}%)")
+        elif (fund.get("fundamental_score_pct") or 0) >= 40:
+            score += 1
+
+        if (fund.get("analyst_upside_pct") or 0) >= 15:
+            score += 2; flags.append(f"Analyst upside {fund['analyst_upside_pct']}%")
+        elif (fund.get("analyst_upside_pct") or 0) >= 5:
+            score += 1
+
+        if (fund.get("revenue_growth_yoy") or 0) > 0:
+            score += 1; flags.append("Revenue growing YoY")
+
+    # ── Catalyst (max 5) ──────────────────────────────────────────────────────
+    if cat:
+        sq = cat.get("short_squeeze_score", 0)
+        sq_max = cat.get("short_squeeze_max", 1) or 1
+        if sq / sq_max >= 0.5:
+            score += 2; flags.append(f"Short squeeze setup ({sq}/{sq_max})")
+
+        vc = cat.get("vol_compression_score", 0)
+        vc_max = cat.get("vol_compression_max", 1) or 1
+        if vc / vc_max >= 0.5:
+            score += 2; flags.append(f"Volatility compression ({vc}/{vc_max})")
+
+    if cong and (cong.get("congress_score") or 0) > 0:
+        score += 1; flags.append(f"Congress buying ({cong.get('congress_score')})")
+
+    # ── SEC Filings (max 3) ───────────────────────────────────────────────────
+    if sec:
+        sec_score = sec.get("score", 0)
+        if sec_score >= 3:
+            score += 3; flags.append(f"Strong SEC signals ({sec_score}/{sec.get('max','?')})")
+        elif sec_score >= 1:
+            score += 1; flags.append(f"SEC signal ({sec_score}/{sec.get('max','?')})")
+
+    # ── Options Flow (max 2) ──────────────────────────────────────────────────
+    if opts:
+        heat = opts.get("heat_score", 0)
+        direction = opts.get("direction", "")
+        if heat >= 60 and "bull" in str(direction).lower():
+            score += 2; flags.append(f"Bullish options flow (heat={heat})")
+        elif heat >= 40 and "bull" in str(direction).lower():
+            score += 1
+
+    # ── Grade ─────────────────────────────────────────────────────────────────
+    pct = score / 25
+    if pct >= 0.72:
+        grade = "A"
+    elif pct >= 0.52:
+        grade = "B"
+    elif pct >= 0.36:
+        grade = "C"
+    else:
+        grade = "D"
+
+    return {"score": score, "max": 25, "grade": grade, "flags": flags}
+
+
+def _build_screen_universe(mode: str = "all") -> List[str]:
+    """
+    Build the ticker universe to scan.
+
+    Modes:
+      watchlist — only tickers already in watchlist.txt
+      small     — small-cap / high-momentum pool from catalyst_screener
+      meme      — meme/retail favourites
+      large     — large-cap / mega-cap
+      config    — EQUITY_WATCHLIST + CUSTOM_WATCHLIST from config.py
+      all       — everything combined (default)
+    """
+    tickers: set = set()
+
+    if mode in ("watchlist",):
+        tickers.update(_read_watchlist_tickers())
+        return sorted(tickers)
+
+    # Always include watchlist so existing holdings are re-evaluated
+    tickers.update(_read_watchlist_tickers())
+
+    # Pull config universe
+    try:
+        from config import EQUITY_WATCHLIST, CUSTOM_WATCHLIST
+        tickers.update(EQUITY_WATCHLIST)
+        tickers.update(CUSTOM_WATCHLIST)
+    except ImportError:
+        pass
+
+    # Pull catalyst_screener universes
+    try:
+        import catalyst_screener as cs
+        if mode in ("small", "all"):
+            tickers.update(getattr(cs, "SMALL_CAP_UNIVERSE", []))
+        if mode in ("meme", "all"):
+            tickers.update(getattr(cs, "MEME_UNIVERSE", []))
+        if mode in ("large", "all"):
+            tickers.update(getattr(cs, "LARGE_CAP_WATCH", []))
+    except ImportError:
+        pass
+
+    return sorted(tickers)
+
+
+def screen_tickers(
+    tickers: List[str],
+    min_score: int = 8,
+    top_n: int = 0,
+    verbose: bool = False,
+) -> List[dict]:
+    """
+    Score every ticker in the universe without calling Claude.
+    Returns full ranked list filtered by min_score (then top_n if set).
+    """
+    print(f"\n  Screening {len(tickers)} tickers (no API cost)...\n")
+    results = []
+
+    for i, ticker in enumerate(tickers, 1):
+        print(f"  [{i:>3}/{len(tickers)}] {ticker:<8}", end=" ", flush=True)
+        signals = collect_all_signals(ticker, verbose=False)
+        screen  = _pre_screen_score(signals)
+        results.append({
+            "ticker":  ticker,
+            "signals": signals,
+            "screen":  screen,
+        })
+        print(f"score={screen['score']:>2}/25  grade={screen['grade']}")
+
+    results.sort(key=lambda r: r["screen"]["score"], reverse=True)
+
+    qualified = [r for r in results if r["screen"]["score"] >= min_score]
+    if top_n > 0:
+        qualified = qualified[:top_n]
+
+    return qualified
+
+
+def print_screen_table(results: List[dict], watchlist_tickers: set = None) -> None:
+    """Print ranked screening results table."""
+    if watchlist_tickers is None:
+        watchlist_tickers = set(_read_watchlist_tickers())
+
+    print()
+    print("AI QUANT — SCREENER RESULTS")
+    print("=" * 80)
+    print(f"  {'#':<3}  {'TICKER':<8}  {'SCORE':>6}  {'GRADE'}  {'WL?':<5}  TOP SIGNALS")
+    print("  " + "-" * 74)
+
+    for rank, r in enumerate(results, 1):
+        sc       = r["screen"]["score"]
+        grade    = r["screen"]["grade"]
+        ticker   = r["ticker"]
+        in_wl    = "YES" if ticker in watchlist_tickers else "new"
+        flags    = r["screen"]["flags"][:3]
+        flag_str = " | ".join(flags) if flags else "—"
+        print(f"  {rank:<3}  {ticker:<8}  {sc:>4}/25  [{grade}]  {in_wl:<5}  {flag_str}")
+
+    print()
+
+
+def update_watchlist_from_screen(
+    results: List[dict],
+    watchlist_path: str = "./watchlist.txt",
+    min_tier1: int = 18,   # score >= 18 → TIER 1  (grade A)
+    min_tier2: int = 13,   # score >= 13 → TIER 2  (grade B)
+    min_tier3: int = 8,    # score >=  8 → TIER 3  (grade C)
+) -> None:
+    """
+    Re-write watchlist.txt using screener scores.
+
+    Tiers:
+      TIER 1  score >= 18  (grade A)   — highest conviction buys
+      TIER 2  score >= 13  (grade B)   — worth monitoring
+      TIER 3  score >=  8  (grade C)   — weak signal, low priority
+      Dropped score <  8  (grade D)   — removed from watchlist
+    """
+    from datetime import datetime as _dt
+
+    tier1, tier2, tier3 = [], [], []
+    for r in results:
+        sc     = r["screen"]["score"]
+        ticker = r["ticker"]
+        flags  = r["screen"]["flags"]
+        note   = flags[0] if flags else ""
+        entry  = f"{ticker:<8}  # {sc}/25 — {note}"
+        if sc >= min_tier1:
+            tier1.append(entry)
+        elif sc >= min_tier2:
+            tier2.append(entry)
+        elif sc >= min_tier3:
+            tier3.append(entry)
+        # Below min_tier3 → not written
+
+    today = _dt.now().strftime("%Y-%m-%d")
+    lines = [
+        "# ============================================================",
+        f"# WATCHLIST — AI Quant screener  |  updated {today}",
+        "# Scored by 10-module signal quality (max 25)",
+        "# TIER 1 ≥18  TIER 2 ≥13  TIER 3 ≥8  (below 8 excluded)",
+        "# ============================================================",
+        "",
+        "# TIER 1 — High conviction (Grade A, score ≥18)",
+    ] + tier1 + [
+        "",
+        "# TIER 2 — Monitor (Grade B, score ≥13)",
+    ] + tier2 + [
+        "",
+        "# TIER 3 — Weak signal (Grade C, score ≥8)",
+    ] + tier3 + [""],
+
+    with open(watchlist_path, "w") as f:
+        f.write("\n".join(lines[0]))  # lines is a tuple due to trailing comma
+
+    dropped = len(results) - len(tier1) - len(tier2) - len(tier3)
+    print(f"  Watchlist updated: {len(tier1)} TIER 1 | {len(tier2)} TIER 2 | {len(tier3)} TIER 3 | {dropped} dropped")
+    print(f"  Written to: {watchlist_path}")
+
+
+# ==============================================================================
+# SECTION 5: ANALYSIS PIPELINE
 # ==============================================================================
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False) -> Optional[dict]:
@@ -964,8 +1315,19 @@ def main():
     )
     parser.add_argument("--ticker", type=str, help="Single ticker analysis")
     parser.add_argument("--tickers", nargs="+", help="Multiple tickers")
-    parser.add_argument("--watchlist", action="store_true", help="TIER 1 + TIER 2 watchlist")
-    parser.add_argument("--tier1-only", action="store_true", help="TIER 1 watchlist only")
+    parser.add_argument("--watchlist", action="store_true", help="TIER 1 + TIER 2 watchlist (full Claude analysis)")
+    parser.add_argument("--tier1-only", action="store_true", help="TIER 1 watchlist only (full Claude analysis)")
+    parser.add_argument("--screen", action="store_true",
+                        help="Screen full universe by signal quality — finds high-potential tickers, no Claude cost")
+    parser.add_argument("--universe", choices=["all", "large", "small", "meme", "config", "watchlist"],
+                        default="all",
+                        help="Universe to scan with --screen (default: all)")
+    parser.add_argument("--top", type=int, default=0, metavar="N",
+                        help="After --screen, run Claude on top N candidates")
+    parser.add_argument("--min-score", type=int, default=8, metavar="N",
+                        help="Minimum signal score to appear in --screen results (default: 8/25)")
+    parser.add_argument("--update-watchlist", action="store_true",
+                        help="After --screen, rewrite watchlist.txt using screener scores")
     parser.add_argument("--report", type=str, help="Analyze existing signal report file")
     parser.add_argument("--raw", action="store_true", help="Show raw Claude response")
     parser.add_argument("--verbose", action="store_true", help="Show collection progress")
@@ -978,13 +1340,78 @@ def main():
     print("================================================================")
     print()
 
+    # --screen does NOT need the API key for signal collection
+    if args.screen:
+        universe = _build_screen_universe(args.universe)
+        if not universe:
+            print("  No tickers found for the selected universe.")
+            sys.exit(1)
+
+        print(f"  Universe: {args.universe.upper()} — {len(universe)} tickers")
+
+        # Score ALL tickers in universe, no top_n limit yet (need full list for watchlist update)
+        all_scored = screen_tickers(universe, min_score=0, top_n=0, verbose=args.verbose)
+
+        # Tickers already in watchlist (for WL? column)
+        wl_set = set(_read_watchlist_tickers())
+
+        # Qualified candidates for display
+        qualified = [r for r in all_scored if r["screen"]["score"] >= args.min_score]
+        display   = qualified[:args.top] if args.top else qualified
+        print_screen_table(display, watchlist_tickers=wl_set)
+
+        if not qualified:
+            print(f"  No tickers passed the min-score threshold ({args.min_score}/25).")
+        else:
+            new_finds = [r["ticker"] for r in qualified if r["ticker"] not in wl_set]
+            if new_finds:
+                print(f"  New high-potential tickers NOT yet in watchlist: {', '.join(new_finds)}")
+                print()
+
+        # Optionally update watchlist.txt
+        if args.update_watchlist:
+            update_watchlist_from_screen(all_scored)
+
+        # Optionally run Claude on the top N
+        if args.top and qualified:
+            top_candidates = display
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                print("  ERROR: ANTHROPIC_API_KEY not set — cannot run Claude analysis.")
+                print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+                sys.exit(1)
+
+            print(f"  Running Claude analysis on top {len(top_candidates)}: "
+                  f"{', '.join(r['ticker'] for r in top_candidates)}")
+            results = []
+            for i, r in enumerate(top_candidates, 1):
+                ticker = r["ticker"]
+                print(f"\n[{i}/{len(top_candidates)}] {ticker}")
+                prompt = _build_prompt(r["signals"])
+                raw    = _call_claude(prompt, verbose=args.verbose)
+                if raw is None:
+                    continue
+                if args.raw:
+                    print(raw)
+                thesis = _parse_response(raw)
+                if thesis:
+                    thesis["ticker"]       = ticker
+                    thesis["signals"]      = r["signals"]
+                    thesis["raw_response"] = raw
+                    thesis["screen"]       = r["screen"]
+                    results.append(thesis)
+                time.sleep(1)
+
+            results.sort(key=lambda r: (-(r.get("conviction", 0)),
+                                        {"BULL": 0, "NEUTRAL": 1, "BEAR": 2}.get(r.get("direction", "NEUTRAL"), 1)))
+            print_full_report(results)
+        return
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("  ERROR: ANTHROPIC_API_KEY not set.")
         print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
         sys.exit(1)
 
     if args.report:
-        # Analyze a full report file
         print(f"  Analyzing report: {args.report}")
         analysis = analyze_report_file(args.report, verbose=args.verbose)
         if analysis:
@@ -1033,6 +1460,12 @@ def main():
         print("  Examples:")
         print("    python3 ai_quant.py --ticker COIN")
         print("    python3 ai_quant.py --tickers COIN GME NVDA --verbose")
+        print("    python3 ai_quant.py --screen                            # scan full universe, rank by signal score")
+        print("    python3 ai_quant.py --screen --universe large           # large-cap only")
+        print("    python3 ai_quant.py --screen --universe small           # small-cap / high-momentum")
+        print("    python3 ai_quant.py --screen --top 5                    # screen then Claude on top 5")
+        print("    python3 ai_quant.py --screen --top 5 --update-watchlist # screen + update watchlist.txt")
+        print("    python3 ai_quant.py --screen --min-score 12 --top 3")
         print("    python3 ai_quant.py --watchlist")
         print("    python3 ai_quant.py --report signal_reports/signal_report_20260318.txt")
         print()
