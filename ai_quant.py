@@ -238,6 +238,15 @@ def _collect_cross_asset_signals(ticker: str) -> dict:
         return {}
 
 
+def _collect_max_pain_signals(ticker: str) -> dict:
+    """Max pain — options expiration price gravity target."""
+    try:
+        from max_pain import get_max_pain
+        return get_max_pain(ticker)
+    except Exception:
+        return {}
+
+
 def _collect_options_signals(ticker: str) -> dict:
     """Pull options flow data from options_flow module."""
     try:
@@ -332,6 +341,13 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         print("done")
 
     if verbose:
+        print(f"  [{ticker}]   → max pain...", end=" ", flush=True)
+    mp = _collect_max_pain_signals(ticker)
+    signals["max_pain"] = mp
+    if verbose:
+        print("done")
+
+    if verbose:
         print(f"  [{ticker}]   → congress...", end=" ", flush=True)
     cong = _collect_congress_signals(ticker)
     signals["congress"] = cong
@@ -393,6 +409,7 @@ def _build_prompt(signals: dict) -> str:
     cadiv  = signals.get("cross_asset", {})
     fund   = signals.get("fundamentals", {})
     opts   = signals.get("options_flow", {})
+    mp     = signals.get("max_pain", {})
     cong   = signals.get("congress", {})
     poly   = signals.get("polymarket", {})
 
@@ -483,6 +500,33 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Fundamental data: unavailable")
+
+    prompt_parts += ["", "## MAX PAIN (Options Expiration Price Target)"]
+    if mp:
+        exps = mp.get("all_expirations", [])
+        prompt_parts += [
+            f"Current price: ${mp.get('current_price', 'N/A')}",
+            f"Nearest expiry ({mp.get('nearest_expiry', 'N/A')}, {mp.get('nearest_days_to_expiry', '?')}d away):",
+            f"  Max pain: ${mp.get('nearest_max_pain', 'N/A')}  |  "
+            f"Distance: {mp.get('nearest_distance_pct', 'N/A'):+.2f}%  |  "
+            f"Direction: {mp.get('nearest_direction', 'N/A')}  |  "
+            f"Strength: {mp.get('nearest_signal_strength', 'N/A')}"
+            if isinstance(mp.get('nearest_distance_pct'), (int, float)) else
+            f"  Max pain: ${mp.get('nearest_max_pain', 'N/A')}",
+            f"  Pin zone: ${mp.get('pin_zone_low', 'N/A')} — ${mp.get('pin_zone_high', 'N/A')}  "
+            f"(OI: {mp.get('nearest_total_oi', 0):,})",
+        ]
+        if len(exps) > 1:
+            prompt_parts.append("Upcoming expirations:")
+            for e in exps[1:]:
+                prompt_parts.append(
+                    f"  {e['expiry']} ({e['days_to_expiry']}d): "
+                    f"max pain ${e['max_pain']}  {e['distance_pct']:+.2f}%  "
+                    f"{e['direction']}  OI:{e['total_oi']:,}"
+                )
+        prompt_parts.append(f"Interpretation: {mp.get('interpretation', '')}")
+    else:
+        prompt_parts.append("Max pain: unavailable (no listed options or data failure)")
 
     prompt_parts += ["", "## CONGRESSIONAL TRADES"]
     if cong:
