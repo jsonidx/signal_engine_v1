@@ -220,6 +220,15 @@ def _collect_fundamental_signals(ticker: str) -> dict:
         return {}
 
 
+def _collect_volume_profile_signals(ticker: str) -> dict:
+    """Volume-at-price support/resistance levels."""
+    try:
+        from volume_profile import get_volume_profile
+        return get_volume_profile(ticker)
+    except Exception:
+        return {}
+
+
 def _collect_cross_asset_signals(ticker: str) -> dict:
     """Cross-asset divergence signal (Bottom/Top Finder logic)."""
     try:
@@ -302,6 +311,13 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         print("done")
 
     if verbose:
+        print(f"  [{ticker}]   → volume profile...", end=" ", flush=True)
+    vp = _collect_volume_profile_signals(ticker)
+    signals["volume_profile"] = vp
+    if verbose:
+        print("done")
+
+    if verbose:
         print(f"  [{ticker}]   → cross-asset divergence...", end=" ", flush=True)
     cadiv = _collect_cross_asset_signals(ticker)
     signals["cross_asset"] = cadiv
@@ -373,6 +389,7 @@ def _build_prompt(signals: dict) -> str:
     """Build the analysis prompt from collected signals."""
     ticker = signals["ticker"]
     tech   = signals.get("technical", {})
+    vp     = signals.get("volume_profile", {})
     cadiv  = signals.get("cross_asset", {})
     fund   = signals.get("fundamentals", {})
     opts   = signals.get("options_flow", {})
@@ -400,6 +417,29 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Technical data: unavailable")
+
+    prompt_parts += ["", "## VOLUME PROFILE (Support & Resistance)"]
+    if vp:
+        sup  = vp.get("support_levels", [])
+        res  = vp.get("resistance_levels", [])
+        prompt_parts += [
+            f"POC (highest volume):  ${vp.get('poc_price', 'N/A')}  ({vp.get('poc_distance_pct', 'N/A'):+.2f}% from price)" if isinstance(vp.get('poc_distance_pct'), (int, float)) else f"POC: ${vp.get('poc_price', 'N/A')}",
+            f"Value Area:            ${vp.get('value_area_low', 'N/A')} — ${vp.get('value_area_high', 'N/A')}  (70% of volume)",
+            f"VWAP 20d: ${vp.get('vwap_20d', 'N/A')}  |  VWAP 50d: ${vp.get('vwap_50d', 'N/A')}",
+        ]
+        if res:
+            prompt_parts.append("Resistance levels (above price):")
+            for r in res:
+                prompt_parts.append(f"  ${r['price']}  dist: {r['distance_pct']:+.2f}%  strength: {r['strength_pct']}%")
+        if sup:
+            prompt_parts.append("Support levels (below price):")
+            for s in sup:
+                prompt_parts.append(f"  ${s['price']}  dist: {s['distance_pct']:+.2f}%  strength: {s['strength_pct']}%")
+        lvns = vp.get("lvn_levels", [])
+        if lvns:
+            prompt_parts.append(f"Low-volume zones (price moves fast through): {lvns}")
+    else:
+        prompt_parts.append("Volume profile: unavailable")
 
     prompt_parts += ["", "## CROSS-ASSET DIVERGENCE (vs RSP / HYG / DXY)"]
     if cadiv:
