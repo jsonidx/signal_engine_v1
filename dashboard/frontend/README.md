@@ -1,73 +1,86 @@
-# React + TypeScript + Vite
+# Signal Engine — React Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A quant terminal UI for signal_engine_v1. Built with React 19, TypeScript, Vite, TailwindCSS, Recharts, and Radix UI.
 
-Currently, two official plugins are available:
+## Setup
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+### 1. Start the API
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd /path/to/signal_engine_v1
+source venv/bin/activate
+uvicorn dashboard.api.main:app --reload --port 8000
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### 2. Install frontend dependencies
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd dashboard/frontend
+npm install
 ```
+
+### 3. Run dev server
+
+```bash
+npm run dev
+# Opens at http://localhost:5173
+# API calls are proxied to http://localhost:8000
+```
+
+### 4. Production build
+
+```bash
+npm run build
+# Output in dist/
+```
+
+## Environment variables
+
+None required. The Vite dev server proxies `/api/*` to `http://localhost:8000` automatically.
+
+## Pages
+
+| Route | Shortcut | Description |
+|-------|----------|-------------|
+| `/` | `p` | Portfolio overview — P&L chart, positions table, metrics |
+| `/heatmap` | `h` | Signal heatmap — 8-module scores for all tickers, virtualised |
+| `/ticker/:symbol` | — | Ticker deep dive — AI thesis, price ladder, module scores, squeeze/options/dark pool cards |
+| `/screeners` | `s` | Screeners — Squeeze / Catalysts / Options tabs with sortable tables and CSV export |
+| `/darkpool` | `d` | Dark pool flow — donut gauge cards, short-ratio mini charts, accumulation/distribution filter |
+| `/backtest` | `b` | Walk-forward backtest — Sharpe timeline, factor IC table, weight rebalancing bars |
+| `/resolution` | `r` | Conflict resolution log — daily arbitration log, override badges, module accuracy tracker |
+
+## Key files
+
+```
+src/
+  lib/api.ts              — All API types and axios client
+  hooks/
+    usePortfolio.ts       — Portfolio query hooks
+    useHeatmap.ts         — Heatmap + ticker signal hooks
+    useRegime.ts          — Regime query hook
+    useDarkPool.ts        — Dark pool query hooks
+  pages/
+    PortfolioPage.tsx     — /
+    HeatmapPage.tsx       — /heatmap  (virtualised, 200+ rows)
+    TickerPage.tsx        — /ticker/:symbol
+    ScreenersPage.tsx     — /screeners
+    DarkPoolPage.tsx      — /darkpool
+    BacktestPage.tsx      — /backtest
+    ResolutionPage.tsx    — /resolution
+  components/
+    layout/Shell.tsx      — Sidebar + header + keyboard shortcuts
+    charts/PriceLadder.tsx — SVG price level ladder
+    ui/                   — MetricCard, MonoNumber, DirectionBadge, etc.
+    ErrorBoundary.tsx     — Per-page error boundary with retry
+```
+
+## Data generation
+
+All data comes from running:
+
+```bash
+./run_master.sh
+```
+
+The dashboard is read-only — it displays data generated by the Python pipeline.

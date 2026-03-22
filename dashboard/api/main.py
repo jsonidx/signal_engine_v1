@@ -1433,3 +1433,10 @@ async def cache_invalidate():
     """Force-clear the in-memory cache (useful after a data refresh)."""
     _cache._store.clear()
     return {"status": "cache cleared"}
+
+
+@app.post("/api/cache/invalidate")
+async def cache_invalidate_post():
+    """POST version — called by run_master.sh after the pipeline completes."""
+    _cache._store.clear()
+    return {"invalidated": True, "timestamp": datetime.utcnow().isoformat() + "Z"}

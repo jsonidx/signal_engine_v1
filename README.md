@@ -151,6 +151,37 @@ This requires additional engineering and is NOT included in this tool.
 
 ---
 
+## Dashboard
+
+Start the React dashboard and FastAPI backend together:
+
+```bash
+bash start_dashboard.sh
+# API docs:  http://localhost:8000/docs
+# Dashboard: http://localhost:5173
+```
+
+### Production build (no hot-reload)
+
+```bash
+cd dashboard/frontend && npm run build
+```
+
+Then serve the `dist/` folder:
+
+```bash
+# Option A — simple static server on port 5173
+python3 -m http.server 5173 --directory dashboard/frontend/dist/
+
+# Option B — mount into FastAPI (single port, no separate process)
+# Add to dashboard/api/main.py:
+# from fastapi.staticfiles import StaticFiles
+# app.mount("/", StaticFiles(directory="dashboard/frontend/dist", html=True), name="static")
+# Then: uvicorn dashboard.api.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
 ## License
 
 For personal, non-commercial use only. No warranty expressed or implied.
