@@ -1,297 +1,157 @@
 #!/bin/bash
-# ============================================================
-# SIGNAL ENGINE — MASTER REPORT GENERATOR
-# ============================================================
-# Runs ALL modules and produces ONE summary file you can
-# drag & drop into Claude for analysis.
+# Signal Engine v1 — Master Pipeline
+# Schedule: Sunday 19:00 + Wednesday 20:00 via launchd
 #
-# USAGE:
-#   cd ~/Documents/GitHub/signal_engine_v1
-#   source venv/bin/activate
-#   bash run_master.sh
+# COST ESTIMATE (ai_quant.py --top-n 10):
+#   ~10 Claude API calls × ~€0.02–0.04 = ~€0.20–0.40 per run
+#   2 runs/week = ~€1.60–3.20/month
+#   To process more tickers: change --top-n 10 to --top-n 20
+#   Full universe (no cap): python3 ai_quant.py --no-limit  ← WARNING: high cost
 #
-# OUTPUT:
-#   signal_reports/signal_report_YYYYMMDD.txt
-#
-# STEPS:
-#    1. Portfolio status
-#    2. Signal engine (equity + BTC 200MA)
-#    3. Paper trader snapshot
-#    4. Options flow screen (high-vol, unusual activity, expected move)
-#    5. Catalyst screener (social + polymarket + congress + watchlist update)
-#    6. RSI early warning alerts
-#    7. Fundamental analysis (watchlist)
-#    8. SEC insider + congressional trade scan (watchlist)
-#    9. Per-ticker deep dives (TIER 1 + TIER 2) incl. AI quant per ticker
-#    9b. AI quant portfolio briefing (Claude Opus 4.6 — requires API key)
-#   10. Action zones (open positions)
-#
-# AI QUANT: Set ANTHROPIC_API_KEY to enable Claude analysis.
-#           Cost: ~$0.10-0.40 per ticker + ~$0.50 for portfolio briefing.
-#
-# TIME: ~15-20 min without AI, ~25-35 min with AI quant enabled
-# ============================================================
+# Open positions are read dynamically from trade_journal.db at runtime via
+# _get_open_positions() in ai_quant.py. Static fallback: config.AI_QUANT_ALWAYS_INCLUDE
 
-PROJECT_DIR="$HOME/Documents/GitHub/signal_engine_v1"
-VENV="$PROJECT_DIR/venv/bin/activate"
+set -e  # exit immediately if any step fails
+
+REPORT_DIR="signal_reports"
 DATE=$(date +%Y%m%d)
-TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-
-REPORT_DIR="$PROJECT_DIR/signal_reports"
+REPORT_FILE="$REPORT_DIR/signal_report_$DATE.txt"
 mkdir -p "$REPORT_DIR"
-REPORT="$REPORT_DIR/signal_report_${DATE}.txt"
+mkdir -p "data"
+mkdir -p "logs"
 
-cd "$PROJECT_DIR"
-source "$VENV"
+echo "================================================"
+echo " Signal Engine v1 — $(date '+%Y-%m-%d %H:%M')"
+echo "================================================"
+echo "" | tee "$REPORT_FILE"
 
-# Clear previous report
-> "$REPORT"
+# ── Step 0: Universe builder ──────────────────────────────
+echo "Step 0: Building dynamic universe (Russell 1000/2000, S&P 500, Nasdaq 100)..."
+python3 universe_builder.py --build-cache
+echo "Step 0 complete." | tee -a "$REPORT_FILE"
 
-cat >> "$REPORT" << EOF
-================================================================
-  SIGNAL ENGINE — WEEKLY MASTER REPORT
-  Generated: $TIMESTAMP
-  System: signal_engine_v1
-================================================================
+# ── Step 1: Dark pool flow ────────────────────────────────
+echo "Step 1: Scanning FINRA dark pool / short volume data..."
+python3 dark_pool_flow.py --scan --output data/dark_pool_latest.json
+echo "Step 1 complete." | tee -a "$REPORT_FILE"
 
-EOF
+# ── Step 2: Regime filter ─────────────────────────────────
+echo "Step 2: Computing market and sector regime..."
+python3 regime_filter.py --compute --output data/regime_latest.json
+echo "Step 2 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 1: Portfolio Status ────────────────────────────────
-echo "  [1/10] Portfolio status..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 1: PORTFOLIO STATUS" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 trade_journal.py --status >> "$REPORT" 2>&1
+# ── Step 3: Signal engine ─────────────────────────────────
+echo "Step 3: Running multi-factor equity screener (reads regime from Step 2)..."
+python3 signal_engine.py --watchlist | tee -a "$REPORT_FILE"
+echo "Step 3 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 2: Signal Engine (equity + BTC) ────────────────────
-echo "  [2/10] Signal engine..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 2: EQUITY SIGNALS + BTC 200MA" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 signal_engine.py >> "$REPORT" 2>&1
+# ── Step 4: Catalyst screener ─────────────────────────────
+echo "Step 4: Running catalyst screener (dynamic universe)..."
+python3 catalyst_screener.py --use-dynamic-universe | tee -a "$REPORT_FILE"
+echo "Step 4 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 3: Paper Trader Snapshot ───────────────────────────
-echo "  [3/10] Paper trader..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 3: PAPER TRADER SNAPSHOT" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 paper_trader.py --record >> "$REPORT" 2>&1
+# ── Step 5: Options flow ──────────────────────────────────
+echo "Step 5: Running options flow screener..."
+python3 options_flow.py | tee -a "$REPORT_FILE"
+echo "Step 5 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 4: Options Flow Screen ─────────────────────────────
-# Screens for high-IV, unusual options volume, expected move
-echo "  [4/10] Options flow screen (~2 min)..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 4: OPTIONS FLOW SCREENER (HEAT RANKING)" >> "$REPORT"
-echo "  Screens for: unusual options vol, IV rank, expected move," >> "$REPORT"
-echo "  put/call ratio — targets high-movement candidates" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 options_flow.py --full --top 20 >> "$REPORT" 2>&1
+# ── Step 6: Squeeze screener ──────────────────────────────
+echo "Step 6: Running short squeeze screener..."
+python3 squeeze_screener.py | tee -a "$REPORT_FILE"
+echo "Step 6 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 5: Catalyst Screener ───────────────────────────────
-# Flags: --social (Reddit), --polymarket (prediction markets),
-#        --congress (House + Senate STOCK Act trades),
-#        --update-watchlist (re-rank watchlist.txt + append history)
-echo "  [5/10] Catalyst screener (social + polymarket + congress + watchlist update — ~4 min)..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 5: CATALYST SCREENER (SOCIAL + POLYMARKET + CONGRESS)" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 catalyst_screener.py --social --polymarket --congress --update-watchlist >> "$REPORT" 2>&1
+# ── Step 7: Fundamental analysis ──────────────────────────
+echo "Step 7: Running fundamental analysis scorecard..."
+python3 fundamental_analysis.py | tee -a "$REPORT_FILE"
+echo "Step 7 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 6: RSI Alerts ──────────────────────────────────────
-echo "  [6/10] RSI alerts..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 6: RSI EARLY WARNING ALERTS" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 catalyst_backtest.py --universe full >> "$REPORT" 2>&1
+# ── Step 8: SEC insider signals ───────────────────────────
+echo "Step 8: Scanning SEC EDGAR (Form 4, 13D, 8-K)..."
+python3 sec_module.py | tee -a "$REPORT_FILE"
+echo "Step 8 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 7: Fundamental Analysis (watchlist) ────────────────
-echo "  [7/10] Fundamental analysis (watchlist)..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 7: FUNDAMENTAL ANALYSIS (WATCHLIST)" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 fundamental_analysis.py --watchlist >> "$REPORT" 2>&1
+# ── Step 9: Congressional trades ─────────────────────────
+echo "Step 9: Fetching congressional trade disclosures..."
+python3 congress_trades.py | tee -a "$REPORT_FILE"
+echo "Step 9 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 8: SEC + Congressional Scan ───────────────────────
-echo "  [8/10] SEC + congressional scan..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 8: SEC INSIDER + CONGRESSIONAL TRADES (WATCHLIST)" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 sec_module.py --scan >> "$REPORT" 2>&1
-echo "" >> "$REPORT"
-echo "  Congressional Trade Scan:" >> "$REPORT"
-python3 congress_trades.py --scan >> "$REPORT" 2>&1
-python3 congress_trades.py --top-traders >> "$REPORT" 2>&1
+# ── Step 10: Polymarket ───────────────────────────────────
+echo "Step 10: Fetching Polymarket prediction market signals..."
+python3 polymarket_screener.py | tee -a "$REPORT_FILE"
+echo "Step 10 complete." | tee -a "$REPORT_FILE"
 
-# ── STEP 9: Per-Ticker Deep Dives ───────────────────────────
-# Reads TIER 1 (≥50%) and TIER 2 (30–49%) tickers from watchlist.txt
-# and runs full deep dive + AI quant analysis per ticker.
-echo "  [9/10] Per-ticker deep dives (TIER 1 + TIER 2)..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 9: PER-TICKER DEEP DIVES" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
+# ── Step 11: Social sentiment ─────────────────────────────
+echo "Step 11: Pre-warming social sentiment cache (Google Trends + StockTwits)..."
+python3 social_sentiment.py --batch
+echo "Step 11 complete." | tee -a "$REPORT_FILE"
 
-# Extract tickers from TIER 1 and TIER 2 sections of watchlist.txt
-# Lines in those sections look like: "GME        # ↑3  65% | ..."
-# We stop collecting when we hit TIER 3 or MANUALLY ADDED.
-DEEP_DIVE_TICKERS=""
-IN_DEEP_TIER=0
+# ── Step 12: Conflict resolver ────────────────────────────
+echo "Step 12: Running deterministic conflict resolution layer..."
+python3 conflict_resolver.py --pre-resolve --output data/resolved_signals.json
+echo "Step 12 complete." | tee -a "$REPORT_FILE"
 
-while IFS= read -r line; do
-    # Detect section headers
-    if echo "$line" | grep -qE "TIER 1|TIER 2"; then
-        IN_DEEP_TIER=1
-        continue
-    fi
-    if echo "$line" | grep -qE "TIER 3|MANUALLY ADDED"; then
-        IN_DEEP_TIER=0
-        continue
-    fi
-    # Skip comment-only lines and blank lines
-    if echo "$line" | grep -qE '^\s*#|^\s*$'; then
-        continue
-    fi
-    # Extract ticker (first word before any whitespace or #)
-    if [ "$IN_DEEP_TIER" -eq 1 ]; then
-        TICKER=$(echo "$line" | awk '{print $1}' | tr -d '[:space:]')
-        if [ -n "$TICKER" ]; then
-            DEEP_DIVE_TICKERS="$DEEP_DIVE_TICKERS $TICKER"
-        fi
-    fi
-done < "$PROJECT_DIR/watchlist.txt"
+# ── Step 13: AI Quant synthesis — TOP 10 ONLY ─────────────
+# Hard cap: Claude API called for top 10 tickers by priority score only.
+# Open positions are read dynamically from trade_journal.db at runtime.
+# Static fallback: config.AI_QUANT_ALWAYS_INCLUDE = ['GME', 'COIN', 'SAP']
+# To override: python3 ai_quant.py --tickers AAPL,MSFT or --no-limit (high cost).
+echo "Step 13: AI Quant synthesis (top 10 tickers — Claude API capped)..."
+python3 ai_quant.py --top-n 10 | tee -a "$REPORT_FILE"
+echo "Step 13 complete." | tee -a "$REPORT_FILE"
 
-# Fallback: if watchlist uses old format (no tiers), take first 5 tickers
-if [ -z "$DEEP_DIVE_TICKERS" ]; then
-    DEEP_DIVE_TICKERS=$(grep -v '^\s*#' "$PROJECT_DIR/watchlist.txt" \
-        | grep -v '^\s*$' \
-        | awk '{print $1}' \
-        | head -5 | tr '\n' ' ')
-fi
+# ── Step 14: Max pain ─────────────────────────────────────
+echo "Step 14: Computing options max pain levels..."
+python3 max_pain.py | tee -a "$REPORT_FILE"
+echo "Step 14 complete." | tee -a "$REPORT_FILE"
 
-if [ -z "$DEEP_DIVE_TICKERS" ]; then
-    echo "  No tickers found for deep dive." >> "$REPORT"
-else
-    echo "  Deep dive tickers:$DEEP_DIVE_TICKERS" >> "$REPORT"
-    echo "" >> "$REPORT"
+# ── Step 15: Volume profile ───────────────────────────────
+echo "Step 15: Computing volume profiles and VWAP levels..."
+python3 volume_profile.py | tee -a "$REPORT_FILE"
+echo "Step 15 complete." | tee -a "$REPORT_FILE"
 
-    for TICKER in $DEEP_DIVE_TICKERS; do
-        echo "  → Deep dive: $TICKER"
+# ── Step 16: Paper trader ─────────────────────────────────
+echo "Step 16: Recording paper trading snapshot..."
+python3 paper_trader.py --record | tee -a "$REPORT_FILE"
+echo "Step 16 complete." | tee -a "$REPORT_FILE"
 
-        echo "────────────────────────────────────────────────────────" >> "$REPORT"
-        echo "  DEEP DIVE: $TICKER" >> "$REPORT"
-        echo "────────────────────────────────────────────────────────" >> "$REPORT"
+# ── Step 17: Trade journal ────────────────────────────────
+echo "Step 17: Updating trade journal and action zones..."
+python3 trade_journal.py --update | tee -a "$REPORT_FILE"
+echo "Step 17 complete." | tee -a "$REPORT_FILE"
 
-        echo "  [$TICKER] Options flow..." >> "$REPORT"
-        python3 options_flow.py --ticker "$TICKER" >> "$REPORT" 2>&1
+# ── Step 18: IV history collection ───────────────────────
+echo "Step 18: Collecting and storing IV history for top tickers..."
+python3 -c "
+from utils.iv_calculator import collect_and_store_iv
+from utils.ticker_selector import select_top_tickers
+from ai_quant import _get_open_positions
+import config
 
-        echo "" >> "$REPORT"
-        echo "  [$TICKER] Catalyst signals..." >> "$REPORT"
-        python3 catalyst_screener.py --ticker "$TICKER" --social --polymarket --congress >> "$REPORT" 2>&1
+# Use dynamic open positions (live from trade_journal.db, fallback to config)
+open_positions = _get_open_positions()
 
-        echo "" >> "$REPORT"
-        echo "  [$TICKER] Pattern study (3yr history)..." >> "$REPORT"
-        python3 catalyst_backtest.py --ticker "$TICKER" --verbose >> "$REPORT" 2>&1
+selected = select_top_tickers(
+    resolved_signals_path='data/resolved_signals.json',
+    equity_signals_path=None,
+    max_tickers=config.AI_QUANT_MAX_TICKERS,
+    always_include=open_positions
+)
+tickers = list({s['ticker'] for s in selected} | set(open_positions))
+results = collect_and_store_iv(tickers)
+print(f'IV stored for {len(results)} tickers (open positions: {open_positions})')
+"
+echo "Step 18 complete." | tee -a "$REPORT_FILE"
 
-        echo "" >> "$REPORT"
-        echo "  [$TICKER] Fundamentals..." >> "$REPORT"
-        python3 fundamental_analysis.py --ticker "$TICKER" >> "$REPORT" 2>&1
+# ── Post-run: invalidate dashboard cache ─────────────────
+echo "Invalidating dashboard cache (if running)..."
+curl -s -X POST http://localhost:8000/api/cache/invalidate || true
 
-        echo "" >> "$REPORT"
-        echo "  [$TICKER] SEC filings..." >> "$REPORT"
-        python3 sec_module.py --ticker "$TICKER" >> "$REPORT" 2>&1
-
-        echo "" >> "$REPORT"
-
-        # AI Quant analysis (requires ANTHROPIC_API_KEY)
-        if [ -n "$ANTHROPIC_API_KEY" ]; then
-            echo "  [$TICKER] AI quant analysis..." >> "$REPORT"
-            python3 ai_quant.py --ticker "$TICKER" >> "$REPORT" 2>&1
-            echo "" >> "$REPORT"
-        fi
-    done
-fi
-
-# ── STEP 9b: AI Quant — Portfolio-Level Analysis ────────────
-# Only runs if ANTHROPIC_API_KEY is set
-if [ -n "$ANTHROPIC_API_KEY" ]; then
-    echo "  [9b/10] AI quant — portfolio briefing (Claude Opus 4.6)..."
-    echo "" >> "$REPORT"
-    echo "================================================================" >> "$REPORT"
-    echo "  STEP 9b: AI QUANT — PORTFOLIO BRIEFING (CLAUDE OPUS 4.6)" >> "$REPORT"
-    echo "  Powered by adaptive thinking — synthesizes ALL signals above" >> "$REPORT"
-    echo "================================================================" >> "$REPORT"
-    python3 ai_quant.py --report "$REPORT" >> "$REPORT" 2>&1
-else
-    echo "  [9b/10] AI quant skipped (ANTHROPIC_API_KEY not set)"
-    echo "" >> "$REPORT"
-    echo "  STEP 9b: AI QUANT — SKIPPED (set ANTHROPIC_API_KEY to enable)" >> "$REPORT"
-fi
-
-# ── STEP 10: Trade Journal Zones ────────────────────────────
-echo "  [10/10] Action zones..."
-echo "" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-echo "  STEP 10: ACTION ZONES (OPEN POSITIONS)" >> "$REPORT"
-echo "================================================================" >> "$REPORT"
-python3 trade_journal.py --zones >> "$REPORT" 2>&1
-
-# ── Footer ──────────────────────────────────────────────────
-cat >> "$REPORT" << EOF
-
-================================================================
-  END OF REPORT
-  Generated: $(date "+%Y-%m-%d %H:%M:%S")
-
-  WHAT THIS REPORT CONTAINS:
-    - Portfolio & paper trader status
-    - Broad equity + BTC signal scan (z-score factors)
-    - Options flow heat ranking (IV rank, unusual vol, expected move)
-    - Catalyst screener composite scores (social + polymarket + congress)
-    - Watchlist re-ranked by composite score (watchlist.txt updated)
-    - Fundamental scorecard: valuation, growth, quality, balance
-    - SEC insider activity scan (Form 4, 13D, 8-K, 13F)
-    - Congressional trade scan (House + Senate, incl. spouse trades)
-    - Most active politicians leaderboard
-    - Per-ticker deep dives (TIER 1 + TIER 2 only):
-        • Options flow heat (IV rank, expected move, put/call)
-        • Catalyst signals + social + polymarket + congress
-        • 3-year pattern study (hit rates, forward returns)
-        • Full fundamental breakdown
-        • SEC Form 4 / 13D / 8-K filings
-        • AI quant thesis (if ANTHROPIC_API_KEY set)
-    - AI quant portfolio briefing (Claude Opus 4.6, if API key set)
-    - Action zones for open positions
-
-  HOW TO USE:
-    The AI quant (Step 9b) already analyzed this report in-line above.
-    For additional context, drag this file into Claude Desktop and ask:
-    "Act as a quant PM. What are your top 3 trade ideas from this report
-     with specific entry, stop, and target levels?"
-================================================================
-EOF
-
-# ── Done ────────────────────────────────────────────────────
 echo ""
-echo "  ✅ MASTER REPORT COMPLETE"
-echo "  📄 File: $REPORT"
-echo "  📋 Lines: $(wc -l < "$REPORT")"
-echo ""
-echo "  Deep dive tickers covered: $DEEP_DIVE_TICKERS"
-if [ -n "$ANTHROPIC_API_KEY" ]; then
-    echo "  AI quant: enabled (Claude Opus 4.6)"
-else
-    echo "  AI quant: disabled (set ANTHROPIC_API_KEY to enable)"
-fi
-echo ""
-echo "  → Drag $REPORT into Claude"
-echo ""
+echo "================================================"
+echo " Pipeline complete — $(date '+%Y-%m-%d %H:%M')"
+echo " Report: $REPORT_FILE"
+echo "================================================"
 
-osascript -e 'display notification "Master report ready — deep dives complete" with title "Signal Engine" sound name "Glass"' 2>/dev/null
+# ── IMPORTANT: Step 13 uses --top-n 10. Do not change this line. ──
+# Any future edits to run_master.sh must preserve: python3 ai_quant.py --top-n 10
+# See config.py AI_QUANT_MAX_TICKERS to change the cap.

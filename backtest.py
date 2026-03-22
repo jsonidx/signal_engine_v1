@@ -1,796 +1,1080 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-BACKTEST MODULE v1.0
+WALK-FORWARD BACKTESTING FRAMEWORK v1.0
 ================================================================================
-Walk-forward validation for the Weekly Signal Engine.
+Validates all signal_engine factors and module weights with out-of-sample
+walk-forward testing.
 
-Tests the EXACT same signal logic used in signal_engine.py against historical
-data to determine whether the multi-factor equity and crypto trend signals
-have generated alpha after costs.
+DESIGN:
+    Training window : 504 trading days (approx 2 years)
+    Test window     : 126 trading days (approx 6 months)
+    Step size       : 63 trading days  (approx 3 months)
+    First train     : 2020-01-01 to 2021-12-31
+    First test      : 2022-01-01 to 2022-06-30
 
-METHODOLOGY:
-    - Walk-forward: Signals computed using only data available at each point
-    - Weekly rebalance (every 5 trading days) to match live cadence
-    - Realistic transaction costs applied on every rebalance
-    - No look-ahead bias: universe is fixed at start (survivorship bias caveat)
-    - Performance vs benchmark (SPY for equity, BTC-USD for crypto)
+SURVIVORSHIP BIAS MITIGATION:
+    Tickers that IPO'd after a window's train_start are excluded for that
+    window. IPO dates are fetched once from yfinance and cached in-memory.
+
+POINT-IN-TIME FUNDAMENTALS:
+    earnings_revision uses yfinance.Ticker.info which returns current
+    values only — no historical PIT data. In backtest mode this factor is
+    excluded. The 45-day-lag approximation applies to any future integration
+    with EDGAR XBRL as-reported data.
+
+TRANSACTION COST MODEL:
+    Round-trip cost = 2 x tc_bps x |turnover fraction|
+    Default: 5 bps one-way (10 bps round-trip), consistent with RISK_PARAMS.
 
 USAGE:
-    python backtest.py                    # Full backtest, both modules
-    python backtest.py --equity-only      # Equity backtest only
-    python backtest.py --crypto-only      # Crypto backtest only
-    python backtest.py --years 5          # Override lookback period
+    python3 backtest.py --run-full          # all windows
+    python3 backtest.py --run-latest        # most recent window only
+    python3 backtest.py --factor-ic         # IC table for all factors
+    python3 backtest.py --suggest-weights   # weight recommendations
 
-IMPORTANT:
-    - Survivorship bias WARNING: universe is today's constituents projected
-      backward. Stocks that delisted/bankrupted are NOT in the sample.
-      This FLATTERS results. Treat all metrics with appropriate skepticism.
-    - Yahoo Finance data may have gaps or adjustment errors.
-    - This is NOT investment advice. For research/educational purposes only.
-
-DEPENDENCIES:
-    pip install yfinance pandas numpy scipy tabulate matplotlib
 ================================================================================
 """
 
+from __future__ import annotations
+
 import argparse
-import os
+import json
 import sys
 import warnings
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy import stats
+from scipy.stats import spearmanr
 
 warnings.filterwarnings("ignore")
 
+# ── Import signal_engine primitives ──────────────────────────────────────────
 try:
-    from config import (
-        PORTFOLIO_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION,
-        EQUITY_WATCHLIST, CUSTOM_WATCHLIST, CRYPTO_TICKERS,
-        EQUITY_FACTORS, CRYPTO_PARAMS, RISK_PARAMS, OUTPUT_DIR,
+    from signal_engine import (
+        compute_momentum,
+        compute_realized_vol,
+        compute_ivol,
+        compute_52wk_high_proximity,
+        zscore_cross_sectional,
+        ANNUALIZATION_FACTOR,
     )
-except ImportError:
-    print("ERROR: config.py not found. Place it in the same directory.")
+    from config import EQUITY_FACTORS, RISK_PARAMS
+except ImportError as exc:
+    print(f"ERROR: Could not import signal_engine or config: {exc}")
     sys.exit(1)
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-TRADING_DAYS_YEAR = 252
-ANNUALIZE = np.sqrt(TRADING_DAYS_YEAR)
-REBALANCE_FREQ = 5  # Trading days between rebalances (weekly)
-MIN_HISTORY = 252    # Minimum days of history before first signal
+# ── Backtest constants ────────────────────────────────────────────────────────
+FIRST_TRAIN_START = "2020-01-01"
+TOP_N_POSITIONS = 15
+POSITION_CAP = 0.08       # 8% max single position
+MIN_TICKERS = 10          # minimum universe size per window
+FUNDAMENTAL_LAG_DAYS = 45  # approximation for point-in-time fundamental data
+
+# Factors available for backtest (price-based only; earnings_revision excluded —
+# yfinance.Ticker.info returns current values only, no historical PIT data).
+_BT_FACTORS = [
+    "momentum_12_1",
+    "momentum_6_1",
+    "mean_reversion_5d",
+    "volatility_quality",
+    "52wk_high_proximity",
+    "ivol",
+]
 
 
 # ==============================================================================
-# SECTION 1: DATA
+# SECTION 1: FACTOR COMPUTATION (backtest-safe, price-data only)
 # ==============================================================================
 
-def fetch_backtest_data(tickers: List[str], years: int, label: str) -> pd.DataFrame:
-    """Fetch historical prices for backtesting."""
-    end = datetime.now()
-    start = end - timedelta(days=years * 365 + MIN_HISTORY)
-
-    print(f"\n  Fetching {label}: {len(tickers)} tickers, {years}y + {MIN_HISTORY}d warmup")
-    print(f"  Window: {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')}")
-
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True,
-                      progress=True, threads=True)
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"] if "Close" in raw.columns.get_level_values(0) else raw
-    else:
-        prices = raw[["Close"]].rename(columns={"Close": tickers[0]}) if len(tickers) == 1 else raw
-
-    min_obs = int((years * 252 + MIN_HISTORY) * 0.5)
-    valid = prices.columns[prices.count() >= min_obs]
-    dropped = set(prices.columns) - set(valid)
-    if dropped:
-        print(f"  [WARN] Dropped {len(dropped)} tickers: {', '.join(list(dropped)[:10])}")
-    prices = prices[valid].ffill(limit=5)
-    print(f"  [OK] {len(prices.columns)} tickers, {len(prices)} days loaded")
-    return prices
-
-
-# ==============================================================================
-# SECTION 2: SIGNAL REPLICATION (same logic as signal_engine.py)
-# ==============================================================================
-
-def zscore_cs(series: pd.Series) -> pd.Series:
-    """Cross-sectional Z-score, winsorized at ±3."""
-    z = (series - series.mean()) / (series.std() + 1e-10)
-    return z.clip(-3, 3)
-
-
-def compute_equity_signal_at_date(prices: pd.DataFrame, idx: int) -> pd.Series:
+def compute_factor_scores(
+    prices: pd.DataFrame,
+    spy_series: Optional[pd.Series] = None,
+) -> Dict[str, pd.Series]:
     """
-    Compute composite equity signal using data up to index `idx`.
-    Returns a Series of composite Z-scores indexed by ticker.
-    Mirrors signal_engine.py logic exactly.
+    Compute all price-based factor Z-scores for a price DataFrame slice.
+    Uses only data in `prices` — no forward-look.
+
+    Returns dict of {factor_name: pd.Series(z_scores)} indexed by ticker.
+    Factors with insufficient data silently return an empty/partial Series.
+
+    earnings_revision is excluded: yfinance returns only current-day values,
+    making historical simulation impossible without EDGAR XBRL PIT data.
     """
-    if idx < MIN_HISTORY:
-        return pd.Series(dtype=float)
+    if len(prices) < 252:
+        return {}
 
-    window = prices.iloc[:idx + 1]
-    signals = pd.DataFrame(index=window.columns)
+    factors: Dict[str, pd.Series] = {}
+    cfg = EQUITY_FACTORS
 
-    # Factor 1: 12-1 month momentum
-    cfg = EQUITY_FACTORS["momentum_12_1"]
-    lb, skip = cfg["lookback_long"], cfg["lookback_skip"]
-    if len(window) > lb:
-        raw = window.iloc[-skip] / window.iloc[-lb] - 1
-        signals["mom_12_1"] = zscore_cs(raw) * cfg["weight"]
-    else:
-        return pd.Series(dtype=float)
+    # momentum_12_1
+    raw = compute_momentum(
+        prices,
+        cfg["momentum_12_1"]["lookback_long"],
+        cfg["momentum_12_1"]["lookback_skip"],
+    )
+    factors["momentum_12_1"] = zscore_cross_sectional(raw.dropna())
 
-    # Factor 2: 6-1 month momentum
-    cfg = EQUITY_FACTORS["momentum_6_1"]
-    lb, skip = cfg["lookback_long"], cfg["lookback_skip"]
-    raw = window.iloc[-skip] / window.iloc[-lb] - 1 if len(window) > lb else pd.Series(0, index=window.columns)
-    signals["mom_6_1"] = zscore_cs(raw) * cfg["weight"]
+    # momentum_6_1
+    raw = compute_momentum(
+        prices,
+        cfg["momentum_6_1"]["lookback_long"],
+        cfg["momentum_6_1"]["lookback_skip"],
+    )
+    factors["momentum_6_1"] = zscore_cross_sectional(raw.dropna())
 
-    # Factor 3: 5-day mean reversion (inverted)
-    cfg = EQUITY_FACTORS["mean_reversion_5d"]
-    raw = -(window.iloc[-1] / window.iloc[-cfg["lookback"]] - 1)
-    signals["mr_5d"] = zscore_cs(raw) * cfg["weight"]
+    # mean_reversion_5d  (invert: negative 5d return = positive signal)
+    raw_5d = compute_momentum(prices, 5)
+    factors["mean_reversion_5d"] = zscore_cross_sectional((-raw_5d).dropna())
 
-    # Factor 4: Low volatility
-    cfg = EQUITY_FACTORS["volatility_quality"]
-    log_ret = np.log(window / window.shift(1))
-    vol = -(log_ret.iloc[-cfg["lookback"]:].std() * ANNUALIZE)
-    signals["low_vol"] = zscore_cs(vol) * cfg["weight"]
+    # volatility_quality  (invert: lower vol = higher quality)
+    vol_raw = compute_realized_vol(prices, 63)
+    factors["volatility_quality"] = zscore_cross_sectional((-vol_raw).dropna())
 
-    # Factor 5: Risk-adjusted momentum
-    cfg = EQUITY_FACTORS["risk_adjusted_momentum"]
-    mom = window.iloc[-1] / window.iloc[-cfg["mom_lookback"]] - 1
-    v = log_ret.iloc[-cfg["vol_lookback"]:].std() * ANNUALIZE
-    v = v.replace(0, np.nan)
-    ram = mom / v
-    signals["risk_adj"] = zscore_cs(ram) * cfg["weight"]
+    # 52wk_high_proximity
+    prox_vals = {
+        t: compute_52wk_high_proximity(prices[t].dropna())
+        for t in prices.columns
+    }
+    prox_series = pd.Series(prox_vals, dtype=float).dropna()
+    if not prox_series.empty:
+        factors["52wk_high_proximity"] = zscore_cross_sectional(prox_series)
 
-    composite = signals.sum(axis=1).dropna()
-    return composite
+    # ivol  (needs SPY as market proxy; silently omitted if unavailable)
+    if spy_series is not None and len(spy_series) >= 63:
+        ivol_vals = {
+            t: compute_ivol(
+                prices[t].dropna(),
+                spy_series,
+                lookback=cfg["ivol"]["lookback"],
+            )
+            for t in prices.columns
+        }
+        ivol_series = pd.Series(ivol_vals, dtype=float).dropna()
+        if not ivol_series.empty:
+            factors["ivol"] = zscore_cross_sectional(ivol_series)
+
+    return factors
 
 
-def compute_crypto_signal_at_date(prices: pd.DataFrame, idx: int, ticker: str) -> float:
+def composite_score(
+    factors: Dict[str, pd.Series],
+    weights: Dict[str, float],
+) -> pd.Series:
     """
-    Compute crypto trend/momentum signal for a single asset at index `idx`.
-    Returns adjusted signal value. Mirrors signal_engine.py logic.
+    Combine factor Z-scores with given weights.
+
+    Graceful degradation: if a factor is missing for a ticker, its weight is
+    redistributed proportionally across available factors (same logic as
+    signal_engine.compute_equity_composite).
+
+    Returns pd.Series of composite scores, index = ticker.
     """
-    params = CRYPTO_PARAMS
-    px = prices[ticker].iloc[:idx + 1].dropna()
+    all_tickers: set = set()
+    for s in factors.values():
+        all_tickers.update(s.index)
 
-    if len(px) < params["ema_trend"]:
-        return np.nan
+    scores: Dict[str, float] = {}
+    for t in all_tickers:
+        total_w = 0.0
+        val = 0.0
+        for fname, series in factors.items():
+            if t in series.index and pd.notna(series[t]):
+                w = weights.get(fname, 0.0)
+                val += float(series[t]) * w
+                total_w += w
+        if total_w > 0.0:
+            scores[t] = val / total_w
 
-    current = px.iloc[-1]
-
-    # EMAs
-    ema_f = px.ewm(span=params["ema_fast"], adjust=False).mean().iloc[-1]
-    ema_s = px.ewm(span=params["ema_slow"], adjust=False).mean().iloc[-1]
-    ema_t = px.ewm(span=params["ema_trend"], adjust=False).mean().iloc[-1]
-
-    trend = ((1 if current > ema_f else -1) +
-             (1 if current > ema_s else -1) +
-             (1 if current > ema_t else -1)) / 3.0
-
-    # ROC
-    roc = 0
-    for period, weight in zip(params["roc_periods"], params["roc_weights"]):
-        if len(px) > period:
-            roc += (px.iloc[-1] / px.iloc[-period] - 1) * weight
-
-    # RSI
-    delta = px.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_g = gain.ewm(com=params["rsi_period"] - 1, min_periods=params["rsi_period"]).mean().iloc[-1]
-    avg_l = loss.ewm(com=params["rsi_period"] - 1, min_periods=params["rsi_period"]).mean().iloc[-1]
-    rsi = 100 - (100 / (1 + avg_g / max(avg_l, 1e-10)))
-
-    rsi_sig = 1.0 if rsi < params["rsi_oversold"] else (-0.5 if rsi > params["rsi_overbought"] else 0.0)
-
-    # Vol regime
-    log_ret = np.log(px / px.shift(1)).dropna()
-    rvol = log_ret.iloc[-params["vol_lookback"]:].std() * ANNUALIZE
-
-    if rvol > params["vol_threshold_extreme"]:
-        vol_scale = 0.0
-    elif rvol > params["vol_threshold_high"]:
-        vol_scale = params["vol_scale_factor"]
-    else:
-        vol_scale = 1.0
-
-    raw = (0.40 * trend +
-           0.30 * np.clip(roc * 5, -1, 1) +
-           0.15 * rsi_sig +
-           0.15 * (1 if trend > 0 and roc > 0 else -0.5))
-
-    return raw * vol_scale
+    return pd.Series(scores)
 
 
 # ==============================================================================
-# SECTION 3: WALK-FORWARD BACKTEST ENGINE
+# SECTION 2: POSITION SIZING
 # ==============================================================================
 
-def backtest_equity(prices: pd.DataFrame, benchmark: pd.Series,
-                    top_n: int = 10, cost_bps: float = 15) -> pd.DataFrame:
+def inv_vol_weights(
+    ranked_tickers: List[str],
+    prices: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    cap: float = POSITION_CAP,
+) -> Dict[str, float]:
     """
-    Walk-forward equity backtest.
+    Inverse-volatility weights with a per-position cap.
 
-    At each rebalance:
-    1. Compute composite signal using only past data
-    2. Go long top_n stocks, equal-weight (simple) or inverse-vol
-    3. Hold for REBALANCE_FREQ days
-    4. Deduct transaction costs on turnover
+    1. Compute 63-day annualized vol for each ticker up to as_of_date.
+    2. Weight = 1/vol, normalized to sum to 1.
+    3. Apply cap; redistribute residual iteratively until stable.
 
-    Returns DataFrame with daily portfolio and benchmark returns.
+    Returns dict {ticker: weight}.
     """
-    cost = cost_bps / 10_000
-    n_days = len(prices)
-    dates = prices.index
-
-    port_values = [1.0]  # Start with $1
-    bench_values = [1.0]
-    holdings = {}  # ticker -> weight
-    trade_log = []
-
-    rebal_dates = list(range(MIN_HISTORY, n_days, REBALANCE_FREQ))
-
-    print(f"\n  Running equity walk-forward: {len(rebal_dates)} rebalance points")
-    print(f"  Top {top_n} stocks, {cost_bps} bps/side, rebal every {REBALANCE_FREQ} days")
-
-    for i in range(MIN_HISTORY, n_days):
-        date = dates[i]
-
-        # Daily return for current holdings
-        if holdings:
-            daily_ret = 0
-            for ticker, weight in holdings.items():
-                if ticker in prices.columns:
-                    prev = prices[ticker].iloc[i - 1]
-                    curr = prices[ticker].iloc[i]
-                    if prev > 0 and not np.isnan(prev) and not np.isnan(curr):
-                        daily_ret += weight * (curr / prev - 1)
-            port_values.append(port_values[-1] * (1 + daily_ret))
+    vols: Dict[str, float] = {}
+    for t in ranked_tickers:
+        if t not in prices.columns:
+            vols[t] = 1.0
+            continue
+        px = prices.loc[:as_of_date, t].dropna()
+        if len(px) >= 21:
+            log_ret = np.log(px / px.shift(1)).dropna()
+            v = float(log_ret.tail(63).std() * ANNUALIZATION_FACTOR)
+            vols[t] = max(v, 0.01)
         else:
-            port_values.append(port_values[-1])
+            vols[t] = 1.0
 
-        # Benchmark return
-        bp = benchmark.iloc[i]
-        bp_prev = benchmark.iloc[i - 1]
-        if bp_prev > 0 and not np.isnan(bp_prev) and not np.isnan(bp):
-            bench_values.append(bench_values[-1] * (bp / bp_prev))
-        else:
-            bench_values.append(bench_values[-1])
+    inv_v = {t: 1.0 / v for t, v in vols.items()}
+    total = sum(inv_v.values())
+    if total == 0:
+        n = len(ranked_tickers)
+        return {t: 1.0 / n for t in ranked_tickers}
 
-        # Rebalance?
-        if i in rebal_dates:
-            signal = compute_equity_signal_at_date(prices, i)
-            if signal.empty:
+    weights = {t: v / total for t, v in inv_v.items()}
+
+    # Cap and redistribute (up to 10 iterations for convergence)
+    for _ in range(10):
+        over = {t: w for t, w in weights.items() if w > cap}
+        if not over:
+            break
+        excess = sum(w - cap for w in over.values())
+        under = {t: w for t, w in weights.items() if w < cap}
+        if not under:
+            break
+        extra = excess / len(under)
+        weights = {
+            t: cap if t in over else min(w + extra, cap)
+            for t, w in weights.items()
+        }
+
+    total_f = sum(weights.values())
+    return {t: w / total_f for t, w in weights.items()} if total_f > 0 else weights
+
+
+# ==============================================================================
+# SECTION 3: WALK-FORWARD BACKTEST CLASS
+# ==============================================================================
+
+class WalkForwardBacktest:
+    """
+    Walk-forward backtesting framework.
+
+    Key features:
+    - Survivorship-bias-adjusted universe (IPO date filtering)
+    - Per-window factor weight optimization via Sharpe grid search
+    - Weekly portfolio rebalancing with inverse-vol sizing (8% cap)
+    - Transaction cost model (round-trip = 2 x tc_bps x turnover)
+    - Per-factor IC and ICIR attribution
+    """
+
+    def __init__(
+        self,
+        tickers: List[str],
+        training_days: int = 504,
+        test_days: int = 126,
+        step_days: int = 63,
+        transaction_cost_bps: float = 5.0,
+    ):
+        self.tickers = list(tickers)
+        self.training_days = training_days
+        self.test_days = test_days
+        self.step_days = step_days
+        self.tc_bps = transaction_cost_bps
+
+        self._ipo_cache: Dict[str, Optional[pd.Timestamp]] = {}
+        self._all_results: List[dict] = []
+        self._aggregated_ic: Dict[str, List[float]] = {}
+
+    # ── Window generation ────────────────────────────────────────────────────
+
+    def _generate_windows(
+        self, first_train_start: str = FIRST_TRAIN_START
+    ) -> List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+        """
+        Generate walk-forward windows.
+
+        Test periods are non-overlapping by construction: the training window
+        slides forward by step_days at each iteration, so consecutive test
+        windows are adjacent (no shared trading days).
+
+        Returns list of (train_start, train_end, test_start, test_end).
+        """
+        ts = pd.Timestamp(first_train_start)
+        today = pd.Timestamp.today().normalize()
+        windows: List[Tuple] = []
+
+        while True:
+            train_end = ts + pd.offsets.BDay(self.training_days - 1)
+            test_start = train_end + pd.offsets.BDay(1)
+            test_end = test_start + pd.offsets.BDay(self.test_days - 1)
+
+            if test_end > today:
+                break
+
+            windows.append((ts, train_end, test_start, test_end))
+            ts = ts + pd.offsets.BDay(self.step_days)
+
+        return windows
+
+    # ── Survivorship bias ────────────────────────────────────────────────────
+
+    def _get_ipo_date(self, ticker: str) -> Optional[pd.Timestamp]:
+        """
+        Return first trading date for ticker (from yfinance firstTradingDay).
+        Cached in self._ipo_cache. Returns None on failure (treated as pre-window).
+        """
+        if ticker in self._ipo_cache:
+            return self._ipo_cache[ticker]
+
+        result: Optional[pd.Timestamp] = None
+        try:
+            info = yf.Ticker(ticker).info
+            first = info.get("firstTradingDay")
+            if first and isinstance(first, (int, float)) and first > 0:
+                result = pd.Timestamp(int(first), unit="s").normalize()
+        except Exception:
+            pass
+
+        self._ipo_cache[ticker] = result
+        return result
+
+    def _filter_universe(
+        self, tickers: List[str], window_start: pd.Timestamp
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Remove tickers that IPO'd strictly after window_start.
+
+        Rationale: including only companies that survived to today would
+        overestimate historical returns (survivorship bias). Excluding
+        post-window-start IPOs approximates the investable universe as of
+        the test window start.
+
+        Returns (included, excluded).
+        """
+        included, excluded = [], []
+        for t in tickers:
+            ipo = self._get_ipo_date(t)
+            if ipo is None or ipo <= window_start:
+                included.append(t)
+            else:
+                excluded.append(t)
+        return included, excluded
+
+    # ── Weight optimization ──────────────────────────────────────────────────
+
+    def _generate_weight_combinations(
+        self, factor_names: List[str], n: int = 10
+    ) -> List[Dict[str, float]]:
+        """
+        Generate n weight dicts for grid search.
+
+        Combination 0: config defaults renormalized to available (backtest) factors.
+        Combinations 1..n-1: Dirichlet(alpha=1) random samples (uniform simplex).
+        """
+        rng = np.random.default_rng(42)
+        combos: List[Dict[str, float]] = []
+
+        # Config defaults renormalized; fall back to equal weights when factor
+        # names are not in EQUITY_FACTORS (e.g. synthetic names in tests).
+        raw = {f: EQUITY_FACTORS[f]["weight"] for f in factor_names if f in EQUITY_FACTORS}
+        if not raw:
+            raw = {f: 1.0 for f in factor_names}
+        total = sum(raw.values()) or 1.0
+        combos.append({f: raw.get(f, 1.0 / len(factor_names)) / total for f in factor_names})
+
+        for _ in range(n - 1):
+            alpha = np.ones(len(factor_names))
+            raw_w = rng.dirichlet(alpha).tolist()
+            combos.append(dict(zip(factor_names, raw_w)))
+
+        return combos
+
+    def _optimize_weights(
+        self,
+        train_prices: pd.DataFrame,
+        spy_train: Optional[pd.Series],
+        n_combinations: int = 10,
+    ) -> Tuple[Dict[str, float], float]:
+        """
+        Grid search over weight combinations to maximize Sharpe on training window.
+
+        Returns (best_weights, best_sharpe).
+        Falls back to config defaults when training data is insufficient.
+        """
+        # Fallback: config defaults renormalized to BT factors
+        raw_defaults = {f: EQUITY_FACTORS[f]["weight"] for f in _BT_FACTORS if f in EQUITY_FACTORS}
+        total_d = sum(raw_defaults.values()) or 1.0
+        default_w = {f: w / total_d for f, w in raw_defaults.items()}
+
+        weekly_idx = train_prices.resample("W-MON").last().index
+        if len(weekly_idx) < 12:
+            return default_w, 0.0
+
+        # Pre-compute weekly factor scores + forward returns on training data
+        weekly_data: List[Tuple] = []
+        for i in range(len(weekly_idx) - 1):
+            d = weekly_idx[i]
+            d_next = weekly_idx[i + 1]
+
+            prices_up_to_d = train_prices.loc[:d]
+            if len(prices_up_to_d) < 252:
                 continue
 
-            # Top N stocks
-            top = signal.nlargest(top_n)
-            new_holdings = {}
-            for ticker in top.index:
-                new_holdings[ticker] = 1.0 / len(top)  # Equal weight
+            spy_slice = spy_train.loc[:d] if spy_train is not None else None
+            factors = compute_factor_scores(prices_up_to_d, spy_slice)
+            if not factors:
+                continue
 
-            # Compute turnover & costs
-            old_tickers = set(holdings.keys())
-            new_tickers = set(new_holdings.keys())
-            turnover = 0
-            for t in old_tickers | new_tickers:
-                old_w = holdings.get(t, 0)
-                new_w = new_holdings.get(t, 0)
-                turnover += abs(new_w - old_w)
+            p0 = train_prices.loc[:d].iloc[-1]
+            p1_slice = train_prices.loc[d:d_next]
+            if len(p1_slice) < 2:
+                continue
+            p1 = p1_slice.iloc[-1]
+            fwd = (p1 / p0.replace(0.0, np.nan) - 1).dropna()
+            if fwd.empty:
+                continue
 
-            cost_drag = turnover * cost  # Per side
-            port_values[-1] *= (1 - cost_drag)
+            weekly_data.append((d, factors, fwd))
 
-            trade_log.append({
-                "date": date,
-                "turnover": turnover,
-                "cost_bps": turnover * cost_bps,
-                "n_holdings": len(new_holdings),
-                "top_pick": top.index[0] if len(top) > 0 else None,
+        if len(weekly_data) < 8:
+            return default_w, 0.0
+
+        factor_names = sorted({k for _, fs, _ in weekly_data for k in fs})
+        combos = self._generate_weight_combinations(factor_names, n_combinations)
+
+        best_sharpe = -np.inf
+        best_weights = default_w
+
+        for combo in combos:
+            port_rets: List[float] = []
+            for d, factors, fwd in weekly_data:
+                scores = composite_score(factors, combo)
+                valid = scores[scores.index.isin(fwd.index)].dropna()
+                if len(valid) < 3:
+                    continue
+                top_t = valid.nlargest(min(TOP_N_POSITIONS, len(valid))).index.tolist()
+                pos = inv_vol_weights(top_t, train_prices, d)
+                pr = sum(pos.get(t, 0.0) * float(fwd.get(t, 0.0)) for t in pos)
+                port_rets.append(pr)
+
+            if len(port_rets) < 4:
+                continue
+            arr = np.array(port_rets, dtype=float)
+            sharpe = float(arr.mean() / arr.std() * np.sqrt(52)) if arr.std() > 0 else 0.0
+            if sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_weights = combo
+
+        return best_weights, best_sharpe
+
+    # ── Test window execution ─────────────────────────────────────────────────
+
+    def _run_test_window(
+        self,
+        all_prices: pd.DataFrame,
+        spy_prices: Optional[pd.Series],
+        test_start: pd.Timestamp,
+        test_end: pd.Timestamp,
+        weights: Dict[str, float],
+    ) -> Optional[dict]:
+        """
+        Execute test window: weekly rebalance, inverse-vol sizing, TC drag.
+
+        Returns metrics dict or None if insufficient data.
+        """
+        test_slice = all_prices.loc[test_start:test_end]
+        weekly_idx = [
+            d for d in test_slice.resample("W-MON").last().index
+            if test_start <= d <= test_end
+        ]
+
+        if len(weekly_idx) < 2:
+            return None
+
+        tc_rate = self.tc_bps / 10_000  # one-way fraction
+
+        portfolio_rets: List[float] = []
+        spy_rets: List[float] = []
+        turnovers: List[float] = []
+        factor_scores_history: List[Dict[str, pd.Series]] = []
+        fwd_ret_history: List[pd.Series] = []
+        current_holdings: Dict[str, float] = {}
+
+        for i in range(len(weekly_idx) - 1):
+            d = weekly_idx[i]
+            d_next = weekly_idx[i + 1]
+
+            # Slice up to d only — no look-ahead
+            prices_up_to_d = all_prices.loc[:d]
+            if len(prices_up_to_d) < 252:
+                continue
+
+            spy_up_to_d = spy_prices.loc[:d] if spy_prices is not None else None
+            factors = compute_factor_scores(prices_up_to_d, spy_up_to_d)
+            if not factors:
+                continue
+
+            scores = composite_score(factors, weights)
+
+            # Forward returns: d to d_next (next-week outcome)
+            p0 = all_prices.loc[:d].iloc[-1]
+            p1 = all_prices.loc[:d_next].iloc[-1]
+            fwd = (p1 / p0.replace(0.0, np.nan) - 1).dropna()
+
+            valid = scores[scores.index.isin(fwd.index)].dropna()
+            if len(valid) < 3:
+                continue
+
+            top_t = valid.nlargest(min(TOP_N_POSITIONS, len(valid))).index.tolist()
+            new_holdings = inv_vol_weights(top_t, all_prices, d)
+
+            # Turnover (avg of abs weight changes / 2 = one-way turnover)
+            all_t_set = set(current_holdings) | set(new_holdings)
+            turnover = sum(
+                abs(new_holdings.get(t, 0.0) - current_holdings.get(t, 0.0))
+                for t in all_t_set
+            ) / 2.0
+
+            # Round-trip cost drag
+            tc_drag = turnover * tc_rate * 2.0
+
+            # Portfolio gross return minus TC drag
+            port_ret = (
+                sum(new_holdings.get(t, 0.0) * float(fwd.get(t, 0.0)) for t in new_holdings)
+                - tc_drag
+            )
+
+            # Benchmark SPY return
+            spy_ret = 0.0
+            if spy_prices is not None:
+                try:
+                    sp0 = float(spy_prices.loc[:d].iloc[-1])
+                    sp1 = float(spy_prices.loc[:d_next].iloc[-1])
+                    spy_ret = sp1 / sp0 - 1.0 if sp0 > 0 else 0.0
+                except (IndexError, ZeroDivisionError):
+                    pass
+
+            portfolio_rets.append(port_ret)
+            spy_rets.append(spy_ret)
+            turnovers.append(turnover)
+            factor_scores_history.append(factors)
+            fwd_ret_history.append(fwd)
+            current_holdings = new_holdings
+
+        if len(portfolio_rets) < 2:
+            return None
+
+        rets = pd.Series(portfolio_rets, dtype=float)
+        spy_series = pd.Series(spy_rets, dtype=float)
+
+        sharpe = float(rets.mean() / rets.std() * np.sqrt(52)) if rets.std() > 0 else 0.0
+        cum = (1 + rets).cumprod()
+        max_dd = float(((cum - cum.cummax()) / cum.cummax()).min())
+        hit_rate = float((rets > 0).mean())
+        avg_turnover = float(np.mean(turnovers)) if turnovers else 0.0
+
+        ic_df = self.compute_per_factor_attribution(rets, factor_scores_history, fwd_ret_history)
+
+        best_factor = ic_df.loc[ic_df["ICIR"].idxmax(), "factor_name"] if not ic_df.empty else ""
+        worst_factor = ic_df.loc[ic_df["ICIR"].idxmin(), "factor_name"] if not ic_df.empty else ""
+
+        return {
+            "sharpe": round(sharpe, 4),
+            "max_drawdown": round(max_dd, 4),
+            "hit_rate": round(hit_rate, 4),
+            "turnover": round(avg_turnover, 4),
+            "weekly_returns": rets.tolist(),
+            "spy_returns": spy_series.tolist(),
+            "best_factor": best_factor,
+            "worst_factor": worst_factor,
+            "factor_ic": ic_df.to_dict("records") if not ic_df.empty else [],
+            "n_weeks": len(rets),
+        }
+
+    # ── Per-factor IC attribution ─────────────────────────────────────────────
+
+    def compute_per_factor_attribution(
+        self,
+        returns: pd.Series,
+        factor_scores_list: List[Dict[str, pd.Series]],
+        fwd_ret_list: List[pd.Series],
+    ) -> pd.DataFrame:
+        """
+        Compute per-factor IC and ICIR.
+
+        IC   = Spearman rank correlation of factor score with next-week return,
+               computed each week and averaged.
+        ICIR = IC.mean() / IC.std(ddof=1)  — consistency measure (t-stat proxy).
+        Contribution = factor_weight * mean_IC * n_observations.
+
+        Returns DataFrame sorted by ICIR descending:
+            [factor_name, mean_IC, ICIR, n_observations, contribution_pct]
+        """
+        factor_names: set = set()
+        for fs in factor_scores_list:
+            factor_names.update(fs.keys())
+
+        results = []
+        for fname in sorted(factor_names):
+            ic_series: List[float] = []
+            for factors, fwd in zip(factor_scores_list, fwd_ret_list):
+                if fname not in factors:
+                    continue
+                fscore = factors[fname].dropna()
+                common = fscore.index.intersection(fwd.dropna().index)
+                if len(common) < 5:
+                    continue
+                corr, _ = spearmanr(fscore[common].values, fwd[common].values)
+                if np.isfinite(corr):
+                    ic_series.append(float(corr))
+
+            if len(ic_series) < 2:
+                continue
+
+            ic_arr = np.array(ic_series, dtype=float)
+            mean_ic = float(np.mean(ic_arr))
+            std_ic = float(np.std(ic_arr, ddof=1))
+            icir = float(mean_ic / std_ic) if std_ic > 0 else 0.0
+            weight = EQUITY_FACTORS.get(fname, {}).get("weight", 0.0)
+            contribution = weight * mean_ic * len(ic_series)
+
+            results.append({
+                "factor_name": fname,
+                "mean_IC": round(mean_ic, 4),
+                "ICIR": round(icir, 4),
+                "n_observations": len(ic_series),
+                "contribution_pct": round(contribution, 4),
             })
 
-            holdings = new_holdings
+        if not results:
+            return pd.DataFrame(
+                columns=["factor_name", "mean_IC", "ICIR", "n_observations", "contribution_pct"]
+            )
 
-    # Align lengths
-    result_dates = dates[MIN_HISTORY - 1:]
-    min_len = min(len(result_dates), len(port_values), len(bench_values))
+        return (
+            pd.DataFrame(results)
+            .sort_values("ICIR", ascending=False)
+            .reset_index(drop=True)
+        )
 
-    results = pd.DataFrame({
-        "date": result_dates[:min_len],
-        "portfolio": port_values[:min_len],
-        "benchmark": bench_values[:min_len],
-    }).set_index("date")
+    # ── Single window entry point ─────────────────────────────────────────────
 
-    return results, trade_log
+    def run_single_window(
+        self,
+        train_start: pd.Timestamp,
+        train_end: pd.Timestamp,
+        test_start: pd.Timestamp,
+        test_end: pd.Timestamp,
+    ) -> Optional[dict]:
+        """
+        Full pipeline for one walk-forward window:
 
+        1. Survivorship-bias filter universe (exclude post-window-start IPOs).
+        2. Download OHLCV for all tickers in one batch (train_start to test_end).
+        3. Optimize factor weights on training window.
+        4. Run test window with optimized weights.
+        5. Return metrics dict.
 
-def backtest_crypto(prices: pd.DataFrame, benchmark: pd.Series,
-                    top_n: int = 3, cost_bps: float = 30) -> Tuple[pd.DataFrame, list]:
-    """
-    Walk-forward crypto backtest.
+        Note: fundamental signals (earnings_revision) use a 45-day-lag
+        approximation when integrated with EDGAR data. Current yfinance
+        implementation is excluded from backtest entirely.
+        """
+        print(
+            f"\n  Window: train {train_start.date()} - {train_end.date()} | "
+            f"test {test_start.date()} - {test_end.date()}"
+        )
 
-    At each rebalance:
-    1. Compute trend/momentum signal for each asset
-    2. Go long top_n assets with positive signals only
-    3. Cash (flat) if no positive signals
-    4. Apply vol regime scaling
-    """
-    cost = cost_bps / 10_000
-    n_days = len(prices)
-    dates = prices.index
+        # 1. Filter universe for survivorship bias
+        included, excluded = self._filter_universe(self.tickers, train_start)
+        print(
+            f"    Universe: {len(included)} tickers "
+            f"({len(excluded)} excluded for IPO after window start)"
+        )
 
-    port_values = [1.0]
-    bench_values = [1.0]
-    holdings = {}
-    trade_log = []
+        if len(included) < MIN_TICKERS:
+            print(f"    [SKIP] Universe too small (need >= {MIN_TICKERS})")
+            return None
 
-    rebal_dates = list(range(MIN_HISTORY, n_days, REBALANCE_FREQ))
+        # 2. Download price data (add SPY for IVOL benchmark)
+        fetch_tickers = included + (["SPY"] if "SPY" not in included else [])
+        buffer_start = train_start - pd.offsets.BDay(30)  # extra buffer for vol calcs
 
-    print(f"\n  Running crypto walk-forward: {len(rebal_dates)} rebalance points")
-    print(f"  Top {top_n} positive signals, {cost_bps} bps/side")
+        try:
+            raw = yf.download(
+                fetch_tickers,
+                start=buffer_start.strftime("%Y-%m-%d"),
+                end=test_end.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+        except Exception as exc:
+            print(f"    [ERROR] Download failed: {exc}")
+            return None
 
-    for i in range(MIN_HISTORY, n_days):
-        date = dates[i]
+        if raw.empty:
+            print("    [SKIP] Empty price data from yfinance")
+            return None
 
-        # Daily return
-        if holdings:
-            daily_ret = 0
-            for ticker, weight in holdings.items():
-                if ticker in prices.columns:
-                    prev = prices[ticker].iloc[i - 1]
-                    curr = prices[ticker].iloc[i]
-                    if prev > 0 and not np.isnan(prev) and not np.isnan(curr):
-                        daily_ret += weight * (curr / prev - 1)
-            port_values.append(port_values[-1] * (1 + daily_ret))
+        if isinstance(raw.columns, pd.MultiIndex):
+            prices = raw["Close"].copy()
         else:
-            port_values.append(port_values[-1])
+            prices = raw[["Close"]].rename(columns={"Close": fetch_tickers[0]})
 
-        # Benchmark
-        bp = benchmark.iloc[i]
-        bp_prev = benchmark.iloc[i - 1]
-        if bp_prev > 0 and not np.isnan(bp_prev) and not np.isnan(bp):
-            bench_values.append(bench_values[-1] * (bp / bp_prev))
-        else:
-            bench_values.append(bench_values[-1])
+        prices = prices.ffill(limit=5)
 
-        # Rebalance
-        if i in rebal_dates:
-            signals = {}
-            for ticker in prices.columns:
-                sig = compute_crypto_signal_at_date(prices, i, ticker)
-                if not np.isnan(sig):
-                    signals[ticker] = sig
+        spy_prices = prices["SPY"].dropna() if "SPY" in prices.columns else None
+        ticker_prices = prices.drop(columns=["SPY"], errors="ignore")
 
-            # Only long positive signals
-            positive = {k: v for k, v in signals.items() if v > 0.3}
-            sorted_sigs = sorted(positive.items(), key=lambda x: -x[1])[:top_n]
+        # Drop tickers with very sparse data (<50% of training window)
+        min_obs = int(self.training_days * 0.5)
+        valid_cols = ticker_prices.columns[ticker_prices.count() >= min_obs]
+        ticker_prices = ticker_prices[valid_cols]
 
-            new_holdings = {}
-            if sorted_sigs:
-                for ticker, _ in sorted_sigs:
-                    new_holdings[ticker] = 1.0 / len(sorted_sigs)
+        if len(ticker_prices.columns) < MIN_TICKERS:
+            print("    [SKIP] Too few tickers after data quality filter")
+            return None
 
-            # Turnover & costs
-            old_tickers = set(holdings.keys())
-            new_tickers = set(new_holdings.keys())
-            turnover = 0
-            for t in old_tickers | new_tickers:
-                turnover += abs(holdings.get(t, 0) - new_holdings.get(t, 0))
+        # 3. Optimize weights on training window
+        train_prices = ticker_prices.loc[train_start:train_end]
+        spy_train = spy_prices.loc[train_start:train_end] if spy_prices is not None else None
+        best_weights, train_sharpe = self._optimize_weights(train_prices, spy_train)
 
-            cost_drag = turnover * cost
-            port_values[-1] *= (1 - cost_drag)
+        top_w_factor = max(best_weights, key=best_weights.get) if best_weights else "n/a"
+        print(
+            f"    Training Sharpe: {train_sharpe:.3f} | "
+            f"Top weight: {top_w_factor} ({best_weights.get(top_w_factor, 0):.2%})"
+        )
 
-            trade_log.append({
-                "date": date,
-                "turnover": turnover,
-                "n_holdings": len(new_holdings),
-                "in_market": len(new_holdings) > 0,
-            })
+        # 4. Run test window
+        result = self._run_test_window(
+            ticker_prices, spy_prices, test_start, test_end, best_weights
+        )
 
-            holdings = new_holdings
+        if result is None:
+            print("    [SKIP] Insufficient test data")
+            return None
 
-    result_dates = dates[MIN_HISTORY - 1:]
-    min_len = min(len(result_dates), len(port_values), len(bench_values))
-
-    results = pd.DataFrame({
-        "date": result_dates[:min_len],
-        "portfolio": port_values[:min_len],
-        "benchmark": bench_values[:min_len],
-    }).set_index("date")
-
-    return results, trade_log
-
-
-# ==============================================================================
-# SECTION 4: PERFORMANCE METRICS
-# ==============================================================================
-
-def compute_metrics(results: pd.DataFrame, trade_log: list, label: str) -> dict:
-    """
-    Compute comprehensive performance metrics.
-    Returns dict with all key stats.
-    """
-    port = results["portfolio"]
-    bench = results["benchmark"]
-
-    # Daily returns
-    port_ret = port.pct_change().dropna()
-    bench_ret = bench.pct_change().dropna()
-
-    # Annualized return (CAGR)
-    n_years = len(port_ret) / TRADING_DAYS_YEAR
-    if n_years > 0 and port.iloc[-1] > 0 and port.iloc[0] > 0:
-        cagr_port = (port.iloc[-1] / port.iloc[0]) ** (1 / n_years) - 1
-        cagr_bench = (bench.iloc[-1] / bench.iloc[0]) ** (1 / n_years) - 1
-    else:
-        cagr_port = cagr_bench = 0
-
-    # Volatility
-    vol_port = port_ret.std() * ANNUALIZE
-    vol_bench = bench_ret.std() * ANNUALIZE
-
-    # Sharpe (assuming 0% risk-free for simplicity)
-    sharpe = cagr_port / vol_port if vol_port > 0 else 0
-
-    # Sortino (downside deviation)
-    downside = port_ret[port_ret < 0]
-    downside_vol = downside.std() * ANNUALIZE if len(downside) > 0 else 0
-    sortino = cagr_port / downside_vol if downside_vol > 0 else 0
-
-    # Max drawdown
-    cummax = port.cummax()
-    drawdown = (port - cummax) / cummax
-    max_dd = drawdown.min()
-
-    # Max drawdown duration (days)
-    dd_duration = 0
-    current_dd = 0
-    for i in range(1, len(port)):
-        if port.iloc[i] < cummax.iloc[i]:
-            current_dd += 1
-            dd_duration = max(dd_duration, current_dd)
-        else:
-            current_dd = 0
-
-    # Hit rate (% of positive weekly returns)
-    weekly_ret = port_ret.rolling(5).sum().dropna()
-    hit_rate = (weekly_ret > 0).mean()
-
-    # Profit factor
-    gross_profit = port_ret[port_ret > 0].sum()
-    gross_loss = abs(port_ret[port_ret < 0].sum())
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-
-    # Beta to benchmark
-    if len(port_ret) > 30 and bench_ret.std() > 0:
-        cov = np.cov(port_ret.values, bench_ret.values)
-        beta = cov[0, 1] / cov[1, 1] if cov[1, 1] > 0 else 0
-    else:
-        beta = 0
-
-    # Alpha (Jensen's)
-    alpha = cagr_port - beta * cagr_bench
-
-    # Information ratio
-    excess = port_ret - bench_ret
-    tracking_error = excess.std() * ANNUALIZE
-    info_ratio = (cagr_port - cagr_bench) / tracking_error if tracking_error > 0 else 0
-
-    # Total costs
-    total_turnover = sum(t.get("turnover", 0) for t in trade_log)
-    avg_turnover = total_turnover / len(trade_log) if trade_log else 0
-
-    # Time in market (crypto)
-    if trade_log and "in_market" in trade_log[0]:
-        time_in_market = sum(1 for t in trade_log if t.get("in_market", False)) / len(trade_log)
-    else:
-        time_in_market = 1.0
-
-    return {
-        "label": label,
-        "period_years": round(n_years, 1),
-        "cagr_port": cagr_port,
-        "cagr_bench": cagr_bench,
-        "vol_port": vol_port,
-        "vol_bench": vol_bench,
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "max_drawdown": max_dd,
-        "max_dd_duration_days": dd_duration,
-        "hit_rate_weekly": hit_rate,
-        "profit_factor": profit_factor,
-        "beta": beta,
-        "alpha": alpha,
-        "info_ratio": info_ratio,
-        "avg_turnover_per_rebal": avg_turnover,
-        "total_return_port": port.iloc[-1] / port.iloc[0] - 1,
-        "total_return_bench": bench.iloc[-1] / bench.iloc[0] - 1,
-        "time_in_market": time_in_market,
-    }
-
-
-# ==============================================================================
-# SECTION 5: REPORTING
-# ==============================================================================
-
-def print_metrics(m: dict):
-    """Print formatted performance report."""
-    print(f"\n{'═' * 60}")
-    print(f"  {m['label']}")
-    print(f"  Period: {m['period_years']} years")
-    print(f"{'═' * 60}")
-
-    print(f"\n  RETURNS:")
-    print(f"  {'Portfolio CAGR:':<30} {m['cagr_port']:>10.2%}")
-    print(f"  {'Benchmark CAGR:':<30} {m['cagr_bench']:>10.2%}")
-    print(f"  {'Total Return (port):':<30} {m['total_return_port']:>10.2%}")
-    print(f"  {'Total Return (bench):':<30} {m['total_return_bench']:>10.2%}")
-
-    print(f"\n  RISK:")
-    print(f"  {'Portfolio Vol:':<30} {m['vol_port']:>10.2%}")
-    print(f"  {'Benchmark Vol:':<30} {m['vol_bench']:>10.2%}")
-    print(f"  {'Max Drawdown:':<30} {m['max_drawdown']:>10.2%}")
-    print(f"  {'Max DD Duration:':<30} {m['max_dd_duration_days']:>10} days")
-
-    print(f"\n  RISK-ADJUSTED:")
-    print(f"  {'Sharpe Ratio:':<30} {m['sharpe']:>10.3f}")
-    print(f"  {'Sortino Ratio:':<30} {m['sortino']:>10.3f}")
-    print(f"  {'Information Ratio:':<30} {m['info_ratio']:>10.3f}")
-
-    # Sharpe quality assessment
-    sharpe = m["sharpe"]
-    if sharpe >= 2.5:
-        quality = "⚠️  SUSPICIOUS — likely overfitting or survivorship bias"
-    elif sharpe >= 1.5:
-        quality = "🟢 EXCELLENT (but verify out-of-sample)"
-    elif sharpe >= 0.8:
-        quality = "🟡 ACCEPTABLE — proceed with caution"
-    elif sharpe >= 0.5:
-        quality = "🟠 MARGINAL — needs improvement"
-    else:
-        quality = "🔴 INSUFFICIENT — does not clear hurdle"
-    print(f"  {'Sharpe Assessment:':<30} {quality}")
-
-    print(f"\n  FACTOR ANALYSIS:")
-    print(f"  {'Beta to Benchmark:':<30} {m['beta']:>10.3f}")
-    print(f"  {'Alpha (Jensen):':<30} {m['alpha']:>10.2%}")
-
-    print(f"\n  TRADE STATISTICS:")
-    print(f"  {'Hit Rate (weekly):':<30} {m['hit_rate_weekly']:>10.1%}")
-    print(f"  {'Profit Factor:':<30} {m['profit_factor']:>10.2f}")
-    print(f"  {'Avg Turnover/Rebal:':<30} {m['avg_turnover_per_rebal']:>10.2%}")
-    if m["time_in_market"] < 1.0:
-        print(f"  {'Time in Market:':<30} {m['time_in_market']:>10.1%}")
-
-
-def print_annual_returns(results: pd.DataFrame, label: str):
-    """Print year-by-year performance breakdown."""
-    port = results["portfolio"]
-    bench = results["benchmark"]
-
-    print(f"\n  ANNUAL RETURNS ({label}):")
-    print(f"  {'Year':<8}{'Portfolio':>12}{'Benchmark':>12}{'Excess':>12}")
-    print(f"  {'─' * 44}")
-
-    years = sorted(set(results.index.year))
-    for year in years:
-        mask = results.index.year == year
-        yr_data = results[mask]
-        if len(yr_data) < 20:
-            continue
-        p_ret = yr_data["portfolio"].iloc[-1] / yr_data["portfolio"].iloc[0] - 1
-        b_ret = yr_data["benchmark"].iloc[-1] / yr_data["benchmark"].iloc[0] - 1
-        excess = p_ret - b_ret
-        marker = "✓" if excess > 0 else "✗"
-        print(f"  {year:<8}{p_ret:>11.2%} {b_ret:>11.2%} {excess:>11.2%}  {marker}")
-
-
-def print_drawdown_analysis(results: pd.DataFrame, label: str):
-    """Print worst drawdown periods."""
-    port = results["portfolio"]
-    cummax = port.cummax()
-    drawdown = (port - cummax) / cummax
-
-    # Find top 5 drawdown troughs
-    dd_series = drawdown.copy()
-    worst_dds = []
-
-    for _ in range(5):
-        if dd_series.empty or dd_series.min() >= -0.001:
-            break
-        trough_idx = dd_series.idxmin()
-        trough_val = dd_series[trough_idx]
-
-        # Find start (last peak before trough)
-        pre_trough = dd_series.loc[:trough_idx]
-        peaks = pre_trough[pre_trough >= -0.001]
-        start_idx = peaks.index[-1] if len(peaks) > 0 else pre_trough.index[0]
-
-        # Find recovery (next peak after trough)
-        post_trough = dd_series.loc[trough_idx:]
-        recoveries = post_trough[post_trough >= -0.001]
-        end_idx = recoveries.index[0] if len(recoveries) > 0 else post_trough.index[-1]
-
-        worst_dds.append({
-            "start": start_idx,
-            "trough": trough_idx,
-            "end": end_idx,
-            "depth": trough_val,
-            "duration": (end_idx - start_idx).days,
+        result.update({
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+            "train_sharpe": round(train_sharpe, 4),
+            "optimized_weights": json.dumps({k: round(v, 4) for k, v in best_weights.items()}),
+            "tickers_included": len(included),
+            "tickers_excluded": len(excluded),
         })
 
-        # Zero out this region to find next worst
-        dd_series.loc[start_idx:end_idx] = 0
+        print(
+            f"    Test Sharpe: {result['sharpe']:.3f} | "
+            f"MaxDD: {result['max_drawdown']:.1%} | "
+            f"Hit: {result['hit_rate']:.1%} | "
+            f"Turnover: {result['turnover']:.1%}"
+        )
 
-    if worst_dds:
-        print(f"\n  WORST DRAWDOWNS ({label}):")
-        print(f"  {'#':<4}{'Depth':>8}{'Start':>14}{'Trough':>14}{'Recovery':>14}{'Days':>8}")
-        print(f"  {'─' * 62}")
-        for i, dd in enumerate(worst_dds, 1):
-            rec = dd["end"].strftime("%Y-%m-%d") if dd["end"] != results.index[-1] else "ongoing"
-            print(f"  {i:<4}{dd['depth']:>7.1%} "
-                  f"{dd['start'].strftime('%Y-%m-%d'):>13} "
-                  f"{dd['trough'].strftime('%Y-%m-%d'):>13} "
-                  f"{rec:>13} "
-                  f"{dd['duration']:>7}")
+        return result
 
+    # ── Full backtest ─────────────────────────────────────────────────────────
 
-def save_results(results: pd.DataFrame, metrics: dict, label: str):
-    """Save backtest results to CSV."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    tag = label.lower().replace(" ", "_").replace("/", "_")
+    def run_full_backtest(self) -> pd.DataFrame:
+        """
+        Run all rolling walk-forward windows.
 
-    results_path = os.path.join(OUTPUT_DIR, f"backtest_{tag}_equity_curve.csv")
-    results.to_csv(results_path)
+        Returns DataFrame (one row per window):
+            window_start, window_end, sharpe, max_drawdown, hit_rate,
+            turnover, best_factor, worst_factor, optimized_weights (JSON),
+            train_sharpe, n_weeks, tickers_included, tickers_excluded.
 
-    metrics_path = os.path.join(OUTPUT_DIR, f"backtest_{tag}_metrics.csv")
-    pd.Series(metrics).to_csv(metrics_path, header=["value"])
+        Also populates self._all_results and self._aggregated_ic for use
+        by generate_report() and compute_per_factor_attribution().
+        """
+        windows = self._generate_windows()
+        print(f"\n{'='*60}")
+        print(f"  WALK-FORWARD BACKTEST")
+        print(
+            f"  {len(windows)} windows | train={self.training_days}d | "
+            f"test={self.test_days}d | step={self.step_days}d"
+        )
+        print(f"  Universe: {len(self.tickers)} tickers")
+        print(f"  Transaction cost: {self.tc_bps} bps one-way")
+        print(f"{'='*60}")
 
-    print(f"\n  📁 Saved: {results_path}")
-    print(f"  📁 Saved: {metrics_path}")
+        self._all_results = []
+        for train_start, train_end, test_start, test_end in windows:
+            r = self.run_single_window(train_start, train_end, test_start, test_end)
+            if r:
+                self._all_results.append(r)
 
+        if not self._all_results:
+            print("\n  [ERROR] No results. Check universe size and date range.")
+            return pd.DataFrame()
 
-def print_verdict(eq_metrics: dict = None, cr_metrics: dict = None):
-    """Final assessment using the strategy framework."""
-    print(f"\n\n{'█' * 60}")
-    print(f"  BACKTEST VERDICT")
-    print(f"{'█' * 60}")
+        rows = []
+        self._aggregated_ic = {}
 
-    if eq_metrics:
-        s = eq_metrics["sharpe"]
-        print(f"\n  EQUITY MULTI-FACTOR:")
-        if s >= 0.8:
-            print(f"  → PROCEED — Sharpe {s:.2f} clears 0.8 hurdle (net of costs)")
-            print(f"  → Alpha of {eq_metrics['alpha']:.1%} vs benchmark suggests real signal")
-        elif s >= 0.5:
-            print(f"  → INVESTIGATE FURTHER — Sharpe {s:.2f} is marginal")
-            print(f"  → May improve with factor tuning or universe expansion")
-        else:
-            print(f"  → TERMINATE — Sharpe {s:.2f} below 0.5 threshold")
-            print(f"  → Signal does not justify transaction costs")
+        for r in self._all_results:
+            rows.append({
+                "window_start": r["test_start"].date(),
+                "window_end": r["test_end"].date(),
+                "sharpe": r["sharpe"],
+                "max_drawdown": r["max_drawdown"],
+                "hit_rate": r["hit_rate"],
+                "turnover": r["turnover"],
+                "best_factor": r["best_factor"],
+                "worst_factor": r["worst_factor"],
+                "optimized_weights": r.get("optimized_weights", "{}"),
+                "train_sharpe": r.get("train_sharpe", 0.0),
+                "n_weeks": r.get("n_weeks", 0),
+                "tickers_included": r.get("tickers_included", 0),
+                "tickers_excluded": r.get("tickers_excluded", 0),
+            })
+            for ic_row in r.get("factor_ic", []):
+                self._aggregated_ic.setdefault(ic_row["factor_name"], []).append(
+                    ic_row["mean_IC"]
+                )
 
-        if s > 2.5:
-            print(f"  → ⚠️  Sharpe > 2.5 is SUSPICIOUS. Likely survivorship bias.")
+        return pd.DataFrame(rows)
 
-    if cr_metrics:
-        s = cr_metrics["sharpe"]
-        print(f"\n  CRYPTO TREND/MOMENTUM:")
-        if s >= 0.8:
-            print(f"  → PROCEED — Sharpe {s:.2f} clears hurdle")
-        elif s >= 0.5:
-            print(f"  → INVESTIGATE FURTHER — Sharpe {s:.2f}, trend-following")
-            print(f"    has inherent whipsaw cost in range-bound markets")
-        else:
-            print(f"  → TERMINATE or redesign — Sharpe {s:.2f}")
+    # ── Report ────────────────────────────────────────────────────────────────
 
-        tim = cr_metrics.get("time_in_market", 1.0)
-        if tim < 0.3:
-            print(f"  → Only in market {tim:.0%} of the time — signal is very selective")
+    def generate_report(self, results: pd.DataFrame) -> str:
+        """
+        Print and return formatted backtest summary.
 
-    print(f"\n  SURVIVORSHIP BIAS CAVEAT:")
-    print(f"  These results use today's universe projected backward.")
-    print(f"  Stocks that went bankrupt or delisted are NOT included.")
-    print(f"  Real-world performance would be WORSE than shown here.")
-    print(f"  Discount all Sharpe ratios by ~0.2-0.4 for this effect.")
+        Sections:
+          1. Out-of-sample Sharpe (all windows combined)
+          2. Sharpe vs SPY benchmark + excess
+          3. Per-window table
+          4. Worst drawdown window (failure mode)
+          5. Per-factor IC table sorted by |mean_IC|
+          6. Weight recommendations based on IC
+          7. Transaction cost drag estimate
+        """
+        if results.empty:
+            print("  No results to report.")
+            return ""
 
-    print(f"\n  RECOMMENDATION:")
-    print(f"  Run this backtest quarterly as your universe changes.")
-    print(f"  If Sharpe degrades below 0.5, revisit signal construction.")
-    print(f"{'█' * 60}\n")
+        lines: List[str] = []
+        sep = "=" * 70
+
+        lines.append(sep)
+        lines.append("  WALK-FORWARD BACKTEST REPORT")
+        lines.append(
+            f"  {len(results)} windows | "
+            f"{results['window_start'].iloc[0]} - {results['window_end'].iloc[-1]}"
+        )
+        lines.append(sep)
+
+        # Combined out-of-sample metrics
+        all_weekly = [r for res in self._all_results for r in res.get("weekly_returns", [])]
+        all_spy = [r for res in self._all_results for r in res.get("spy_returns", [])]
+
+        if all_weekly:
+            rets = np.array(all_weekly, dtype=float)
+            spy_arr = np.array(all_spy, dtype=float)
+
+            overall_sharpe = (
+                float(rets.mean() / rets.std() * np.sqrt(52)) if rets.std() > 0 else 0.0
+            )
+            spy_sharpe = (
+                float(spy_arr.mean() / spy_arr.std() * np.sqrt(52))
+                if spy_arr.std() > 0 else 0.0
+            )
+            total_ret = float(np.prod(1 + rets) - 1)
+            spy_total = float(np.prod(1 + spy_arr) - 1)
+
+            lines.append(f"\n  OUT-OF-SAMPLE PERFORMANCE ({len(rets)} weeks combined)")
+            lines.append(f"  {'Sharpe (portfolio):':<35} {overall_sharpe:>8.3f}")
+            lines.append(f"  {'Sharpe (SPY benchmark):':<35} {spy_sharpe:>8.3f}")
+            lines.append(f"  {'Excess Sharpe:':<35} {overall_sharpe - spy_sharpe:>8.3f}")
+            lines.append(f"  {'Total return (portfolio):':<35} {total_ret:>7.1%}")
+            lines.append(f"  {'Total return (SPY):':<35} {spy_total:>7.1%}")
+            lines.append(
+                f"  {'Avg hit rate (weekly):':<35} "
+                f"{float(results['hit_rate'].mean()):>7.1%}"
+            )
+
+        # Per-window table
+        lines.append(f"\n  PER-WINDOW SUMMARY")
+        lines.append(
+            f"  {'Window':>25} {'Sharpe':>8} {'MaxDD':>8} {'HitRate':>9} {'Turnover':>10}"
+        )
+        lines.append(f"  {'-'*63}")
+        for _, row in results.iterrows():
+            lines.append(
+                f"  {str(row['window_start']):>12} - {str(row['window_end']):<12}"
+                f"{row['sharpe']:>7.2f}"
+                f"{row['max_drawdown']:>7.1%}"
+                f"{row['hit_rate']:>8.1%}"
+                f"{row['turnover']:>9.1%}"
+            )
+
+        # Worst drawdown window
+        worst_idx = int(results["max_drawdown"].idxmin())
+        worst = results.iloc[worst_idx]
+        lines.append(f"\n  WORST WINDOW (failure mode)")
+        lines.append(
+            f"  {worst['window_start']} - {worst['window_end']}: "
+            f"drawdown={worst['max_drawdown']:.1%}, sharpe={worst['sharpe']:.2f}"
+        )
+        lines.append(f"  Worst factor in that window: {worst['worst_factor']}")
+
+        # Per-factor IC table
+        aggregated = self._aggregated_ic
+        if aggregated:
+            lines.append(f"\n  PER-FACTOR IC TABLE (sorted by |mean_IC|)")
+            lines.append(
+                f"  {'Factor':<25} {'Mean IC':>10} {'Windows':>10} {'Verdict':>10}"
+            )
+            lines.append(f"  {'-'*57}")
+
+            ic_summary = sorted(
+                [
+                    (f, float(np.mean(ic_list)), len(ic_list))
+                    for f, ic_list in aggregated.items()
+                ],
+                key=lambda x: abs(x[1]),
+                reverse=True,
+            )
+            for fname, mean_ic, n in ic_summary:
+                verdict = "KEEP" if abs(mean_ic) > 0.02 else "REVIEW"
+                lines.append(
+                    f"  {fname:<25} {mean_ic:>+10.4f} {n:>10}  {verdict}"
+                )
+
+        # Weight recommendations
+        lines.append(f"\n  WEIGHT RECOMMENDATION")
+        lines.append("  Based on IC, suggest reweighting (positive IC factors only):")
+        if aggregated:
+            pos_factors = [
+                (f, float(np.mean(ic)))
+                for f, ic in aggregated.items()
+                if float(np.mean(ic)) > 0
+            ]
+            if pos_factors:
+                total_pos = sum(abs(ic) for _, ic in pos_factors)
+                for fname, mean_ic in sorted(pos_factors, key=lambda x: x[1], reverse=True):
+                    suggested_w = abs(mean_ic) / total_pos if total_pos > 0 else 0.0
+                    current_w = EQUITY_FACTORS.get(fname, {}).get("weight", 0.0)
+                    direction = "^ UP" if suggested_w > current_w else "v DOWN"
+                    lines.append(
+                        f"    {fname:<25} current={current_w:.2f}  "
+                        f"suggested={suggested_w:.2f}  {direction}"
+                    )
+
+        # Transaction cost drag
+        avg_turnover = float(results["turnover"].mean())
+        annual_tc_bps = avg_turnover * 52 * self.tc_bps * 2  # round-trip annualized
+        lines.append(f"\n  TRANSACTION COST DRAG")
+        lines.append(f"  Avg weekly turnover: {avg_turnover:.1%}")
+        lines.append(
+            f"  Turnover of {avg_turnover:.1%} costs "
+            f"{annual_tc_bps:.1f} bps annually "
+            f"({annual_tc_bps / 100:.2%} return drag)"
+        )
+
+        lines.append(sep)
+
+        report = "\n".join(lines)
+        print(report)
+        return report
 
 
 # ==============================================================================
-# SECTION 6: MAIN
+# SECTION 4: CLI
 # ==============================================================================
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Walk-Forward Backtest Framework v1.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--run-full", action="store_true",
+                   help="Run all walk-forward windows")
+    g.add_argument("--run-latest", action="store_true",
+                   help="Run most recent window only (fast validation)")
+    p.add_argument("--factor-ic", action="store_true",
+                   help="Print IC table (use with --run-full or --run-latest)")
+    p.add_argument("--suggest-weights", action="store_true",
+                   help="Print weight recommendations (use with --run-full)")
+    p.add_argument("--tickers", type=str, default=None,
+                   help="Comma-separated tickers (default: config.EQUITY_WATCHLIST)")
+    p.add_argument("--tc-bps", type=float, default=5.0,
+                   help="One-way transaction cost in bps (default: 5)")
+    p.add_argument("--output-csv", type=str, default=None,
+                   help="Save results DataFrame to CSV")
+    return p
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Signal Engine Backtester v1.0")
-    parser.add_argument("--equity-only", action="store_true")
-    parser.add_argument("--crypto-only", action="store_true")
-    parser.add_argument("--years", type=int, default=3, help="Years of history (default: 3)")
-    parser.add_argument("--top-n-equity", type=int, default=10, help="Top N equities (default: 10)")
-    parser.add_argument("--top-n-crypto", type=int, default=3, help="Top N crypto (default: 3)")
+    parser = _build_parser()
     args = parser.parse_args()
 
-    print("\n" + "█" * 60)
-    print("  SIGNAL ENGINE BACKTESTER v1.0")
-    print(f"  Lookback: {args.years} years | Walk-forward | Weekly rebalance")
-    print("█" * 60)
+    if args.tickers:
+        tickers = [t.strip() for t in args.tickers.split(",")]
+    else:
+        try:
+            from config import EQUITY_WATCHLIST, CUSTOM_WATCHLIST
+            tickers = list(dict.fromkeys(EQUITY_WATCHLIST + CUSTOM_WATCHLIST))
+        except ImportError:
+            print("ERROR: config.py not found and --tickers not specified.")
+            sys.exit(1)
 
-    eq_metrics = None
-    cr_metrics = None
+    bt = WalkForwardBacktest(tickers=tickers, transaction_cost_bps=args.tc_bps)
 
-    # ── Equity Backtest ──
-    if not args.crypto_only:
-        print("\n\n" + "█" * 60)
-        print("  EQUITY MULTI-FACTOR BACKTEST")
-        print("█" * 60)
+    if args.run_full:
+        results = bt.run_full_backtest()
+        if results.empty:
+            sys.exit(1)
+        bt.generate_report(results)
+        if args.output_csv:
+            results.to_csv(args.output_csv, index=False)
+            print(f"\n  Results saved to: {args.output_csv}")
 
-        universe = list(set(EQUITY_WATCHLIST + CUSTOM_WATCHLIST + ["SPY"]))
-        prices = fetch_backtest_data(universe, args.years, "equity + benchmark")
+    elif args.run_latest:
+        windows = bt._generate_windows()
+        if not windows:
+            print("ERROR: No complete windows available yet (check date range).")
+            sys.exit(1)
 
-        if "SPY" in prices.columns:
-            benchmark = prices["SPY"]
-            eq_prices = prices.drop(columns=["SPY"], errors="ignore")
-        else:
-            print("  [ERROR] SPY benchmark not available. Cannot proceed.")
-            eq_prices = pd.DataFrame()
-            benchmark = pd.Series()
+        train_start, train_end, test_start, test_end = windows[-1]
+        print(f"\n  Running latest window only: {test_start.date()} - {test_end.date()}")
 
-        if not eq_prices.empty:
-            results, trade_log = backtest_equity(
-                eq_prices, benchmark,
-                top_n=args.top_n_equity,
-                cost_bps=RISK_PARAMS["equity_cost_bps"]
-            )
-            eq_metrics = compute_metrics(results, trade_log, "Equity Multi-Factor")
-            print_metrics(eq_metrics)
-            print_annual_returns(results, "Equity")
-            print_drawdown_analysis(results, "Equity")
-            save_results(results, eq_metrics, "equity")
+        r = bt.run_single_window(train_start, train_end, test_start, test_end)
+        if not r:
+            print("  [ERROR] Latest window returned no results.")
+            sys.exit(1)
 
-    # ── Crypto Backtest ──
-    if not args.equity_only:
-        print("\n\n" + "█" * 60)
-        print("  CRYPTO TREND/MOMENTUM BACKTEST")
-        print("█" * 60)
+        bt._all_results = [r]
+        bt._aggregated_ic = {}
+        for ic_row in r.get("factor_ic", []):
+            bt._aggregated_ic.setdefault(ic_row["factor_name"], []).append(ic_row["mean_IC"])
 
-        crypto_universe = CRYPTO_TICKERS + ["BTC-USD"] if "BTC-USD" not in CRYPTO_TICKERS else CRYPTO_TICKERS
-        prices = fetch_backtest_data(crypto_universe, args.years, "crypto + benchmark")
+        df = pd.DataFrame([{
+            "window_start": r["test_start"].date(),
+            "window_end": r["test_end"].date(),
+            "sharpe": r["sharpe"],
+            "max_drawdown": r["max_drawdown"],
+            "hit_rate": r["hit_rate"],
+            "turnover": r["turnover"],
+            "best_factor": r["best_factor"],
+            "worst_factor": r["worst_factor"],
+            "optimized_weights": r.get("optimized_weights", "{}"),
+            "train_sharpe": r.get("train_sharpe", 0.0),
+            "n_weeks": r.get("n_weeks", 0),
+            "tickers_included": r.get("tickers_included", 0),
+            "tickers_excluded": r.get("tickers_excluded", 0),
+        }])
+        bt.generate_report(df)
 
-        if "BTC-USD" in prices.columns:
-            benchmark = prices["BTC-USD"]
-        else:
-            print("  [ERROR] BTC-USD benchmark not available.")
-            benchmark = pd.Series()
+    elif args.factor_ic or args.suggest_weights:
+        print("  --factor-ic / --suggest-weights must be combined with --run-full.")
+        print("  Example: python3 backtest.py --run-full --factor-ic")
+        sys.exit(1)
 
-        if not prices.empty and not benchmark.empty:
-            results, trade_log = backtest_crypto(
-                prices, benchmark,
-                top_n=args.top_n_crypto,
-                cost_bps=RISK_PARAMS["crypto_cost_bps"]
-            )
-            cr_metrics = compute_metrics(results, trade_log, "Crypto Trend/Momentum")
-            print_metrics(cr_metrics)
-            print_annual_returns(results, "Crypto")
-            print_drawdown_analysis(results, "Crypto")
-            save_results(results, cr_metrics, "crypto")
-
-    # ── Final Verdict ──
-    print_verdict(eq_metrics, cr_metrics)
-
-    print("  ⚠️  THIS IS NOT INVESTMENT ADVICE.")
-    print("  All results are for research/educational purposes only.\n")
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

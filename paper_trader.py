@@ -45,12 +45,15 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from utils.db import get_connection
+
 warnings.filterwarnings("ignore")
 
 try:
     from config import (
         PORTFOLIO_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION, CASH_BUFFER,
         EQUITY_WATCHLIST, CUSTOM_WATCHLIST, RISK_PARAMS,
+        TRANSACTION_COST_BPS,
     )
 except ImportError:
     print("ERROR: config.py not found.")
@@ -71,7 +74,7 @@ BTC_MA_PERIOD = 200  # 200-day moving average for BTC signal
 
 def init_db():
     """Initialize SQLite database with required tables."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection(DB_PATH)
     c = conn.cursor()
 
     c.execute("""
@@ -101,9 +104,15 @@ def init_db():
             weight_pct REAL,
             position_eur REAL,
             entry_price REAL,
+            transaction_cost_eur REAL DEFAULT 0,
             FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
         )
     """)
+    # Migrate: add transaction_cost_eur column if it doesn't exist yet
+    try:
+        c.execute("ALTER TABLE equity_positions ADD COLUMN transaction_cost_eur REAL DEFAULT 0")
+    except Exception:
+        pass  # Column already exists
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_returns (
@@ -297,11 +306,15 @@ def record_snapshot(conn: sqlite3.Connection):
 
         price = current_prices.get(ticker, 0)
 
+        # Round-trip transaction cost: position enters and exits, so 2x one-way cost
+        tc_eur = pos_eur * (TRANSACTION_COST_BPS / 10_000) * 2
+
         c.execute("""
             INSERT INTO equity_positions (snapshot_id, ticker, rank, composite_z,
-                                          weight_pct, position_eur, entry_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (snapshot_id, ticker, rank, composite, weight, pos_eur, price))
+                                          weight_pct, position_eur, entry_price,
+                                          transaction_cost_eur)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (snapshot_id, ticker, rank, composite, weight, pos_eur, price, tc_eur))
 
     conn.commit()
 
@@ -509,6 +522,20 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
               f"  ${price:>11,.2f}"
               f"  ${ma200:>11,.2f}"
               f"{gap:>9.1f}%")
+
+    # Transaction costs YTD
+    c.execute("""
+        SELECT COALESCE(SUM(ep.transaction_cost_eur), 0)
+        FROM equity_positions ep
+        JOIN snapshots s ON ep.snapshot_id = s.id
+        WHERE substr(s.date, 1, 4) = ?
+    """, (str(datetime.now().year),))
+    ytd_tc_eur = float(c.fetchone()[0] or 0)
+    equity_deployed = PORTFOLIO_NAV * EQUITY_ALLOCATION
+    tc_bps_drag = (ytd_tc_eur / equity_deployed * 10_000) if equity_deployed > 0 else 0
+
+    print(f"\n  TRANSACTION COSTS:")
+    print(f"  Transaction costs YTD: €{ytd_tc_eur:.2f} ({tc_bps_drag:.1f} bps drag on equity)")
 
     # Verdict
     print(f"\n  PAPER TRADING VERDICT:")

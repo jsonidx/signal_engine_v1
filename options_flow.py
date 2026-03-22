@@ -56,6 +56,12 @@ except ImportError:
     EQUITY_WATCHLIST = []
     CUSTOM_WATCHLIST = []
 
+try:
+    from utils.iv_calculator import compute_atm_iv, get_iv_rank_and_percentile
+    _IV_CALCULATOR_AVAILABLE = True
+except ImportError:
+    _IV_CALCULATOR_AVAILABLE = False
+
 
 # ==============================================================================
 # SECTION 1: UNIVERSE
@@ -355,6 +361,22 @@ def _score_volume_spike(options_vol: int, avg_stock_vol: float, stock_price: flo
     return vol_score, label
 
 
+def _score_iv_rank_true(rank: float) -> float:
+    """
+    Score using a true IV rank (from iv_history.db) with discrete thresholds.
+    Used when iv_source == 'true'.  Returns 0-25 pts.
+        > 0.80  → 25 pts  (IV at/near 52-week highs — options richly priced)
+        0.50-0.80 → 15 pts  (elevated IV)
+        < 0.50  →  5 pts  (compressed IV)
+    """
+    if rank > 0.80:
+        return 25.0
+    elif rank >= 0.50:
+        return 15.0
+    else:
+        return 5.0
+
+
 def _score_iv_rank(current_iv: float, iv_low: float, iv_high: float,
                    implied_vol_pct: Optional[float]) -> Tuple[float, float]:
     """
@@ -449,7 +471,25 @@ def analyze_ticker(ticker: str, verbose: bool = False) -> Optional[dict]:
         if price <= 0:
             return None
 
-        # Get historical vol for IV rank
+        # -- True IV from live options chain (fall back to realized vol proxy) --
+        true_iv = None
+        iv_rank_true = None
+        iv_percentile_true = None
+        iv_source = "estimated"
+
+        if _IV_CALCULATOR_AVAILABLE:
+            try:
+                true_iv = compute_atm_iv(ticker)
+                if true_iv is not None:
+                    iv_rank_true, iv_percentile_true = get_iv_rank_and_percentile(
+                        ticker, true_iv
+                    )
+                    if iv_rank_true is not None:
+                        iv_source = "true"
+            except Exception:
+                pass
+
+        # Historical realized vol — used for estimated fallback IV rank
         t = yf.Ticker(ticker)
         current_iv, iv_low, iv_high = _get_historical_iv(t)
 
@@ -460,9 +500,13 @@ def analyze_ticker(ticker: str, verbose: bool = False) -> Optional[dict]:
         vol_score, vol_label = _score_volume_spike(
             opts["total_volume"], avg_vol, price
         )
-        iv_score, iv_rank = _score_iv_rank(
-            current_iv, iv_low, iv_high, opts.get("implied_vol")
-        )
+        if iv_source == "true" and iv_rank_true is not None:
+            iv_score = _score_iv_rank_true(iv_rank_true)
+            iv_rank = round(iv_rank_true * 100, 1)
+        else:
+            iv_score, iv_rank = _score_iv_rank(
+                current_iv, iv_low, iv_high, opts.get("implied_vol")
+            )
         em_score, em_label = _score_expected_move(opts["expected_move_pct"])
         pc_score, pc_label = _score_put_call(opts["pc_ratio"])
 
@@ -490,9 +534,16 @@ def analyze_ticker(ticker: str, verbose: bool = False) -> Optional[dict]:
             "put_vol": opts["put_volume"],
             "vol_score": vol_score,
             "vol_label": vol_label,
-            # IV
+            # IV — true (BS from live chain) when available, estimated otherwise
             "iv_rank": iv_rank,
             "implied_vol_pct": opts.get("implied_vol"),
+            "true_iv_pct": round(true_iv * 100, 1) if true_iv is not None else None,
+            "iv_source": iv_source,
+            "iv_percentile": (
+                round(iv_percentile_true * 100, 1)
+                if iv_percentile_true is not None
+                else None
+            ),
             "iv_score": iv_score,
             # Expected move
             "expected_move_pct": opts["expected_move_pct"],
@@ -616,8 +667,13 @@ def print_deep_dive(r: dict) -> None:
     print("  Component Scores:")
     print(f"    Volume spike  {r['vol_score']:>5.0f}/30   {r['vol_label']}")
     print(f"    IV rank       {r['iv_score']:>5.0f}/25   rank={r['iv_rank']:.0f}%", end="")
-    if r.get("implied_vol_pct"):
-        print(f"  IV={r['implied_vol_pct']:.0f}%", end="")
+    if r.get("true_iv_pct"):
+        src = r.get("iv_source", "est")
+        print(f"  IV={r['true_iv_pct']:.0f}% [{src}]", end="")
+        if r.get("iv_percentile") is not None:
+            print(f"  pctile={r['iv_percentile']:.0f}%", end="")
+    elif r.get("implied_vol_pct"):
+        print(f"  IV={r['implied_vol_pct']:.0f}% [estimated]", end="")
     print()
     print(f"    Expected move {r['em_score']:>5.0f}/25   {r['expected_move_pct']:.1f}% (${r['straddle_cost']:.2f} straddle)")
     print(f"    Put/call      {r['pc_score']:>5.0f}/20   {r['pc_label']}")
@@ -669,7 +725,10 @@ def get_options_heat(ticker: str) -> dict:
         "direction": result["direction"],
         "expected_move_pct": result["expected_move_pct"],
         "implied_vol_pct": result.get("implied_vol_pct"),
+        "true_iv_pct": result.get("true_iv_pct"),
         "iv_rank": result["iv_rank"],
+        "iv_source": result.get("iv_source", "estimated"),
+        "iv_percentile": result.get("iv_percentile"),
         "pc_ratio": result["pc_ratio"],
         "total_options_vol": result["total_options_vol"],
         "call_vol": result["call_vol"],

@@ -51,9 +51,17 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 try:
-    from config import OUTPUT_DIR
+    from config import OUTPUT_DIR, UNIVERSE_CACHE_TTL_HOURS as _UNIVERSE_TTL
 except ImportError:
     OUTPUT_DIR = "./signals_output"
+    _UNIVERSE_TTL = 24
+
+try:
+    import universe_builder as _ub
+    _UNIVERSE_BUILDER_AVAILABLE = True
+except ImportError:
+    _ub = None  # type: ignore[assignment]
+    _UNIVERSE_BUILDER_AVAILABLE = False
 
 try:
     from polymarket_screener import PolymarketScreener
@@ -67,13 +75,39 @@ try:
 except ImportError:
     _CONGRESS_AVAILABLE = False
 
+try:
+    import dark_pool_flow as _dpf
+    _DARK_POOL_AVAILABLE = True
+except ImportError:
+    _dpf = None  # type: ignore[assignment]
+    _DARK_POOL_AVAILABLE = False
+
+try:
+    from social_sentiment import get_combined_social_score as _get_social_score
+    _SOCIAL_SENTIMENT_AVAILABLE = True
+except ImportError:
+    _get_social_score = None  # type: ignore[assignment]
+    _SOCIAL_SENTIMENT_AVAILABLE = False
+
+try:
+    from squeeze_screener import detect_recent_squeeze as _squeeze_detect_recent
+    _SQUEEZE_GUARD_AVAILABLE = True
+except ImportError:
+    _squeeze_detect_recent = None  # type: ignore[assignment]
+    _SQUEEZE_GUARD_AVAILABLE = False
+
 
 # ==============================================================================
 # UNIVERSES
 # ==============================================================================
 
-# Small/mid cap with historically high retail interest and short activity
-SMALL_CAP_UNIVERSE = [
+# ---------------------------------------------------------------------------
+# DEPRECATED: hardcoded fallback lists — kept for --use-dynamic-universe=false
+# or when universe_builder.py / its cache is unavailable.
+# Prefer: python3 universe_builder.py --build-cache (run as Step 0)
+# ---------------------------------------------------------------------------
+
+_FALLBACK_SMALL_CAP_UNIVERSE = [
     # Meme / retail favorites
     "GME", "AMC", "BB", "CLOV", "SOFI", "PLTR", "RIVN",
     "LCID", "NIO", "MARA", "RIOT", "COIN", "HOOD", "DKNG", "SKLZ",
@@ -88,16 +122,21 @@ SMALL_CAP_UNIVERSE = [
     "JOBY", "LILM", "LUNR", "RKLB", "ASTS",
 ]
 
-MEME_UNIVERSE = [
+_FALLBACK_MEME_UNIVERSE = [
     "GME", "AMC", "BB", "SOFI", "PLTR", "RIVN", "LCID", "NIO",
     "MARA", "RIOT", "COIN", "HOOD", "DKNG", "IONQ", "RGTI", "QUBT",
     "SMCI", "SOUN", "BBAI", "RKLB", "ASTS", "LUNR", "AFRM", "UPST",
 ]
 
-LARGE_CAP_WATCH = [
+_FALLBACK_LARGE_CAP_WATCH = [
     "NVDA", "TSLA", "AMD", "META", "NFLX", "GOOGL", "AMZN", "AAPL",
     "MSFT", "CRM", "SHOP", "SQ", "ROKU", "SNAP", "PINS", "ABNB",
 ]
+
+# Aliases kept so any external code that imports the old names still works
+SMALL_CAP_UNIVERSE = _FALLBACK_SMALL_CAP_UNIVERSE
+MEME_UNIVERSE      = _FALLBACK_MEME_UNIVERSE
+LARGE_CAP_WATCH    = _FALLBACK_LARGE_CAP_WATCH
 
 
 # ==============================================================================
@@ -586,177 +625,76 @@ def score_polymarket_signal(ticker: str, poly_signals: Dict[str, list]) -> dict:
 
 
 # ==============================================================================
-# SECTION 3B: SOCIAL SENTIMENT (Reddit)
+# SECTION 3B: SOCIAL SENTIMENT (Google Trends + StockTwits)
 # ==============================================================================
 
-def scan_reddit_mentions(tickers: List[str]) -> Dict[str, dict]:
+def score_social_sentiment(ticker: str, data: dict) -> dict:
     """
-    Scan Reddit for ticker mentions using public JSON API.
-    No API key needed — just rate-limited.
+    Social sentiment score using Google Trends search-volume and StockTwits
+    public stream — both free and unauthenticated.
 
-    Scans 3 feeds per subreddit (hot, new, top/week) to catch:
-    - hot: currently trending posts
-    - new: fresh posts that haven't gained traction yet
-    - top (week): high-engagement weekday posts that fell off hot by Sunday
+    Replaces the previous Reddit scan_reddit_mentions() approach which broke
+    when Reddit enforced API authentication in 2023.
 
-    Lookback: 7 days (captures full Mon-Sun cycle for weekly runs).
+    Scoring (0–5 scale, max=5):
+      score_100 > 75  → 5  (strongly bullish across both sources)
+      score_100 > 65  → 4  (bullish)
+      score_100 > 58  → 3  (mildly bullish)
+      score_100 42–58 → 2  (neutral — slight positive for any social attention)
+      score_100 < 35  → 1  (bearish)
+      score_100 < 25  → 0  (strongly bearish)
+      no data         → 0  (graceful degradation)
 
-    Checks: r/wallstreetbets, r/stocks, r/investing, r/options,
-            r/smallstreetbets, r/squeezeplays
-
-    NOTE: For production use, consider the official Reddit API with
-    proper auth, or services like Quiver Quantitative or SwaggyStocks.
+    Delegates to social_sentiment.get_combined_social_score() which handles
+    caching, rate-limiting, and single-source confidence discounting.
     """
-    import re
-    import urllib.request
+    if not _SOCIAL_SENTIMENT_AVAILABLE:
+        return {"score": 0, "max": 5, "flags": ["[social_sentiment.py not found]"]}
 
-    subreddits = ["wallstreetbets", "stocks", "investing", "options",
-                  "smallstreetbets", "squeezeplays"]
-    feeds = ["hot", "new", "top"]  # top defaults to week on Reddit
-    LOOKBACK_HOURS = 168  # 7 days
+    info = data.get("info") or {}
+    company_name = info.get("longName") or None
 
-    mention_counts = {t: {
-        "total": 0, "weighted_total": 0.0, "subreddits": {},
-        "recent_posts": [], "seen_ids": set(),
-        "weekday_mentions": 0, "weekend_mentions": 0,
-    } for t in tickers}
+    try:
+        combined = _get_social_score(ticker, company_name=company_name)
+    except Exception as exc:
+        return {"score": 0, "max": 5, "flags": [f"[social error: {exc}]"]}
 
-    headers = {"User-Agent": "SignalEngine/1.0 (educational research tool)"}
+    score_100 = combined.get("score")
+    if score_100 is None:
+        return {
+            "score": 0,
+            "max": 5,
+            "flags": ["Social data unavailable (Trends + StockTwits both failed)"],
+        }
 
-    print(f"\n  Scanning Reddit (7-day window, {len(subreddits)} subs, {len(feeds)} feeds each)...")
+    # Map 0–100 → 0–5
+    if score_100 > 75:
+        mapped = 5
+    elif score_100 > 65:
+        mapped = 4
+    elif score_100 > 58:
+        mapped = 3
+    elif score_100 >= 25:
+        mapped = 2 if score_100 >= 42 else 1
+    else:
+        mapped = 0
 
-    for sub in subreddits:
-        for feed in feeds:
-            try:
-                if feed == "top":
-                    url = f"https://www.reddit.com/r/{sub}/top.json?t=week&limit=100"
-                else:
-                    url = f"https://www.reddit.com/r/{sub}/{feed}.json?limit=100"
+    flags: List[str] = []
+    interp = combined.get("interpretation", "NEUTRAL")
+    trends_sig = combined.get("trends_signal") or "N/A"
+    twits_sig = combined.get("twits_signal") or "N/A"
+    sources = combined.get("sources", [])
 
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
+    label = f"score {score_100}/100 | Trends={trends_sig} | StockTwits={twits_sig}"
+    if interp in ("BULLISH", "MILDLY_BULLISH"):
+        flags.append(f"Positive social signal ({label})")
+    elif interp in ("BEARISH", "MILDLY_BEARISH"):
+        flags.append(f"⚠️  Negative social signal ({label})")
+    else:
+        src_str = "+".join(sources) if sources else "no sources"
+        flags.append(f"Neutral social signal ({label}) [{src_str}]")
 
-                posts = data.get("data", {}).get("children", [])
-
-                for post in posts:
-                    pdata = post.get("data", {})
-                    post_id = pdata.get("id", "")
-                    title = (pdata.get("title", "") or "").upper()
-                    selftext = (pdata.get("selftext", "") or "").upper()
-                    text = title + " " + selftext
-                    upvotes = pdata.get("ups", 0)
-                    comments = pdata.get("num_comments", 0)
-                    created = pdata.get("created_utc", 0)
-
-                    age_hours = (time.time() - created) / 3600
-                    if age_hours > LOOKBACK_HOURS:
-                        continue
-
-                    # Recency weight: posts from last 24h = 1.0x,
-                    # 1-3 days = 0.7x, 3-5 days = 0.4x, 5-7 days = 0.2x
-                    if age_hours <= 24:
-                        recency_weight = 1.0
-                    elif age_hours <= 72:
-                        recency_weight = 0.7
-                    elif age_hours <= 120:
-                        recency_weight = 0.4
-                    else:
-                        recency_weight = 0.2
-
-                    # Weekday vs weekend (0=Mon, 6=Sun)
-                    from datetime import datetime as dt
-                    post_day = dt.utcfromtimestamp(created).weekday()
-                    is_weekday = post_day < 5
-
-                    for ticker in tickers:
-                        pattern = r'(?:^|\s|\$)' + re.escape(ticker) + r'(?:\s|$|[,.\!\?])'
-                        if re.search(pattern, text):
-                            # Deduplicate across feeds
-                            if post_id in mention_counts[ticker]["seen_ids"]:
-                                continue
-                            mention_counts[ticker]["seen_ids"].add(post_id)
-
-                            mention_counts[ticker]["total"] += 1
-                            mention_counts[ticker]["weighted_total"] += recency_weight
-                            mention_counts[ticker]["subreddits"][sub] = \
-                                mention_counts[ticker]["subreddits"].get(sub, 0) + 1
-
-                            if is_weekday:
-                                mention_counts[ticker]["weekday_mentions"] += 1
-                            else:
-                                mention_counts[ticker]["weekend_mentions"] += 1
-
-                            if len(mention_counts[ticker]["recent_posts"]) < 5:
-                                mention_counts[ticker]["recent_posts"].append({
-                                    "subreddit": sub,
-                                    "title": pdata.get("title", "")[:80],
-                                    "upvotes": upvotes,
-                                    "comments": comments,
-                                    "age_hours": round(age_hours, 1),
-                                    "recency_weight": recency_weight,
-                                })
-
-                time.sleep(1)  # Rate limit: 1 request per second
-
-            except Exception as e:
-                print(f"    [WARN] r/{sub}/{feed}: {e}")
-                continue
-
-    # Clean up non-serializable sets before returning
-    for t in tickers:
-        del mention_counts[t]["seen_ids"]
-
-    return mention_counts
-
-
-def score_social_momentum(ticker: str, mentions: dict) -> dict:
-    """
-    Score based on Reddit mention velocity, engagement, and recency.
-
-    Uses weighted_total (recency-adjusted) so a weekday post from
-    Tuesday still counts on Sunday, just at reduced weight.
-    """
-    score = 0
-    flags = []
-    data = mentions.get(ticker, {"total": 0, "weighted_total": 0, "recent_posts": []})
-
-    total = data["total"]
-    weighted = data.get("weighted_total", 0)
-    weekday = data.get("weekday_mentions", 0)
-    weekend = data.get("weekend_mentions", 0)
-
-    # Score on weighted total (recency-adjusted)
-    if weighted >= 8:
-        score += 3
-        flags.append(f"🔥 HIGH social buzz: {total} mentions (7d), weighted score {weighted:.1f}")
-    elif weighted >= 4:
-        score += 2
-        flags.append(f"Rising social interest: {total} mentions (7d), weighted {weighted:.1f}")
-    elif weighted >= 1.5:
-        score += 1
-        flags.append(f"Some social activity: {total} mentions (7d), weighted {weighted:.1f}")
-
-    # Weekday activity indicator
-    if weekday > 0 and total > 0:
-        weekday_pct = weekday / total * 100
-        if weekday >= 3:
-            flags.append(f"Active weekday discussion: {weekday} weekday posts ({weekday_pct:.0f}%)")
-
-    # High-engagement posts
-    for post in data.get("recent_posts", []):
-        if post["upvotes"] > 500:
-            score += 1
-            flags.append(f"Viral post ({post['upvotes']} upvotes): {post['title'][:50]}...")
-            break
-
-    # Multi-subreddit spread (organic vs coordinated)
-    n_subs = len(data.get("subreddits", {}))
-    if n_subs >= 3:
-        score += 1
-        flags.append(f"Mentioned across {n_subs} subreddits — organic spread")
-
-    return {"score": score, "max": 5, "flags": flags}
+    return {"score": mapped, "max": 5, "flags": flags}
 
 
 # ==============================================================================
@@ -776,10 +714,10 @@ def screen_universe(
     print(f"  Universe: {len(tickers)} tickers | Date: {datetime.now().strftime('%Y-%m-%d')}")
     print(f"{'█' * 60}")
 
-    # Social data (if requested)
-    social_data = {}
-    if include_social:
-        social_data = scan_reddit_mentions(tickers)
+    # Social data is fetched per-ticker (cached inside social_sentiment.py);
+    # no bulk pre-scan is needed for the new Google Trends + StockTwits approach.
+    if include_social and not _SOCIAL_SENTIMENT_AVAILABLE:
+        print("  [WARN] social_sentiment.py not found — install pytrends and retry")
 
     # Polymarket data (if requested and available)
     poly_data: Dict[str, list] = {}
@@ -810,6 +748,26 @@ def screen_universe(
         else:
             print("  [WARN] congress_trades.py not found — skipping congressional signals")
 
+    # Dark pool — pre-load FINRA files once; try result cache first (from run_master.sh)
+    _dp_result_cache: Dict[str, dict] = {}
+    _dp_preloaded: Dict = {}
+    if _DARK_POOL_AVAILABLE:
+        try:
+            _dp_result_cache = _dpf.load_result_cache()
+            if _dp_result_cache:
+                print(f"  Dark pool: loaded {len(_dp_result_cache)} tickers from today's cache")
+            else:
+                print(f"  Dark pool: pre-loading FINRA files (~20 business days)...")
+                _bdays = _dpf._prev_business_days(27)
+                for _day in _bdays:
+                    _ds = _day.strftime("%Y%m%d")
+                    _df = _dpf._fetch_single_date(_day)
+                    if _df is not None:
+                        _dp_preloaded[_ds] = _df
+                print(f"  Dark pool: {len(_dp_preloaded)} FINRA date files loaded")
+        except Exception as _e:
+            print(f"  [WARN] Dark pool pre-load failed: {_e}")
+
     results = []
     total = len(tickers)
 
@@ -829,7 +787,7 @@ def screen_universe(
 
         social = {"score": 0, "max": 5, "flags": []}
         if include_social:
-            social = score_social_momentum(ticker, social_data)
+            social = score_social_sentiment(ticker, data)
 
         polymarket = {"score": 0, "max": 5, "flags": []}
         if include_polymarket:
@@ -846,19 +804,48 @@ def screen_universe(
             except Exception:
                 pass
 
+        # Dark pool: +2 bonus (ACCUMULATION) or -1 penalty (DISTRIBUTION)
+        dark_pool = {"score": 0, "max": 2, "flags": [], "signal": "NEUTRAL", "detail": None}
+        if _DARK_POOL_AVAILABLE:
+            try:
+                dark_pool = _dpf.score_dark_pool(
+                    ticker,
+                    preloaded_frames=_dp_preloaded if _dp_preloaded else None,
+                    result_cache=_dp_result_cache if _dp_result_cache else None,
+                )
+            except Exception:
+                pass
+
         # Composite score
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
                         options["max"] + technical["max"] + social["max"] +
-                        polymarket["max"] + congress["max"])
+                        polymarket["max"] + congress["max"] + dark_pool["max"])
         raw_total = (squeeze["score"] + volume["score"] + vol_squeeze["score"] +
                      options["score"] + technical["score"] + social["score"] +
-                     polymarket["score"] + congress["score"])
+                     polymarket["score"] + congress["score"] + dark_pool["score"])
 
         composite = raw_total / max_possible * 100 if max_possible > 0 else 0
 
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
                      options["flags"] + technical["flags"] + social["flags"] +
-                     polymarket["flags"] + congress["flags"])
+                     polymarket["flags"] + congress["flags"] + dark_pool["flags"])
+
+        # Cross-module post-squeeze guard (mirrors squeeze_screener.py logic).
+        # Zeroes the composite score when a squeeze has already fired — the
+        # setup is spent; entries before the price resets are low-probability.
+        _recent_sq = False
+        if _SQUEEZE_GUARD_AVAILABLE:
+            try:
+                _recent_sq = bool(_squeeze_detect_recent(data))
+            except Exception:
+                pass
+        if _recent_sq:
+            composite = 0.0
+            all_flags.insert(
+                0,
+                "POST-SQUEEZE GUARD — squeeze already fired, score zeroed. "
+                "Wait for price reset before re-entry.",
+            )
 
         results.append({
             "ticker": ticker,
@@ -874,6 +861,9 @@ def screen_universe(
             "social_score": social["score"],
             "polymarket_score": polymarket["score"],
             "congress_score": congress["score"],
+            "dark_pool_score": dark_pool["score"],
+            "dark_pool_signal": dark_pool["signal"],
+            "post_squeeze_guard": bool(_recent_sq),
             "composite": round(composite, 1),
             "flags": all_flags,
             "n_flags": len(all_flags),
@@ -886,6 +876,9 @@ def screen_universe(
     df = pd.DataFrame(results)
     if not df.empty:
         df = df.sort_values("composite", ascending=False)
+        # Keep post_squeeze_guard as Python bool so `is True` comparisons work
+        if "post_squeeze_guard" in df.columns:
+            df["post_squeeze_guard"] = df["post_squeeze_guard"].astype(object)
 
     return df
 
@@ -902,14 +895,16 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
 
     has_poly = "polymarket_score" in df.columns and df["polymarket_score"].sum() > 0
     has_congress = "congress_score" in df.columns and df["congress_score"].sum() > 0
+    has_dark_pool = "dark_pool_score" in df.columns and df["dark_pool_score"].abs().sum() > 0
 
     print(f"\n  {'Rank':<5}{'Ticker':<8}{'Price':>10}{'MktCap':>10}"
           f"{'Short%':>8}{'VolRatio':>9}{'Squeeze':>8}{'Volume':>8}"
           f"{'VolComp':>8}{'Options':>8}{'Tech':>7}{'Social':>7}"
           + (f"{'Poly':>6}" if has_poly else "")
           + (f"{'Cong':>6}" if has_congress else "")
+          + (f"{'DkPool':>7}" if has_dark_pool else "")
           + f"{'TOTAL':>8}")
-    print(f"  {'─' * (104 + (6 if has_poly else 0) + (6 if has_congress else 0))}")
+    print(f"  {'─' * (104 + (6 if has_poly else 0) + (6 if has_congress else 0) + (7 if has_dark_pool else 0))}")
 
     for i, (_, row) in enumerate(df.head(top_n).iterrows()):
         if row["composite"] >= 50:
@@ -936,6 +931,10 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
             line += f"{row['polymarket_score']:>4}/5"
         if has_congress:
             line += f"{row['congress_score']:>4}/5"
+        if has_dark_pool:
+            dp_s = row.get("dark_pool_score", 0)
+            dp_icon = "↑" if dp_s > 0 else ("↓" if dp_s < 0 else " ")
+            line += f"  {dp_icon}{dp_s:+d}"
         line += f" {tier}{row['composite']:>5.0f}%"
         print(line)
 
@@ -984,12 +983,36 @@ def deep_dive(ticker: str, include_social: bool = False, include_polymarket: boo
         for flag in result["flags"]:
             print(f"    • {flag}")
 
+    # Dark pool flow
+    if _DARK_POOL_AVAILABLE:
+        try:
+            dp = _dpf.score_dark_pool(ticker)
+            detail = dp.get("detail") or {}
+            dp_score_str = f"{detail.get('dark_pool_score', '?')}/100" if detail else "no data"
+            print(f"\n  DARK POOL FLOW (FINRA ATS): {dp_score_str}  [{dp['signal']}]")
+            for flag in dp["flags"]:
+                print(f"    • {flag}")
+            if detail:
+                print(f"    Short ratio today  : {detail.get('short_ratio_today', 0):.3%}")
+                print(f"    Short ratio trend  : {detail.get('short_ratio_trend', 0):+.5f}/day")
+                print(f"    Dark pool intensity: {detail.get('dark_pool_intensity', 0):.1%}")
+                print(f"    Days of FINRA data : {detail.get('days_of_data', 0)}")
+        except Exception as _e:
+            print(f"\n  DARK POOL FLOW: unavailable ({_e})")
+
     if include_social:
-        mentions = scan_reddit_mentions([ticker])
-        social = score_social_momentum(ticker, mentions)
-        print(f"\n  SOCIAL MOMENTUM: {social['score']}/{social['max']}")
+        social = score_social_sentiment(ticker, data)
+        print(f"\n  SOCIAL SENTIMENT (Trends + StockTwits): {social['score']}/{social['max']}")
         for flag in social["flags"]:
             print(f"    • {flag}")
+
+    # Post-squeeze guard status in deep-dive
+    if _SQUEEZE_GUARD_AVAILABLE:
+        try:
+            if _squeeze_detect_recent(data):
+                print("\n  ⚠️  POST-SQUEEZE GUARD ACTIVE — squeeze already fired. Wait for reset.")
+        except Exception:
+            pass
 
     if include_polymarket:
         if _POLYMARKET_AVAILABLE:
@@ -1285,6 +1308,14 @@ def main():
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
     parser.add_argument("--update-watchlist", action="store_true",
                         help="After screening, re-rank watchlist.txt and append history")
+    parser.add_argument(
+        "--use-dynamic-universe",
+        dest="use_dynamic_universe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use universe_builder dynamic universe (default: True). "
+             "Pass --no-use-dynamic-universe to force hardcoded lists.",
+    )
     args = parser.parse_args()
 
     if args.ticker:
@@ -1292,15 +1323,76 @@ def main():
                   include_polymarket=args.polymarket, include_congress=args.congress)
         return
 
-    # Build universe
-    if args.universe == "small":
-        universe = SMALL_CAP_UNIVERSE
-    elif args.universe == "meme":
-        universe = MEME_UNIVERSE
-    elif args.universe == "large":
-        universe = LARGE_CAP_WATCH
+    # ------------------------------------------------------------------
+    # Build universe — two-pass dynamic or hardcoded fallback
+    # ------------------------------------------------------------------
+    universe = _build_universe(args)
+    _main_continue(args, universe)
+
+
+def _build_universe(args) -> list:
+    """
+    Build the screening universe for the given CLI args.
+
+    Pass 1 (dynamic): universe_builder.build_master_universe() + fast_momentum_prescreen()
+        Requires: --use-dynamic-universe (default True) AND universe_builder importable
+                  AND data/universe_cache/ contains fresh files (< UNIVERSE_CACHE_TTL_HOURS)
+    Pass 2 (fallback): hardcoded _FALLBACK_* lists — logs a WARNING when used.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+
+    if args.use_dynamic_universe and _UNIVERSE_BUILDER_AVAILABLE:
+        cache_dir = _Path(__file__).parent / "data" / "universe_cache"
+        cache_is_fresh = False
+        if cache_dir.exists():
+            cache_files = list(cache_dir.glob("*_constituents.json"))
+            if cache_files:
+                oldest_mtime = min(f.stat().st_mtime for f in cache_files)
+                age_h = (_time.time() - oldest_mtime) / 3600
+                cache_is_fresh = age_h < _UNIVERSE_TTL
+
+        if cache_is_fresh or args.use_dynamic_universe:
+            try:
+                universe = _ub.build_master_universe()
+                universe = _ub.fast_momentum_prescreen(universe)
+                print(
+                    f"  Dynamic universe: {len(universe)} tickers "
+                    f"(after momentum pre-screen)"
+                )
+                return universe
+            except Exception as exc:
+                print(
+                    f"  [WARN] universe_builder failed: {exc} "
+                    f"— falling back to hardcoded universe"
+                )
+
+    # Hardcoded fallback
+    if not args.use_dynamic_universe:
+        print("  Using hardcoded universe (--no-use-dynamic-universe)")
     else:
-        universe = list(set(SMALL_CAP_UNIVERSE + MEME_UNIVERSE + LARGE_CAP_WATCH))
+        print(
+            "  [WARN] Dynamic universe unavailable "
+            "(run: python3 universe_builder.py --build-cache) "
+            "— using hardcoded universe"
+        )
+
+    if args.universe == "small":
+        return list(_FALLBACK_SMALL_CAP_UNIVERSE)
+    elif args.universe == "meme":
+        return list(_FALLBACK_MEME_UNIVERSE)
+    elif args.universe == "large":
+        return list(_FALLBACK_LARGE_CAP_WATCH)
+    else:
+        return list(set(
+            _FALLBACK_SMALL_CAP_UNIVERSE
+            + _FALLBACK_MEME_UNIVERSE
+            + _FALLBACK_LARGE_CAP_WATCH
+        ))
+
+
+def _main_continue(args, universe):
+    """Continuation of main() after universe is built — kept for readability."""
 
     results = screen_universe(universe, include_social=args.social,
                               include_polymarket=args.polymarket, include_congress=args.congress)

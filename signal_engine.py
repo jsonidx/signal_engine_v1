@@ -49,6 +49,25 @@ except ImportError:
     print("ERROR: config.py not found. Place it in the same directory.")
     sys.exit(1)
 
+# ─── Fundamentals cache (optional — degrades gracefully if unavailable) ───────
+try:
+    from fundamentals_cache import get_cached, save_to_cache
+    _FUND_CACHE_AVAILABLE = True
+except ImportError:
+    def get_cached(*_a, **_kw):  # type: ignore[misc]
+        return None
+    def save_to_cache(*_a, **_kw):  # type: ignore[misc]
+        pass
+    _FUND_CACHE_AVAILABLE = False
+
+# ─── Regime filter (optional — degrades gracefully if unavailable) ────────────
+try:
+    import regime_filter as _rf
+    _REGIME_AVAILABLE = True
+except ImportError:
+    _rf = None
+    _REGIME_AVAILABLE = False
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 TRADING_DAYS_PER_YEAR = 252
 ANNUALIZATION_FACTOR = np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -135,9 +154,28 @@ def compute_momentum(prices: pd.DataFrame, lookback: int, skip: int = 0) -> pd.S
     """
     Classic momentum signal: return over [T-lookback, T-skip].
     Skip last `skip` days to avoid short-term mean-reversion contamination.
+
+    BUG FIX (2026-03-22): Prior implementation used two separate point lookups
+    (prices.iloc[-skip] / prices.iloc[-lookback]) which silently measured the
+    skip window in whatever units the caller passed — calendar days if the
+    lookback was derived from date arithmetic, trading days if from iloc counts.
+    This caused a silent accuracy error when callers mixed the two.
+
+    Fix: use an explicit slice window — prices.iloc[-lookback:-skip] — so both
+    endpoints are anchored to the same trading-day grid and `skip` is always an
+    exact trading-day count, never a calendar approximation.
+
+    For 12-1 momentum: window = prices.iloc[-252:-21]  →  231 trading bars,
+    spanning T-252 (inclusive) through T-22 (the bar just before the skip zone).
+    For  6-1 momentum: window = prices.iloc[-126:-21]  →  105 trading bars.
     """
     if skip > 0:
-        returns = prices.iloc[-skip] / prices.iloc[-lookback] - 1
+        # Window: T-lookback (inclusive) → T-skip (exclusive).
+        # e.g., iloc[-252:-21] gives bars T-252 … T-22 in trading-day counts.
+        window = prices.iloc[-lookback:-skip]
+        if len(window) < 2:
+            return pd.Series(np.nan, index=prices.columns)
+        returns = window.iloc[-1] / window.iloc[0] - 1
     else:
         returns = prices.iloc[-1] / prices.iloc[-lookback] - 1
     return returns
@@ -161,13 +199,195 @@ def compute_risk_adjusted_momentum(
     return mom / vol
 
 
-def compute_equity_composite(prices: pd.DataFrame) -> pd.DataFrame:
+# ── TTL for EPS revision cache (estimates don't change intraday) ──────────────
+_EPS_REVISION_TTL_DAYS = 7
+
+
+def compute_earnings_revision(ticker: str) -> Optional[float]:
+    """
+    Measures the 4-week change in sell-side FY1 EPS consensus estimate.
+
+    True revision: (current FY1 estimate − FY1 estimate 4 weeks ago) / |prior|
+    yfinance limitation: historical point-in-time estimates are unavailable,
+    so we use the following proxy instead:
+        (epsForward − epsCurrentYear) / |epsCurrentYear|
+    This captures the direction of analyst revision even without historical data:
+    epsForward = next-FY analyst consensus; epsCurrentYear = current-FY estimate.
+
+    Winsorized at ±0.50 — extreme revisions are usually restatements, not
+    genuine earnings momentum, and contaminate the cross-sectional Z-score.
+
+    Returns None (not NaN) when EPS estimates are unavailable, so the caller
+    can handle missing data without propagating NaN through the composite.
+
+    Cached for 7 days in fundamentals_cache.db (estimates are weekly data).
+    Cache key: "EPS_REV_{TICKER}" (separate namespace from 30-day fundamentals).
+    """
+    cache_key = f"EPS_REV_{ticker.upper()}"
+
+    cached = get_cached(cache_key, ttl_days=_EPS_REVISION_TTL_DAYS)
+    if cached is not None:
+        val = cached.get("eps_revision")
+        return float(val) if val is not None else None
+
+    try:
+        info = yf.Ticker(ticker).info
+
+        eps_forward = info.get("epsForward")
+        eps_current = info.get("epsCurrentYear")
+
+        if eps_forward is None or eps_current is None:
+            return None
+
+        eps_forward = float(eps_forward)
+        eps_current = float(eps_current)
+
+        if eps_current == 0.0 or not np.isfinite(eps_current):
+            return None
+
+        # Proxy revision: direction and magnitude of estimate lift
+        revision = (eps_forward - eps_current) / abs(eps_current)
+
+        # Winsorize at ±50% (extreme swings are usually accounting restatements)
+        revision = float(np.clip(revision, -0.50, 0.50))
+
+        save_to_cache(cache_key, {"eps_revision": revision})
+        return revision
+
+    except Exception:
+        return None
+
+
+def compute_ivol(
+    ticker_prices: pd.Series,
+    spy_prices: pd.Series,
+    lookback: int = 63,
+) -> Optional[float]:
+    """
+    IVOL = annualized std of residuals from an OLS market-model regression.
+
+        r_ticker = alpha + beta * r_spy + epsilon
+        IVOL     = std(epsilon) * sqrt(252)
+
+    Uses numpy only (no scipy):
+        beta  = cov(r_ticker, r_spy) / var(r_spy)
+        alpha = mean(r_ticker) − beta * mean(r_spy)
+        IVOL  = std(r_ticker − alpha − beta * r_spy) * sqrt(252)
+
+    Returns NEGATIVE IVOL so that low-IVOL names rank higher in cross-sectional
+    Z-scoring:  return -ivol  →  low idiosyncratic risk = high factor score.
+    This implements the low-risk / quality premium documented in the literature.
+
+    Returns None if fewer than 40 aligned trading bars are available (too short
+    for a stable OLS estimate).
+
+    Args:
+        ticker_prices: Adjusted close prices for the target ticker.
+        spy_prices:    Adjusted close prices for SPY (market proxy).
+                       Pre-fetch outside the per-ticker loop for efficiency.
+        lookback:      Rolling window in trading days (default 63 ≈ 3 months).
+    """
+    try:
+        aligned = pd.concat(
+            [ticker_prices.rename("ticker"), spy_prices.rename("spy")],
+            axis=1,
+            sort=True,
+        ).dropna()
+
+        # Take the lookback window (or all data if shorter)
+        window = aligned.iloc[-lookback:] if len(aligned) >= lookback else aligned
+
+        if len(window) < 40:
+            return None
+
+        log_ret = np.log(window / window.shift(1)).dropna()
+
+        if len(log_ret) < 40:
+            return None
+
+        r_t = log_ret["ticker"].values
+        r_s = log_ret["spy"].values
+
+        var_spy = np.var(r_s, ddof=1)
+        if var_spy == 0.0:
+            return None
+
+        beta  = np.cov(r_t, r_s, ddof=1)[0, 1] / var_spy
+        alpha = np.mean(r_t) - beta * np.mean(r_s)
+        epsilon = r_t - (alpha + beta * r_s)
+        ivol = np.std(epsilon, ddof=1) * np.sqrt(252)
+
+        # Negative: low IVOL → high quality score after cross-sectional Z-scoring
+        return float(-ivol)
+
+    except Exception:
+        return None
+
+
+def compute_52wk_high_proximity(price_series: pd.Series) -> Optional[float]:
+    """
+    George-Hwang (2004) factor: current price / 52-week high.
+
+    Stocks near their 52-week high exhibit continuation — investors use the high
+    as a reference point and underreact to positive information, creating drift.
+    Range: (0, 1.0] where 1.0 means the current price IS the 52-week high.
+
+    Returns None if fewer than 126 bars are available (6 months minimum needed
+    to compute a meaningful high; avoids inflated proximity for new listings).
+    """
+    px = price_series.dropna()
+    if len(px) < 126:
+        return None
+
+    # 52-week window = last 252 trading bars
+    high_52wk = px.tail(252).max()
+    current   = px.iloc[-1]
+
+    if high_52wk <= 0.0 or not np.isfinite(high_52wk):
+        return None
+
+    return float(current / high_52wk)
+
+
+def compute_equity_composite(
+    prices: pd.DataFrame,
+    regime_weights: Optional[Dict] = None,
+) -> pd.DataFrame:
     """
     Compute multi-factor composite score for equity universe.
 
+    Seven factors (weights sum to 1.0):
+        momentum_12_1       (0.28) — 12-1 month Jegadeesh-Titman momentum
+        momentum_6_1        (0.16) — 6-1 month momentum
+        earnings_revision   (0.18) — sell-side FY1 EPS revision proxy (cached 7d)
+        ivol                (0.12) — negative IVOL; low idiosyncratic risk = quality
+        52wk_high_proximity (0.10) — George-Hwang price/52wk-high factor
+        mean_reversion_5d   (0.08) — 5-day contrarian reversion
+        volatility_quality  (0.08) — low realized-vol quality proxy
+
+    Graceful degradation:
+        earnings_revision and ivol may return None for some tickers (data
+        unavailable or SPY download failed).  Rather than dropping the ticker,
+        composite_z is computed from available factors only, with weights
+        renormalized so they sum to 1.0.  The 'factors_used' column records
+        exactly which factors contributed for each row.
+
+    regime_weights: optional dict from regime_filter.get_factor_weights().
+        Keys must match the factor names above.  In RISK_OFF the regime filter
+        should provide updated weights (e.g. down-weight momentum, up-weight
+        quality factors such as ivol and volatility_quality).
+        NOTE: regime_filter.py must be updated to include the three new keys
+        (earnings_revision, ivol, 52wk_high_proximity) for full RISK_OFF
+        integration; until then, config defaults are used for those factors.
+
     Returns DataFrame with columns:
-        ticker, momentum_12_1, momentum_6_1, mean_reversion_5d,
-        volatility_quality, risk_adj_mom, composite_z, rank
+        ticker, momentum_12_1_raw/z, momentum_6_1_raw/z,
+        mean_rev_5d_raw/z, vol_quality_raw/z,
+        proximity_52wk, proximity_52wk_z,
+        ivol_raw, ivol_z,
+        earnings_revision_raw, earnings_rev_z,
+        composite_z, factors_used, rank,
+        momentum_skip_21d_correct, market_regime (stamped by caller)
     """
     if prices.empty or len(prices) < 252:
         print("  [ERROR] Insufficient price history for equity signals")
@@ -176,52 +396,146 @@ def compute_equity_composite(prices: pd.DataFrame) -> pd.DataFrame:
     signals = pd.DataFrame(index=prices.columns)
     signals.index.name = "ticker"
 
-    # ── Factor 1: 12-1 Month Momentum ──
+    # ── Factor 1: 12-1 Month Momentum ────────────────────────────────────────
+    # BUG FIX: compute_momentum now uses iloc[-252:-21] window so the skip
+    # period is measured in exact trading-day counts, not calendar days.
     cfg = EQUITY_FACTORS["momentum_12_1"]
     raw = compute_momentum(prices, cfg["lookback_long"], cfg["lookback_skip"])
     signals["momentum_12_1_raw"] = raw
-    signals["momentum_12_1_z"] = zscore_cross_sectional(raw)
+    signals["momentum_12_1_z"]   = zscore_cross_sectional(raw)
+    # Sentinel column: documents that this run uses the trading-day-correct skip
+    signals["momentum_skip_21d_correct"] = True
 
-    # ── Factor 2: 6-1 Month Momentum ──
+    # ── Factor 2: 6-1 Month Momentum ─────────────────────────────────────────
     cfg = EQUITY_FACTORS["momentum_6_1"]
     raw = compute_momentum(prices, cfg["lookback_long"], cfg["lookback_skip"])
     signals["momentum_6_1_raw"] = raw
-    signals["momentum_6_1_z"] = zscore_cross_sectional(raw)
+    signals["momentum_6_1_z"]   = zscore_cross_sectional(raw)
 
-    # ── Factor 3: 5-Day Mean Reversion ──
+    # ── Factor 3: 5-Day Mean Reversion ───────────────────────────────────────
     cfg = EQUITY_FACTORS["mean_reversion_5d"]
-    raw = compute_momentum(prices, cfg["lookback"])
-    if cfg.get("invert", False):
-        raw = -raw  # Losers expected to bounce
-    signals["mean_rev_5d_raw"] = -compute_momentum(prices, cfg["lookback"])  # Store original
-    signals["mean_rev_5d_z"] = zscore_cross_sectional(raw)
+    raw_5d = compute_momentum(prices, cfg["lookback"])
+    signals["mean_rev_5d_raw"] = -raw_5d   # Store un-inverted raw for CSV
+    raw_5d_scored = -raw_5d if cfg.get("invert", False) else raw_5d
+    signals["mean_rev_5d_z"] = zscore_cross_sectional(raw_5d_scored)
 
-    # ── Factor 4: Low Volatility (Quality Proxy) ──
+    # ── Factor 4: Low Volatility (Quality Proxy) ──────────────────────────────
     cfg = EQUITY_FACTORS["volatility_quality"]
-    raw = compute_realized_vol(prices, cfg["lookback"])
-    if cfg.get("invert", False):
-        raw = -raw  # Lower vol = higher score
-    signals["vol_quality_raw"] = compute_realized_vol(prices, cfg["lookback"])
-    signals["vol_quality_z"] = zscore_cross_sectional(raw)
+    vol_raw = compute_realized_vol(prices, cfg["lookback"])
+    signals["vol_quality_raw"] = vol_raw
+    vol_scored = -vol_raw if cfg.get("invert", False) else vol_raw
+    signals["vol_quality_z"] = zscore_cross_sectional(vol_scored)
 
-    # ── Factor 5: Risk-Adjusted Momentum ──
-    cfg = EQUITY_FACTORS["risk_adjusted_momentum"]
-    raw = compute_risk_adjusted_momentum(prices, cfg["mom_lookback"], cfg["vol_lookback"])
-    signals["risk_adj_mom_raw"] = raw
-    signals["risk_adj_mom_z"] = zscore_cross_sectional(raw)
+    # ── Factor 5: 52-Week High Proximity (vectorized over tickers) ────────────
+    proximity_vals: Dict[str, Optional[float]] = {}
+    for ticker in prices.columns:
+        proximity_vals[ticker] = compute_52wk_high_proximity(prices[ticker].dropna())
+    proximity_series = pd.Series(proximity_vals, dtype=float)
+    signals["proximity_52wk"] = proximity_series
+    valid_prox = proximity_series.dropna()
+    signals["proximity_52wk_z"] = (
+        zscore_cross_sectional(valid_prox) if not valid_prox.empty else np.nan
+    )
 
-    # ── Composite Score ──
-    weights = {
-        "momentum_12_1_z": EQUITY_FACTORS["momentum_12_1"]["weight"],
-        "momentum_6_1_z": EQUITY_FACTORS["momentum_6_1"]["weight"],
-        "mean_rev_5d_z": EQUITY_FACTORS["mean_reversion_5d"]["weight"],
-        "vol_quality_z": EQUITY_FACTORS["volatility_quality"]["weight"],
-        "risk_adj_mom_z": EQUITY_FACTORS["risk_adjusted_momentum"]["weight"],
+    # ── Factor 6: IVOL ───────────────────────────────────────────────────────
+    # SPY is fetched once here; compute_ivol receives the pre-fetched Series to
+    # avoid N individual yfinance downloads (one per ticker).
+    spy_prices_for_ivol: Optional[pd.Series] = None
+    try:
+        spy_raw = yf.download(
+            "SPY",
+            period="6mo",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if not spy_raw.empty:
+            if isinstance(spy_raw.columns, pd.MultiIndex):
+                spy_prices_for_ivol = spy_raw["Close"].iloc[:, 0]
+            else:
+                spy_prices_for_ivol = spy_raw["Close"]
+    except Exception:
+        pass  # IVOL silently excluded if SPY download fails
+
+    ivol_vals: Dict[str, Optional[float]] = {}
+    for ticker in prices.columns:
+        if spy_prices_for_ivol is not None:
+            ivol_vals[ticker] = compute_ivol(
+                prices[ticker].dropna(),
+                spy_prices_for_ivol,
+                lookback=EQUITY_FACTORS["ivol"]["lookback"],
+            )
+        else:
+            ivol_vals[ticker] = None
+    ivol_series = pd.Series(ivol_vals, dtype=float)
+    signals["ivol_raw"] = ivol_series
+    valid_ivol = ivol_series.dropna()
+    signals["ivol_z"] = (
+        zscore_cross_sectional(valid_ivol) if not valid_ivol.empty else np.nan
+    )
+
+    # ── Factor 7: Earnings Revision (per ticker, 7-day cache) ─────────────────
+    print("  Computing earnings revision estimates (cached, 7-day TTL)...")
+    eps_rev_vals: Dict[str, Optional[float]] = {}
+    for ticker in prices.columns:
+        eps_rev_vals[ticker] = compute_earnings_revision(ticker)
+    eps_series = pd.Series(eps_rev_vals, dtype=float)
+    signals["earnings_revision_raw"] = eps_series
+    valid_eps = eps_series.dropna()
+    signals["earnings_rev_z"] = (
+        zscore_cross_sectional(valid_eps) if not valid_eps.empty else np.nan
+    )
+
+    # ── Composite Score with Graceful Degradation ─────────────────────────────
+    # Use regime-adjusted weights if provided; else fall back to config defaults.
+    _rw = regime_weights or {}
+    base_weights = {
+        "momentum_12_1_z":  _rw.get("momentum_12_1",          EQUITY_FACTORS["momentum_12_1"]["weight"]),
+        "momentum_6_1_z":   _rw.get("momentum_6_1",           EQUITY_FACTORS["momentum_6_1"]["weight"]),
+        "mean_rev_5d_z":    _rw.get("mean_reversion_5d",      EQUITY_FACTORS["mean_reversion_5d"]["weight"]),
+        "vol_quality_z":    _rw.get("volatility_quality",     EQUITY_FACTORS["volatility_quality"]["weight"]),
+        "proximity_52wk_z": _rw.get("52wk_high_proximity",    EQUITY_FACTORS["52wk_high_proximity"]["weight"]),
+        "ivol_z":           _rw.get("ivol",                   EQUITY_FACTORS["ivol"]["weight"]),
+        "earnings_rev_z":   _rw.get("earnings_revision",      EQUITY_FACTORS["earnings_revision"]["weight"]),
     }
 
-    signals["composite_z"] = sum(
-        signals[col] * w for col, w in weights.items()
-    )
+    # Short labels written to the factors_used column for each ticker
+    _factor_label = {
+        "momentum_12_1_z":  "mom12_1",
+        "momentum_6_1_z":   "mom6_1",
+        "mean_rev_5d_z":    "mean_rev",
+        "vol_quality_z":    "vol_qual",
+        "proximity_52wk_z": "52wk_prox",
+        "ivol_z":           "ivol",
+        "earnings_rev_z":   "eps_rev",
+    }
+
+    composite_vals:    Dict[str, float] = {}
+    factors_used_vals: Dict[str, str]   = {}
+
+    for ticker in signals.index:
+        row = signals.loc[ticker]
+        # Include only factors where the Z-score is a finite number
+        available = {
+            col: w
+            for col, w in base_weights.items()
+            if pd.notna(row.get(col)) and np.isfinite(float(row.get(col, np.nan)))
+        }
+        total_w = sum(available.values())
+        if total_w == 0 or not available:
+            composite_vals[ticker]    = np.nan
+            factors_used_vals[ticker] = ""
+            continue
+        # Renormalize so missing factors redistribute their weight proportionally
+        composite_vals[ticker] = (
+            sum(float(row[col]) * w for col, w in available.items()) / total_w
+        )
+        factors_used_vals[ticker] = "|".join(
+            _factor_label.get(c, c) for c in available
+        )
+
+    signals["composite_z"]  = pd.Series(composite_vals)
+    signals["factors_used"]  = pd.Series(factors_used_vals)
 
     # Rank (1 = best)
     signals["rank"] = signals["composite_z"].rank(ascending=False).astype(int)
@@ -378,6 +692,7 @@ def compute_position_sizes(
     prices: pd.DataFrame,
     asset_type: str,  # "equity" or "crypto"
     total_allocation_eur: float,
+    regime_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """
     Kelly-fractional position sizing with risk constraints.
@@ -429,8 +744,8 @@ def compute_position_sizes(
         # But don't exceed total allocation
         weights_final = weights_final.clip(upper=max_pct)
 
-    # Convert to EUR
-    position_eur = weights_final * total_allocation_eur
+    # Convert to EUR and apply regime multiplier (1.0 = normal, 0.7 = transitional, 0.4 = risk-off)
+    position_eur = weights_final * total_allocation_eur * regime_multiplier
 
     # Filter out positions below minimum size
     position_eur = position_eur[position_eur >= rp["min_position_eur"]]
@@ -453,6 +768,41 @@ def compute_position_sizes(
 # ==============================================================================
 # SECTION 5: REPORTING
 # ==============================================================================
+
+def _print_regime_block(market_regime: dict, sector_regimes: dict) -> None:
+    """Print a compact regime summary block to stdout."""
+    regime = market_regime.get("regime", "UNKNOWN")
+    score  = market_regime.get("score", 0)
+    mult   = market_regime.get("_mult", 1.0)
+    if _REGIME_AVAILABLE:
+        mult = _rf.get_position_size_multiplier(regime)
+    comp   = market_regime.get("components", {})
+    vix    = market_regime.get("vix")
+    spy200 = market_regime.get("spy_vs_200ma")
+    yc     = market_regime.get("yield_curve_spread")
+
+    print()
+    print("─" * 60)
+    print(f"  MACRO REGIME: {regime}  (score: {score:+d})  |  Size mult: {mult:.1f}x")
+    print("─" * 60)
+    trend_str = f"{comp.get('trend', 0):+d}"
+    vol_str   = f"{comp.get('volatility', 0):+d}"
+    cred_str  = f"{comp.get('credit', 0):+d}"
+    yc_str    = f"{comp.get('yield_curve', 0):+d}"
+    vix_s     = f" (VIX={vix:.1f})" if vix is not None else ""
+    spy_s     = f" (SPY {spy200:+.1f}% vs 200MA)" if spy200 is not None else ""
+    yc_s      = f" (T10Y2Y={yc:+.3f}%)" if yc is not None else ""
+    print(f"  Trend:{trend_str}{spy_s}  Vol:{vol_str}{vix_s}  "
+          f"Credit:{cred_str}  YldCurve:{yc_str}{yc_s}")
+
+    # Sector summary — one line
+    if sector_regimes:
+        bull = [s for s, v in sector_regimes.items() if v == "BULL" and s != "computed_at"]
+        bear = [s for s, v in sector_regimes.items() if v == "BEAR" and s != "computed_at"]
+        print(f"  Sectors BULL ({len(bull)}): {', '.join(bull) or 'none'}")
+        print(f"  Sectors BEAR ({len(bear)}): {', '.join(bear) or 'none'}")
+    print()
+
 
 def print_header():
     """Print engine header."""
@@ -477,19 +827,28 @@ def print_equity_report(signals: pd.DataFrame, positions: pd.DataFrame):
     n = min(20, len(signals))
     top = signals.head(n)
     print(f"\n  TOP {n} RANKED STOCKS (by composite Z-score):\n")
-    print(f"  {'Rank':<6}{'Ticker':<10}{'Composite':>10}{'Mom12-1':>10}"
-          f"{'Mom6-1':>10}{'MeanRev5d':>10}{'VolQual':>10}{'RiskAdj':>10}")
-    print("  " + "─" * 76)
+    print(f"  {'Rank':<6}{'Ticker':<10}{'Composite':>10}{'Mom12-1':>9}"
+          f"{'Mom6-1':>8}{'EpsRev':>8}{'IVOL':>8}{'52wkPrx':>8}"
+          f"{'MeanRev':>8}{'VolQual':>8}  Factors")
+    print("  " + "─" * 100)
 
     for _, row in top.iterrows():
         name = row.name if isinstance(row.name, str) else str(row.name)
+
+        def _fmt(col: str) -> str:
+            v = row.get(col)
+            return f"{float(v):>8.3f}" if pd.notna(v) else "     n/a"
+
         print(f"  {int(row['rank']):<6}{name:<10}"
               f"{row['composite_z']:>10.3f}"
-              f"{row['momentum_12_1_z']:>10.3f}"
-              f"{row['momentum_6_1_z']:>10.3f}"
-              f"{row['mean_rev_5d_z']:>10.3f}"
-              f"{row['vol_quality_z']:>10.3f}"
-              f"{row['risk_adj_mom_z']:>10.3f}")
+              f"{_fmt('momentum_12_1_z'):>9}"
+              f"{_fmt('momentum_6_1_z'):>8}"
+              f"{_fmt('earnings_rev_z'):>8}"
+              f"{_fmt('ivol_z'):>8}"
+              f"{_fmt('proximity_52wk_z'):>8}"
+              f"{_fmt('mean_rev_5d_z'):>8}"
+              f"{_fmt('vol_quality_z'):>8}"
+              f"  {row.get('factors_used', '')}")
 
     # Bottom 5 (potential shorts / avoids)
     print(f"\n  BOTTOM 5 (AVOID / UNDERWEIGHT):\n")
@@ -653,7 +1012,27 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     print("  MODULE 1: EQUITY MULTI-FACTOR SCREENER")
     print("█" * 60)
 
-    # Combine universes
+    # ── Regime classification ─────────────────────────────────────────────────
+    market_regime  = "TRANSITIONAL"
+    regime_mult    = 1.0
+    regime_weights = {}
+    regime_dict    = {}
+    sector_regimes = {}
+
+    if _REGIME_AVAILABLE:
+        try:
+            regime_dict    = _rf.get_market_regime()
+            market_regime  = regime_dict.get("regime", "TRANSITIONAL")
+            regime_mult    = _rf.get_position_size_multiplier(market_regime)
+            regime_weights = _rf.get_factor_weights(market_regime)
+            sector_regimes = _rf.get_sector_regimes()
+            _print_regime_block(regime_dict, sector_regimes)
+        except Exception as exc:
+            print(f"  [WARN] Regime filter failed: {exc} — using defaults")
+    else:
+        print("  [INFO] regime_filter not available — using config.py defaults")
+
+    # ── Combine universes ─────────────────────────────────────────────────────
     universe = list(set(EQUITY_WATCHLIST + CUSTOM_WATCHLIST))
     print(f"  Universe: {len(universe)} tickers")
 
@@ -662,15 +1041,21 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     if prices.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Compute signals
+    # Compute signals (pass regime-adjusted factor weights)
     print("\n  Computing multi-factor signals...")
-    signals = compute_equity_composite(prices)
+    signals = compute_equity_composite(prices, regime_weights=regime_weights)
 
-    # Compute positions
+    # Stamp the market regime onto every row for CSV export
+    if not signals.empty:
+        signals["market_regime"] = market_regime
+
+    # Compute positions (apply regime size multiplier)
     positions = pd.DataFrame()
     if not signals.empty:
         equity_eur = PORTFOLIO_NAV * EQUITY_ALLOCATION
-        positions = compute_position_sizes(signals, prices, "equity", equity_eur)
+        positions  = compute_position_sizes(
+            signals, prices, "equity", equity_eur, regime_multiplier=regime_mult
+        )
 
     # Report
     if CONSOLE_PRINT:

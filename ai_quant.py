@@ -47,6 +47,7 @@ IMPORTANT: This is NOT investment advice. Claude is analyzing the same
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -54,6 +55,10 @@ import time
 import warnings
 from datetime import datetime
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from utils.db import get_connection
 
 warnings.filterwarnings("ignore")
 
@@ -72,6 +77,22 @@ except ImportError:
     CRYPTO_ALLOCATION = 0.25
     EQUITY_ALLOCATION = 0.65
 
+# ─── Regime filter (optional — degrades gracefully) ───────────────────────────
+try:
+    import regime_filter as _rf
+    _REGIME_AVAILABLE = True
+except ImportError:
+    _rf = None
+    _REGIME_AVAILABLE = False
+
+# ─── Conflict resolver (optional — degrades gracefully) ───────────────────────
+try:
+    import conflict_resolver as _cr
+    _RESOLVER_AVAILABLE = True
+except ImportError:
+    _cr = None
+    _RESOLVER_AVAILABLE = False
+
 
 # ==============================================================================
 # SECTION 0: RESULT CACHE (SQLite)
@@ -82,7 +103,7 @@ _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_quant_ca
 
 def _init_db() -> sqlite3.Connection:
     """Open (and if needed, create) the cache database."""
-    conn = sqlite3.connect(_DB_PATH)
+    conn = get_connection(_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS thesis_cache (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,9 +126,31 @@ def _init_db() -> sqlite3.Connection:
             raw_response  TEXT,
             signals_json  TEXT,
             created_at    TEXT,
+            bull_probability       REAL,
+            bear_probability       REAL,
+            neutral_probability    REAL,
+            signal_agreement_score REAL,
+            key_invalidation       TEXT,
+            primary_scenario       TEXT,
+            bear_scenario          TEXT,
             UNIQUE(ticker, date)
         )
     """)
+    # Migrate existing databases that pre-date the probabilistic schema
+    _new_columns = [
+        ("bull_probability",       "REAL"),
+        ("bear_probability",       "REAL"),
+        ("neutral_probability",    "REAL"),
+        ("signal_agreement_score", "REAL"),
+        ("key_invalidation",       "TEXT"),
+        ("primary_scenario",       "TEXT"),
+        ("bear_scenario",          "TEXT"),
+    ]
+    for col, coltype in _new_columns:
+        try:
+            conn.execute(f"ALTER TABLE thesis_cache ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # Column already exists — safe to ignore
     conn.commit()
     return conn
 
@@ -133,6 +176,8 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
             "entry_low", "entry_high", "stop_loss", "target_1", "target_2",
             "position_size_pct", "thesis", "data_quality", "notes",
             "catalysts_json", "risks_json", "raw_response", "signals_json", "created_at",
+            "bull_probability", "bear_probability", "neutral_probability",
+            "signal_agreement_score", "key_invalidation", "primary_scenario", "bear_scenario",
         ]
         d = dict(zip(cols, row))
         # Expand JSON fields back to lists/dicts
@@ -155,8 +200,10 @@ def save_thesis(thesis: dict) -> None:
                 (ticker, date, direction, conviction, time_horizon,
                  entry_low, entry_high, stop_loss, target_1, target_2,
                  position_size_pct, thesis, data_quality, notes,
-                 catalysts_json, risks_json, raw_response, signals_json, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 catalysts_json, risks_json, raw_response, signals_json, created_at,
+                 bull_probability, bear_probability, neutral_probability,
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
@@ -174,7 +221,14 @@ def save_thesis(thesis: dict) -> None:
                 risks_json=excluded.risks_json,
                 raw_response=excluded.raw_response,
                 signals_json=excluded.signals_json,
-                created_at=excluded.created_at
+                created_at=excluded.created_at,
+                bull_probability=excluded.bull_probability,
+                bear_probability=excluded.bear_probability,
+                neutral_probability=excluded.neutral_probability,
+                signal_agreement_score=excluded.signal_agreement_score,
+                key_invalidation=excluded.key_invalidation,
+                primary_scenario=excluded.primary_scenario,
+                bear_scenario=excluded.bear_scenario
         """, (
             thesis.get("ticker", "").upper(),
             date,
@@ -195,6 +249,13 @@ def save_thesis(thesis: dict) -> None:
             thesis.get("raw_response", ""),
             json.dumps(thesis.get("signals") or {}),
             datetime.now().isoformat(),
+            thesis.get("bull_probability"),
+            thesis.get("bear_probability"),
+            thesis.get("neutral_probability"),
+            thesis.get("signal_agreement_score"),
+            thesis.get("key_invalidation"),
+            thesis.get("primary_scenario"),
+            thesis.get("bear_scenario"),
         ))
         conn.commit()
         conn.close()
@@ -497,6 +558,178 @@ def _collect_catalyst_signals(ticker: str) -> dict:
         return {}
 
 
+def _get_weekly_regime(ticker: str) -> dict:
+    """
+    Weekly structural trend filter: price vs 20-week SMA + MA slope.
+
+    Four regime states:
+      bullish    — price above MA, MA slope positive   → trade with trend
+      weakening  — price above MA, MA slope negative   → proceed with caution
+      recovering — price below MA, MA slope positive   → wait for confirmation
+      bearish    — price below MA, MA slope negative   → avoid long setups
+      unknown    — insufficient data
+    """
+    try:
+        import yfinance as yf
+
+        t = yf.Ticker(ticker)
+        hist = t.history(period="9mo", interval="1wk")
+        if hist.empty or len(hist) < 5:
+            return {"regime": "unknown", "reason": "insufficient weekly data"}
+
+        close = hist["Close"]
+        price = float(close.iloc[-1])
+
+        # 20-week SMA (or fewer bars if history is short)
+        ma_period = min(20, len(close))
+        ma20w = float(close.rolling(ma_period).mean().iloc[-1])
+
+        # Slope: compare current MA to MA 4 weeks ago (% change)
+        ma_series = close.rolling(ma_period).mean().dropna()
+        if len(ma_series) >= 5:
+            ma_slope_pct = float((ma_series.iloc[-1] / ma_series.iloc[-5] - 1) * 100)
+        else:
+            ma_slope_pct = 0.0
+
+        above_ma = price > ma20w
+        pct_from_ma = (price - ma20w) / ma20w * 100
+
+        if above_ma and ma_slope_pct >= 0:
+            regime = "bullish"
+        elif above_ma and ma_slope_pct < 0:
+            regime = "weakening"
+        elif not above_ma and ma_slope_pct > 0:
+            regime = "recovering"
+        else:
+            regime = "bearish"
+
+        return {
+            "regime": regime,
+            "price": round(price, 2),
+            "ma20w": round(ma20w, 2),
+            "pct_from_ma20w": round(pct_from_ma, 1),
+            "ma_slope_4w_pct": round(ma_slope_pct, 2),
+            "above_ma20w": above_ma,
+        }
+    except Exception as e:
+        return {"regime": "unknown", "reason": str(e)}
+
+
+def _collect_dark_pool_signals(ticker: str) -> dict:
+    """
+    Pull dark pool / institutional flow signal from dark_pool_flow module.
+    Uses today's pre-computed result cache (data/dark_pool_latest.json) if
+    available, otherwise computes live from cached FINRA files.
+    """
+    try:
+        from dark_pool_flow import compute_dark_pool_signal, load_result_cache
+        cache = load_result_cache()
+        if ticker in cache:
+            return cache[ticker]
+        result = compute_dark_pool_signal(ticker)
+        return result or {}
+    except Exception:
+        return {}
+
+
+def _collect_squeeze_signals(ticker: str) -> dict:
+    """Pull dedicated squeeze score from squeeze_screener module (0–100 score)."""
+    try:
+        from squeeze_screener import run_screener
+        results = run_screener(
+            tickers=[ticker],
+            min_score=0,
+            top_n=1,
+            include_finviz=False,   # skip Finviz to keep ai_quant fast
+            include_ftd=False,      # FTD already fetched in full universe run
+            verbose=False,
+        )
+        if not results:
+            return {}
+        r = results[0]
+        return {
+            "squeeze_score_100": r.final_score,
+            "juice_target_pct": r.juice_target,
+            "recent_squeeze": r.recent_squeeze,
+            "signal_breakdown": r.signal_breakdown,
+            "squeeze_flags": r.flags[:6],
+        }
+    except Exception:
+        return {}
+
+
+def compute_signal_agreement(signals_dict: dict) -> float:
+    """
+    Pre-compute a 0.0–1.0 signal agreement score across all directional modules.
+
+    Each module casts a BULL or BEAR vote when it has a clear directional signal.
+    Score = agreements_with_plurality_direction / total_valid_votes.
+    Returns 0.0 when no module produces a valid directional output.
+
+    Modules evaluated:
+      signal_engine  composite_z >  0.5  → BULL  |  < -0.5  → BEAR
+      squeeze        squeeze_score_100 > 50       → BULL
+      options_flow   heat_score > 60              → BULL
+      cross_asset    signal contains 'BOTTOM'     → BULL  |  'TOP' → BEAR
+      fundamentals   fundamental_score_pct > 60   → BULL  |  < 40  → BEAR
+      polymarket     probability > 0.65            → BULL  |  < 0.35 → BEAR
+    """
+    from collections import Counter
+
+    votes: list = []
+
+    # 1. signal_engine composite_z
+    comp_z = (signals_dict.get("signal_engine") or {}).get("composite_z")
+    if comp_z is not None:
+        if comp_z > 0.5:
+            votes.append("BULL")
+        elif comp_z < -0.5:
+            votes.append("BEAR")
+
+    # 2. squeeze_screener final_score  (key: squeeze_score_100)
+    sq_score = (signals_dict.get("squeeze") or {}).get("squeeze_score_100")
+    if sq_score is not None:
+        if sq_score > 50:
+            votes.append("BULL")
+
+    # 3. options_flow heat score
+    heat = (signals_dict.get("options_flow") or {}).get("heat_score")
+    if heat is not None:
+        if heat > 60:
+            votes.append("BULL")
+
+    # 4. cross_asset_divergence signal  (BOTTOM → BULL, TOP → BEAR)
+    cadiv_signal = str((signals_dict.get("cross_asset") or {}).get("signal") or "")
+    upper_sig = cadiv_signal.upper()
+    if "BOTTOM" in upper_sig:
+        votes.append("BULL")
+    elif "TOP" in upper_sig:
+        votes.append("BEAR")
+
+    # 5. fundamental_analysis composite score
+    fund_score = (signals_dict.get("fundamentals") or {}).get("fundamental_score_pct")
+    if fund_score is not None:
+        if fund_score > 60:
+            votes.append("BULL")
+        elif fund_score < 40:
+            votes.append("BEAR")
+
+    # 6. polymarket consensus probability
+    poly_prob = (signals_dict.get("polymarket") or {}).get("polymarket_probability")
+    if poly_prob is not None and poly_prob > 0:
+        if poly_prob > 0.65:
+            votes.append("BULL")
+        elif poly_prob < 0.35:
+            votes.append("BEAR")
+
+    if not votes:
+        return 0.0
+
+    counts = Counter(votes)
+    plurality_count = counts.most_common(1)[0][1]
+    return round(plurality_count / len(votes), 4)
+
+
 def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     """
     Collect all available signals for a ticker.
@@ -507,6 +740,13 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
 
     if verbose:
         print(f"  [{ticker}] Collecting signals...")
+
+    if verbose:
+        print(f"  [{ticker}]   → weekly regime...", end=" ", flush=True)
+    wr = _get_weekly_regime(ticker)
+    signals["weekly_regime"] = wr
+    if verbose:
+        print(f"done ({wr.get('regime', 'unknown')})")
 
     if verbose:
         print(f"  [{ticker}]   → technical...", end=" ", flush=True)
@@ -578,12 +818,350 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     if verbose:
         print("done")
 
+    if verbose:
+        print(f"  [{ticker}]   → squeeze score...", end=" ", flush=True)
+    squeeze = _collect_squeeze_signals(ticker)
+    signals["squeeze"] = squeeze
+    if verbose:
+        print("done")
+
+    if verbose:
+        print(f"  [{ticker}]   → dark pool flow...", end=" ", flush=True)
+    dp = _collect_dark_pool_signals(ticker)
+    signals["dark_pool_flow"] = dp
+    if verbose:
+        print(f"done ({dp.get('signal', 'no data')})")
+
+    # ── Macro + sector regime ─────────────────────────────────────────────────
+    if _REGIME_AVAILABLE:
+        if verbose:
+            print(f"  [{ticker}]   → macro regime...", end=" ", flush=True)
+        try:
+            mr = _rf.get_market_regime()
+            sr = _rf.get_sector_regimes()
+            signals["market_regime"] = mr
+            signals["ticker_sector"] = _rf.get_ticker_sector(ticker)
+            # Derive sector-level regime for this ticker
+            ticker_sector_name = signals["ticker_sector"] or ""
+            # Map yfinance sector names to our SECTOR_ETFS keys (best-effort)
+            _sector_key_map = {
+                "Technology":              "tech",
+                "Financial Services":      "financials",
+                "Energy":                  "energy",
+                "Healthcare":              "healthcare",
+                "Consumer Cyclical":       "consumer_disc",
+                "Consumer Defensive":      "consumer_staples",
+                "Industrials":             "industrials",
+                "Basic Materials":         "materials",
+                "Utilities":               "utilities",
+                "Real Estate":             "real_estate",
+                "Communication Services":  "comm_services",
+            }
+            sector_key = _sector_key_map.get(ticker_sector_name)
+            signals["ticker_sector_regime"] = sr.get(sector_key) if sector_key else None
+        except Exception as exc:
+            logger.warning("Regime collection failed for %s: %s", ticker, exc)
+            signals["market_regime"]       = {}
+            signals["ticker_sector"]       = None
+            signals["ticker_sector_regime"] = None
+        if verbose:
+            regime_label = signals.get("market_regime", {}).get("regime", "unknown")
+            print(f"done ({regime_label})")
+    else:
+        signals["market_regime"]       = {}
+        signals["ticker_sector"]       = None
+        signals["ticker_sector_regime"] = None
+
     return signals
+
+
+# ==============================================================================
+# SECTION 1b: TOP-N SELECTION HELPERS
+# ==============================================================================
+
+def _find_latest_equity_signals_file() -> Optional[str]:
+    """Return the most recent signals_output/equity_signals_YYYYMMDD.csv path."""
+    import glob as _glob
+    pattern = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "signals_output",
+        "equity_signals_*.csv",
+    )
+    matches = sorted(_glob.glob(pattern), reverse=True)
+    return matches[0] if matches else None
+
+
+def _generate_resolved_signals_file(
+    tickers: List[str],
+    output_path: str,
+    verbose: bool = False,
+) -> dict:
+    """
+    For each ticker: collect_all_signals() + run conflict_resolver.
+    Saves result to output_path (data/resolved_signals.json).
+    Returns the full {ticker: resolved_dict} dict.
+
+    Called by the --top-n mode before select_top_tickers() to build the
+    priority-scoring input. Does NOT call Claude — purely signal collection.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    resolved_all: dict = {}
+
+    print(f"\n  Pre-screening {len(tickers)} tickers (no Claude cost)...\n")
+    for i, ticker in enumerate(tickers, 1):
+        print(f"  [{i:>3}/{len(tickers)}] {ticker:<8}", end=" ", flush=True)
+        try:
+            signals = collect_all_signals(ticker, verbose=False)
+
+            if _RESOLVER_AVAILABLE:
+                mr_dict    = signals.get("market_regime") or {}
+                regime_str = mr_dict.get("regime", "TRANSITIONAL") if mr_dict else "TRANSITIONAL"
+                resolved   = _cr.resolve(signals, regime_str)
+            else:
+                # Minimal resolver output from the lightweight agreement scorer
+                agreement = compute_signal_agreement(signals)
+                resolved = {
+                    "pre_resolved_direction":  "NEUTRAL",
+                    "pre_resolved_confidence": 0.0,
+                    "signal_agreement_score":  agreement,
+                    "override_flags":          [],
+                    "module_votes":            {},
+                    "bull_weight":             0.0,
+                    "bear_weight":             0.0,
+                    "skip_claude":             False,
+                    "max_conviction_override": None,
+                    "position_size_override":  None,
+                }
+
+            resolved_all[ticker] = resolved
+            direction = resolved.get("pre_resolved_direction", "NEUTRAL")
+            skip      = resolved.get("skip_claude", False)
+            agreement = resolved.get("signal_agreement_score", 0.0)
+            print(
+                f"{direction:<8} agreement={agreement:.0%}"
+                + ("  [skip_claude]" if skip else "")
+            )
+        except Exception as exc:
+            logger.warning("[%s] Signal collection error: %s", ticker, exc)
+            print(f"ERROR: {exc}")
+
+    try:
+        with open(output_path, "w") as f:
+            json.dump(resolved_all, f, indent=2, default=str)
+        print(f"\n  Resolved signals saved → {output_path}")
+    except Exception as exc:
+        logger.warning("Failed to save resolved signals: %s", exc)
+
+    return resolved_all
+
+
+def _get_open_positions() -> list:
+    """
+    Reads open positions dynamically from trade_journal.db at runtime.
+    Falls back to config.AI_QUANT_ALWAYS_INCLUDE if the DB is unavailable
+    or returns an empty list.
+
+    This means newly opened positions are automatically included in the
+    top-10 AI synthesis without any manual config.py edits.
+    Closed positions are automatically excluded the next run after closing.
+    """
+    try:
+        from trade_journal import get_open_positions
+        positions = get_open_positions()
+        tickers = list(dict.fromkeys(
+            p["ticker"] for p in positions if p.get("ticker")
+        ))
+        if tickers:
+            logger.info(f"_get_open_positions: live from DB → {tickers}")
+            return tickers
+        # DB returned empty — fall back rather than passing empty always_include
+        raise ValueError("No open positions returned from trade_journal.db")
+    except Exception as e:
+        logger.warning(f"_get_open_positions fallback to config: {e}")
+        from config import AI_QUANT_ALWAYS_INCLUDE
+        return list(AI_QUANT_ALWAYS_INCLUDE)
+
+
+def _run_top_n_mode(args, use_cache: bool) -> None:
+    """
+    Priority-based ticker selection mode (--top-n / --no-limit / --dry-run).
+
+    Flow:
+      1. Determine ticker pool (watchlist TIER 1+2, or force list from --tickers)
+      2. If --no-limit: use all non-skipped tickers (no priority scoring)
+      3. Otherwise: generate data/resolved_signals.json, call select_top_tickers()
+      4. If --dry-run: print table + cost estimate, exit without calling Claude
+      5. Run analyze_ticker() on selected tickers only
+    """
+    from utils.ticker_selector import select_top_tickers
+
+    try:
+        from config import AI_QUANT_MAX_TICKERS, AI_QUANT_MIN_AGREEMENT, AI_QUANT_ALWAYS_INCLUDE
+    except ImportError:
+        AI_QUANT_MAX_TICKERS   = 10
+        AI_QUANT_MIN_AGREEMENT = 0.60
+        AI_QUANT_ALWAYS_INCLUDE = []
+
+    top_n         = args.top_n if args.top_n is not None else AI_QUANT_MAX_TICKERS
+    min_agreement = args.min_agreement if args.min_agreement is not None else AI_QUANT_MIN_AGREEMENT
+
+    # ── Always-include: live open positions via _get_open_positions() ──────────
+    always_include = _get_open_positions()
+    print(f"  Always-include: {always_include} (from trade_journal.db; fallback: config.AI_QUANT_ALWAYS_INCLUDE)")
+
+    # --tickers used as force list in top-n mode (support both "A B" and "A,B")
+    force_tickers: Optional[List[str]] = None
+    if args.tickers:
+        force_tickers = []
+        for t in args.tickers:
+            force_tickers.extend(t.upper().split(","))
+        force_tickers = [t.strip() for t in force_tickers if t.strip()]
+
+    resolved_signals_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "resolved_signals.json"
+    )
+
+    # ── Force mode (--tickers provided) ──────────────────────────────────────
+    if force_tickers:
+        ticker_list = force_tickers[:top_n]
+        selected = [
+            {
+                "ticker":           t,
+                "priority_score":   0.0,
+                "selection_reason": "force_tickers override",
+            }
+            for t in ticker_list
+        ]
+        print(f"Force mode: {ticker_list}")
+
+    # ── No-limit mode ─────────────────────────────────────────────────────────
+    elif args.no_limit:
+        print("WARNING: --no-limit flag set. Running on ALL non-skipped tickers.")
+        print("         API costs apply (~€0.03 per ticker).")
+        wl = _read_watchlist_tickers(tier_filter=["TIER 1", "TIER 2"])
+        if not wl:
+            print("  No TIER 1/TIER 2 tickers found in watchlist.txt")
+            sys.exit(1)
+        resolved_all = _generate_resolved_signals_file(
+            wl, resolved_signals_path, verbose=args.verbose
+        )
+        ticker_list = [t for t, r in resolved_all.items() if not r.get("skip_claude")]
+        selected = [
+            {
+                "ticker":           t,
+                "priority_score":   0.0,
+                "selection_reason": "no_limit mode — all non-skipped tickers",
+            }
+            for t in ticker_list
+        ]
+
+    # ── Normal top-N mode ─────────────────────────────────────────────────────
+    else:
+        wl = _read_watchlist_tickers(tier_filter=["TIER 1", "TIER 2"])
+        if not wl:
+            print("  No TIER 1/TIER 2 tickers found in watchlist.txt")
+            sys.exit(1)
+        _generate_resolved_signals_file(wl, resolved_signals_path, verbose=args.verbose)
+        equity_path = _find_latest_equity_signals_file()
+        selected = select_top_tickers(
+            resolved_signals_path=resolved_signals_path,
+            equity_signals_path=equity_path,
+            max_tickers=top_n,
+            min_agreement=min_agreement,
+            always_include=always_include,
+            force_tickers=None,
+        )
+        ticker_list = [s["ticker"] for s in selected]
+
+    print(f"\nAI Quant: processing {len(ticker_list)} tickers\n")
+
+    # ── Dry-run exit ──────────────────────────────────────────────────────────
+    if args.dry_run:
+        print(f"Dry run complete. Would process {len(ticker_list)} tickers.")
+        print(f"Estimated cost: ~€{len(ticker_list) * 0.03:.2f}")
+        return
+
+    # ── API key required beyond this point ───────────────────────────────────
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("  ERROR: ANTHROPIC_API_KEY not set.")
+        print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+        sys.exit(1)
+
+    # ── Run Claude on selected tickers ────────────────────────────────────────
+    results = []
+    for i, selection in enumerate(selected, 1):
+        ticker = selection["ticker"]
+        print(f"\n[{i}/{len(selected)}] {ticker}")
+
+        # Cache check
+        if use_cache:
+            cached = get_cached_thesis(ticker)
+            if cached:
+                print(f"  [{ticker}] Using cached result from today — skipping API call.")
+                results.append(cached)
+                continue
+
+        result = analyze_ticker(
+            ticker, verbose=args.verbose, raw_output=args.raw, use_cache=False
+        )
+        if result:
+            result["selection_rank"]   = i
+            result["priority_score"]   = selection.get("priority_score", 0.0)
+            result["selection_reason"] = selection.get("selection_reason", "")
+            results.append(result)
+        time.sleep(1)
+
+    print_full_report(results)
 
 
 # ==============================================================================
 # SECTION 2: PROMPT CONSTRUCTION
 # ==============================================================================
+
+def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
+    """
+    Return a templated NEUTRAL thesis when conflict_resolver sets skip_claude=True.
+    Saves ~$0.04/ticker for post-squeeze guards, pre-earnings holds, and similar blocks.
+
+    The returned dict has all fields expected by save_thesis() and print_thesis().
+    """
+    overrides     = resolved.get("override_flags", [])
+    override_str  = "; ".join(overrides) if overrides else "pre_resolved block"
+    tech          = signals.get("technical") or {}
+    price         = tech.get("price")
+    max_conv      = resolved.get("max_conviction_override")  # None means no cap
+
+    notes_parts = [f"Claude API call skipped — {override_str}"]
+    if max_conv is not None:
+        notes_parts.append(f"Max conviction cap: {max_conv}")
+
+    return {
+        "ticker":              ticker,
+        "direction":           "NEUTRAL",
+        "conviction":          1,
+        "time_horizon":        "days",
+        "entry_low":           price,
+        "entry_high":          price,
+        "stop_loss":           None,
+        "target_1":            None,
+        "target_2":            None,
+        "position_size_pct":   resolved.get("position_size_override") or 0,
+        "thesis":              f"No directional thesis: {override_str}.",
+        "data_quality":        "MEDIUM",
+        "notes":               " | ".join(notes_parts),
+        "catalysts":           [],
+        "risks":               [override_str],
+        "raw_response":        "",
+        "signals":             signals,
+        "bull_probability":    0.33,
+        "bear_probability":    0.33,
+        "neutral_probability": 0.34,
+        "signal_agreement_score": resolved.get("signal_agreement_score", 0.0),
+        "key_invalidation":    None,
+        "primary_scenario":    f"Blocked: {override_str}",
+        "bear_scenario":       None,
+    }
+
 
 SYSTEM_PROMPT = """You are a senior quant analyst at a top-tier hedge fund.
 You think rigorously, quantitatively, and concisely. You have expertise in:
@@ -601,26 +1179,37 @@ Do not hedge everything — give a clear directional view with conviction.
 Output MUST be in JSON format with this exact structure:
 {
   "ticker": "...",
-  "direction": "BULL|BEAR|NEUTRAL",
+  "direction": "BULL | BEAR | NEUTRAL",
+  "bull_probability": 0.0-1.0,
+  "bear_probability": 0.0-1.0,
+  "neutral_probability": 0.0-1.0,
   "conviction": 1-5,
-  "time_horizon": "X days|X weeks|X months",
+  "time_horizon": "days | weeks | months",
+  "primary_scenario": "one sentence describing the bull/bear case",
+  "bear_scenario": "one sentence describing the opposing scenario",
+  "key_invalidation": "specific price level or event that breaks the thesis",
   "entry_low": price,
   "entry_high": price,
   "stop_loss": price,
   "target_1": price,
   "target_2": price (or null),
   "position_size_pct": 0-100 (percent of allocated crypto/equity slice),
-  "catalysts": ["...", "...", "..."],
-  "risks": ["...", "...", "..."],
+  "signal_agreement_score": float (echo back the pre-computed value, or 0.0 if not provided),
+  "catalysts": ["...", "..."],
+  "risks": ["...", "..."],
   "thesis": "2-3 sentence narrative",
   "data_quality": "HIGH|MEDIUM|LOW",
   "notes": "any caveats or data gaps"
-}"""
+}
+
+IMPORTANT: bull_probability + bear_probability + neutral_probability MUST sum to exactly 1.0."""
 
 
 def _build_prompt(signals: dict) -> str:
     """Build the analysis prompt from collected signals."""
-    ticker   = signals["ticker"]
+    ticker            = signals["ticker"]
+    agreement_score   = signals.get("signal_agreement_score")
+    wr       = signals.get("weekly_regime", {})
     tech     = signals.get("technical", {})
     vp       = signals.get("volume_profile", {})
     cadiv    = signals.get("cross_asset", {})
@@ -631,12 +1220,63 @@ def _build_prompt(signals: dict) -> str:
     poly     = signals.get("polymarket", {})
     sec      = signals.get("sec", {})
     catalyst = signals.get("catalyst", {})
+    mr       = signals.get("market_regime", {})
+    sr       = signals.get("ticker_sector_regime")
+    sector   = signals.get("ticker_sector")
 
     prompt_parts = [
         f"Analyze {ticker} using the following signal data collected on {datetime.now().strftime('%Y-%m-%d')}.",
         "",
-        "## TECHNICAL SIGNALS",
+        "## MACRO REGIME",
     ]
+
+    if mr and mr.get("regime"):
+        regime      = mr.get("regime", "UNKNOWN")
+        score       = mr.get("score", "?")
+        comp        = mr.get("components", {})
+        vix         = mr.get("vix")
+        spy200      = mr.get("spy_vs_200ma")
+        yc          = mr.get("yield_curve_spread")
+        mult        = _rf.get_position_size_multiplier(regime) if _REGIME_AVAILABLE else "N/A"
+        max_conv    = _rf.get_max_conviction(regime) if _REGIME_AVAILABLE else "N/A"
+        sector_str  = f"  Sector ({sector}): {sr}" if sector and sr else ""
+        prompt_parts += [
+            f"Market regime: {regime} (composite score: {score:+d})",
+            f"  Trend: {comp.get('trend', '?'):+d}  |  VIX: {comp.get('volatility', '?'):+d} "
+            f"(VIX={vix})" if vix else
+            f"  Trend: {comp.get('trend', '?'):+d}  |  VIX: {comp.get('volatility', '?'):+d}",
+            f"  Credit (HYG): {comp.get('credit', '?'):+d}  |  Yield curve: {comp.get('yield_curve', '?'):+d} "
+            f"(T10Y2Y={yc:+.3f}%)" if yc is not None else
+            f"  Credit (HYG): {comp.get('credit', '?'):+d}  |  Yield curve: {comp.get('yield_curve', '?'):+d}",
+        ]
+        if sector_str:
+            prompt_parts.append(sector_str)
+        prompt_parts += [
+            f"Position size multiplier: {mult}x  |  Max conviction allowed: {max_conv}/5",
+            f"Note: {'Risk-on environment — full position sizing and momentum weights active.' if regime == 'RISK_ON' else 'Risk-off environment — reduce sizing, favour quality/mean-reversion signals.' if regime == 'RISK_OFF' else 'Transitional environment — moderate sizing, use balanced signal weights.'}",
+        ]
+    else:
+        prompt_parts.append("Macro regime: unavailable")
+
+    prompt_parts += [
+        "",
+        "## WEEKLY REGIME (Structural Trend Filter)",
+    ]
+
+    if wr and wr.get("regime") != "unknown":
+        regime = wr.get("regime", "unknown").upper()
+        prompt_parts += [
+            f"Regime: {regime}",
+            f"Price vs 20-week MA: ${wr.get('price', 'N/A')} vs ${wr.get('ma20w', 'N/A')} "
+            f"({wr.get('pct_from_ma20w', 'N/A'):+.1f}%)" if isinstance(wr.get('pct_from_ma20w'), (int, float)) else
+            f"Price vs 20-week MA: ${wr.get('price', 'N/A')} vs ${wr.get('ma20w', 'N/A')}",
+            f"MA slope (4-week): {wr.get('ma_slope_4w_pct', 'N/A'):+.2f}%" if isinstance(wr.get('ma_slope_4w_pct'), (int, float)) else "",
+            f"Note: {'Long setups aligned with weekly trend.' if wr.get('regime') in ('bullish', 'recovering') else 'Weekly structure is bearish — long setups are counter-trend and require higher conviction.'}",
+        ]
+    else:
+        prompt_parts.append(f"Weekly regime: unavailable ({wr.get('reason', 'unknown error')})")
+
+    prompt_parts += ["", "## TECHNICAL SIGNALS"]
 
     if tech:
         price = tech.get("price", "N/A")
@@ -811,12 +1451,91 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Polymarket data: no relevant markets found")
 
+    dp = signals.get("dark_pool_flow") or {}
+    prompt_parts += ["", "## DARK POOL FLOW (FINRA ATS — Institutional Routing)"]
+    if dp and dp.get("signal"):
+        prompt_parts += [
+            f"Signal: {dp.get('signal', 'N/A')}  (score {dp.get('dark_pool_score', 'N/A')}/100, 50=neutral)",
+            f"Short ratio today   : {dp.get('short_ratio_today', 0):.3%}"
+            if isinstance(dp.get('short_ratio_today'), float) else
+            f"Short ratio today   : {dp.get('short_ratio_today', 'N/A')}",
+            f"Short ratio mean    : {dp.get('short_ratio_mean', 0):.3%}"
+            if isinstance(dp.get('short_ratio_mean'), float) else
+            f"Short ratio mean    : {dp.get('short_ratio_mean', 'N/A')}",
+            f"Short ratio trend   : {dp.get('short_ratio_trend', 0):+.5f}/day"
+            if isinstance(dp.get('short_ratio_trend'), float) else
+            f"Short ratio trend   : {dp.get('short_ratio_trend', 'N/A')}",
+            f"Short ratio z-score : {dp.get('short_ratio_zscore', 0):+.2f}"
+            if isinstance(dp.get('short_ratio_zscore'), float) else
+            f"Short ratio z-score : {dp.get('short_ratio_zscore', 'N/A')}",
+            f"Dark pool intensity : {dp.get('dark_pool_intensity', 0):.1%}"
+            if isinstance(dp.get('dark_pool_intensity'), float) else
+            f"Dark pool intensity : {dp.get('dark_pool_intensity', 'N/A')}",
+            f"Days of FINRA data  : {dp.get('days_of_data', 'N/A')}",
+            f"Interpretation      : {dp.get('interpretation', '')}",
+        ]
+    else:
+        prompt_parts.append("Dark pool data: unavailable (FINRA file not yet published or ticker not found)")
+
     # Portfolio context
     prompt_parts += [
         "",
         "## PORTFOLIO CONTEXT",
         f"Portfolio NAV: ${PORTFOLIO_NAV:,}",
         f"Equity allocation: {EQUITY_ALLOCATION*100:.0f}% | Crypto allocation: {CRYPTO_ALLOCATION*100:.0f}%",
+    ]
+
+    # Pre-computed signal agreement + conflict resolution context
+    cr_data = signals.get("conflict_resolution") or {}
+    if agreement_score is not None or cr_data:
+        prompt_parts += [
+            "",
+            "## PRE-COMPUTED SIGNAL AGREEMENT & CONFLICT RESOLUTION",
+        ]
+        if agreement_score is not None:
+            prompt_parts += [
+                f"signal_agreement_score: {agreement_score:.4f}",
+                "IMPORTANT: signal_agreement_score is pre-computed — do not recalculate it.",
+                "Use it as a confidence prior. A score above 0.75 means strong module consensus.",
+            ]
+        if cr_data:
+            direction = cr_data.get("pre_resolved_direction", "NEUTRAL")
+            conf      = cr_data.get("pre_resolved_confidence", 0.0)
+            bull_w    = cr_data.get("bull_weight", 0.0)
+            bear_w    = cr_data.get("bear_weight", 0.0)
+            votes     = cr_data.get("module_votes") or {}
+            overrides = cr_data.get("override_flags") or []
+            max_conv_cap   = cr_data.get("max_conviction_override")
+            pos_size_cap   = cr_data.get("position_size_override")
+
+            prompt_parts += [
+                "",
+                f"Pre-resolved direction: {direction}  (confidence: {conf:.0%})",
+                f"Weighted vote — bull: {bull_w:.3f}  |  bear: {bear_w:.3f}",
+            ]
+            # Per-module breakdown (only modules that cast a vote)
+            active_votes = [(m, v) for m, v in votes.items() if v is not None]
+            if active_votes:
+                vote_str = "  |  ".join(f"{m.replace('_', ' ')}: {v}" for m, v in active_votes)
+                prompt_parts.append(f"Module votes: {vote_str}")
+            if overrides:
+                prompt_parts.append(f"Override/context flags: {'; '.join(overrides)}")
+            if max_conv_cap is not None:
+                prompt_parts.append(
+                    f"HARD CONSTRAINT: max conviction = {max_conv_cap} (regime override applied)"
+                )
+            if pos_size_cap is not None:
+                prompt_parts.append(
+                    f"HARD CONSTRAINT: max position_size_pct = {pos_size_cap:.1f}% (regime override applied)"
+                )
+            prompt_parts += [
+                "",
+                f"Your role: reason about WHY the pre_resolved_direction of '{direction}' is correct, "
+                f"or explain what nuance the weighted vote missed. "
+                f"Do NOT recalculate the weighted vote — accept it as a given and add qualitative depth.",
+            ]
+
+    prompt_parts += [
         "",
         "## TASK",
         f"Produce a quant thesis for {ticker} in the required JSON format.",
@@ -831,6 +1550,26 @@ def _build_prompt(signals: dict) -> str:
 # ==============================================================================
 # SECTION 3: CLAUDE API CALL
 # ==============================================================================
+
+def _validate_probabilities(thesis: dict) -> None:
+    """
+    Warn (not raise) if bull + bear + neutral probabilities do not sum to ~1.0.
+    Tolerance: ±0.05.
+    """
+    bull    = thesis.get("bull_probability")    or 0.0
+    bear    = thesis.get("bear_probability")    or 0.0
+    neutral = thesis.get("neutral_probability") or 0.0
+    if bull == 0.0 and bear == 0.0 and neutral == 0.0:
+        return  # Probabilities not present; nothing to validate
+    total = bull + bear + neutral
+    if abs(total - 1.0) > 0.05:
+        warnings.warn(
+            f"[{thesis.get('ticker', '?')}] Probability sum {total:.3f} ≠ 1.0 "
+            f"(bull={bull}, bear={bear}, neutral={neutral}). Check Claude response.",
+            UserWarning,
+            stacklevel=2,
+        )
+
 
 def _call_claude(prompt: str, verbose: bool = False) -> Optional[str]:
     """
@@ -925,22 +1664,35 @@ def _pre_screen_score(signals: dict) -> dict:
     Score a ticker's collected signals without calling Claude.
     Returns {score, max, flags, grade} for ranking candidates.
 
-    Scoring breakdown (max = 25):
-      Technical   0-10  — trend, momentum, volume
-      Fundamental 0-5   — valuation, growth, analyst
-      Catalyst    0-5   — short squeeze, vol compression, congress
-      SEC         0-3   — insider buying, activist stakes
-      Options     0-2   — bullish flow
+    Scoring breakdown (max = 28):
+      Weekly Regime -3 to +3 — structural trend filter (bearish penalized)
+      Technical      0 to 10 — trend, momentum, volume
+      Fundamental    0 to  5 — valuation, growth, analyst
+      Catalyst       0 to  5 — short squeeze, vol compression, congress
+      SEC            0 to  3 — insider buying, activist stakes
+      Options        0 to  2 — bullish flow
     """
     score = 0
     flags = []
 
+    wr   = signals.get("weekly_regime", {})
     tech = signals.get("technical", {})
     fund = signals.get("fundamentals", {})
     cat  = signals.get("catalyst", {})
     cong = signals.get("congress", {})
     sec  = signals.get("sec", {})
     opts = signals.get("options_flow", {})
+
+    # ── Weekly Regime (max +3, min -3) ────────────────────────────────────────
+    regime = wr.get("regime", "unknown")
+    if regime == "bullish":
+        score += 3; flags.append("Weekly regime: BULLISH (above MA, slope up)")
+    elif regime == "weakening":
+        score += 1; flags.append("Weekly regime: WEAKENING (above MA, slope rolling over)")
+    elif regime == "recovering":
+        score += 1; flags.append("Weekly regime: RECOVERING (below MA, slope turning up)")
+    elif regime == "bearish":
+        score -= 3; flags.append("Weekly regime: BEARISH (below MA, slope down) — counter-trend")
 
     # ── Technical (max 10) ────────────────────────────────────────────────────
     if tech:
@@ -1014,7 +1766,7 @@ def _pre_screen_score(signals: dict) -> dict:
             score += 1
 
     # ── Grade ─────────────────────────────────────────────────────────────────
-    pct = score / 25
+    pct = score / 28
     if pct >= 0.72:
         grade = "A"
     elif pct >= 0.52:
@@ -1076,16 +1828,32 @@ def screen_tickers(
     min_score: int = 8,
     top_n: int = 0,
     verbose: bool = False,
+    regime_filter: bool = True,
 ) -> List[dict]:
     """
     Score every ticker in the universe without calling Claude.
     Returns full ranked list filtered by min_score (then top_n if set).
+
+    regime_filter=True (default): fetch weekly regime first and skip bearish
+    tickers before collecting any other signals, saving time.
     """
     print(f"\n  Screening {len(tickers)} tickers (no API cost)...\n")
     results = []
+    skipped_bearish = []
 
     for i, ticker in enumerate(tickers, 1):
         print(f"  [{i:>3}/{len(tickers)}] {ticker:<8}", end=" ", flush=True)
+
+        # Weekly regime pre-filter: skip structurally bearish names immediately
+        if regime_filter:
+            wr = _get_weekly_regime(ticker)
+            if wr.get("regime") == "bearish":
+                skipped_bearish.append(ticker)
+                print(f"SKIP  weekly regime BEARISH "
+                      f"(${wr.get('price','?')} < 20w MA ${wr.get('ma20w','?')}, "
+                      f"slope {wr.get('ma_slope_4w_pct', 0):+.1f}%)")
+                continue
+
         signals = collect_all_signals(ticker, verbose=False)
         screen  = _pre_screen_score(signals)
         results.append({
@@ -1093,7 +1861,11 @@ def screen_tickers(
             "signals": signals,
             "screen":  screen,
         })
-        print(f"score={screen['score']:>2}/25  grade={screen['grade']}")
+        print(f"score={screen['score']:>2}/28  grade={screen['grade']}")
+
+    if skipped_bearish:
+        print(f"\n  [regime filter] Skipped {len(skipped_bearish)} bearish tickers: "
+              f"{', '.join(skipped_bearish)}")
 
     results.sort(key=lambda r: r["screen"]["score"], reverse=True)
 
@@ -1122,7 +1894,7 @@ def print_screen_table(results: List[dict], watchlist_tickers: set = None) -> No
         in_wl    = "YES" if ticker in watchlist_tickers else "new"
         flags    = r["screen"]["flags"][:3]
         flag_str = " | ".join(flags) if flags else "—"
-        print(f"  {rank:<3}  {ticker:<8}  {sc:>4}/25  [{grade}]  {in_wl:<5}  {flag_str}")
+        print(f"  {rank:<3}  {ticker:<8}  {sc:>4}/28  [{grade}]  {in_wl:<5}  {flag_str}")
 
     print()
 
@@ -1164,7 +1936,7 @@ def update_watchlist_from_screen(
     lines = [
         "# ============================================================",
         f"# WATCHLIST — AI Quant screener  |  updated {today}",
-        "# Scored by 10-module signal quality (max 25)",
+        "# Scored by 10-module signal quality (max 28, weekly regime ±3)",
         "# TIER 1 ≥18  TIER 2 ≥13  TIER 3 ≥8  (below 8 excluded)",
         "# ============================================================",
         "",
@@ -1211,7 +1983,30 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     # Collect signals
     signals = collect_all_signals(ticker, verbose=verbose)
 
-    # Build prompt
+    # Pre-compute agreement score (kept for backward compat; may be overridden by resolver)
+    signals["signal_agreement_score"] = compute_signal_agreement(signals)
+
+    # ── Conflict resolution — pre-resolve before Claude ──────────────────────
+    if _RESOLVER_AVAILABLE:
+        try:
+            mr_dict    = signals.get("market_regime") or {}
+            regime_str = mr_dict.get("regime", "TRANSITIONAL") if mr_dict else "TRANSITIONAL"
+            resolved   = _cr.resolve(signals, regime_str)
+            signals["conflict_resolution"] = resolved
+            # Resolver's agreement score uses MODULE_WEIGHTS; prefer it over simple vote
+            signals["signal_agreement_score"] = resolved["signal_agreement_score"]
+
+            if resolved["skip_claude"]:
+                flags = resolved.get("override_flags", [])
+                flag0 = flags[0] if flags else "pre-resolved block"
+                print(f"  [{ticker}] Claude skipped — {flag0}")
+                thesis = _make_neutral_thesis(ticker, signals, resolved)
+                save_thesis(thesis)
+                return thesis
+        except Exception as exc:
+            logger.warning("Conflict resolver failed for %s: %s", ticker, exc)
+
+    # Build prompt (includes conflict_resolution context if available)
     prompt = _build_prompt(signals)
 
     if verbose and raw_output:
@@ -1239,6 +2034,53 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     thesis["ticker"] = ticker
     thesis["signals"] = signals
     thesis["raw_response"] = raw
+
+    # ── Apply conflict resolver hard constraints (Override 2: bear market cap) ─
+    if _RESOLVER_AVAILABLE:
+        try:
+            cr_data = signals.get("conflict_resolution") or {}
+            max_conv_cap  = cr_data.get("max_conviction_override")
+            pos_size_cap  = cr_data.get("position_size_override")
+
+            if max_conv_cap is not None:
+                raw_conv = thesis.get("conviction", 5)
+                if isinstance(raw_conv, (int, float)) and raw_conv > max_conv_cap:
+                    thesis["conviction"] = max_conv_cap
+                    thesis["notes"] = (
+                        f"[Conviction capped at {max_conv_cap} — conflict resolver] "
+                        + (thesis.get("notes") or "")
+                    ).strip()
+
+            if pos_size_cap is not None:
+                raw_pos = thesis.get("position_size_pct", 0) or 0
+                if isinstance(raw_pos, (int, float)) and raw_pos > pos_size_cap:
+                    thesis["position_size_pct"] = pos_size_cap
+                    thesis["notes"] = (
+                        f"[Position capped at {pos_size_cap:.1f}% — conflict resolver] "
+                        + (thesis.get("notes") or "")
+                    ).strip()
+        except Exception:
+            pass
+
+    # ── Cap conviction by market regime (regime_filter layer) ────────────────
+    if _REGIME_AVAILABLE:
+        try:
+            mr_cached  = signals.get("market_regime", {})
+            mkt_regime = mr_cached.get("regime") if mr_cached else None
+            if mkt_regime:
+                max_conv = _rf.get_max_conviction(mkt_regime)
+                raw_conv = thesis.get("conviction", 5)
+                if isinstance(raw_conv, (int, float)) and raw_conv > max_conv:
+                    thesis["conviction"] = max_conv
+                    thesis["notes"] = (
+                        f"[Conviction capped at {max_conv} — {mkt_regime} regime] "
+                        + (thesis.get("notes") or "")
+                    ).strip()
+        except Exception:
+            pass
+
+    # Validate probability sum; emit warning if not ~1.0
+    _validate_probabilities(thesis)
 
     # --- Save to cache ---
     save_thesis(thesis)
@@ -1295,6 +2137,18 @@ def print_thesis(t: dict) -> None:
     print(f"  └{'─'*58}┘")
     print()
 
+    # Regime line
+    sigs = t.get("signals", {})
+    mr   = sigs.get("market_regime", {}) if isinstance(sigs, dict) else {}
+    if mr and mr.get("regime") and _REGIME_AVAILABLE:
+        regime      = mr.get("regime", "?")
+        score       = mr.get("score", 0)
+        mult        = _rf.get_position_size_multiplier(regime)
+        sector_reg  = sigs.get("ticker_sector_regime") if isinstance(sigs, dict) else None
+        sector_str  = f" | Sector: {sector_reg}" if sector_reg else ""
+        print(f"  Regime: {regime} (score: {score:+d}){sector_str} | Position multiplier: {mult:.1f}x")
+        print()
+
     # Price levels
     entry_low = t.get("entry_low")
     entry_high = t.get("entry_high")
@@ -1324,7 +2178,32 @@ def print_thesis(t: dict) -> None:
         except Exception:
             pass
 
+    # Agreement / probabilistic summary line
+    agreement = t.get("signal_agreement_score")
+    bull_prob = t.get("bull_probability")
+    bear_prob = t.get("bear_probability")
+    key_inv   = t.get("key_invalidation")
+    summary_parts = []
+    if agreement is not None:
+        summary_parts.append(f"Agreement: {agreement:.0%}")
+    if bull_prob is not None and bear_prob is not None:
+        summary_parts.append(f"Bull: {bull_prob:.0%} / Bear: {bear_prob:.0%}")
+    if key_inv:
+        summary_parts.append(f"Invalidation: {key_inv}")
+    if summary_parts:
+        print(f"  {' | '.join(summary_parts)}")
+
     print()
+
+    # Scenarios
+    primary = t.get("primary_scenario")
+    bear_sc  = t.get("bear_scenario")
+    if primary:
+        print(f"  Primary:  {primary}")
+    if bear_sc:
+        print(f"  Counter:  {bear_sc}")
+    if primary or bear_sc:
+        print()
 
     # Thesis
     print(f"  Thesis: {t.get('thesis', 'N/A')}")
@@ -1517,6 +2396,37 @@ def main():
                         help="Force fresh analysis, ignoring today's cached results")
     parser.add_argument("--cache-show", action="store_true",
                         help="Show recent cached results and exit")
+    # ── Top-N priority selection args ─────────────────────────────────────────
+    try:
+        from config import AI_QUANT_MAX_TICKERS, AI_QUANT_MIN_AGREEMENT
+        _default_top_n   = AI_QUANT_MAX_TICKERS
+        _default_min_agr = AI_QUANT_MIN_AGREEMENT
+    except ImportError:
+        _default_top_n   = 10
+        _default_min_agr = 0.60
+    parser.add_argument(
+        "--top-n", type=int, default=None, metavar="N",
+        help=(
+            f"Run Claude on top N tickers by priority score "
+            f"(default when used: {_default_top_n}). "
+            f"Uses TIER 1+2 watchlist. --tickers acts as force list."
+        ),
+    )
+    parser.add_argument(
+        "--min-agreement", type=float, default=None, metavar="F",
+        help=(
+            f"Min signal_agreement_score 0.0-1.0 for top-n mode "
+            f"(default: {_default_min_agr:.2f})"
+        ),
+    )
+    parser.add_argument(
+        "--no-limit", action="store_true",
+        help="Run on ALL non-skipped tickers (WARNING: high API cost)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print selection table and cost estimate without calling Claude",
+    )
     args = parser.parse_args()
     use_cache = not args.no_cache
 
@@ -1591,6 +2501,7 @@ def main():
                         cached["screen"] = r["screen"]
                         results.append(cached)
                         continue
+                r["signals"]["signal_agreement_score"] = compute_signal_agreement(r["signals"])
                 prompt = _build_prompt(r["signals"])
                 raw    = _call_claude(prompt, verbose=args.verbose)
                 if raw is None:
@@ -1603,6 +2514,7 @@ def main():
                     thesis["signals"]      = r["signals"]
                     thesis["raw_response"] = raw
                     thesis["screen"]       = r["screen"]
+                    _validate_probabilities(thesis)
                     save_thesis(thesis)
                     results.append(thesis)
                 time.sleep(1)
@@ -1610,6 +2522,11 @@ def main():
             results.sort(key=lambda r: (-(r.get("conviction", 0)),
                                         {"BULL": 0, "NEUTRAL": 1, "BEAR": 2}.get(r.get("direction", "NEUTRAL"), 1)))
             print_full_report(results)
+        return
+
+    # ── Top-N priority selection mode (--top-n / --no-limit / --dry-run) ──────
+    if args.top_n is not None or args.no_limit or args.dry_run:
+        _run_top_n_mode(args, use_cache)
         return
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -1670,16 +2587,19 @@ def main():
         print("  Examples:")
         print("    python3 ai_quant.py --ticker COIN")
         print("    python3 ai_quant.py --tickers COIN GME NVDA --verbose")
-        print("    python3 ai_quant.py --screen                            # scan full universe, rank by signal score")
-        print("    python3 ai_quant.py --screen --universe large           # large-cap only")
-        print("    python3 ai_quant.py --screen --universe small           # small-cap / high-momentum")
-        print("    python3 ai_quant.py --screen --top 5                    # screen then Claude on top 5")
-        print("    python3 ai_quant.py --screen --top 5 --update-watchlist # screen + update watchlist.txt")
-        print("    python3 ai_quant.py --screen --min-score 12 --top 3")
+        print("    python3 ai_quant.py --top-n 10                    # top 10 watchlist tickers by priority score")
+        print("    python3 ai_quant.py --top-n 10 --dry-run          # preview selection table, no Claude calls")
+        print("    python3 ai_quant.py --top-n 5 --min-agreement 0.7 # stricter agreement filter")
+        print("    python3 ai_quant.py --tickers AAPL,MSFT --top-n 2 # force specific tickers")
+        print("    python3 ai_quant.py --no-limit                    # all non-skipped tickers (high cost)")
+        print("    python3 ai_quant.py --screen                      # scan full universe, no Claude cost")
+        print("    python3 ai_quant.py --screen --universe large      # large-cap only")
+        print("    python3 ai_quant.py --screen --top 5              # screen then Claude on top 5")
+        print("    python3 ai_quant.py --screen --top 5 --update-watchlist")
         print("    python3 ai_quant.py --watchlist")
         print("    python3 ai_quant.py --report signal_reports/signal_report_20260318.txt")
-        print("    python3 ai_quant.py --ticker COIN --no-cache     # force fresh analysis")
-        print("    python3 ai_quant.py --cache-show                 # view cached results")
+        print("    python3 ai_quant.py --ticker COIN --no-cache      # force fresh analysis")
+        print("    python3 ai_quant.py --cache-show                  # view cached results")
         print()
 
 

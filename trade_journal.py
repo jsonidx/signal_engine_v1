@@ -41,6 +41,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from utils.db import get_connection
+
 from fx_rates import (
     get_eur_rate, convert_to_eur, get_all_rates,
     get_ticker_currency, convert_ticker_price_to_eur,
@@ -59,12 +61,69 @@ DB_PATH = "trade_journal.db"
 REPORTS_DIR = "./weekly_reports"
 
 
+def get_open_positions() -> list:
+    """
+    Returns all open (not yet closed) positions from trade_journal.db as a
+    list of dicts, each guaranteed to have a 'ticker' key.
+
+    A position is open if action = 'BUY' AND status = 'open'.
+    (Schema uses action/status — no exit_date column exists.)
+
+    Returns [] if the database does not exist, has no open positions, or
+    on any error so callers can degrade gracefully.
+    """
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = get_connection(db_path)
+        cursor = conn.execute("""
+            SELECT ticker, date AS entry_date, price AS entry_price,
+                   shares AS quantity, action AS direction, status
+            FROM trades
+            WHERE action = 'BUY' AND status = 'open'
+            ORDER BY date DESC
+        """)
+        cols = [d[0] for d in cursor.description]
+        rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        import logging
+        logging.warning(f"get_open_positions DB error: {e}")
+        return []
+
+
+def get_open_position_tickers() -> list:
+    """
+    Return a list of unique ticker symbols with at least one open BUY trade.
+    Used by ai_quant.py to dynamically populate AI_QUANT_ALWAYS_INCLUDE so
+    open positions always receive a fresh Claude synthesis regardless of their
+    priority score.
+
+    Returns [] if the database does not exist or has no open positions.
+    Falls back to [] (not an exception) so callers can degrade gracefully.
+    """
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = get_connection(db_path)
+        rows = conn.execute(
+            "SELECT DISTINCT ticker FROM trades WHERE action = 'BUY' AND status = 'open' ORDER BY ticker"
+        ).fetchall()
+        conn.close()
+        return [row[0].upper() for row in rows]
+    except Exception:
+        return []
+
+
 # ==============================================================================
 # SECTION 1: DATABASE
 # ==============================================================================
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection(DB_PATH)
     c = conn.cursor()
 
     c.execute("""

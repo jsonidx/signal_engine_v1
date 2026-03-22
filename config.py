@@ -64,30 +64,38 @@ CRYPTO_TICKERS = [
 # ============================================================
 EQUITY_FACTORS = {
     "momentum_12_1": {
-        "weight": 0.35,         # 12-month return minus last month (Jegadeesh-Titman)
+        "weight": 0.28,         # 12-month return minus last month (Jegadeesh-Titman)
         "lookback_long": 252,   # ~12 months trading days
-        "lookback_skip": 21,    # Skip last month (mean-reversion contamination)
+        "lookback_skip": 21,    # Skip last 21 trading days (mean-reversion contamination)
     },
     "momentum_6_1": {
-        "weight": 0.20,         # 6-month momentum
+        "weight": 0.16,         # 6-month momentum
         "lookback_long": 126,
         "lookback_skip": 21,
     },
+    "earnings_revision": {
+        "weight": 0.18,         # Sell-side FY1 EPS revision momentum (well-documented alpha)
+    },
+    "ivol": {
+        "weight": 0.12,         # Negative idiosyncratic vol — low IVOL = quality premium
+        "lookback": 63,         # 3-month regression window
+    },
+    "52wk_high_proximity": {
+        "weight": 0.10,         # George-Hwang (2004): price / 52wk high
+    },
     "mean_reversion_5d": {
-        "weight": 0.15,         # 5-day mean reversion (contrarian at short horizon)
+        "weight": 0.08,         # 5-day mean reversion (contrarian at short horizon)
         "lookback": 5,
         "invert": True,         # Negative return = positive signal
     },
     "volatility_quality": {
-        "weight": 0.15,         # Low-vol factor (quality proxy)
+        "weight": 0.08,         # Low-vol factor (quality proxy)
         "lookback": 63,         # 3-month realized vol
         "invert": True,         # Lower vol = higher score
     },
-    "risk_adjusted_momentum": {
-        "weight": 0.15,         # Momentum / volatility (Sharpe-like)
-        "mom_lookback": 126,
-        "vol_lookback": 63,
-    },
+    # NOTE: regime_filter.py's get_factor_weights() overrides these in RISK_OFF.
+    # Update regime_filter to include: earnings_revision, ivol, 52wk_high_proximity.
+    # Weights above sum to 1.0.  Removed: risk_adjusted_momentum (0.15 → redistributed).
 }
 
 # ============================================================
@@ -130,6 +138,7 @@ RISK_PARAMS = {
     "equity_cost_bps": 15,      # ~15 bps for retail on large-cap
     "crypto_cost_bps": 30,      # ~30 bps on major exchanges
 
+
     # Drawdown limits
     "weekly_dd_warning": -0.03,     # -3% weekly = warning
     "monthly_dd_stop": -0.08,      # -8% monthly = flatten
@@ -150,11 +159,77 @@ CONSOLE_PRINT = True
 # DATA SETTINGS
 # ============================================================
 DATA_LOOKBACK_DAYS = 400        # ~18 months of history for signal calc
+TRANSACTION_COST_BPS = 5        # One-way transaction cost (bps) for paper trader + backtest
 YAHOO_FINANCE_TIMEOUT = 30      # Seconds before timeout per ticker
 
 # ============================================================
 # POLYMARKET PREDICTION MARKET PARAMETERS
 # ============================================================
+# ============================================================
+# UNIVERSE BUILDER PARAMETERS
+# ============================================================
+UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "nasdaq100"]
+UNIVERSE_PRESCREEN_TOP_N = 200
+UNIVERSE_MIN_DOLLAR_VOLUME = 3_000_000   # 30-day avg dollar volume ($)
+UNIVERSE_MIN_PRICE = 2.0                 # Minimum share price ($)
+UNIVERSE_CACHE_TTL_HOURS = 24            # Cache TTL for index constituents
+
+# ============================================================
+# REGIME FILTER PARAMETERS
+# ============================================================
+REGIME_CACHE_TTL_HOURS    = 24           # Cache TTL for regime + sector data (hours)
+FRED_YIELD_CURVE_SERIES   = "T10Y2Y"     # FRED series: 10-year minus 2-year Treasury spread
+FRED_USER_AGENT           = "SignalEngine/1.0 (research)"
+REGIME_RISK_ON_THRESHOLD  = 3            # Total score >= this → RISK_ON
+REGIME_RISK_OFF_THRESHOLD = 0            # Total score <= this → RISK_OFF
+
+# ============================================================
+# POLYMARKET PREDICTION MARKET PARAMETERS
+# ============================================================
+# ============================================================
+# DARK POOL FLOW PARAMETERS
+# ============================================================
+DARK_POOL_ACCUMULATION_THRESHOLD = 65   # score above this = ACCUMULATION
+DARK_POOL_DISTRIBUTION_THRESHOLD = 35   # score below this = DISTRIBUTION
+DARK_POOL_INTENSITY_HIGH = 0.45         # above this = heavy institutional off-exchange routing
+
+# ============================================================
+# POLYMARKET PREDICTION MARKET PARAMETERS
+# ============================================================
+# ============================================================
+# IMPLIED VOLATILITY (IV) PARAMETERS
+# ============================================================
+IV_RISK_FREE_RATE    = 0.05              # Fed funds rate approximation (update as rates change)
+IV_TARGET_DTE        = 30               # Target days-to-expiry for ATM IV interpolation
+IV_MIN_HISTORY_DAYS  = 60               # Min stored rows before iv_rank/percentile returns a value
+IV_HISTORY_DB        = "data/iv_history.db"  # SQLite store — grows ~1 KB per ticker per day
+
+# ============================================================
+# SOCIAL SENTIMENT PARAMETERS
+# ============================================================
+SOCIAL_TRENDS_LOOKBACK_DAYS      = 30   # Google Trends timeframe: f'now {N}-d' (max 90)
+SOCIAL_TRENDS_CACHE_TTL_HOURS    = 24   # Re-fetch Trends data at most once per day
+SOCIAL_STOCKTWITS_CACHE_TTL_HOURS = 4  # StockTwits updates frequently; 4hr TTL is safe
+SOCIAL_BULLISH_THRESHOLD         = 0.65 # bull_ratio above this → BULLISH sentiment signal
+SOCIAL_BEARISH_THRESHOLD         = 0.35 # bull_ratio below this → BEARISH sentiment signal
+
+# ============================================================
+# POLYMARKET PREDICTION MARKET PARAMETERS
+# ============================================================
+# ============================================================
+# AI QUANT API CALL LIMITS
+# ============================================================
+AI_QUANT_MAX_TICKERS = 10           # Hard cap on Claude API calls per run
+AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
+AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
+AI_QUANT_ALWAYS_INCLUDE = [         # Always process regardless of rank (open positions)
+    "GME", "COIN", "SAP",
+]
+
+# Paths
+import pathlib
+BASE_DIR = pathlib.Path(__file__).parent
+
 POLYMARKET_PARAMS = {
     # API
     "api_base_url": "https://gamma-api.polymarket.com",
