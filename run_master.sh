@@ -1,6 +1,8 @@
 #!/bin/bash
 # Signal Engine v1 — Master Pipeline
-# Schedule: Monday 14:45 Berlin time via launchd (com.signalengine.master.monday)
+# Schedule:
+#   Daily  06:00 Berlin — com.signalengine.skipai.daily    (--skip-ai, €0.00)
+#   Monday 14:45 Berlin — com.signalengine.master.monday   (full run, ~€0.10–0.20)
 #
 # COST ESTIMATE (ai_quant.py --top-n 5):
 #   ~5 Claude API calls × ~€0.02–0.04 = ~€0.10–0.20 per run
@@ -73,7 +75,7 @@ echo "Step 2 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 3: Signal engine ─────────────────────────────────
 echo "Step 3: Running multi-factor equity screener (reads regime from Step 2)..."
-python3 signal_engine.py --watchlist | tee -a "$REPORT_FILE"
+python3 signal_engine.py | tee -a "$REPORT_FILE"
 echo "Step 3 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 4: Catalyst screener ─────────────────────────────
@@ -93,17 +95,17 @@ echo "Step 6 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 7: Fundamental analysis ──────────────────────────
 echo "Step 7: Running fundamental analysis scorecard..."
-python3 fundamental_analysis.py | tee -a "$REPORT_FILE"
+python3 fundamental_analysis.py --watchlist | tee -a "$REPORT_FILE"
 echo "Step 7 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 8: SEC insider signals ───────────────────────────
 echo "Step 8: Scanning SEC EDGAR (Form 4, 13D, 8-K)..."
-python3 sec_module.py | tee -a "$REPORT_FILE"
+python3 sec_module.py --scan | tee -a "$REPORT_FILE"
 echo "Step 8 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 9: Congressional trades ─────────────────────────
 echo "Step 9: Fetching congressional trade disclosures..."
-python3 congress_trades.py | tee -a "$REPORT_FILE"
+python3 congress_trades.py --scan | tee -a "$REPORT_FILE"
 echo "Step 9 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 10: Polymarket ───────────────────────────────────
@@ -142,12 +144,12 @@ fi
 
 # ── Step 14: Max pain ─────────────────────────────────────
 echo "Step 14: Computing options max pain levels..."
-python3 max_pain.py | tee -a "$REPORT_FILE"
+python3 max_pain.py --watchlist | tee -a "$REPORT_FILE"
 echo "Step 14 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 15: Volume profile ───────────────────────────────
 echo "Step 15: Computing volume profiles and VWAP levels..."
-python3 volume_profile.py | tee -a "$REPORT_FILE"
+python3 volume_profile.py --watchlist | tee -a "$REPORT_FILE"
 echo "Step 15 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 16: Paper trader ─────────────────────────────────

@@ -857,12 +857,17 @@ def main():
     parser.add_argument("--status", action="store_true", help="Open positions + P&L")
     parser.add_argument("--history", action="store_true", help="Closed trade history")
     parser.add_argument("--report", action="store_true", help="Weekly report section")
+    parser.add_argument("--update", action="store_true", help="Show zones + open positions (pipeline mode)")
     parser.add_argument("--notes", type=str, default="", help="Trade notes")
     args = parser.parse_args()
 
     conn = init_db()
 
-    if args.zones:
+    if args.update:
+        show_zones()
+        print()
+        show_status(conn)
+    elif args.zones:
         show_zones()
     elif args.buy:
         ticker, price, size = args.buy

@@ -550,12 +550,28 @@ def main() -> None:
                         help="Also display all 11 sector regimes")
     parser.add_argument("--refresh", action="store_true",
                         help="Force cache refresh (ignore TTL)")
+    parser.add_argument("--compute", action="store_true",
+                        help="Compute regime and write JSON output (use with --output)")
+    parser.add_argument("--output", metavar="PATH",
+                        help="Write regime JSON to this file path")
     args = parser.parse_args()
 
     mr = get_market_regime(force_refresh=args.refresh)
     sr = get_sector_regimes(force_refresh=args.refresh) if args.sectors else None
-    _print_regime_summary(mr, sr)
-    print()
+
+    if args.compute and args.output:
+        payload = {"market": mr}
+        if sr is not None:
+            payload["sectors"] = sr
+        import pathlib
+        pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output, "w") as fh:
+            import json as _json
+            _json.dump(payload, fh, indent=2, default=str)
+        print(f"  Regime written → {args.output}")
+    else:
+        _print_regime_summary(mr, sr)
+        print()
 
 
 if __name__ == "__main__":

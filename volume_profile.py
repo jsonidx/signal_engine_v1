@@ -314,40 +314,71 @@ def get_volume_profile(
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Volume Profile — Support & Resistance")
-    parser.add_argument("ticker",           help="Ticker symbol (e.g. AAPL, GME)")
-    parser.add_argument("--period",  default=DEFAULT_PERIOD, help="yfinance period (default: 1y)")
-    parser.add_argument("--bins",    type=int, default=DEFAULT_BINS, help="Price bins (default: 60)")
-    args = parser.parse_args()
+def _load_watchlist(path: str = "./watchlist.txt"):
+    tickers = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ticker = line.split("#")[0].strip().upper()
+                if ticker and not ticker.endswith("-USD"):
+                    tickers.append(ticker)
+    except FileNotFoundError:
+        print(f"  No {path} found.")
+    return list(dict.fromkeys(tickers))
 
-    ticker = args.ticker.upper()
-    print(f"\nBuilding volume profile for {ticker}...")
-    result = get_volume_profile(ticker, period=args.period, n_bins=args.bins)
 
-    if not result:
-        print("  ERROR: Could not compute (insufficient data or download failed).")
-        sys.exit(1)
-
+def _print_volume_profile(ticker: str, result: dict) -> None:
     cur = result["current_price"]
     print(f"\n  Current price:   ${cur}")
     print(f"  POC:             ${result['poc_price']}  ({result['poc_distance_pct']:+.2f}%)")
     print(f"  Value Area:      ${result['value_area_low']} — ${result['value_area_high']}")
     print(f"  VWAP 20d:        ${result['vwap_20d']}")
     print(f"  VWAP 50d:        ${result['vwap_50d']}")
-
     print(f"\n  RESISTANCE (above ${cur}):")
     for r in result["resistance_levels"]:
         print(f"    ${r['price']:>10.2f}  dist: {r['distance_pct']:+.2f}%  strength: {r['strength_pct']}%")
-
     print(f"\n  SUPPORT (below ${cur}):")
     for s in result["support_levels"]:
         print(f"    ${s['price']:>10.2f}  dist: {s['distance_pct']:+.2f}%  strength: {s['strength_pct']}%")
-
     if result["lvn_levels"]:
         print(f"\n  LVN (thin air zones): {result['lvn_levels']}")
-
     print(f"\n  → {result['interpretation']}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Volume Profile — Support & Resistance")
+    parser.add_argument("ticker", nargs="?", help="Ticker symbol (e.g. AAPL, GME)")
+    parser.add_argument("--watchlist", action="store_true", help="Run for all tickers in watchlist.txt")
+    parser.add_argument("--period",  default=DEFAULT_PERIOD, help="yfinance period (default: 1y)")
+    parser.add_argument("--bins",    type=int, default=DEFAULT_BINS, help="Price bins (default: 60)")
+    args = parser.parse_args()
+
+    if args.watchlist:
+        tickers = _load_watchlist()
+        if not tickers:
+            print("  Watchlist is empty.")
+            return
+        print(f"\n  Volume profile scan — {len(tickers)} tickers")
+        for t in tickers:
+            print(f"\nBuilding volume profile for {t}...")
+            result = get_volume_profile(t, period=args.period, n_bins=args.bins)
+            if not result:
+                print(f"  {t}: Could not compute (insufficient data or download failed).")
+            else:
+                _print_volume_profile(t, result)
+    elif args.ticker:
+        ticker = args.ticker.upper()
+        print(f"\nBuilding volume profile for {ticker}...")
+        result = get_volume_profile(ticker, period=args.period, n_bins=args.bins)
+        if not result:
+            print("  ERROR: Could not compute (insufficient data or download failed).")
+            sys.exit(1)
+        _print_volume_profile(ticker, result)
+    else:
+        parser.error("provide a ticker or --watchlist")
 
 
 if __name__ == "__main__":

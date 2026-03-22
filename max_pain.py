@@ -231,21 +231,23 @@ def get_max_pain(
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(description="Max Pain — Options expiration price target")
-    parser.add_argument("ticker", help="Ticker symbol (e.g. AAPL, GME)")
-    parser.add_argument("--expirations", type=int, default=DEFAULT_N_EXPIRATIONS,
-                        help=f"Number of expirations to analyze (default: {DEFAULT_N_EXPIRATIONS})")
-    args = parser.parse_args()
+def _load_watchlist(path: str = "./watchlist.txt"):
+    tickers = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ticker = line.split("#")[0].strip().upper()
+                if ticker and not ticker.endswith("-USD"):
+                    tickers.append(ticker)
+    except FileNotFoundError:
+        print(f"  No {path} found.")
+    return list(dict.fromkeys(tickers))
 
-    ticker = args.ticker.upper()
-    print(f"\nCalculating max pain for {ticker}...")
-    result = get_max_pain(ticker, n_expirations=args.expirations)
 
-    if not result:
-        print("  ERROR: No options data (no listed options, or download failed).")
-        sys.exit(1)
-
+def _print_max_pain(ticker: str, result: dict) -> None:
     print(f"\n  Current price:  ${result['current_price']}")
     print(f"\n  {'EXPIRY':<12}  {'MAX PAIN':>10}  {'DIST':>7}  {'DIR':>5}  {'OI':>8}  STRENGTH")
     print("  " + "-" * 62)
@@ -255,9 +257,41 @@ def main():
             f"{e['distance_pct']:>+6.2f}%  {e['direction']:>5}  "
             f"{e['total_oi']:>8,}  {e['signal_strength']}"
         )
-
     print(f"\n  Pin zone (nearest): ${result['pin_zone_low']} — ${result['pin_zone_high']}")
     print(f"\n  → {result['interpretation']}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Max Pain — Options expiration price target")
+    parser.add_argument("ticker", nargs="?", help="Ticker symbol (e.g. AAPL, GME)")
+    parser.add_argument("--watchlist", action="store_true", help="Run for all tickers in watchlist.txt")
+    parser.add_argument("--expirations", type=int, default=DEFAULT_N_EXPIRATIONS,
+                        help=f"Number of expirations to analyze (default: {DEFAULT_N_EXPIRATIONS})")
+    args = parser.parse_args()
+
+    if args.watchlist:
+        tickers = _load_watchlist()
+        if not tickers:
+            print("  Watchlist is empty.")
+            return
+        print(f"\n  Max pain scan — {len(tickers)} tickers")
+        for t in tickers:
+            print(f"\nCalculating max pain for {t}...")
+            result = get_max_pain(t, n_expirations=args.expirations)
+            if not result:
+                print(f"  {t}: No options data.")
+            else:
+                _print_max_pain(t, result)
+    elif args.ticker:
+        ticker = args.ticker.upper()
+        print(f"\nCalculating max pain for {ticker}...")
+        result = get_max_pain(ticker, n_expirations=args.expirations)
+        if not result:
+            print("  ERROR: No options data (no listed options, or download failed).")
+            sys.exit(1)
+        _print_max_pain(ticker, result)
+    else:
+        parser.error("provide a ticker or --watchlist")
 
 
 if __name__ == "__main__":

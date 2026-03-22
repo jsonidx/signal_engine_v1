@@ -984,8 +984,8 @@ Examples:
         choices=["score", "ev", "juice"],
         default="ev",
         help=(
-            "Ranking key: 'ev' = expected value score×juice (default, best for picking), "
-            "'score' = squeeze setup quality only, 'juice' = raw upside % only"
+            "Ranking key: 'ev' = expected value score x juice (default, best for picking), "
+            "'score' = squeeze setup quality only, 'juice' = raw upside %% only"
         ),
     )
     parser.add_argument(
