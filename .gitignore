@@ -23,5 +23,9 @@ polymarket_cache.json
 # Local cache databases (generated, not committed)
 *.db
 
+# Dashboard frontend build artifacts
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+
 # OS
 .DS_Store
