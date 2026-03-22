@@ -1,12 +1,27 @@
 #!/bin/bash
 # Signal Engine v1 — Master Pipeline
-# Schedule: Sunday 19:00 + Wednesday 20:00 via launchd
+# Schedule: Monday 14:45 Berlin time via launchd (com.signalengine.master.monday)
 #
 # COST ESTIMATE (ai_quant.py --top-n 5):
 #   ~5 Claude API calls × ~€0.02–0.04 = ~€0.10–0.20 per run
 #   2 runs/week = ~€0.80–1.60/month
 #   To process more tickers: change --top-n 5 to --top-n 10
 #   Full universe (no cap): python3 ai_quant.py --no-limit  ← WARNING: high cost
+#
+# USAGE:
+#   bash run_master.sh             → full run including Claude API (~€0.10–0.20)
+#   bash run_master.sh --skip-ai   → data refresh only, no API cost (€0.00)
+#
+# USE --skip-ai WHEN:
+#   - You want fresh data without paying for Claude synthesis
+#   - Running mid-week outside the Monday schedule
+#   - Debugging pipeline steps without burning API credits
+#   - The last Claude run was recent and thesis is still valid
+#
+# OMIT --skip-ai WHEN:
+#   - It is your scheduled Monday run
+#   - A major market event happened (earnings, macro print, squeeze)
+#   - You opened or closed a position since the last run
 #
 # Open positions are read dynamically from trade_journal.db at runtime via
 # _get_open_positions() in ai_quant.py. Static fallback: config.AI_QUANT_ALWAYS_INCLUDE
@@ -19,6 +34,22 @@ REPORT_FILE="$REPORT_DIR/signal_report_$DATE.txt"
 mkdir -p "$REPORT_DIR"
 mkdir -p "data"
 mkdir -p "logs"
+
+# ── Flag parsing ──────────────────────────────────────────
+SKIP_AI=false
+for arg in "$@"; do
+  case $arg in
+    --skip-ai) SKIP_AI=true ;;
+  esac
+done
+
+if [ "$SKIP_AI" = true ]; then
+  echo "────────────────────────────────────────────────"
+  echo " --skip-ai: Step 13 skipped. Cost this run: €0.00"
+  echo " All data modules will run. Claude API will NOT."
+  echo "────────────────────────────────────────────────"
+  echo ""
+fi
 
 echo "================================================"
 echo " Signal Engine v1 — $(date '+%Y-%m-%d %H:%M')"
@@ -95,9 +126,19 @@ echo "Step 12 complete." | tee -a "$REPORT_FILE"
 # Open positions are read dynamically from trade_journal.db at runtime.
 # Static fallback: config.AI_QUANT_ALWAYS_INCLUDE = ['GME', 'COIN', 'SAP']
 # To override: python3 ai_quant.py --tickers AAPL,MSFT or --no-limit (high cost).
-echo "Step 13: AI Quant synthesis (top 5 tickers — Claude API capped)..."
-python3 ai_quant.py --top-n 5 | tee -a "$REPORT_FILE"
-echo "Step 13 complete." | tee -a "$REPORT_FILE"
+if [ "$SKIP_AI" = true ]; then
+  echo "Step 13: SKIPPED — no Anthropic API calls (--skip-ai flag set)" \
+    | tee -a "$REPORT_FILE"
+  echo "  Last Claude synthesis: check ai_quant_cache.db for most recent run." \
+    | tee -a "$REPORT_FILE"
+  echo "  To run synthesis now: python3 ai_quant.py --top-n 5" \
+    | tee -a "$REPORT_FILE"
+  echo "Step 13 skipped." | tee -a "$REPORT_FILE"
+else
+  echo "Step 13: AI Quant synthesis (top 5 tickers — Claude API capped)..."
+  python3 ai_quant.py --top-n 5 | tee -a "$REPORT_FILE"
+  echo "Step 13 complete." | tee -a "$REPORT_FILE"
+fi
 
 # ── Step 14: Max pain ─────────────────────────────────────
 echo "Step 14: Computing options max pain levels..."
@@ -150,6 +191,13 @@ echo ""
 echo "================================================"
 echo " Pipeline complete — $(date '+%Y-%m-%d %H:%M')"
 echo " Report: $REPORT_FILE"
+if [ "$SKIP_AI" = true ]; then
+  echo " Cost this run:  €0.00 (--skip-ai — Claude API skipped)"
+  echo " AI thesis:      NOT refreshed — using cached results"
+else
+  echo " Cost this run:  ~€0.10–0.20 (5 Claude API calls)"
+  echo " AI thesis:      refreshed for top 5 tickers"
+fi
 echo "================================================"
 
 # ── IMPORTANT: Step 13 uses --top-n 5. Do not change this line. ──
