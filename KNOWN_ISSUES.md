@@ -1,6 +1,6 @@
 # Known Issues & TODOs
 
-Last updated: 2026-03-22
+Last updated: 2026-03-22 (dashboard verification pass + post-integration corrections)
 
 ---
 
@@ -34,7 +34,8 @@ These are structural limitations of free data sources — not bugs, but delibera
 | 8 | **Multi-asset crypto signals retired** — original module had −0.20 Sharpe | `paper_trader.py` | Replaced with BTC-only 200-MA binary signal; no altcoin signal currently |
 | 9 | **`--social` flag in catalyst_screener.py** — Reddit sentiment component exists in CLI and scoring logic but implementation is uncertain after Reddit API policy changes (2023) | `catalyst_screener.py` | Unknown — needs audit; may silently return empty results |
 | 10 | **`catalyst_backtest.py` referenced but may not exist** — `run_master.sh` Step 7 calls `catalyst_backtest.py --universe full` | `run_master.sh` | Needs verification; if missing, Step 7 silently fails |
-| 11 | **No React/frontend dashboard** — referenced in planning docs but no frontend code exists in the repo | — | Not started |
+| 11 | **`/api/darkpool/top` returns empty** — `data/dark_pool_latest.json` is not generated until `run_master.sh` Step 1 runs at least once | `dark_pool_flow.py`, `dashboard/api/main.py` | Run `python3 dark_pool_flow.py --scan --output data/dark_pool_latest.json` to populate |
+| 11a | **`signal_agreement_score` null in heatmap** — existing `ai_quant_cache.db` rows from before the 2026-03-22 refactor have null agreement scores | `dashboard/api/main.py` | Schema migrated; values populate on next `ai_quant.py` run |
 
 ---
 
@@ -42,11 +43,11 @@ These are structural limitations of free data sources — not bugs, but delibera
 
 | # | Issue | Affected Module | Notes |
 |---|-------|----------------|-------|
-| 12 | **No conflict resolution layer** — conflicting signals from different modules are not automatically reconciled; delegated entirely to Claude in `ai_quant.py` or manual review | `ai_quant.py` | By design for now; consider a weighted-vote aggregator |
+| 12 | **Conflict resolution layer implemented** — `conflict_resolver.py` runs deterministic weighted vote across all modules before Claude is called. MODULE_WEIGHTS are currently heuristic (see Note E). | `conflict_resolver.py`, `ai_quant.py` | Recalibrate weights after 12 weeks using resolution logs. |
 | 13 | **No real-time intraday capability** — all data via yfinance 15-min delayed quotes; system is weekly/end-of-day only | All modules | Would require Polygon.io or similar for intraday |
 | 14 | **Survivorship bias** — universe defined from current ticker lists; delisted stocks excluded from all analysis and backtests | `signal_engine.py`, backtest modules | Affects backtest validity |
 | 15 | **Point-in-time fundamental data missing** — yfinance returns current values, not as-reported historical values; backtests using fundamental scores have look-ahead bias | `fundamental_analysis.py`, backtest modules | Requires a point-in-time data provider to fix |
-| 16 | **SQLite concurrency risk** — if modules run in parallel, write locks on `ai_quant_cache.db` and `fundamentals_cache.db` may error | `ai_quant.py`, `fundamentals_cache.py` | `run_master.sh` runs modules sequentially as mitigation |
+| 16 | **SQLite concurrency** — WAL mode active via `utils/db.py` on all three databases. Write locks are no longer a risk for sequential runs. Parallel execution still not supported. | `ai_quant.py`, `fundamentals_cache.py`, `trade_journal.py` | Do not run two pipeline instances simultaneously. |
 | 17 | **FX conversion not applied to crypto P&L** — `fx_rates.py` maps 54 equity tickers to currencies but crypto prices are USD throughout; EUR P&L for crypto positions may be inconsistent | `fx_rates.py`, `paper_trader.py` | Needs explicit USD→EUR conversion in crypto position sizing |
 
 ---
