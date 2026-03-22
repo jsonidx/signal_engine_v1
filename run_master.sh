@@ -2,10 +2,10 @@
 # Signal Engine v1 — Master Pipeline
 # Schedule: Sunday 19:00 + Wednesday 20:00 via launchd
 #
-# COST ESTIMATE (ai_quant.py --top-n 10):
-#   ~10 Claude API calls × ~€0.02–0.04 = ~€0.20–0.40 per run
-#   2 runs/week = ~€1.60–3.20/month
-#   To process more tickers: change --top-n 10 to --top-n 20
+# COST ESTIMATE (ai_quant.py --top-n 5):
+#   ~5 Claude API calls × ~€0.02–0.04 = ~€0.10–0.20 per run
+#   2 runs/week = ~€0.80–1.60/month
+#   To process more tickers: change --top-n 5 to --top-n 10
 #   Full universe (no cap): python3 ai_quant.py --no-limit  ← WARNING: high cost
 #
 # Open positions are read dynamically from trade_journal.db at runtime via
@@ -95,8 +95,8 @@ echo "Step 12 complete." | tee -a "$REPORT_FILE"
 # Open positions are read dynamically from trade_journal.db at runtime.
 # Static fallback: config.AI_QUANT_ALWAYS_INCLUDE = ['GME', 'COIN', 'SAP']
 # To override: python3 ai_quant.py --tickers AAPL,MSFT or --no-limit (high cost).
-echo "Step 13: AI Quant synthesis (top 10 tickers — Claude API capped)..."
-python3 ai_quant.py --top-n 10 | tee -a "$REPORT_FILE"
+echo "Step 13: AI Quant synthesis (top 5 tickers — Claude API capped)..."
+python3 ai_quant.py --top-n 5 | tee -a "$REPORT_FILE"
 echo "Step 13 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 14: Max pain ─────────────────────────────────────
@@ -152,6 +152,6 @@ echo " Pipeline complete — $(date '+%Y-%m-%d %H:%M')"
 echo " Report: $REPORT_FILE"
 echo "================================================"
 
-# ── IMPORTANT: Step 13 uses --top-n 10. Do not change this line. ──
-# Any future edits to run_master.sh must preserve: python3 ai_quant.py --top-n 10
+# ── IMPORTANT: Step 13 uses --top-n 5. Do not change this line. ──
+# Any future edits to run_master.sh must preserve: python3 ai_quant.py --top-n 5
 # See config.py AI_QUANT_MAX_TICKERS to change the cap.

@@ -219,7 +219,7 @@ SOCIAL_BEARISH_THRESHOLD         = 0.35 # bull_ratio below this → BEARISH sent
 # ============================================================
 # AI QUANT API CALL LIMITS
 # ============================================================
-AI_QUANT_MAX_TICKERS = 10           # Hard cap on Claude API calls per run
+AI_QUANT_MAX_TICKERS = 5            # Hard cap on Claude API calls per run
 AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
 AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
 AI_QUANT_ALWAYS_INCLUDE = [         # Always process regardless of rank (open positions)
