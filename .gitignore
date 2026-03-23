@@ -18,10 +18,17 @@ signals_output/
 signal_reports/
 *.csv
 *.json
-polymarket_cache.json
-
 # Local cache databases (generated, not committed)
 *.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+
+# Cache JSON files
+fx_cache.json
+polymarket_cache.json
 
 # Dashboard frontend build artifacts
 dashboard/frontend/node_modules/
