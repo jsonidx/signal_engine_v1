@@ -207,12 +207,13 @@ type SignalFilter = 'ALL' | 'ACCUMULATION' | 'DISTRIBUTION'
 export function DarkPoolPage() {
   const [filter, setFilter] = useState<SignalFilter>('ALL')
 
-  const { data, isLoading } = useQuery({
+  const { data: rawData, isLoading } = useQuery({
     queryKey: ['darkpool', 'top', filter],
     queryFn: () => api.darkpoolTop(filter === 'ALL' ? undefined : filter, 30),
     staleTime: 15 * 60 * 1000,
     retry: 1,
   })
+  const data = Array.isArray(rawData) ? rawData : (rawData as any)?.data ?? []
 
   return (
     <Shell title="Dark Pool Flow">

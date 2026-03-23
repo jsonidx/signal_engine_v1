@@ -58,10 +58,9 @@ _INDEX_URLS: dict = {
         "https://www.ishares.com/us/products/239726/ISHARES-CORE-SP-500-ETF"
         "/1467271812596.ajax?fileType=csv&fileName=IVV_holdings&dataType=fund"
     ),
-    "nasdaq100": (
-        "https://www.ishares.com/us/products/253741/ISHARES-NASDAQ-100-ETF"
-        "/1467271812596.ajax?fileType=csv&fileName=CNDX_holdings&dataType=fund"
-    ),
+    # nasdaq100 removed — CNDX URL is the London UCITS version and 404s on iShares US.
+    # Russell 1000 + S&P 500 already cover all Nasdaq 100 constituents.
+    # "nasdaq100": "...",
     "sp400": (
         "https://www.ishares.com/us/products/239763/ISHARES-SP-MIDCAP-400-ETF"
         "/1467271812596.ajax?fileType=csv&fileName=IJH_holdings&dataType=fund"
@@ -101,7 +100,7 @@ try:
         UNIVERSE_CACHE_TTL_HOURS,
     )
 except ImportError:
-    UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "nasdaq100"]
+    UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "sp400"]
     UNIVERSE_PRESCREEN_TOP_N = 200
     UNIVERSE_MIN_DOLLAR_VOLUME = 3_000_000
     UNIVERSE_MIN_PRICE = 2.0
@@ -228,16 +227,24 @@ def _batch_close_volume(
     all_close: dict = {}
     all_volume: dict = {}
 
+    import io, contextlib, logging as _logging
+    # Silence yfinance's own ERROR/WARNING log spam for delisted/non-US tickers
+    _yf_logger = _logging.getLogger("yfinance")
+    _prev_level = _yf_logger.level
+    _yf_logger.setLevel(_logging.CRITICAL)
+
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
         try:
-            df = yf.download(
-                batch,
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
+            _buf = io.StringIO()
+            with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
+                df = yf.download(
+                    batch,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
             if df.empty:
                 continue
 
@@ -262,6 +269,7 @@ def _batch_close_volume(
                 "Batch download failed (batch starting %s): %s", batch[0], exc
             )
 
+    _yf_logger.setLevel(_prev_level)
     return all_close, all_volume
 
 
@@ -351,7 +359,7 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 100) -> list:
     for t in tickers:
         c = all_close.get(t)
         v = all_volume.get(t)
-        if c is None or v is None or len(c) < 126:
+        if c is None or v is None or len(c) < 20:   # 3mo period ≈ 63 bars; require ≥20
             continue
         price = float(c.iloc[-1])
         if price < UNIVERSE_MIN_PRICE:
@@ -479,30 +487,29 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
     return scores
 
 
-def _get_tier1_watchlist(watchlist_path: Path = None) -> list:
+def _get_favorites(watchlist_path: Path = None) -> list:
     """
-    Parse watchlist.txt and return tickers from the TIER 1 section only.
-    Returns [] if file not found or TIER 1 is empty.
+    Parse watchlist.txt and return all tickers from the FAVORITES section.
+    Returns [] if file not found or FAVORITES section is empty.
     """
     path = watchlist_path or _WATCHLIST_PATH
     if not path.exists():
         return []
     try:
         tickers: list = []
-        in_tier1 = False
+        in_favorites = False
         with open(path) as fh:
             for line in fh:
                 line = line.rstrip()
-                if "TIER 1" in line:
-                    in_tier1 = True
-                    continue
-                if in_tier1 and any(
-                    kw in line for kw in ("TIER 2", "TIER 3", "MANUALLY ADDED")
-                ):
-                    break
-                if not in_tier1:
-                    continue
                 stripped = line.strip()
+                if "FAVORITES" in stripped.upper() and stripped.startswith("#"):
+                    in_favorites = True
+                    continue
+                # Stop at next section header (# ── UNIVERSE or similar)
+                if in_favorites and stripped.startswith("# ──"):
+                    break
+                if not in_favorites:
+                    continue
                 if not stripped or stripped.startswith("#"):
                     continue
                 ticker = stripped.split()[0].strip()
@@ -510,7 +517,7 @@ def _get_tier1_watchlist(watchlist_path: Path = None) -> list:
                     tickers.append(ticker.upper())
         return tickers
     except Exception as exc:
-        logger.warning("Failed to parse watchlist.txt for Tier 1: %s", exc)
+        logger.warning("Failed to parse watchlist.txt for favorites: %s", exc)
         return []
 
 
@@ -531,7 +538,7 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     if top_n is None:
         top_n = UNIVERSE_PRESCREEN_TOP_N
 
-    tier1 = set(t.upper() for t in _get_tier1_watchlist())
+    tier1 = set(t.upper() for t in _get_favorites())
     t0 = time.time()
 
     scores = _compute_prescreen_scores(tickers)
@@ -561,6 +568,81 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     logger.info(msg)
 
     return result
+
+
+# ===========================================================================
+# WATCHLIST SEED
+# ===========================================================================
+
+def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> None:
+    """
+    Build master universe (2000+ tickers), run momentum prescreen to pick the
+    top trending candidates, then rewrite the UNIVERSE (auto) block in
+    watchlist.txt.
+
+    FAVORITES section is always preserved unchanged.
+    The UNIVERSE (auto) block is replaced with the latest momentum prescreen
+    results (default top 200 by 20d RS rank / volume surge / 52-week proximity).
+
+    Run via:
+        python3 universe_builder.py --update-watchlist [--top 300]
+    """
+    if top_n is None:
+        top_n = UNIVERSE_PRESCREEN_TOP_N
+
+    watchlist_path = _WATCHLIST_PATH
+
+    print("\n  Building master universe (liquidity filter)...")
+    universe = build_master_universe(indices)
+    print(f"  Liquidity-filtered universe: {len(universe)} tickers")
+
+    print(f"  Running momentum prescreen → top {top_n}...")
+    top_tickers = fast_momentum_prescreen(universe, top_n=top_n)
+
+    # Read existing watchlist lines verbatim
+    existing_lines: list[str] = []
+    if watchlist_path.exists():
+        existing_lines = watchlist_path.read_text().splitlines()
+
+    # Collect FAVORITES tickers (keep them out of the auto block)
+    favorites: set[str] = set(t.upper() for t in _get_favorites(watchlist_path))
+
+    # Tickers for the auto block = prescreen results minus favorites
+    auto_tickers = [t for t in top_tickers if t.upper() not in favorites]
+
+    # Strip old auto block; keep everything up to it
+    filtered_lines: list[str] = []
+    in_auto_block = False
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped.startswith("# ── UNIVERSE (auto)"):
+            in_auto_block = True
+            continue
+        if in_auto_block and (stripped.startswith("# ──") or stripped.startswith("# ==")):
+            in_auto_block = False
+        if not in_auto_block:
+            filtered_lines.append(line)
+
+    # Strip trailing blank lines from existing content
+    while filtered_lines and not filtered_lines[-1].strip():
+        filtered_lines.pop()
+
+    # Append new dynamic block
+    from datetime import datetime as _dt
+    stamp = _dt.now().strftime("%Y-%m-%d %H:%M")
+    filtered_lines.append("")
+    filtered_lines.append(
+        f"# ── UNIVERSE (auto) — top {len(auto_tickers)} by momentum prescreen  [{stamp}] ──"
+    )
+    for t in auto_tickers:
+        filtered_lines.append(t)
+    filtered_lines.append("")
+
+    watchlist_path.write_text("\n".join(filtered_lines) + "\n")
+    print(
+        f"  Watchlist updated: {len(favorites)} favorites + {len(auto_tickers)} dynamic tickers"
+        f"  →  watchlist.txt"
+    )
 
 
 # ===========================================================================
@@ -601,6 +683,11 @@ def main() -> None:
         help="Indices to use (default: config.UNIVERSE_INDICES)",
     )
     parser.add_argument(
+        "--update-watchlist",
+        action="store_true",
+        help="Refresh UNIVERSE (auto) block in watchlist.txt with top momentum tickers",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress INFO logging",
@@ -611,6 +698,10 @@ def main() -> None:
     logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
 
     indices = args.indices or UNIVERSE_INDICES
+
+    if args.update_watchlist:
+        _write_watchlist_from_universe(indices, top_n=args.top)
+        return
 
     if args.build_cache:
         print(f"\nBuilding universe cache for: {indices}")

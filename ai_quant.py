@@ -133,6 +133,7 @@ def _init_db() -> sqlite3.Connection:
             key_invalidation       TEXT,
             primary_scenario       TEXT,
             bear_scenario          TEXT,
+            expected_moves_json    TEXT,
             UNIQUE(ticker, date)
         )
     """)
@@ -145,6 +146,7 @@ def _init_db() -> sqlite3.Connection:
         ("key_invalidation",       "TEXT"),
         ("primary_scenario",       "TEXT"),
         ("bear_scenario",          "TEXT"),
+        ("expected_moves_json",    "TEXT"),
     ]
     for col, coltype in _new_columns:
         try:
@@ -178,13 +180,15 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
             "catalysts_json", "risks_json", "raw_response", "signals_json", "created_at",
             "bull_probability", "bear_probability", "neutral_probability",
             "signal_agreement_score", "key_invalidation", "primary_scenario", "bear_scenario",
+            "expected_moves_json",
         ]
         d = dict(zip(cols, row))
         # Expand JSON fields back to lists/dicts
-        d["catalysts"]     = json.loads(d.pop("catalysts_json") or "[]")
-        d["risks"]         = json.loads(d.pop("risks_json")     or "[]")
-        d["raw_response"]  = d.get("raw_response", "")
-        d["signals"]       = json.loads(d.pop("signals_json")   or "{}")
+        d["catalysts"]      = json.loads(d.pop("catalysts_json")      or "[]")
+        d["risks"]          = json.loads(d.pop("risks_json")          or "[]")
+        d["raw_response"]   = d.get("raw_response", "")
+        d["signals"]        = json.loads(d.pop("signals_json")        or "{}")
+        d["expected_moves"] = json.loads(d.pop("expected_moves_json") or "[]")
         return d
     except Exception:
         return None
@@ -202,8 +206,9 @@ def save_thesis(thesis: dict) -> None:
                  position_size_pct, thesis, data_quality, notes,
                  catalysts_json, risks_json, raw_response, signals_json, created_at,
                  bull_probability, bear_probability, neutral_probability,
-                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
+                 expected_moves_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
@@ -228,7 +233,8 @@ def save_thesis(thesis: dict) -> None:
                 signal_agreement_score=excluded.signal_agreement_score,
                 key_invalidation=excluded.key_invalidation,
                 primary_scenario=excluded.primary_scenario,
-                bear_scenario=excluded.bear_scenario
+                bear_scenario=excluded.bear_scenario,
+                expected_moves_json=excluded.expected_moves_json
         """, (
             thesis.get("ticker", "").upper(),
             date,
@@ -256,6 +262,7 @@ def save_thesis(thesis: dict) -> None:
             thesis.get("key_invalidation"),
             thesis.get("primary_scenario"),
             thesis.get("bear_scenario"),
+            json.dumps(thesis.get("expected_moves") or []),
         ))
         conn.commit()
         conn.close()
@@ -678,13 +685,21 @@ def compute_signal_agreement(signals_dict: dict) -> float:
 
     votes: list = []
 
-    # 1. signal_engine composite_z
+    # 1. signal_engine composite_z (live run) or RSI proxy (stored signals use "technical")
     comp_z = (signals_dict.get("signal_engine") or {}).get("composite_z")
     if comp_z is not None:
         if comp_z > 0.5:
             votes.append("BULL")
         elif comp_z < -0.5:
             votes.append("BEAR")
+    else:
+        # Fallback: use RSI from "technical" block (always present in stored signals)
+        rsi = (signals_dict.get("technical") or {}).get("rsi_14")
+        if rsi is not None:
+            if rsi > 60:
+                votes.append("BULL")
+            elif rsi < 40:
+                votes.append("BEAR")
 
     # 2. squeeze_screener final_score  (key: squeeze_score_100)
     sq_score = (signals_dict.get("squeeze") or {}).get("squeeze_score_100")
@@ -1160,6 +1175,7 @@ def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
         "key_invalidation":    None,
         "primary_scenario":    f"Blocked: {override_str}",
         "bear_scenario":       None,
+        "expected_moves":      [],
     }
 
 
@@ -1199,9 +1215,29 @@ Output MUST be in JSON format with this exact structure:
   "risks": ["...", "..."],
   "thesis": "2-3 sentence narrative",
   "data_quality": "HIGH|MEDIUM|LOW",
-  "notes": "any caveats or data gaps"
+  "notes": "any caveats or data gaps",
+  "expected_moves": [
+    {
+      "horizon": "today",
+      "bear_pct": -X.X,
+      "base_pct": X.X,
+      "bull_pct": X.X,
+      "bear_price": price,
+      "base_price": price,
+      "bull_price": price,
+      "bull_prob": 0.0-1.0,
+      "bear_prob": 0.0-1.0,
+      "neutral_prob": 0.0-1.0
+    },
+    { "horizon": "week", ... },
+    { "horizon": "month", ... },
+    { "horizon": "year", ... }
+  ]
 }
 
+For expected_moves: use intraday volatility (ATR/daily range) for "today", weekly ATR for "week",
+options expected move or fundamental catalysts for "month", and fundamental/macro thesis for "year".
+Each row's bull_prob + bear_prob + neutral_prob MUST sum to 1.0.
 IMPORTANT: bull_probability + bear_probability + neutral_probability MUST sum to exactly 1.0."""
 
 
@@ -2034,6 +2070,8 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     thesis["ticker"] = ticker
     thesis["signals"] = signals
     thesis["raw_response"] = raw
+    # Always use the pre-computed agreement score — don't rely on Claude to echo it back
+    thesis["signal_agreement_score"] = signals.get("signal_agreement_score", 0.0)
 
     # ── Apply conflict resolver hard constraints (Override 2: bear market cap) ─
     if _RESOLVER_AVAILABLE:
@@ -2427,8 +2465,33 @@ def main():
         "--dry-run", action="store_true",
         help="Print selection table and cost estimate without calling Claude",
     )
+    parser.add_argument(
+        "--backfill-agreement", action="store_true",
+        help="Recompute signal_agreement_score for all cached tickers (no API calls)",
+    )
     args = parser.parse_args()
     use_cache = not args.no_cache
+
+    # --backfill-agreement: recompute agreement scores from stored signals_json, no Claude calls
+    if args.backfill_agreement:
+        conn = _init_db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ticker, signals_json FROM thesis_cache"
+        ).fetchall()
+        updated = 0
+        for r in rows:
+            sigs = json.loads(r["signals_json"]) if r["signals_json"] else {}
+            score = compute_signal_agreement(sigs)
+            conn.execute(
+                "UPDATE thesis_cache SET signal_agreement_score=? WHERE ticker=?",
+                (score, r["ticker"]),
+            )
+            updated += 1
+        conn.commit()
+        conn.close()
+        print(f"Backfilled signal_agreement_score for {updated} cached ticker(s).")
+        return
 
     # --cache-show: print cache table and exit
     if args.cache_show:

@@ -309,7 +309,12 @@ def select_top_tickers(
     # ── Step 2: Load resolved signals, filter skip_claude ─────────────────────
     try:
         with open(resolved_signals_path) as f:
-            resolved_all = json.load(f)
+            raw = json.load(f)
+        # Support both list-of-dicts and dict-keyed-by-ticker formats
+        if isinstance(raw, list):
+            resolved_all = {r["ticker"]: r for r in raw if "ticker" in r}
+        else:
+            resolved_all = raw
     except Exception as exc:
         logger.error("Cannot load resolved signals from %s: %s", resolved_signals_path, exc)
         return []

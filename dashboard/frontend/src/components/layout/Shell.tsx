@@ -20,7 +20,7 @@ import { usePortfolioSummary } from '../../hooks/usePortfolio'
 const NAV_ITEMS = [
   { path: '/', label: 'Portfolio', icon: LayoutDashboard, exact: true, shortcut: 'p' },
   { path: '/heatmap', label: 'Signal Heatmap', icon: Grid3x3, shortcut: 'h' },
-  { path: '/ticker/AAPL', label: 'Ticker Deep Dive', icon: Search, shortcut: '' },
+  { path: '/deepdive', label: 'Deep Dive', icon: Search, shortcut: 't' },
   { path: '/screeners', label: 'Screeners', icon: Filter, shortcut: 's' },
   { path: '/darkpool', label: 'Dark Pool', icon: Activity, shortcut: 'd' },
   { path: '/backtest', label: 'Backtest', icon: BarChart2, shortcut: 'b' },

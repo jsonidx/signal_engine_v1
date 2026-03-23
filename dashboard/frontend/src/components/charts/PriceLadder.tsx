@@ -70,26 +70,26 @@ export function PriceLadder({
 
   const lines: LineSpec[] = []
 
-  if (target2 !== undefined)
+  if (target2 != null)
     lines.push({ price: target2, label: 'Target 2', color: '#22c55e', strokeW: 1, dashed: true, textColor: '#22c55e' })
-  if (target1 !== undefined)
+  if (target1 != null)
     lines.push({ price: target1, label: 'Target 1', color: '#22c55e', strokeW: 1.5, dashed: false, textColor: '#22c55e' })
-  if (stopLoss !== undefined)
+  if (stopLoss != null)
     lines.push({ price: stopLoss, label: 'Stop', color: '#ef4444', strokeW: 1, dashed: true, textColor: '#ef4444' })
 
   // Reference lines (ticks)
   const ticks: LineSpec[] = []
-  if (poc !== undefined)
+  if (poc != null)
     ticks.push({ price: poc, label: 'POC', color: '#a855f7', strokeW: 1, dashed: true, textColor: '#a855f7' })
-  if (vwap !== undefined)
+  if (vwap != null)
     ticks.push({ price: vwap, label: 'VWAP', color: '#3b82f6', strokeW: 1, dashed: true, textColor: '#3b82f6' })
-  if (maxPain !== undefined)
+  if (maxPain != null)
     ticks.push({ price: maxPain, label: 'MaxPain', color: '#f59e0b', strokeW: 1, dashed: true, textColor: '#f59e0b' })
 
   const currentY = y(currentPrice)
-  const hasEntryZone = entryLow !== undefined && entryHigh !== undefined
-  const entryY1 = entryHigh !== undefined ? y(entryHigh) : 0
-  const entryY2 = entryLow !== undefined ? y(entryLow) : 0
+  const hasEntryZone = entryLow != null && entryHigh != null
+  const entryY1 = entryHigh != null ? y(entryHigh) : 0
+  const entryY2 = entryLow != null ? y(entryLow) : 0
 
   return (
     <svg width={SVG_WIDTH} height={svgH} style={{ fontFamily: 'IBM Plex Mono, monospace' }}>

@@ -328,10 +328,20 @@ def compute_weighted_vote(signals_dict: dict) -> dict:
     total = bull_weight + bear_weight
     confidence = abs(bull_weight - bear_weight) / (total + 0.001)
 
-    # Agreement fraction over modules that actually cast a vote
+    # Agreement fraction over modules that actually cast a vote.
+    # For NEUTRAL outcomes no module can vote NEUTRAL, so use the larger side's
+    # count — conveys "this many modules agreed on the strongest direction".
     voting_directions = [v for v in module_votes.values() if v is not None]
-    agreeing = [v for v in voting_directions if v == net_direction]
-    agreement_fraction = (len(agreeing) / len(voting_directions)) if voting_directions else 0.0
+    if voting_directions:
+        if net_direction == "NEUTRAL":
+            bull_count = voting_directions.count("BULL")
+            bear_count = voting_directions.count("BEAR")
+            agreement_fraction = max(bull_count, bear_count) / len(voting_directions)
+        else:
+            agreeing = [v for v in voting_directions if v == net_direction]
+            agreement_fraction = len(agreeing) / len(voting_directions)
+    else:
+        agreement_fraction = 0.0
 
     return {
         "bull_weight":        round(bull_weight, 4),
@@ -519,3 +529,105 @@ def _log_resolution(ticker: str, resolved: dict) -> None:
             ])
     except Exception as exc:
         logger.warning("Failed to write conflict resolution log: %s", exc)
+
+
+# ==============================================================================
+# CLI ENTRY POINT
+# ==============================================================================
+
+def _load_watchlist(path: str = "./watchlist.txt") -> list:
+    tickers = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                t = line.split("#")[0].strip().upper()
+                if t:
+                    tickers.append(t)
+    except FileNotFoundError:
+        pass
+    return list(dict.fromkeys(tickers))
+
+
+def _load_ai_quant_signals(ticker: str, db_path: str = "./ai_quant_cache.db") -> dict:
+    """Pull latest signals_json for a ticker from ai_quant_cache.db."""
+    try:
+        import sqlite3, json as _json
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT signals_json FROM thesis_cache WHERE ticker=? ORDER BY date DESC LIMIT 1",
+            (ticker,)
+        ).fetchone()
+        conn.close()
+        if row and row["signals_json"]:
+            return _json.loads(row["signals_json"])
+    except Exception:
+        pass
+    return {}
+
+
+def main():
+    import argparse, json as _json, sys
+
+    parser = argparse.ArgumentParser(description="Conflict Resolver — deterministic signal arbitration")
+    parser.add_argument("--pre-resolve", action="store_true",
+                        help="Run pre-resolution pass for all watchlist tickers")
+    parser.add_argument("--output", metavar="PATH", default="data/resolved_signals.json",
+                        help="Output JSON file (default: data/resolved_signals.json)")
+    parser.add_argument("--regime", default="TRANSITIONAL",
+                        help="Market regime override (default: read from data/regime_latest.json)")
+    args = parser.parse_args()
+
+    if not args.pre_resolve:
+        parser.print_help()
+        sys.exit(0)
+
+    # Load current regime
+    regime = args.regime
+    try:
+        import json as _json2
+        rj = _json2.load(open("data/regime_latest.json"))
+        regime = rj.get("market", {}).get("regime", regime)
+    except Exception:
+        pass
+
+    tickers = _load_watchlist()
+    if not tickers:
+        print("  No watchlist tickers found.")
+        sys.exit(0)
+
+    results = []
+    for ticker in tickers:
+        signals_dict = _load_ai_quant_signals(ticker)
+        signals_dict["ticker"] = ticker
+        try:
+            r = resolve(signals_dict, regime)
+            results.append({
+                "ticker":                  ticker,
+                "direction":               r["pre_resolved_direction"],
+                "confidence":              round(r["pre_resolved_confidence"], 4),
+                "signal_agreement_score":  round(r["signal_agreement_score"], 4),
+                "override_flags":          r["override_flags"],
+                "skip_claude":             r["skip_claude"],
+                "bull_weight":             round(r["bull_weight"], 4),
+                "bear_weight":             round(r["bear_weight"], 4),
+            })
+        except Exception as exc:
+            logger.warning("resolve failed for %s: %s", ticker, exc)
+            results.append({"ticker": ticker, "direction": "NEUTRAL", "confidence": 0.0,
+                            "signal_agreement_score": 0.0, "override_flags": [], "skip_claude": False,
+                            "bull_weight": 0.0, "bear_weight": 0.0})
+
+    import pathlib
+    pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w") as f:
+        _json.dump(results, f, indent=2)
+
+    print(f"  Resolved {len(results)} tickers → {args.output}  (regime: {regime})")
+
+
+if __name__ == "__main__":
+    main()

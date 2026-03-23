@@ -28,6 +28,7 @@ import os
 import sys
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1033,8 +1034,40 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
         print("  [INFO] regime_filter not available — using config.py defaults")
 
     # ── Combine universes ─────────────────────────────────────────────────────
-    universe = list(set(EQUITY_WATCHLIST + CUSTOM_WATCHLIST))
-    print(f"  Universe: {len(universe)} tickers")
+    # Read dynamic watchlist.txt if present, fall back to hardcoded EQUITY_WATCHLIST
+    watchlist_path = Path(__file__).parent / "watchlist.txt"
+    dynamic_tickers: list = []
+    if watchlist_path.exists():
+        for line in watchlist_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            ticker = line.split()[0].upper()
+            # Skip tickers with dots (non-US exchanges — yfinance format incompatible)
+            if "." not in ticker:
+                dynamic_tickers.append(ticker)
+
+    base = dynamic_tickers if dynamic_tickers else EQUITY_WATCHLIST
+
+    # Always include open positions from trade_journal.db
+    open_positions: list = []
+    try:
+        import sqlite3 as _sqlite3
+        _db = Path(__file__).parent / "trade_journal.db"
+        if _db.exists():
+            _conn = _sqlite3.connect(str(_db))
+            open_positions = [r[0] for r in _conn.execute(
+                "SELECT DISTINCT ticker FROM trades WHERE status='open'"
+            ).fetchall()]
+            _conn.close()
+    except Exception as _e:
+        print(f"  [WARN] Could not read open positions from trade_journal.db: {_e}")
+
+    universe = list(set(base + CUSTOM_WATCHLIST + open_positions))
+    if open_positions:
+        print(f"  Universe: {len(universe)} tickers (from {'watchlist.txt' if dynamic_tickers else 'config.py'} + open positions: {open_positions})")
+    else:
+        print(f"  Universe: {len(universe)} tickers (from {'watchlist.txt' if dynamic_tickers else 'config.py'})")
 
     # Fetch data
     prices = fetch_price_data(universe, label="equity universe")

@@ -257,6 +257,62 @@ def _normalize_score(value: float, min_val: float, max_val: float,
         return 0.0
 
 
+def _cross_asset_signal_to_score(signal: Optional[str]) -> Optional[float]:
+    """Convert cross_asset string signal to [-1, 1] score."""
+    if not signal:
+        return None
+    s = str(signal).upper()
+    if "BOTTOM" in s or "OVERSOLD" in s or "BULLISH" in s:
+        return 0.8
+    if "TOP" in s or "OVERBOUGHT" in s or "BEARISH" in s:
+        return -0.8
+    return 0.0
+
+
+def _equity_signals_composite_z(ticker: str) -> Optional[float]:
+    """Look up composite_z for ticker from the latest equity_signals CSV."""
+    try:
+        sig_file = get_latest_signals_file()
+        if not sig_file:
+            return None
+        df = pd.read_csv(sig_file)
+        if "ticker" not in df.columns:
+            df = df.reset_index()
+            df.columns = ["ticker"] + list(df.columns[1:])
+        row = df[df["ticker"].str.upper() == ticker.upper()]
+        if row.empty:
+            return None
+        return _safe_float(row.iloc[0].get("composite_z"))
+    except Exception:
+        return None
+
+
+def _normalise_dp_trend(raw) -> Optional[str]:
+    """Convert dark_pool short_ratio_trend to 'up'/'down'/'flat' string."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    try:
+        val = float(raw)
+        if val > 0.001:
+            return "up"
+        if val < -0.001:
+            return "down"
+        return "flat"
+    except Exception:
+        return None
+
+
+def _normalise_dp_intensity(raw) -> Optional[float]:
+    """Normalise dark_pool_intensity to a 0–100 percentage.
+    dark_pool_flow stores it as a ratio (0.43 = 43%); convert if < 1."""
+    v = _safe_float(raw)
+    if v is None:
+        return None
+    return round(v * 100, 1) if v <= 1.0 else round(v, 1)
+
+
 def _json_safe(obj: Any) -> Any:
     """Recursively replace float NaN/Inf with None for JSON serialization."""
     if isinstance(obj, dict):
@@ -603,7 +659,8 @@ async def signals_latest(date: Optional[str] = Query(None)):
 @app.get("/api/signals/heatmap")
 async def signals_heatmap():
     """
-    Module-level signal matrix for all tickers with ai_quant cache entries.
+    Module-level signal matrix — sourced from equity_signals CSV (all watchlist
+    tickers), enriched with Claude cache, dark pool, squeeze, and fundamentals.
     Each row: ticker × {signal_engine, squeeze, options_flow, dark_pool,
                          fundamentals, social, polymarket, cross_asset}
     All scores normalised to [-1, +1].
@@ -613,99 +670,154 @@ async def signals_heatmap():
     if hit is not None:
         return hit
 
-    conn = _db_connect(AI_QUANT_DB)
-    if conn is None:
-        result = _no_data("ai_quant_cache.db not found")
-        _cache.set(cache_key, result, TTL_SHORT)
-        return result
-
     try:
-        rows = conn.execute("""
-            SELECT ticker, direction, conviction, signal_agreement_score, signals_json
-            FROM thesis_cache
-            ORDER BY date DESC
-        """).fetchall()
-        conn.close()
-
-        # Keep only the most recent entry per ticker
-        seen = {}
-        for r in rows:
-            t = r["ticker"]
-            if t not in seen:
-                seen[t] = r
-
-        # Load latest signals CSV for signal_engine z-score
+        # ── 1. Primary ticker universe: equity_signals CSV ────────────────────
         sig_file = get_latest_signals_file()
-        sig_df = None
+        sig_lookup: dict = {}   # ticker → row dict
         if sig_file:
-            sig_df = pd.read_csv(sig_file, index_col=0)
+            sig_df = pd.read_csv(sig_file)
+            # handle both index=ticker and column=ticker
+            if "ticker" not in sig_df.columns and sig_df.index.name == "ticker":
+                sig_df = sig_df.reset_index()
+            for _, row in sig_df.iterrows():
+                t = str(row.get("ticker", "")).upper()
+                if t:
+                    sig_lookup[t] = row.to_dict()
 
+        # ── 2. Watchlist tickers not in signals CSV ────────────────────────────
+        wl_path = BASE_DIR / "watchlist.txt"
+        if wl_path.exists():
+            for line in wl_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                t = line.split("#")[0].strip().upper()
+                if t and t not in sig_lookup:
+                    sig_lookup[t] = {}
+
+        if not sig_lookup:
+            result = _no_data("no equity_signals CSV and no watchlist.txt found")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        # ── 3. Claude cache: per-ticker module signals_json ───────────────────
+        claude_cache: dict = {}   # ticker → {direction, conviction, agreement, sigs}
+        conn = _db_connect(AI_QUANT_DB)
+        if conn:
+            rows = conn.execute("""
+                SELECT ticker, direction, conviction, signal_agreement_score, signals_json
+                FROM thesis_cache ORDER BY date DESC
+            """).fetchall()
+            conn.close()
+            for r in rows:
+                t = r["ticker"]
+                if t not in claude_cache:
+                    sigs = json.loads(r["signals_json"]) if r["signals_json"] else {}
+                    claude_cache[t] = {
+                        "direction":  r["direction"],
+                        "conviction": r["conviction"],
+                        "agreement":  r["signal_agreement_score"],
+                        "sigs":       sigs,
+                    }
+
+        # ── 4. Dark pool lookup ────────────────────────────────────────────────
+        dp_data = _load_dark_pool() or {}
+
+        # ── 5. Squeeze signals CSV ────────────────────────────────────────────
+        sq_lookup: dict = {}
+        sq_pattern = str(SIGNALS_DIR / "squeeze_signals_*.csv")
+        sq_files = sorted(glob.glob(sq_pattern))
+        if sq_files:
+            sq_df = pd.read_csv(sq_files[-1])
+            for _, row in sq_df.iterrows():
+                t = str(row.get("ticker", "")).upper()
+                if t:
+                    sq_lookup[t] = row.to_dict()
+
+        # ── 6. Fundamentals CSV ───────────────────────────────────────────────
+        fu_lookup: dict = {}
+        fu_pattern = str(SIGNALS_DIR / "fundamental_*.csv")
+        fu_files = sorted(glob.glob(fu_pattern))
+        if fu_files:
+            fu_df = pd.read_csv(fu_files[-1])
+            for _, row in fu_df.iterrows():
+                t = str(row.get("ticker", "")).upper()
+                if t:
+                    fu_lookup[t] = row.to_dict()
+
+        # ── 7. Build heatmap rows ─────────────────────────────────────────────
         heatmap = []
-        for ticker, r in seen.items():
-            signals_json = r["signals_json"]
-            sigs = json.loads(signals_json) if signals_json else {}
+        for ticker, sig_row in sig_lookup.items():
+            cc = claude_cache.get(ticker, {})
+            sigs = cc.get("sigs", {})
 
-            # signal_engine: composite_z from latest CSV → normalise [-3,3] to [-1,+1]
-            se_score = 0.0
-            if sig_df is not None and ticker in sig_df.index:
-                cz = _safe_float(sig_df.loc[ticker].get("composite_z"), 0)
-                se_score = _normalize_score(cz, -3.0, 3.0)
+            # signal_engine: composite_z → normalise [-3, +3] to [-1, +1]
+            cz = _safe_float(sig_row.get("composite_z"), None)
+            se_score = _normalize_score(cz, -3.0, 3.0) if cz is not None else 0.0
 
-            # squeeze: final_score (0–100) → -1/+1 around 50
-            sq = sigs.get("squeeze") or sigs.get("catalyst") or {}
-            sq_raw = _safe_float(sq.get("short_squeeze_score") or sq.get("final_score"), 0)
-            sq_max = _safe_float(sq.get("short_squeeze_max") or 100, 100)
-            sq_score = _normalize_score(sq_raw, 0.0, float(sq_max))
+            # squeeze: from squeeze CSV first, then Claude cache
+            sq_row = sq_lookup.get(ticker, {})
+            sq_raw = _safe_float(sq_row.get("final_score"), None)
+            if sq_raw is None:
+                sq = sigs.get("squeeze") or sigs.get("catalyst") or {}
+                sq_raw = _safe_float(sq.get("short_squeeze_score") or sq.get("final_score"), 50)
+            sq_score = _normalize_score(sq_raw, 0.0, 100.0)
 
-            # options_flow: heat_score (0–100)
+            # options_flow: Claude cache only
             of = sigs.get("options_flow") or {}
             of_score = _normalize_score(_safe_float(of.get("heat_score"), 50), 0.0, 100.0)
 
-            # dark_pool: score (0–100) from resolved signals or signals_json
-            dp_score = 0.0
-            dp_file = DATA_DIR / "dark_pool_latest.json"
-            if dp_file.exists():
-                with open(dp_file) as f:
-                    dp_data = json.load(f)
-                if isinstance(dp_data, dict) and ticker in dp_data:
-                    raw = _safe_float(dp_data[ticker].get("score"), 50)
-                    dp_score = _normalize_score(raw, 0.0, 100.0)
+            # dark_pool
+            dp_row = dp_data.get(ticker, {})
+            dp_raw = _safe_float(dp_row.get("dark_pool_score") or dp_row.get("score"), 50)
+            dp_score = _normalize_score(dp_raw, 0.0, 100.0) if dp_row else 0.0
 
-            # fundamentals: fundamental_score_pct (0–100)
-            fu = sigs.get("fundamentals") or {}
-            fu_score = _normalize_score(_safe_float(fu.get("fundamental_score_pct"), 50), 0.0, 100.0)
+            # fundamentals: from fundamentals CSV (operating_margin, earnings growth)
+            fu_row = fu_lookup.get(ticker, {})
+            fu_cc = sigs.get("fundamentals") or {}
+            fu_pct = _safe_float(fu_cc.get("fundamental_score_pct"), None)
+            if fu_pct is None:
+                # derive a simple score from earnings_growth_yoy if available
+                eg = _safe_float(fu_row.get("earnings_growth_yoy"), None)
+                fu_pct = 50.0 + min(40.0, max(-40.0, (eg or 0) * 100)) if eg is not None else 50.0
+            fu_score = _normalize_score(fu_pct, 0.0, 100.0)
 
-            # social: bull_ratio (0–1) centered at 0.5
+            # social / polymarket / cross_asset: Claude cache only
             soc = sigs.get("social") or {}
             bull_ratio = _safe_float(soc.get("bull_ratio"), 0.5)
             soc_score = _normalize_score(bull_ratio, 0.0, 1.0)
 
-            # polymarket: signal_score already -1/0/+1 or probability-based
             pm = sigs.get("polymarket") or {}
-            pm_raw = _safe_float(pm.get("signal_score") or pm.get("score"), 0)
-            pm_score = max(-1.0, min(1.0, pm_raw))
+            pm_score = max(-1.0, min(1.0, _safe_float(pm.get("signal_score") or pm.get("score"), 0)))
 
-            # cross_asset: BOTTOM=-1, NEUTRAL=0, TOP=+1
             ca = sigs.get("cross_asset") or {}
-            ca_sig = str(ca.get("signal", "NEUTRAL")).upper()
             ca_map = {"TOP": 1.0, "BOTTOM": -1.0, "NEUTRAL": 0.0}
-            ca_score = ca_map.get(ca_sig, 0.0)
+            ca_score = ca_map.get(str(ca.get("signal", "NEUTRAL")).upper(), 0.0)
+
+            # pre_resolved_direction: Claude DB → else derive from composite_z
+            direction = cc.get("direction") or (
+                "BULL" if (cz or 0) > 0.3 else "BEAR" if (cz or 0) < -0.3 else "NEUTRAL"
+            )
+
+            sector_val = str(sig_row.get("sector") or fu_row.get("sector") or "")
 
             heatmap.append({
-                "ticker": ticker,
-                "modules": {
-                    "signal_engine": round(se_score, 3),
-                    "squeeze":       round(sq_score, 3),
-                    "options_flow":  round(of_score, 3),
-                    "dark_pool":     round(dp_score, 3),
-                    "fundamentals":  round(fu_score, 3),
-                    "social":        round(soc_score, 3),
-                    "polymarket":    round(pm_score, 3),
-                    "cross_asset":   round(ca_score, 3),
-                },
-                "pre_resolved_direction":   r["direction"],
-                "signal_agreement_score":   _safe_float(r["signal_agreement_score"]),
+                "ticker":                  ticker,
+                "sector":                  sector_val,
+                "signal_engine":           round(se_score, 3),
+                "squeeze":                 round(sq_score, 3),
+                "options":                 round(of_score, 3),
+                "dark_pool":               round(dp_score, 3),
+                "fundamentals":            round(fu_score, 3),
+                "social":                  round(soc_score, 3),
+                "polymarket":              round(pm_score, 3),
+                "cross_asset":             round(ca_score, 3),
+                "pre_resolved_direction":  direction,
+                "signal_agreement_score":  _safe_float(cc.get("agreement")),
             })
+
+        # Sort by absolute signal_engine score descending
+        heatmap.sort(key=lambda r: abs(r["signal_engine"]), reverse=True)
 
         result = {"data_available": True, "count": len(heatmap), "data": heatmap}
         _cache.set(cache_key, result, TTL_SHORT)
@@ -744,7 +856,7 @@ async def signals_ticker(ticker: str):
         data = dict(row)
 
         # Parse JSON columns
-        for col in ("catalysts_json", "risks_json", "signals_json"):
+        for col in ("catalysts_json", "risks_json", "signals_json", "expected_moves_json"):
             if data.get(col):
                 try:
                     data[col] = json.loads(data[col])
@@ -754,51 +866,178 @@ async def signals_ticker(ticker: str):
         # Extract sub-signals for convenience
         sigs = data.get("signals_json") or {}
         of   = sigs.get("options_flow") or {}
-        dp   = sigs.get("dark_pool") or {}
+        dp   = sigs.get("dark_pool_flow") or sigs.get("dark_pool") or {}
         soc  = sigs.get("social") or {}
         sq   = sigs.get("squeeze") or sigs.get("catalyst") or {}
         vp   = sigs.get("volume_profile") or {}
         mp   = sigs.get("max_pain") or {}
 
+        # Build module scores dict expected by frontend ModuleMiniHeatmap
+        # signal_engine: composite_z from equity_signals CSV (authoritative); no fallback
+        # squeeze: squeeze_score_100 is 0–100 → normalise to [-1, 1] via (x-50)/50
+        # fundamentals: fundamental_score_pct is 0–100 → same normalisation
+        # cross_asset: string signal → numeric score
+        sq_raw   = sigs.get("squeeze") or sigs.get("catalyst") or {}
+        sq_score = _safe_float(sq_raw.get("squeeze_score_100") or sq_raw.get("short_squeeze_score"))
+        fu_raw   = sigs.get("fundamentals") or {}
+        fu_score = _safe_float(fu_raw.get("fundamental_score_pct") or fu_raw.get("composite_score"))
+        pm_raw   = sigs.get("polymarket")
+        pm_score = _safe_float(
+            (pm_raw.get("signal_score") if isinstance(pm_raw, dict) else None)
+        )
+        modules = {
+            "signal_engine": _equity_signals_composite_z(ticker),
+            "squeeze":        round((sq_score - 50) / 50, 3) if sq_score is not None else None,
+            "options":        _normalize_score(_safe_float(of.get("heat_score"), 50), 0, 100),
+            "dark_pool":      _normalize_score(_safe_float(dp.get("dark_pool_score") or dp.get("score"), 50), 0, 100),
+            "fundamentals":   round((fu_score - 50) / 50, 3) if fu_score is not None else None,
+            "social":         _safe_float(soc.get("bull_bear_ratio")),
+            "polymarket":     pm_score,
+            "cross_asset":    _cross_asset_signal_to_score((sigs.get("cross_asset") or {}).get("signal")),
+        }
+        modules = {k: v for k, v in modules.items() if v is not None}
+
+        # Fetch live price for PriceLadder rendering
+        prices = _fetch_current_prices([ticker])
+        current_price = prices.get(ticker)
+
         result = {
+            # ── Identity ──────────────────────────────────────────────────────
             "data_available": True,
-            "ticker":       ticker,
-            "last_updated": data.get("created_at"),
-            "ai_thesis": {
-                "direction":       data.get("direction"),
-                "conviction":      data.get("conviction"),
-                "time_horizon":    data.get("time_horizon"),
-                "thesis":          data.get("thesis"),
-                "primary_scenario": data.get("primary_scenario"),
-                "bear_scenario":   data.get("bear_scenario"),
-                "key_invalidation": data.get("key_invalidation"),
-                "bull_probability":    data.get("bull_probability"),
-                "bear_probability":    data.get("bear_probability"),
-                "neutral_probability": data.get("neutral_probability"),
-                "signal_agreement_score": data.get("signal_agreement_score"),
-                "catalysts":       data.get("catalysts_json"),
-                "risks":           data.get("risks_json"),
-                "data_quality":    data.get("data_quality"),
-            },
-            "entry_zone":   {"low": data.get("entry_low"),  "high": data.get("entry_high")},
+            "ticker":         ticker,
+            "last_updated":   data.get("created_at"),
+            "as_of":          data.get("date"),
+            "current_price":  current_price,
+            # ── Top-level fields expected by TickerDetail/TickerSignal ────────
+            "direction":      data.get("direction"),
+            "conviction":     data.get("conviction"),
+            "signal_agreement_score": data.get("signal_agreement_score"),
+            "ai_synthesis":   data.get("thesis"),   # TickerSignal compat alias
+            "modules":        modules,
+            "regime":         (sigs.get("regime") or {}).get("regime"),
+            # ── AI thesis fields ──────────────────────────────────────────────
+            "thesis":             data.get("thesis"),
+            "primary_scenario":   data.get("primary_scenario"),
+            "bear_scenario":      data.get("bear_scenario"),
+            "key_invalidation":   data.get("key_invalidation"),
+            "bull_probability":   data.get("bull_probability"),
+            "bear_probability":   data.get("bear_probability"),
+            "neutral_probability": data.get("neutral_probability"),
+            "time_horizon":       data.get("time_horizon"),
+            "data_quality":       data.get("data_quality"),
+            "catalysts":          data.get("catalysts_json"),
+            "risks":              data.get("risks_json"),
+            # ── Price levels ──────────────────────────────────────────────────
+            "entry_low":    data.get("entry_low"),
+            "entry_high":   data.get("entry_high"),
             "stop_loss":    data.get("stop_loss"),
-            "targets":      [data.get("target_1"), data.get("target_2")],
+            "target_1":     data.get("target_1"),
+            "target_2":     data.get("target_2"),
             "position_size_pct": data.get("position_size_pct"),
-            "signals":      sigs,
-            "max_pain":     mp,
+            "expected_moves": data.get("expected_moves_json") or [],
             "poc":          _safe_float(vp.get("poc")),
-            "vwap_20d":     _safe_float(vp.get("vwap_20d")),
-            "dark_pool":    dp,
-            "social":       soc,
-            "squeeze":      sq,
+            "vwap":         _safe_float(vp.get("vwap_20d")),
+            "max_pain":     _safe_float(mp.get("nearest_max_pain") or mp.get("max_pain_strike") or mp.get("max_pain")),
+            # ── Squeeze ───────────────────────────────────────────────────────
+            "squeeze_score":    _safe_float(sq.get("score")),
+            "float_short_pct":  _safe_float(sq.get("short_float_pct") or sq.get("float_short_pct")),
+            "days_to_cover":    _safe_float(sq.get("days_to_cover")),
+            "volume_surge":     _safe_float(sq.get("volume_surge")),
+            "recent_squeeze":   sq.get("recent_squeeze"),
+            "ftd_shares":       sq.get("ftd_shares"),
+            # ── Options ───────────────────────────────────────────────────────
+            "heat_score":        _safe_float(of.get("heat_score")),
+            "iv_rank":           _safe_float(of.get("iv_rank")),
+            "iv_source":         of.get("iv_source"),
+            "expected_move_pct": _safe_float(of.get("expected_move_pct")),
+            "put_call_ratio":    _safe_float(of.get("pc_ratio") or of.get("put_call_ratio")),
+            # ── Dark pool ─────────────────────────────────────────────────────
+            "dark_pool_score":     _safe_float(dp.get("dark_pool_score") or dp.get("score")),
+            "short_ratio_trend":   _normalise_dp_trend(dp.get("short_ratio_trend") or dp.get("trend")),
+            "dark_pool_intensity": _normalise_dp_intensity(dp.get("dark_pool_intensity") or dp.get("intensity") or dp.get("off_exchange_pct")),
+            # ── Social ────────────────────────────────────────────────────────
+            "trend_score":   _safe_float(soc.get("trend_score")),
+            "interest_level": _safe_float(soc.get("interest_level")),
+            "bull_bear_ratio": _safe_float(soc.get("bull_bear_ratio")),
+            "message_count": soc.get("message_count"),
+            # ── Raw nested (kept for backward compat) ─────────────────────────
+            "ai_thesis":     {
+                "direction": data.get("direction"), "conviction": data.get("conviction"),
+                "thesis": data.get("thesis"), "signal_agreement_score": data.get("signal_agreement_score"),
+            },
+            "entry_zone":    {"low": data.get("entry_low"), "high": data.get("entry_high")},
+            "targets":       [data.get("target_1"), data.get("target_2")],
+            "signals":       sigs,
+            "dark_pool":     dp,
+            "social":        soc,
+            "squeeze":       sq,
             "volume_profile": vp,
-            "options_heat": of,
+            "options_heat":  of,
         }
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 
     except Exception as e:
         log.exception("signals_ticker error for %s", ticker)
+        return _no_data(str(e))
+
+
+# ==============================================================================
+# SECTION 5b: DEEP DIVE LIST ENDPOINT
+# ==============================================================================
+
+@app.get("/api/deepdive/tickers")
+async def deepdive_tickers():
+    """All tickers analyzed by Claude, most recent first. Powers the Deep Dive list page."""
+    cache_key = "deepdive_tickers"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    conn = _db_connect(AI_QUANT_DB)
+    if conn is None:
+        result = _no_data("ai_quant_cache.db not found")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    try:
+        rows = conn.execute("""
+            SELECT ticker, date, direction, conviction, signal_agreement_score,
+                   time_horizon, data_quality, thesis, bull_probability,
+                   bear_probability, neutral_probability, created_at
+            FROM thesis_cache
+            ORDER BY date DESC, created_at DESC
+        """).fetchall()
+        conn.close()
+
+        # Keep only the most recent entry per ticker
+        seen: set = set()
+        tickers = []
+        for r in rows:
+            t = r["ticker"]
+            if t in seen:
+                continue
+            seen.add(t)
+            tickers.append({
+                "ticker":                 t,
+                "date":                   r["date"],
+                "direction":              r["direction"],
+                "conviction":             r["conviction"],
+                "signal_agreement_score": r["signal_agreement_score"],
+                "time_horizon":           r["time_horizon"],
+                "data_quality":           r["data_quality"],
+                "thesis_short":           (r["thesis"] or "")[:160],
+                "bull_probability":       r["bull_probability"],
+                "bear_probability":       r["bear_probability"],
+                "neutral_probability":    r["neutral_probability"],
+            })
+
+        result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("deepdive_tickers error")
         return _no_data(str(e))
 
 
@@ -1088,19 +1327,37 @@ async def regime_sectors():
 # ==============================================================================
 
 def _load_dark_pool() -> Optional[dict]:
-    """Load dark_pool_latest.json. Returns None if missing."""
+    """Load dark_pool_latest.json. Returns {ticker: row_dict} or None if missing.
+
+    Normalises two formats:
+      - New: {"generated": "...", "results": [{ticker, dark_pool_score, signal, ...}]}
+      - Legacy: {ticker: {signal, score, ...}}
+    """
     dp_file = DATA_DIR / "dark_pool_latest.json"
     if not dp_file.exists():
-        # Try finra_cache directory
         finra_dir = DATA_DIR / "finra_cache"
         if finra_dir.exists():
             files = sorted(finra_dir.glob("*.json"))
             if files:
                 with open(files[-1]) as f:
-                    return json.load(f)
-        return None
-    with open(dp_file) as f:
-        return json.load(f)
+                    raw = json.load(f)
+            else:
+                return None
+        else:
+            return None
+    else:
+        with open(dp_file) as f:
+            raw = json.load(f)
+
+    # New list-of-records format: {"results": [...]}
+    if isinstance(raw, dict) and "results" in raw:
+        return {row["ticker"]: row for row in raw["results"] if "ticker" in row}
+
+    # Legacy dict format: {ticker: {...}}
+    if isinstance(raw, dict):
+        return raw
+
+    return None
 
 
 @app.get("/api/darkpool/top")
@@ -1128,17 +1385,26 @@ async def darkpool_top(
             dp_signal = str(info.get("signal", "")).upper()
             if signal and dp_signal != signal.upper():
                 continue
+
+            # Normalise short_ratio_trend: numeric slope → 'up'/'down'/'flat'
+            raw_trend = info.get("short_ratio_trend")
+            if isinstance(raw_trend, (int, float)):
+                trend_str = "up" if raw_trend > 0.0001 else ("down" if raw_trend < -0.0001 else "flat")
+            else:
+                trend_str = str(raw_trend).lower() if raw_trend else "flat"
+
             rows.append({
-                "ticker":           ticker,
-                "signal":           dp_signal,
-                "score":            _safe_float(info.get("score")),
-                "short_ratio":      _safe_float(info.get("short_ratio")),
-                "off_exchange_pct": _safe_float(info.get("off_exchange_pct")),
-                "trend":            info.get("trend"),
-                "intensity":        info.get("intensity"),
+                "ticker":              ticker,
+                "signal":              dp_signal,
+                "dark_pool_score":     _safe_float(info.get("dark_pool_score") or info.get("score")),
+                "short_ratio":         _safe_float(info.get("short_ratio_today") or info.get("short_ratio")),
+                "short_ratio_trend":   trend_str,
+                "dark_pool_intensity": _safe_float(info.get("dark_pool_intensity") or info.get("intensity")),
+                "off_exchange_pct":    _safe_float(info.get("off_exchange_pct")),
+                "history":             info.get("short_ratio_history") or [],
             })
 
-        rows.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        rows.sort(key=lambda x: x.get("dark_pool_score") or 0, reverse=True)
         rows = rows[:limit]
 
         result = {"data_available": True, "count": len(rows), "data": rows}
@@ -1160,6 +1426,33 @@ async def darkpool_ticker(ticker: str):
     if ticker not in dp:
         return _no_data(f"no dark pool data for {ticker}")
     return {"data_available": True, "ticker": ticker, "data": dp[ticker]}
+
+
+# ==============================================================================
+# SECTION 8b: MAX PAIN LIVE ENDPOINT
+# ==============================================================================
+
+@app.get("/api/max_pain/{ticker}")
+async def max_pain_live(ticker: str, expirations: int = Query(4, ge=1, le=12)):
+    """Live max pain calculation — always fetches fresh options chain (1h TTL)."""
+    ticker = ticker.upper()
+    cache_key = f"max_pain:{ticker}:{expirations}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from max_pain import get_max_pain
+        result = get_max_pain(ticker, n_expirations=expirations)
+        if not result:
+            out = _no_data(f"no options data for {ticker}")
+        else:
+            out = {"data_available": True, "ticker": ticker, "data": result}
+        _cache.set(cache_key, out, 3600)  # 1h TTL — options chains update intraday
+        return out
+    except Exception as e:
+        log.exception("max_pain_live error")
+        return _no_data(str(e))
 
 
 # ==============================================================================
@@ -1322,20 +1615,36 @@ async def backtest_results():
         m = _json_safe(raw_m)
 
         equity_curve = []
+        period_start, period_end = None, None
         if eq_curve_file.exists():
             ec = pd.read_csv(eq_curve_file)
             equity_curve = _json_safe(ec.to_dict(orient="records"))
+            if len(ec) > 0 and "date" in ec.columns:
+                period_start = str(ec["date"].iloc[0])
+                period_end   = str(ec["date"].iloc[-1])
+
+        # Build a synthetic single window from aggregate metrics so the
+        # frontend's windows[] array is non-empty and renders correctly.
+        synthetic_window = {
+            "period_start":      period_start or "",
+            "period_end":        period_end   or "",
+            "total_return_pct":  (_safe_float(m.get("total_return_port")) or 0) * 100,
+            "sharpe":            _safe_float(m.get("sharpe")) or 0,
+            "max_drawdown_pct":  (_safe_float(m.get("max_drawdown")) or 0) * 100,
+            "hit_rate_pct":      (_safe_float(m.get("hit_rate_weekly")) or 0) * 100,
+            "n_trades":          0,
+        }
 
         result = {
             "data_available":    True,
             "label":             m.get("label", "Equity Multi-Factor"),
             "metrics":           m,
             "equity_curve":      equity_curve,
-            "windows":           [],   # populated if backtest_results.json exists
+            "windows":           [synthetic_window],
             "overall_sharpe":    _safe_float(m.get("sharpe_ratio") or m.get("sharpe")),
-            "spy_sharpe":        None,
+            "spy_sharpe":        _safe_float(m.get("cagr_bench")),  # best proxy available
             "factor_ic_table":   [],
-            "worst_window":      {},
+            "worst_window":      None,
             "weight_recommendations": {},
         }
         _cache.set(cache_key, result, TTL_LONG)

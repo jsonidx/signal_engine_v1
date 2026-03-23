@@ -168,7 +168,7 @@ YAHOO_FINANCE_TIMEOUT = 30      # Seconds before timeout per ticker
 # ============================================================
 # UNIVERSE BUILDER PARAMETERS
 # ============================================================
-UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "nasdaq100"]
+UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "sp400"]
 UNIVERSE_PRESCREEN_TOP_N = 200
 UNIVERSE_MIN_DOLLAR_VOLUME = 3_000_000   # 30-day avg dollar volume ($)
 UNIVERSE_MIN_PRICE = 2.0                 # Minimum share price ($)

@@ -87,7 +87,7 @@ export function ResolutionPage() {
   const logDateParam = selectedDate.replace(/-/g, '')
   const { data: richLog, isLoading: logLoading } = useQuery({
     queryKey: ['resolution', 'log', 'rich', logDateParam],
-    queryFn: () => api.resolutionLogRich(selectedDate, 100),
+    queryFn: () => api.resolutionLogRich(logDateParam, 100),
     retry: 1,
   })
 
@@ -110,18 +110,20 @@ export function ResolutionPage() {
     skip_claude: boolean
   }
 
-  const rows: NormRow[] = richLog
-    ? (richLog as NormRow[])
-    : (basicLog ?? []).map(r => ({
-        ticker: r.ticker,
-        timestamp: r.timestamp,
-        pre_resolved: r.input_direction,
-        confidence: 0,
-        bull_weight: 0,
-        bear_weight: 0,
-        overrides: r.override_reason ? [r.override_reason] : [],
-        skip_claude: r.skip_claude,
-      }))
+  const rows: NormRow[] = (richLog ?? basicLog ?? []).map((r: any) => ({
+    ticker: r.ticker,
+    timestamp: r.timestamp,
+    pre_resolved: r.pre_resolved ?? r.input_direction ?? '',
+    confidence: r.confidence ?? 0,
+    bull_weight: r.bull_weight ?? 0,
+    bear_weight: r.bear_weight ?? 0,
+    overrides: Array.isArray(r.overrides)
+      ? r.overrides
+      : r.override_reason
+        ? [r.override_reason]
+        : [],
+    skip_claude: r.skip_claude ?? false,
+  }))
 
   return (
     <Shell title="Conflict Resolution Log">

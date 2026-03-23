@@ -58,9 +58,11 @@ export function PortfolioPage() {
   const { data: history, isLoading: historyLoading } = usePortfolioHistory(52)
   const { data: positions, isLoading: positionsLoading } = usePortfolioPositions()
 
-  const last12Weeks = history?.slice(-12) || []
+  const historyArr = Array.isArray(history) ? history : (history as any)?.data ?? []
+  const last12Weeks = historyArr.slice(-12)
 
-  const sortedPositions = [...(positions || [])].sort(
+  const positionsArr = Array.isArray(positions) ? positions : (positions as any)?.data ?? []
+  const sortedPositions = [...positionsArr].sort(
     (a, b) => Math.abs(b.unrealized_pnl_eur) - Math.abs(a.unrealized_pnl_eur)
   )
 
@@ -138,7 +140,7 @@ export function PortfolioPage() {
             <LoadingSkeleton className="h-48" />
           ) : (
             <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={history}>
+              <AreaChart data={historyArr}>
                 <defs>
                   <linearGradient id="pnlGradient" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.15} />
@@ -229,7 +231,7 @@ export function PortfolioPage() {
             Open Positions
           </span>
           <span className="font-mono text-xs text-text-secondary">
-            {positions?.length ?? 0} positions
+            {positionsArr.length} positions
           </span>
         </div>
         {positionsLoading ? (

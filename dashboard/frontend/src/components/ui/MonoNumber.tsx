@@ -10,8 +10,9 @@ interface MonoNumberProps {
 }
 
 export function MonoNumber({ value, decimals = 2, prefix, suffix, colorBySign, className }: MonoNumberProps) {
-  const isPositive = value > 0
-  const isNegative = value < 0
+  const num = value ?? 0
+  const isPositive = num > 0
+  const isNegative = num < 0
 
   const colorClass = colorBySign
     ? isPositive
@@ -25,7 +26,7 @@ export function MonoNumber({ value, decimals = 2, prefix, suffix, colorBySign, c
 
   return (
     <span className={clsx('font-mono', colorClass, className)}>
-      {prefix}{sign}{value.toFixed(decimals)}{suffix}
+      {prefix}{sign}{num.toFixed(decimals)}{suffix}
     </span>
   )
 }

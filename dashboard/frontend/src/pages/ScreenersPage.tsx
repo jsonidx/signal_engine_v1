@@ -67,8 +67,9 @@ function useSortedRows<T>(
   const [sortDir, setSortDir] = useState<SortDir>(defaultDir)
 
   const sorted = useMemo(() => {
-    if (!rows) return []
-    return [...rows].sort((a, b) => {
+    const arr = Array.isArray(rows) ? rows : (rows as any)?.data ?? []
+    if (!arr.length) return []
+    return [...arr].sort((a, b) => {
       const av = a[sortKey] as number
       const bv = b[sortKey] as number
       return sortDir === 'desc' ? bv - av : av - bv

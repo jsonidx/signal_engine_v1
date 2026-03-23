@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import { PortfolioPage } from './pages/PortfolioPage'
 import { HeatmapPage } from './pages/HeatmapPage'
+import { DeepDivePage } from './pages/DeepDivePage'
 import { TickerPage } from './pages/TickerPage'
 import { ScreenersPage } from './pages/ScreenersPage'
 import { DarkPoolPage } from './pages/DarkPoolPage'
@@ -24,6 +25,7 @@ function KeyboardShortcuts() {
       switch (e.key) {
         case 'p': navigate('/'); break
         case 'h': navigate('/heatmap'); break
+        case 't': navigate('/deepdive'); break
         case 's': navigate('/screeners'); break
         case 'd': navigate('/darkpool'); break
         case 'b': navigate('/backtest'); break
@@ -57,6 +59,14 @@ export default function App() {
           element={
             <ErrorBoundary pageName="Signal Heatmap">
               <HeatmapPage />
+            </ErrorBoundary>
+          }
+        />
+        <Route
+          path="/deepdive"
+          element={
+            <ErrorBoundary pageName="Deep Dive">
+              <DeepDivePage />
             </ErrorBoundary>
           }
         />

@@ -170,8 +170,10 @@ def get_max_pain(
                 if max_pain_strike is None:
                     continue
 
-                total_oi = int(calls["openInterest"].fillna(0).sum() +
-                               puts["openInterest"].fillna(0).sum())
+                call_oi = int(calls["openInterest"].fillna(0).sum())
+                put_oi  = int(puts["openInterest"].fillna(0).sum())
+                total_oi = call_oi + put_oi
+                pc_ratio = round(put_oi / call_oi, 3) if call_oi > 0 else None
 
                 distance_pct = round(
                     (max_pain_strike - current_price) / current_price * 100, 2
@@ -196,7 +198,10 @@ def get_max_pain(
                     "max_pain":       max_pain_strike,
                     "distance_pct":   distance_pct,
                     "direction":      direction,
+                    "call_oi":        call_oi,
+                    "put_oi":         put_oi,
                     "total_oi":       total_oi,
+                    "pc_ratio":       pc_ratio,
                     "signal_strength": strength,
                     "pin_zone_low":   pin_low,
                     "pin_zone_high":  pin_high,
@@ -249,13 +254,14 @@ def _load_watchlist(path: str = "./watchlist.txt"):
 
 def _print_max_pain(ticker: str, result: dict) -> None:
     print(f"\n  Current price:  ${result['current_price']}")
-    print(f"\n  {'EXPIRY':<12}  {'MAX PAIN':>10}  {'DIST':>7}  {'DIR':>5}  {'OI':>8}  STRENGTH")
-    print("  " + "-" * 62)
+    print(f"\n  {'EXPIRY':<12}  {'MAX PAIN':>10}  {'DIST':>7}  {'DIR':>5}  {'OI':>8}  {'P/C':>5}  STRENGTH")
+    print("  " + "-" * 72)
     for e in result["all_expirations"]:
+        pc = f"{e['pc_ratio']:.2f}" if e.get('pc_ratio') is not None else "  —  "
         print(
             f"  {e['expiry']:<12}  ${e['max_pain']:>9.2f}  "
             f"{e['distance_pct']:>+6.2f}%  {e['direction']:>5}  "
-            f"{e['total_oi']:>8,}  {e['signal_strength']}"
+            f"{e['total_oi']:>8,}  {pc:>5}  {e['signal_strength']}"
         )
     print(f"\n  Pin zone (nearest): ${result['pin_zone_low']} — ${result['pin_zone_high']}")
     print(f"\n  → {result['interpretation']}\n")
@@ -277,11 +283,14 @@ def main():
         print(f"\n  Max pain scan — {len(tickers)} tickers")
         for t in tickers:
             print(f"\nCalculating max pain for {t}...")
-            result = get_max_pain(t, n_expirations=args.expirations)
-            if not result:
-                print(f"  {t}: No options data.")
-            else:
-                _print_max_pain(t, result)
+            try:
+                result = get_max_pain(t, n_expirations=args.expirations)
+                if not result:
+                    print(f"  {t}: No options data.")
+                else:
+                    _print_max_pain(t, result)
+            except Exception as exc:
+                print(f"  {t}: ERROR — {exc}")
     elif args.ticker:
         ticker = args.ticker.upper()
         print(f"\nCalculating max pain for {ticker}...")

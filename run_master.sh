@@ -60,7 +60,7 @@ echo "" | tee "$REPORT_FILE"
 
 # ── Step 0: Universe builder ──────────────────────────────
 echo "Step 0: Building dynamic universe (Russell 1000/2000, S&P 500, Nasdaq 100)..."
-python3 universe_builder.py --build-cache
+python3 universe_builder.py --build-cache --update-watchlist
 echo "Step 0 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 1: Dark pool flow ────────────────────────────────
@@ -80,7 +80,7 @@ echo "Step 3 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 4: Catalyst screener ─────────────────────────────
 echo "Step 4: Running catalyst screener (dynamic universe)..."
-python3 catalyst_screener.py --use-dynamic-universe | tee -a "$REPORT_FILE"
+python3 catalyst_screener.py --use-dynamic-universe --update-watchlist | tee -a "$REPORT_FILE"
 echo "Step 4 complete." | tee -a "$REPORT_FILE"
 
 # ── Step 5: Options flow ──────────────────────────────────
@@ -131,6 +131,9 @@ echo "Step 12 complete." | tee -a "$REPORT_FILE"
 if [ "$SKIP_AI" = true ]; then
   echo "Step 13: SKIPPED — no Anthropic API calls (--skip-ai flag set)" \
     | tee -a "$REPORT_FILE"
+  echo "  Backfilling signal_agreement_score from cached signals..." \
+    | tee -a "$REPORT_FILE"
+  python3 ai_quant.py --backfill-agreement | tee -a "$REPORT_FILE"
   echo "  Last Claude synthesis: check ai_quant_cache.db for most recent run." \
     | tee -a "$REPORT_FILE"
   echo "  To run synthesis now: python3 ai_quant.py --top-n 5" \
@@ -184,6 +187,11 @@ results = collect_and_store_iv(tickers)
 print(f'IV stored for {len(results)} tickers (open positions: {open_positions})')
 "
 echo "Step 18 complete." | tee -a "$REPORT_FILE"
+
+# ── Step 19: Backtest (latest window + factor IC) ────────
+echo "Step 19: Running backtest (latest window, factor IC, weight suggestions)..."
+python3 backtest.py --run-latest --factor-ic --suggest-weights | tee -a "$REPORT_FILE"
+echo "Step 19 complete." | tee -a "$REPORT_FILE"
 
 # ── Post-run: invalidate dashboard cache ─────────────────
 echo "Invalidating dashboard cache (if running)..."

@@ -11,7 +11,7 @@ interface MetricCardProps {
 }
 
 export function MetricCard({ label, value, unit, delta, deltaLabel, colorBySign, sentiment }: MetricCardProps) {
-  const numericValue = typeof value === 'number' ? value : parseFloat(String(value))
+  const numericValue = typeof value === 'number' ? (isNaN(value) ? 0 : value) : parseFloat(String(value)) || 0
   const isPositive = numericValue > 0
   const isNegative = numericValue < 0
 
@@ -42,7 +42,7 @@ export function MetricCard({ label, value, unit, delta, deltaLabel, colorBySign,
       </span>
       <div className="flex items-baseline gap-1">
         <span className={clsx('font-mono text-[28px] font-semibold leading-none', valueColor)}>
-          {typeof value === 'number' ? value.toFixed(2) : value}
+          {typeof value === 'number' ? numericValue.toFixed(2) : value}
         </span>
         {unit && (
           <span className="font-mono text-sm text-text-secondary">{unit}</span>

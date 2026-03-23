@@ -9,9 +9,12 @@ import { MonoNumber } from '../components/ui/MonoNumber'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
 import { PriceLadder } from '../components/charts/PriceLadder'
+import { useQuery } from '@tanstack/react-query'
 import { useSignalsTicker } from '../hooks/useHeatmap'
 import { useDarkPoolTicker } from '../hooks/useDarkPool'
 import { useHeatmap } from '../hooks/useHeatmap'
+import { api } from '../lib/api'
+import type { MaxPainData } from '../lib/api'
 import { clsx } from 'clsx'
 
 // ─── Module score color encoding (same as heatmap) ────────────────────────────
@@ -201,7 +204,7 @@ function DarkPoolGauge({ score, trend, intensity }: { score: number; trend?: str
           <TrendIcon size={12} className={trendColor} />
           <span>{trend ?? '—'} trend</span>
         </div>
-        {intensity !== undefined && (
+        {intensity != null && (
           <span>{intensity.toFixed(1)}% intensity</span>
         )}
       </div>
@@ -222,7 +225,7 @@ function SocialCard({
   bullBearRatio?: number
   messageCount?: number
 }) {
-  if (trendScore === undefined && bullBearRatio === undefined) return null
+  if (trendScore == null && bullBearRatio == null) return null
   return (
     <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
       <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
@@ -243,7 +246,7 @@ function SocialCard({
             )}
           </div>
         )}
-        {bullBearRatio !== undefined && (
+        {bullBearRatio != null && (
           <div className="space-y-1.5">
             <div className="font-mono text-[10px] text-text-tertiary uppercase">StockTwits</div>
             <div className="flex items-baseline gap-1">
@@ -320,6 +323,162 @@ function CatalystsAccordion({
   )
 }
 
+// ─── Expected Moves table ──────────────────────────────────────────────────────
+
+interface ExpectedMove {
+  horizon: string
+  bear_pct: number
+  base_pct: number
+  bull_pct: number
+  bear_price: number
+  base_price: number
+  bull_price: number
+  bull_prob: number
+  bear_prob: number
+  neutral_prob: number
+}
+
+const HORIZON_LABEL: Record<string, string> = {
+  today: 'Today',
+  week:  'This Week',
+  month: 'This Month',
+  year:  'This Year',
+}
+
+function ExpectedMovesTable({ moves, currentPrice }: { moves: ExpectedMove[]; currentPrice: number }) {
+  if (!moves?.length) return null
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-3">
+      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+        Expected Price Movement
+      </div>
+      {/* Header */}
+      <div className="grid grid-cols-[80px_1fr_1fr_1fr_1fr] gap-x-2 font-mono text-[9px] uppercase tracking-wide text-text-tertiary border-b border-border-subtle pb-1">
+        <span></span>
+        <span className="text-accent-red text-center">Bear</span>
+        <span className="text-text-secondary text-center">Base</span>
+        <span className="text-accent-green text-center">Bull</span>
+        <span className="text-center">Prob (B/N/Be)</span>
+      </div>
+      {moves.map((m) => {
+        const fmtPct = (v: number) => (v >= 0 ? `+${v.toFixed(1)}%` : `${v.toFixed(1)}%`)
+        const fmtPrice = (v: number) => `$${v.toFixed(2)}`
+        const bullPct  = Math.round((m.bull_prob ?? 0) * 100)
+        const neutralPct = Math.round((m.neutral_prob ?? 0) * 100)
+        const bearPct  = Math.round((m.bear_prob ?? 0) * 100)
+        return (
+          <div
+            key={m.horizon}
+            className="grid grid-cols-[80px_1fr_1fr_1fr_1fr] gap-x-2 items-center"
+          >
+            {/* Horizon label */}
+            <span className="font-mono text-[10px] text-text-tertiary">
+              {HORIZON_LABEL[m.horizon] ?? m.horizon}
+            </span>
+            {/* Bear */}
+            <div className="text-center space-y-0.5">
+              <div className="font-mono text-xs font-semibold text-accent-red">
+                {fmtPct(m.bear_pct)}
+              </div>
+              <div className="font-mono text-[9px] text-text-tertiary">
+                {fmtPrice(m.bear_price)}
+              </div>
+            </div>
+            {/* Base */}
+            <div className="text-center space-y-0.5">
+              <div className={clsx(
+                'font-mono text-xs font-semibold',
+                m.base_pct >= 0 ? 'text-accent-green' : 'text-accent-red'
+              )}>
+                {fmtPct(m.base_pct)}
+              </div>
+              <div className="font-mono text-[9px] text-text-tertiary">
+                {fmtPrice(m.base_price)}
+              </div>
+            </div>
+            {/* Bull */}
+            <div className="text-center space-y-0.5">
+              <div className="font-mono text-xs font-semibold text-accent-green">
+                {fmtPct(m.bull_pct)}
+              </div>
+              <div className="font-mono text-[9px] text-text-tertiary">
+                {fmtPrice(m.bull_price)}
+              </div>
+            </div>
+            {/* Probability bar */}
+            <div className="space-y-1">
+              <div className="h-2 rounded overflow-hidden flex">
+                <div style={{ width: `${bullPct}%` }}    className="bg-accent-green" />
+                <div style={{ width: `${neutralPct}%` }} className="bg-text-tertiary/30" />
+                <div style={{ width: `${bearPct}%` }}    className="bg-accent-red" />
+              </div>
+              <div className="font-mono text-[9px] text-text-tertiary text-center">
+                {bullPct}% / {neutralPct}% / {bearPct}%
+              </div>
+            </div>
+          </div>
+        )
+      })}
+      <div className="font-mono text-[9px] text-text-tertiary pt-1 border-t border-border-subtle">
+        Prob columns: Bull / Neutral / Bear · Prices based on current ${currentPrice.toFixed(2)}
+      </div>
+    </div>
+  )
+}
+
+// ─── Live Max Pain card ────────────────────────────────────────────────────────
+
+function MaxPainCard({ data }: { data: MaxPainData }) {
+  const nearest = data.all_expirations[0]
+  const dirColor = nearest?.direction === 'UP' ? '#22c55e' : nearest?.direction === 'DOWN' ? '#ef4444' : '#a1a1aa'
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
+      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
+        Max Pain (live)
+      </div>
+      {/* Header row */}
+      <div className="flex items-center gap-2 font-mono text-[9px] text-text-tertiary uppercase tracking-wide border-b border-border-subtle pb-1">
+        <span className="w-24">Expiry</span>
+        <span className="w-16 text-right">Max Pain</span>
+        <span className="w-12 text-right">Dist</span>
+        <span className="w-16 text-right">OI</span>
+        <span className="w-10 text-right">P/C</span>
+        <span className="w-12 text-right">Strength</span>
+      </div>
+      <div className="space-y-1.5">
+        {data.all_expirations.map((e) => {
+          const pcColor = e.pc_ratio == null ? '#71717a'
+            : e.pc_ratio > 1.2 ? '#ef4444'
+            : e.pc_ratio < 0.8 ? '#22c55e'
+            : '#a1a1aa'
+          return (
+            <div key={e.expiry} className="flex items-center gap-2">
+              <span className="font-mono text-[10px] text-text-tertiary w-24">{e.expiry}</span>
+              <span className="font-mono text-xs font-semibold text-text-primary w-16 text-right">${e.max_pain.toFixed(2)}</span>
+              <span className="font-mono text-[10px] w-12 text-right" style={{ color: e.direction === 'UP' ? '#22c55e' : e.direction === 'DOWN' ? '#ef4444' : '#a1a1aa' }}>
+                {e.distance_pct > 0 ? '+' : ''}{e.distance_pct.toFixed(1)}%
+              </span>
+              <span className="font-mono text-[10px] text-text-tertiary w-16 text-right">{e.total_oi.toLocaleString()}</span>
+              <span className="font-mono text-[10px] w-10 text-right font-semibold" style={{ color: pcColor }}>
+                {e.pc_ratio != null ? e.pc_ratio.toFixed(2) : '—'}
+              </span>
+              <span className={clsx(
+                'font-mono text-[9px] px-1 rounded w-12 text-center',
+                e.signal_strength === 'HIGH' ? 'bg-accent-green/20 text-accent-green'
+                  : e.signal_strength === 'MEDIUM' ? 'bg-accent-amber/20 text-accent-amber'
+                  : 'bg-bg-elevated text-text-tertiary'
+              )}>{e.signal_strength}</span>
+            </div>
+          )
+        })}
+      </div>
+      <div className="font-mono text-[10px] text-text-tertiary pt-1 border-t border-border-subtle">
+        {data.interpretation}
+      </div>
+    </div>
+  )
+}
+
 // ─── Page ──────────────────────────────────────────────────────────────────────
 
 export function TickerPage() {
@@ -327,6 +486,12 @@ export function TickerPage() {
   const { data: signal, isLoading } = useSignalsTicker(symbol)
   const { data: dpHistory } = useDarkPoolTicker(symbol)
   const { data: heatmapRows } = useHeatmap()
+  const { data: maxPainLive } = useQuery({
+    queryKey: ['max_pain', symbol],
+    queryFn: () => api.maxPainLive(symbol),
+    staleTime: 60 * 60 * 1000, // 1h — matches server TTL
+    enabled: !!symbol,
+  })
 
   const allTickers = useMemo(() => heatmapRows?.map(r => r.ticker).sort() ?? [], [heatmapRows])
 
@@ -371,7 +536,7 @@ export function TickerPage() {
                   <div className="font-mono text-xs text-text-tertiary mt-1">{signal.as_of}</div>
                 </div>
                 <div className="text-right">
-                  {signal.current_price !== undefined && (
+                  {signal.current_price != null && (
                     <div className="font-mono text-[28px] font-semibold leading-none text-text-primary">
                       ${signal.current_price.toFixed(2)}
                     </div>
@@ -439,7 +604,7 @@ export function TickerPage() {
             </div>
 
             {/* Price Ladder */}
-            {signal.current_price !== undefined && (
+            {signal.current_price != null && (
               <div className="bg-bg-surface border border-border-subtle rounded p-4">
                 <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
                   Price Levels
@@ -453,10 +618,18 @@ export function TickerPage() {
                   stopLoss={signal.stop_loss}
                   poc={signal.poc}
                   vwap={signal.vwap}
-                  maxPain={signal.max_pain}
+                  maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
                   height={280}
                 />
               </div>
+            )}
+
+            {/* Expected Moves */}
+            {signal.expected_moves?.length > 0 && signal.current_price != null && (
+              <ExpectedMovesTable
+                moves={signal.expected_moves}
+                currentPrice={signal.current_price}
+              />
             )}
 
             {/* Module mini-heatmap */}
@@ -487,7 +660,7 @@ export function TickerPage() {
                     <div key={label} className="text-center space-y-1">
                       <div className="font-mono text-[10px] text-text-tertiary uppercase">{label}</div>
                       <div className="font-mono text-base font-semibold text-text-primary">
-                        {value !== undefined ? `${value.toFixed(1)}${suffix}` : '—'}
+                        {value != null ? `${value.toFixed(1)}${suffix}` : '—'}
                       </div>
                     </div>
                   ))}
@@ -513,10 +686,10 @@ export function TickerPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-2">
                   {[
-                    { label: 'IV Rank', value: signal.iv_rank !== undefined ? `${signal.iv_rank.toFixed(0)}%` : '—' },
-                    { label: 'Exp Move', value: signal.expected_move_pct !== undefined ? `±${signal.expected_move_pct.toFixed(1)}%` : '—' },
-                    { label: 'P/C Ratio', value: signal.put_call_ratio !== undefined ? signal.put_call_ratio.toFixed(2) : '—' },
-                    { label: 'Max Pain', value: signal.max_pain !== undefined ? `$${signal.max_pain.toFixed(2)}` : '—' },
+                    { label: 'IV Rank', value: signal.iv_rank != null ? `${signal.iv_rank.toFixed(0)}%` : '—' },
+                    { label: 'Exp Move', value: signal.expected_move_pct != null ? `±${signal.expected_move_pct.toFixed(1)}%` : '—' },
+                    { label: 'P/C Ratio', value: signal.put_call_ratio != null ? signal.put_call_ratio.toFixed(2) : '—' },
+                    { label: 'Max Pain', value: (maxPainLive?.nearest_max_pain ?? signal.max_pain) != null ? `$${(maxPainLive?.nearest_max_pain ?? signal.max_pain)!.toFixed(2)}` : '—' },
                   ].map(({ label, value }) => (
                     <div key={label} className="flex justify-between">
                       <span className="font-mono text-[10px] text-text-tertiary uppercase">{label}</span>
@@ -571,6 +744,9 @@ export function TickerPage() {
                 </div>
               </div>
             )}
+
+            {/* Live max pain */}
+            {maxPainLive && <MaxPainCard data={maxPainLive} />}
 
             {/* Catalysts & Risks */}
             <CatalystsAccordion catalysts={signal.catalysts} risks={signal.risks} />

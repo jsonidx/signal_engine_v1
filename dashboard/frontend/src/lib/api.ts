@@ -188,6 +188,34 @@ export interface DarkPoolCard {
   history?: Array<{ date: string; short_ratio: number }>
 }
 
+// ─── Max Pain ─────────────────────────────────────────────────────────────────
+
+export interface MaxPainExpiry {
+  expiry: string
+  days_to_expiry: number
+  max_pain: number
+  distance_pct: number
+  direction: string
+  call_oi: number
+  put_oi: number
+  total_oi: number
+  pc_ratio: number | null
+  signal_strength: string
+}
+
+export interface MaxPainData {
+  current_price: number
+  nearest_expiry: string
+  nearest_max_pain: number
+  nearest_distance_pct: number
+  nearest_direction: string
+  nearest_days_to_expiry: number
+  nearest_total_oi: number
+  nearest_signal_strength: string
+  all_expirations: MaxPainExpiry[]
+  interpretation: string
+}
+
 // ─── Backtest ─────────────────────────────────────────────────────────────────
 
 export interface BacktestResult {
@@ -262,82 +290,116 @@ export interface UniverseStats {
 export const api = {
   // Portfolio
   portfolioSummary: (): Promise<PortfolioSummary> =>
-    client.get('/api/portfolio/summary').then(r => r.data),
+    client.get('/api/portfolio/summary').then(r => {
+      const d = r.data
+      return {
+        ...d,
+        spy_return_pct: d.spy_return_pct ?? d.benchmark_return_pct ?? 0,
+        total_pnl_eur:  d.total_pnl_eur  ?? d.total_value_eur  ?? 0,
+      }
+    }),
 
   portfolioHistory: (weeks: number): Promise<PortfolioHistoryPoint[]> =>
-    client.get(`/api/portfolio/history?weeks=${weeks}`).then(r => r.data),
+    client.get(`/api/portfolio/history?weeks=${weeks}`).then(r => r.data?.data ?? []),
 
   portfolioPositions: (): Promise<Position[]> =>
-    client.get('/api/portfolio/positions').then(r => r.data),
+    client.get('/api/portfolio/positions').then(r => {
+      const rows: any[] = r.data?.data ?? []
+      const dirMap: Record<string, string> = { LONG: 'BULL', SHORT: 'BEAR', BULL: 'BULL', BEAR: 'BEAR', NEUTRAL: 'NEUTRAL' }
+      return rows.map(p => ({
+        ...p,
+        size_eur:    p.size_eur    ?? p.position_size_eur ?? 0,
+        conviction:  p.conviction  ?? 0,
+        direction:   dirMap[p.direction] ?? 'NEUTRAL',
+      }))
+    }),
 
   // Signals
   signalsLatest: (date?: string): Promise<TickerSignal[]> =>
-    client.get('/api/signals/latest', { params: date ? { date } : {} }).then(r => r.data),
+    client.get('/api/signals/latest', { params: date ? { date } : {} }).then(r => r.data?.data ?? []),
 
   signalsHeatmap: (): Promise<HeatmapRow[]> =>
-    client.get('/api/signals/heatmap').then(r => r.data),
+    client.get('/api/signals/heatmap').then(r => r.data?.data ?? []),
 
   signalsTicker: (ticker: string): Promise<TickerDetail> =>
-    client.get(`/api/signals/ticker/${ticker}`).then(r => r.data),
+    client.get(`/api/signals/ticker/${ticker}`).then(r => r.data?.data ?? r.data),
 
   // Regime
   regimeCurrent: (): Promise<RegimeCurrent> =>
-    client.get('/api/regime/current').then(r => r.data),
+    client.get('/api/regime/current').then(r => {
+      const d = r.data
+      return { ...d, as_of: d.as_of ?? d.computed_at }
+    }),
 
   regimeHistory: (): Promise<RegimeCurrent[]> =>
-    client.get('/api/regime/history').then(r => r.data),
-
-  // Screeners (legacy minimal)
-  screenerCatalyst: (): Promise<ScreenerResult[]> =>
-    client.get('/api/screener/catalyst').then(r => r.data),
-
-  screenerSqueeze: (): Promise<ScreenerResult[]> =>
-    client.get('/api/screener/squeeze').then(r => r.data),
-
-  screenerOptions: (): Promise<ScreenerResult[]> =>
-    client.get('/api/screener/options').then(r => r.data),
+    client.get('/api/regime/history').then(r => r.data?.data ?? []),
 
   // Screeners (rich)
   screenerSqueezeRich: (minScore = 40): Promise<SqueezeScreenerRow[]> =>
-    client.get('/api/screeners/squeeze', { params: { min_score: minScore } }).then(r => r.data),
+    client.get('/api/screeners/squeeze', { params: { min_score: minScore } }).then(r => r.data?.data ?? []),
 
   screenerCatalystRich: (minScore = 4): Promise<CatalystScreenerRow[]> =>
-    client.get('/api/screeners/catalysts', { params: { min_score: minScore } }).then(r => r.data),
+    client.get('/api/screeners/catalysts', { params: { min_score: minScore } }).then(r => r.data?.data ?? []),
 
   screenerOptionsRich: (minHeat = 40): Promise<OptionsScreenerRow[]> =>
-    client.get('/api/screeners/options', { params: { min_heat: minHeat } }).then(r => r.data),
+    client.get('/api/screeners/options', { params: { min_heat: minHeat } }).then(r => r.data?.data ?? []),
 
   // Dark pool
-  darkpoolLatest: (): Promise<DarkPoolEntry[]> =>
-    client.get('/api/darkpool/latest').then(r => r.data),
+  darkpoolLatest: (): Promise<DarkPoolCard[]> =>
+    client.get('/api/darkpool/top', { params: { limit: 50 } }).then(r => r.data?.data ?? []),
 
   darkpoolTicker: (ticker: string): Promise<DarkPoolEntry[]> =>
-    client.get(`/api/darkpool/ticker/${ticker}`).then(r => r.data),
+    client.get(`/api/darkpool/ticker/${ticker}`).then(r => r.data?.data ?? r.data),
 
   darkpoolTop: (signal?: string, limit = 30): Promise<DarkPoolCard[]> =>
-    client.get('/api/darkpool/top', { params: { ...(signal ? { signal } : {}), limit } }).then(r => r.data),
+    client.get('/api/darkpool/top', { params: { ...(signal ? { signal } : {}), limit } }).then(r => r.data?.data ?? []),
+
+  // Max pain — live fetch (1h cache on server)
+  maxPainLive: (ticker: string): Promise<MaxPainData | null> =>
+    client.get(`/api/max_pain/${ticker}`).then(r => r.data?.data_available ? r.data.data : null).catch(() => null),
 
   // Backtest
   backtestResults: (): Promise<BacktestResult[]> =>
-    client.get('/api/backtest/results').then(r => r.data),
-
-  backtestSummary: (): Promise<Record<string, unknown>> =>
-    client.get('/api/backtest/summary').then(r => r.data),
+    client.get('/api/backtest/results').then(r => r.data?.windows ?? []),
 
   backtestSummaryFull: (): Promise<BacktestSummaryFull> =>
-    client.get('/api/backtest/summary').then(r => r.data),
+    client.get('/api/backtest/results').then(r => {
+      const d = r.data ?? {}
+      return {
+        oos_sharpe:              d.overall_sharpe,
+        spy_sharpe:              d.spy_sharpe,
+        worst_drawdown_window:   d.worst_window,
+        factor_ics:              d.factor_ic_table ?? [],
+        weight_recommendations:  d.weight_recommendations ?? {},
+        windows:                 d.windows ?? [],
+      }
+    }),
 
   // Resolution
   resolutionLog: (limit?: number): Promise<ResolutionLog[]> =>
-    client.get('/api/resolution/log', { params: limit ? { limit } : {} }).then(r => r.data),
+    client.get('/api/resolution/log', { params: limit ? { limit } : {} }).then(r => r.data?.data ?? []),
 
   resolutionLogRich: (date?: string, limit = 100): Promise<ResolutionLogEntry[]> =>
-    client.get('/api/resolution/log', { params: { ...(date ? { date } : {}), limit } }).then(r => r.data),
+    client.get('/api/resolution/log', { params: { ...(date ? { date } : {}), limit } }).then(r => r.data?.data ?? []),
 
   resolutionStats: (): Promise<ResolutionStats> =>
-    client.get('/api/resolution/stats').then(r => r.data),
+    client.get('/api/resolution/stats').then(r => {
+      const d = r.data ?? {}
+      return {
+        claude_skip_rate_pct:  d.claude_skip_rate_pct  ?? d.claude_skip_rate ?? 0,
+        avg_agreement_score:   d.avg_agreement_score   ?? d.module_agreement_avg ?? 0,
+        most_common_override:  d.most_common_override  ?? '—',
+        bear_cb_hits_30d:      d.bear_cb_hits_30d      ?? d.bear_circuit_breaker_hits ?? 0,
+      }
+    }),
 
   // Universe
   universeStats: (): Promise<UniverseStats> =>
-    client.get('/api/universe/stats').then(r => r.data),
+    client.get('/api/universe/stats').then(r => {
+      const d = r.data ?? {}
+      return {
+        tickers: d.tickers ?? [],
+        total:   d.total   ?? d.total_tickers ?? 0,
+      }
+    }),
 }

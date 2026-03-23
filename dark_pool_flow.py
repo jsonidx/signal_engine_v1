@@ -35,7 +35,7 @@ USAGE:
     python3 dark_pool_flow.py --ticker AAPL
     python3 dark_pool_flow.py --tickers AAPL MSFT NVDA
     python3 dark_pool_flow.py --scan --output data/dark_pool_latest.json
-    python3 dark_pool_flow.py --scan                  # scans watchlist TIER 1+2
+    python3 dark_pool_flow.py --scan                  # scans all tickers in watchlist.txt
 
 OUTPUT (per ticker):
     dark_pool_score      : 0-100  (50 = neutral baseline)
@@ -471,16 +471,20 @@ def compute_dark_pool_signal(
     interpretation = _make_interpretation(signal, slope, sr_zscore, dpi, sr_today)
 
     return {
-        "ticker":              ticker,
-        "dark_pool_score":     score,
-        "signal":              signal,
-        "short_ratio_today":   round(sr_today,  4),
-        "short_ratio_mean":    round(sr_mean,   4),
-        "short_ratio_trend":   round(slope,     6),
-        "short_ratio_zscore":  round(sr_zscore, 3),
-        "dark_pool_intensity": round(dpi,       4),
-        "days_of_data":        n,
-        "interpretation":      interpretation,
+        "ticker":                ticker,
+        "dark_pool_score":       score,
+        "signal":                signal,
+        "short_ratio_today":     round(sr_today,  4),
+        "short_ratio_mean":      round(sr_mean,   4),
+        "short_ratio_trend":     round(slope,     6),
+        "short_ratio_zscore":    round(sr_zscore, 3),
+        "dark_pool_intensity":   round(dpi,       4),
+        "days_of_data":          n,
+        "interpretation":        interpretation,
+        "short_ratio_history":   [
+            {"date": r["date"], "short_ratio": round(r["short_ratio"] * 100, 2)}
+            for r in records
+        ],
     }
 
 
@@ -714,31 +718,22 @@ def _print_result(result: dict) -> None:
 
 
 def _load_watchlist() -> List[str]:
-    """Load TIER 1 + TIER 2 tickers from watchlist.txt."""
+    """Load all tickers from watchlist.txt (FAVORITES + UNIVERSE auto block)."""
     paths = [_MODULE_DIR / "watchlist.txt", Path("watchlist.txt")]
     for path in paths:
         if not path.exists():
             continue
         tickers: List[str] = []
-        in_tier = False
+        seen: set = set()
         with open(path) as fh:
             for line in fh:
                 stripped = line.strip()
-                if not stripped:
+                if not stripped or stripped.startswith("#"):
                     continue
-                upper = stripped.upper()
-                if "TIER 1" in upper or "TIER 2" in upper:
-                    in_tier = True
-                    continue
-                if "TIER 3" in upper or "MANUALLY ADDED" in upper:
-                    in_tier = False
-                    continue
-                if stripped.startswith("#"):
-                    continue
-                if in_tier:
-                    t = stripped.split("#")[0].strip().upper()
-                    if t:
-                        tickers.append(t)
+                t = stripped.split("#")[0].strip().upper()
+                if t and t not in seen:
+                    seen.add(t)
+                    tickers.append(t)
         return tickers
     return []
 
@@ -751,7 +746,7 @@ def main() -> None:
     )
     parser.add_argument("--ticker",   type=str,           help="Single ticker deep dive")
     parser.add_argument("--tickers",  nargs="+",          help="Multiple tickers")
-    parser.add_argument("--scan",     action="store_true", help="Scan watchlist.txt TIER 1+2")
+    parser.add_argument("--scan",     action="store_true", help="Scan all tickers in watchlist.txt")
     parser.add_argument("--output",   type=str,           help="Save JSON results to file")
     parser.add_argument("--lookback", type=int, default=20, help="Lookback days (default 20)")
     parser.add_argument("--verbose",  action="store_true", help="Debug logging")

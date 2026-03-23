@@ -71,6 +71,9 @@ def _build_volume_profile(hist, n_bins):
         bar_low  = float(row["Low"])
         bar_high = float(row["High"])
         bar_vol  = float(row["Volume"])
+        import math
+        if math.isnan(bar_low) or math.isnan(bar_high) or math.isnan(bar_vol):
+            continue
         bar_range = bar_high - bar_low
 
         if bar_range <= 0:
@@ -364,11 +367,14 @@ def main():
         print(f"\n  Volume profile scan — {len(tickers)} tickers")
         for t in tickers:
             print(f"\nBuilding volume profile for {t}...")
-            result = get_volume_profile(t, period=args.period, n_bins=args.bins)
-            if not result:
-                print(f"  {t}: Could not compute (insufficient data or download failed).")
-            else:
-                _print_volume_profile(t, result)
+            try:
+                result = get_volume_profile(t, period=args.period, n_bins=args.bins)
+                if not result:
+                    print(f"  {t}: Could not compute (insufficient data or download failed).")
+                else:
+                    _print_volume_profile(t, result)
+            except Exception as exc:
+                print(f"  {t}: ERROR — {exc}")
     elif args.ticker:
         ticker = args.ticker.upper()
         print(f"\nBuilding volume profile for {ticker}...")
