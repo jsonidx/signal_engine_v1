@@ -50,6 +50,29 @@ except ImportError:
     print("ERROR: config.py not found. Place it in the same directory.")
     sys.exit(1)
 
+
+def _load_saved_nav() -> float | None:
+    """
+    Read cash_eur saved via the dashboard from paper_trades.db.
+    Returns the value as the NAV override, or None if not set.
+    """
+    try:
+        import sqlite3 as _sqlite3
+        db = Path(__file__).resolve().parent / "paper_trades.db"
+        if not db.exists():
+            return None
+        con = _sqlite3.connect(str(db))
+        row = con.execute(
+            "SELECT value FROM portfolio_settings WHERE key='cash_eur'"
+        ).fetchone()
+        con.close()
+        if row and float(row[0]) > 0:
+            return float(row[0])
+    except Exception:
+        pass
+    return None
+
+
 # ─── Fundamentals cache (optional — degrades gracefully if unavailable) ───────
 try:
     from fundamentals_cache import get_cached, save_to_cache
@@ -136,6 +159,65 @@ def fetch_price_data(
     print(f"  [OK] {len(prices.columns)} tickers loaded, "
           f"{len(prices)} trading days")
     return prices
+
+
+# ==============================================================================
+# SECTION 1b: M&A / DELISTING FILTER
+# ==============================================================================
+
+def filter_ma_targets(
+    prices: pd.DataFrame,
+    window: int = 30,
+    cv_threshold: float = 0.005,
+    proximity_threshold: float = 0.99,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Remove tickers that are likely acquisition targets or recently delisted.
+
+    Detection heuristic (no extra API calls — uses already-fetched price data):
+      1. Price coefficient of variation over the last `window` trading days
+         is below `cv_threshold` (price is essentially flat / pinned to deal price).
+      2. Current price is within `proximity_threshold` of the 52-week high
+         (stock is pegged at or just below the announced deal price).
+
+    Both conditions must hold simultaneously — this avoids false positives on
+    genuinely low-volatility blue-chips that happen to be near their highs.
+
+    Common false-positive scenarios that are intentionally NOT flagged:
+      - Low-vol dividend stocks near 52wk highs (CV usually > 0.5%)
+      - Normal momentum leaders (price still moving, CV above threshold)
+
+    Args:
+        prices:               Price DataFrame (date × ticker).
+        window:               Look-back in trading days for CV calculation (default 30).
+        cv_threshold:         Max allowed CV to flag as pinned (default 0.5%).
+        proximity_threshold:  Min 52wk-high proximity to flag (default 99%).
+
+    Returns:
+        (filtered_prices, removed_tickers)
+    """
+    removed: List[str] = []
+    for ticker in prices.columns:
+        px = prices[ticker].dropna()
+        if len(px) < window:
+            continue
+        recent = px.iloc[-window:]
+        mean_px = recent.mean()
+        if mean_px <= 0:
+            continue
+        cv = recent.std() / mean_px
+        proximity = float(px.iloc[-1]) / float(px.max())
+        if cv < cv_threshold and proximity >= proximity_threshold:
+            removed.append(ticker)
+
+    if removed:
+        print(
+            f"\n  [M&A FILTER] Removed {len(removed)} likely acquired/delisted ticker(s) "
+            f"(price pinned ≥{proximity_threshold*100:.0f}% of 52wk-high, CV <{cv_threshold*100:.1f}%): "
+            f"{', '.join(removed)}"
+        )
+
+    return prices.drop(columns=removed), removed
 
 
 # ==============================================================================
@@ -1074,6 +1156,12 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     if prices.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    # Strip M&A targets / delisted stocks before scoring
+    prices, _ma_removed = filter_ma_targets(prices)
+    if prices.empty:
+        print("  [WARN] All tickers removed by M&A filter — no signals to compute.")
+        return pd.DataFrame(), pd.DataFrame()
+
     # Compute signals (pass regime-adjusted factor weights)
     print("\n  Computing multi-factor signals...")
     signals = compute_equity_composite(prices, regime_weights=regime_weights)
@@ -1137,6 +1225,11 @@ def main():
     global PORTFOLIO_NAV
     if args.nav:
         PORTFOLIO_NAV = args.nav
+    else:
+        saved = _load_saved_nav()
+        if saved is not None:
+            print(f"  [cash] Using dashboard-saved cash balance as NAV: €{saved:,.0f}")
+            PORTFOLIO_NAV = saved
 
     if args.watchlist:
         extra = [t.strip().upper() for t in args.watchlist.split(",")]

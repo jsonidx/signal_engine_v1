@@ -40,6 +40,7 @@ import sqlite3
 import sys
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,26 @@ try:
 except ImportError:
     print("ERROR: config.py not found.")
     sys.exit(1)
+
+
+def _load_saved_nav() -> float | None:
+    """Read cash_eur saved via the dashboard; returns it as a NAV override or None."""
+    try:
+        db = Path(__file__).resolve().parent / "paper_trades.db"
+        if not db.exists():
+            return None
+        import sqlite3 as _sqlite3
+        con = _sqlite3.connect(str(db))
+        row = con.execute(
+            "SELECT value FROM portfolio_settings WHERE key='cash_eur'"
+        ).fetchone()
+        con.close()
+        if row and float(row[0]) > 0:
+            return float(row[0])
+    except Exception:
+        pass
+    return None
+
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 DB_PATH = "paper_trades.db"
@@ -616,6 +637,12 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Delete all history")
     parser.add_argument("--weeks", type=int, help="Limit report to N weeks")
     args = parser.parse_args()
+
+    global PORTFOLIO_NAV
+    saved = _load_saved_nav()
+    if saved is not None:
+        print(f"  [cash] Using dashboard-saved cash balance as NAV: €{saved:,.0f}")
+        PORTFOLIO_NAV = saved
 
     conn = init_db()
 

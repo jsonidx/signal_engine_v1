@@ -433,6 +433,145 @@ def score_earnings_catalyst(raw: dict) -> dict:
     return {"score": max(score, 0), "max": 4, "flags": flags}
 
 
+def score_dcf_valuation(ticker: str) -> dict:
+    """
+    Score: 0–4
+    Runs DCF model (utils/dcf_model.py) and scores intrinsic value vs current price.
+    Also incorporates ROIC vs WACC spread as a quality signal.
+    """
+    score = 0
+    flags = []
+    try:
+        from utils.dcf_model import run_dcf
+        result = run_dcf(ticker)
+        if result.get("data_quality") == "INSUFFICIENT":
+            flags.append("DCF: insufficient data for valuation")
+            return {"score": 0, "max": 4, "flags": flags, "dcf": result}
+
+        upside = result.get("upside_pct")
+        spread = result.get("roic_wacc_spread")
+        iv = result.get("intrinsic_value")
+        price = result.get("current_price")
+
+        if upside is not None:
+            if upside > 30:
+                score += 2
+                flags.append(f"DCF: ${iv:.2f} intrinsic vs ${price:.2f} — {upside:.0f}% undervalued")
+            elif upside > 10:
+                score += 1
+                flags.append(f"DCF: ${iv:.2f} intrinsic vs ${price:.2f} — {upside:.0f}% upside")
+            elif upside < -25:
+                score -= 1
+                flags.append(f"DCF: ${iv:.2f} intrinsic vs ${price:.2f} — {abs(upside):.0f}% overvalued")
+            else:
+                flags.append(f"DCF: ${iv:.2f} intrinsic vs ${price:.2f} — fairly valued")
+
+        if spread is not None:
+            if spread > 0.05:
+                score += 2
+                flags.append(f"ROIC {result['roic']*100:.1f}% vs WACC {result['wacc']*100:.1f}% — strong value creation")
+            elif spread > 0:
+                score += 1
+                flags.append(f"ROIC {result['roic']*100:.1f}% > WACC {result['wacc']*100:.1f}% — marginal value creation")
+            elif spread < -0.03:
+                score -= 1
+                flags.append(f"ROIC {result['roic']*100:.1f}% < WACC {result['wacc']*100:.1f}% — value destruction")
+
+        if result.get("fcf_yield") and result["fcf_yield"] > 6:
+            score += 1
+            flags.append(f"FCF yield {result['fcf_yield']:.1f}% — strong cash generation vs market cap")
+
+    except Exception as e:
+        flags.append(f"DCF: module unavailable ({str(e)[:40]})")
+
+    return {"score": max(score, 0), "max": 4, "flags": flags}
+
+
+def score_peer_relative_valuation(ticker: str, sector: str = None) -> dict:
+    """
+    Score: 0–4
+    Runs peer benchmarking (utils/peer_benchmarking.py) and scores relative valuation.
+    Cheap vs sector peers + own history = high score.
+    """
+    score = 0
+    flags = []
+    try:
+        from utils.peer_benchmarking import run_peer_benchmarking
+        result = run_peer_benchmarking(ticker)
+
+        verdict = result.get("relative_valuation", "INSUFFICIENT")
+        pe_vs_hist = result.get("pe_vs_history_pct")
+        pe_vs_peers = result.get("pe_vs_peers_pct")
+
+        if verdict == "CHEAP":
+            score += 2
+        elif verdict == "RICH":
+            score = max(score - 1, 0)
+
+        if pe_vs_hist is not None:
+            if pe_vs_hist < -20:
+                score += 1
+                flags.append(f"P/E {pe_vs_hist:.0f}% below own 5yr history — unusually cheap vs itself")
+            elif pe_vs_hist > 30:
+                flags.append(f"P/E {pe_vs_hist:.0f}% above own 5yr history — historically expensive")
+
+        if pe_vs_peers is not None:
+            if pe_vs_peers < -20:
+                score += 1
+                flags.append(f"P/E {abs(pe_vs_peers):.0f}% below sector median — relative discount")
+            elif pe_vs_peers > 40:
+                flags.append(f"P/E {pe_vs_peers:.0f}% above sector median — relative premium")
+
+        for flag in result.get("flags", []):
+            if flag not in flags:
+                flags.append(flag)
+
+    except Exception as e:
+        flags.append(f"Peer benchmarking unavailable ({str(e)[:40]})")
+
+    return {"score": max(score, 0), "max": 4, "flags": flags}
+
+
+def score_accounting_quality(ticker: str) -> dict:
+    """
+    Score: 0–4  (INVERTED — higher red flags = lower score)
+    Runs red flag screener and penalizes for accounting risk.
+    CLEAN = 4 pts, CAUTION = 2, WARNING = 1, CRITICAL = 0.
+    """
+    score = 2  # neutral default
+    flags = []
+    try:
+        from red_flag_screener import run_red_flag_screener
+        result = run_red_flag_screener(ticker, skip_edgar=True)  # skip EDGAR in batch mode
+
+        risk = result.get("risk_level", "CAUTION")
+        rf_score = result.get("red_flag_score", 50)
+
+        if risk == "CLEAN":
+            score = 4
+            flags.append(f"Accounting quality: CLEAN — no material red flags (score {rf_score}/100)")
+        elif risk == "CAUTION":
+            score = 2
+            flags.append(f"Accounting quality: CAUTION — minor concerns (score {rf_score}/100)")
+        elif risk == "WARNING":
+            score = 1
+            flags.append(f"Accounting quality: WARNING — significant red flags (score {rf_score}/100)")
+        else:  # CRITICAL
+            score = 0
+            flags.append(f"Accounting quality: CRITICAL — multiple serious red flags (score {rf_score}/100)")
+
+        # Surface the top specific flag
+        top_flags = [f for f in result.get("flags", []) if "No material" not in f]
+        for rf in top_flags[:2]:
+            flags.append(f"  • {rf}")
+
+    except Exception as e:
+        score = 2  # neutral on failure
+        flags.append(f"Accounting quality check unavailable ({str(e)[:40]})")
+
+    return {"score": score, "max": 4, "flags": flags}
+
+
 def score_analyst_consensus(raw: dict) -> dict:
     """
     Score: 0–4
@@ -483,8 +622,18 @@ def score_analyst_consensus(raw: dict) -> dict:
 # SECTION 3: COMPOSITE + REPORTING
 # ==============================================================================
 
-def analyze_ticker(ticker: str, use_cache: bool = True) -> Optional[dict]:
-    """Run full fundamental analysis on one ticker. Returns result dict or None."""
+def analyze_ticker(
+    ticker: str,
+    use_cache: bool = True,
+    extended: bool = False,
+) -> Optional[dict]:
+    """
+    Run full fundamental analysis on one ticker.
+
+    extended=True adds DCF valuation, peer benchmarking, and accounting quality
+    scores (3 extra network calls — slower but more complete).
+    Returns result dict or None.
+    """
     raw = fetch_fundamentals(ticker, use_cache=use_cache)
     if raw is None:
         return None
@@ -502,7 +651,29 @@ def analyze_ticker(ticker: str, use_cache: bool = True) -> Optional[dict]:
 
     all_flags = val["flags"] + growth["flags"] + quality["flags"] + balance["flags"] + earnings["flags"] + analyst["flags"]
 
-    return {
+    # ── Extended analysis (optional) ─────────────────────────────────────────
+    dcf_score_result = None
+    peer_score_result = None
+    accounting_score_result = None
+    extended_composite = composite  # fallback = base composite
+
+    if extended:
+        dcf_score_result = score_dcf_valuation(ticker)
+        peer_score_result = score_peer_relative_valuation(ticker, raw.get("sector"))
+        accounting_score_result = score_accounting_quality(ticker)
+
+        ext_total = (
+            total_score
+            + dcf_score_result["score"]
+            + peer_score_result["score"]
+            + accounting_score_result["score"]
+        )
+        ext_max = max_score + 4 + 4 + 4
+        extended_composite = ext_total / ext_max * 100 if ext_max > 0 else composite
+
+        all_flags += dcf_score_result["flags"] + peer_score_result["flags"] + accounting_score_result["flags"]
+
+    result = {
         "ticker": ticker,
         "name": raw.get("name", ticker),
         "sector": raw.get("sector", "N/A"),
@@ -527,8 +698,16 @@ def analyze_ticker(ticker: str, use_cache: bool = True) -> Optional[dict]:
             "analyst": analyst["score"],
         },
         "composite": round(composite, 1),
+        "extended_composite": round(extended_composite, 1),
         "flags": all_flags,
     }
+
+    if extended:
+        result["scores"]["dcf_valuation"] = dcf_score_result["score"] if dcf_score_result else None
+        result["scores"]["peer_relative"] = peer_score_result["score"] if peer_score_result else None
+        result["scores"]["accounting_quality"] = accounting_score_result["score"] if accounting_score_result else None
+
+    return result
 
 
 def print_summary_table(results: List[dict], top_n: int = None):
@@ -648,6 +827,8 @@ def main():
                         help="Show only top N results")
     parser.add_argument("--refresh-cache", action="store_true",
                         help="Force re-fetch from yfinance, ignoring cached data")
+    parser.add_argument("--extended", action="store_true",
+                        help="Run DCF + peer benchmarking + accounting quality (slower, more accurate)")
     parser.add_argument("--cache-status", action="store_true",
                         help="Show what is currently cached and exit")
     args = parser.parse_args()
@@ -698,13 +879,16 @@ def main():
     print(f"\n  Analyzing {len(tickers)} ticker(s)...")
 
     use_cache = not args.refresh_cache
+    use_extended = getattr(args, "extended", False)
     if args.refresh_cache:
         print("  Cache refresh requested — fetching live data from yfinance.\n")
+    if use_extended:
+        print("  Extended mode: DCF + peer benchmarking + accounting quality checks enabled.\n")
 
     results = []
     for i, ticker in enumerate(tickers):
         print(f"\r  Fetching: {ticker:<8} ({i+1}/{len(tickers)})", end="", flush=True)
-        result = analyze_ticker(ticker, use_cache=use_cache)
+        result = analyze_ticker(ticker, use_cache=use_cache, extended=use_extended)
         if result:
             results.append(result)
         time.sleep(0.3)  # Be gentle with yfinance

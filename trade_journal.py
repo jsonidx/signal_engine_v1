@@ -248,10 +248,13 @@ def compute_action_zones(ticker: str) -> dict:
         # Below key support by 1 ATR (room for noise)
         stop_loss = round(key_support - atr, 2)
 
-        # Risk/Reward ratio
-        risk = current - stop_loss
-        reward_1 = target_1 - current
-        reward_2 = target_2 - current
+        # Risk/Reward ratio — from buy zone midpoint (intended entry), not current price.
+        # Using current price inflates risk when price is above the zone and understates
+        # it when below, giving a misleading R:R. Entry mid is the correct reference.
+        entry_mid = (buy_zone_low + buy_zone_high) / 2
+        risk = entry_mid - stop_loss
+        reward_1 = target_1 - entry_mid
+        reward_2 = target_2 - entry_mid
         rr_1 = reward_1 / risk if risk > 0 else 0
         rr_2 = reward_2 / risk if risk > 0 else 0
 
@@ -369,11 +372,12 @@ def show_zones(tickers: list = None):
         ccy_note = "" if ticker_ccy == "EUR" else f"  (from {ticker_ccy}, rate {fx_rate:.4f})"
         print(f"  {ticker}  |  Current: €{price:.2f}  |  ATR: €{atr:.2f} ({z['atr_pct']:.1%}){ccy_note}")
         print(f"  {'─' * 56}")
-        print(f"  📉 STOP LOSS:    €{stop:.2f}  ({(stop/price-1)*100:+.1f}%)")
-        print(f"  🟢 BUY ZONE:     €{buy_lo:.2f} — €{buy_hi:.2f}")
-        print(f"  ⚡ CURRENT:      €{price:.2f}")
-        print(f"  🎯 TARGET 1:     €{t1:.2f}  ({(t1/price-1)*100:+.1f}%)  R:R {z['risk_reward_t1']:.1f}")
-        print(f"  🎯 TARGET 2:     €{t2:.2f}  ({(t2/price-1)*100:+.1f}%)  R:R {z['risk_reward_t2']:.1f}")
+        entry_mid_eur = (buy_lo + buy_hi) / 2
+        print(f"  📉 STOP LOSS:    €{stop:.2f}  ({(stop/entry_mid_eur-1)*100:+.1f}% from entry)")
+        print(f"  🟢 BUY ZONE:     €{buy_lo:.2f} — €{buy_hi:.2f}  (entry mid €{entry_mid_eur:.2f})")
+        print(f"  ⚡ CURRENT:      €{price:.2f}  ({(price/entry_mid_eur-1)*100:+.1f}% vs entry)")
+        print(f"  🎯 TARGET 1:     €{t1:.2f}  ({(t1/entry_mid_eur-1)*100:+.1f}% from entry)  R:R {z['risk_reward_t1']:.1f}")
+        print(f"  🎯 TARGET 2:     €{t2:.2f}  ({(t2/entry_mid_eur-1)*100:+.1f}% from entry)  R:R {z['risk_reward_t2']:.1f}")
         print(f"  💰 SIZE:         €{z['suggested_size_eur']:.0f}  (2% of NAV)")
         print(f"  ⏱️  TIMING:       {z['timing']}")
 

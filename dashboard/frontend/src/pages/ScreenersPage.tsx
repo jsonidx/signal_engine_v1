@@ -5,7 +5,7 @@ import { ArrowUpDown, Download } from 'lucide-react'
 import { Shell } from '../components/layout/Shell'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow } from '../lib/api'
+import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow, type EquityScreenerRow } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
 
@@ -116,6 +116,163 @@ function SortHeader({
         )}
       </div>
     </th>
+  )
+}
+
+// ─── Z-score badge ────────────────────────────────────────────────────────────
+
+function ZBadge({ v }: { v: number | null | undefined }) {
+  if (v == null) return <span className="font-mono text-xs text-text-tertiary">—</span>
+  const color = v >= 0.5 ? 'green' : v < -0.5 ? 'red' : 'gray'
+  return <Badge label={v.toFixed(2)} color={color} />
+}
+
+// ─── Rankings Tab ─────────────────────────────────────────────────────────────
+
+const FACTOR_COLS: { label: string; key: keyof EquityScreenerRow }[] = [
+  { label: 'Mom 12-1',  key: 'momentum_12_1'      },
+  { label: 'Mom 6-1',   key: 'momentum_6_1'        },
+  { label: 'Mean Rev',  key: 'mean_reversion_5d'   },
+  { label: 'Vol Qual',  key: 'volatility_quality'  },
+  { label: 'Risk Mom',  key: 'risk_adj_momentum'   },
+]
+
+function RankingsTable({
+  rows,
+  showSizing,
+  ariaLabel,
+  headerClass,
+}: {
+  rows: EquityScreenerRow[]
+  showSizing: boolean
+  ariaLabel: string
+  headerClass: string
+}) {
+  const navigate = useNavigate()
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <table className="w-full" aria-label={ariaLabel}>
+        <thead>
+          <tr className={clsx('border-b border-border-subtle', headerClass)}>
+            <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Rank</th>
+            <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Ticker</th>
+            <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Composite Z</th>
+            {FACTOR_COLS.map(f => (
+              <th key={f.key} className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
+                {f.label}
+              </th>
+            ))}
+            {showSizing && (
+              <>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Weight %</th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Position EUR</th>
+              </>
+            )}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(row => (
+            <tr
+              key={row.ticker}
+              className="border-b border-border-subtle/50 hover:bg-bg-elevated cursor-pointer transition-colors"
+            >
+              <td className="px-4 py-2.5 font-mono text-xs text-text-tertiary">{row.rank ?? '—'}</td>
+              <td className="px-4 py-2.5">
+                <span
+                  className="font-mono text-sm font-semibold text-accent-blue cursor-pointer hover:underline"
+                  onClick={() => navigate(`/ticker/${row.ticker}`)}
+                  data-testid={`ticker-${row.ticker}`}
+                >
+                  {row.ticker}
+                </span>
+              </td>
+              <td className="px-4 py-2.5"><ZBadge v={row.composite_z} /></td>
+              {FACTOR_COLS.map(f => (
+                <td key={f.key} className="px-4 py-2.5 hidden md:table-cell">
+                  <ZBadge v={row[f.key] as number | null} />
+                </td>
+              ))}
+              {showSizing && (
+                <>
+                  <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
+                    {row.weight_pct != null ? `${row.weight_pct.toFixed(2)}%` : '—'}
+                  </td>
+                  <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
+                    {row.position_eur != null ? `€${row.position_eur.toFixed(0)}` : '—'}
+                  </td>
+                </>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function RankingsTab() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['screeners', 'equity'],
+    queryFn:  api.screenerEquity,
+    retry:    1,
+  })
+
+  const allRows = data?.data ?? []
+  const generatedAt = data?.generated_at ?? data?.as_of
+
+  const top20 = useMemo(
+    () =>
+      [...allRows]
+        .filter(r => r.composite_z != null)
+        .sort((a, b) => (b.composite_z ?? 0) - (a.composite_z ?? 0))
+        .slice(0, 20),
+    [allRows]
+  )
+
+  const bottom5 = useMemo(
+    () =>
+      [...allRows]
+        .filter(r => r.composite_z != null)
+        .sort((a, b) => (a.composite_z ?? 0) - (b.composite_z ?? 0))
+        .slice(0, 5),
+    [allRows]
+  )
+
+  if (isLoading) return <LoadingSkeleton rows={10} />
+  if (!allRows.length) return <EmptyState message="No equity signals found" command="./run_master.sh" />
+
+  return (
+    <div className="space-y-6">
+      {generatedAt && (
+        <div className="font-mono text-[10px] text-text-tertiary">
+          Last updated: {new Date(generatedAt).toLocaleString()}
+        </div>
+      )}
+
+      <div>
+        <div className="font-mono text-xs text-text-tertiary uppercase tracking-widest mb-2">
+          Top 20 — Long Candidates
+        </div>
+        <RankingsTable
+          rows={top20}
+          showSizing={true}
+          ariaLabel="Top 20 long candidates"
+          headerClass="bg-accent-green/10"
+        />
+      </div>
+
+      <div>
+        <div className="font-mono text-xs text-text-tertiary uppercase tracking-widest mb-2">
+          Bottom 5 — Weakest Composite Z
+        </div>
+        <RankingsTable
+          rows={bottom5}
+          showSizing={false}
+          ariaLabel="Bottom 5 short candidates"
+          headerClass="bg-accent-red/10"
+        />
+      </div>
+    </div>
   )
 }
 
@@ -500,6 +657,9 @@ export function ScreenersPage() {
           <Tabs.Trigger value="options" className={TAB_STYLE}>
             Options
           </Tabs.Trigger>
+          <Tabs.Trigger value="rankings" className={TAB_STYLE}>
+            Rankings
+          </Tabs.Trigger>
         </Tabs.List>
 
         <Tabs.Content value="squeeze">
@@ -510,6 +670,9 @@ export function ScreenersPage() {
         </Tabs.Content>
         <Tabs.Content value="options">
           <OptionsTab />
+        </Tabs.Content>
+        <Tabs.Content value="rankings">
+          <RankingsTab />
         </Tabs.Content>
       </Tabs.Root>
     </Shell>

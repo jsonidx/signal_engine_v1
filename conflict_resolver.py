@@ -42,12 +42,12 @@ MODULE_WEIGHTS: Dict[str, float] = {
     "cross_asset_divergence":     0.10,   # Macro relative context
     "polymarket":                 0.08,   # Prediction market (some resolution lag)
     "dark_pool_flow":             0.07,   # FINRA ATS institutional routing signal
+    "red_flag_screener":          0.08,   # Accounting quality — BEAR-only vote
     "sec_insider":                0.03,   # Directional but very noisy
     "congress_trades":            0.01,   # 30–45 day disclosure lag (reduced; weight given to dark_pool)
-    # NOTE: weights intentionally sum to 1.04 after addition of dark_pool_flow.
-    # The weighted-vote algorithm compares bull_weight vs bear_weight with a margin
-    # threshold and does not require exact sum-to-1. Recalibrate after 8-12 weeks
-    # of runs using logs/conflict_resolution_YYYYMMDD.csv.
+    # NOTE: weights sum to ~1.12 (intentional — the weighted-vote algorithm compares
+    # bull_weight vs bear_weight with a margin threshold and does not require exact
+    # sum-to-1). Recalibrate after 8-12 weeks using logs/conflict_resolution_*.csv.
 }
 
 # Maps MODULE_WEIGHTS keys → signals dict keys (as returned by collect_all_signals)
@@ -59,6 +59,7 @@ _SIGNALS_KEY_MAP: Dict[str, str] = {
     "cross_asset_divergence":     "cross_asset",
     "polymarket":                 "polymarket",
     "dark_pool_flow":             "dark_pool_flow",
+    "red_flag_screener":          "red_flags",
     "sec_insider":                "sec",
     "congress_trades":            "congress",
 }
@@ -282,6 +283,17 @@ def extract_module_direction(module_name: str, module_output: dict) -> Optional[
             return "BULL"
         return None
 
+    # ── red_flag_screener ─────────────────────────────────────────────────────
+    # BEAR-only module: significant accounting risk overrides bull signals.
+    # Only votes BEAR when risk_level is WARNING or CRITICAL.
+    # Never votes BULL — clean accounting is baseline expectation, not a positive.
+    if module_name == "red_flag_screener":
+        risk_level = str(module_output.get("red_flag_risk_level", "")).upper()
+        rf_score = float(module_output.get("red_flag_score", 0) or 0)
+        if risk_level in ("WARNING", "CRITICAL") or rf_score >= 46:
+            return "BEAR"
+        return None
+
     return None
 
 
@@ -368,7 +380,7 @@ def apply_hard_overrides(
     ticker: str = "",
 ) -> dict:
     """
-    Apply 4 hard override rules after the weighted vote.
+    Apply 5 hard override rules after the weighted vote.
 
     Override 1 — Post-squeeze guard (cross-module):
       squeeze.recent_squeeze == True → direction NEUTRAL, skip_claude=True
@@ -438,6 +450,45 @@ def apply_hard_overrides(
             "[%s] Override 4: squeeze_driven context flag (score=%.1f, mom_1m=%.2f%%)",
             ticker, squeeze_score, mom_1m,
         )
+
+    # ── Override 5: M&A / acquisition pin filter ─────────────────────────────
+    # Stocks undergoing acquisition trade pinned at the bid price — which often
+    # sits at or very near their 52-week high — with no meaningful 5d price action.
+    # Analysing them wastes API budget; their direction is determined by deal terms.
+    # Fast path: only call yfinance when pct_from_high >= -1% (price near 52wk high).
+    if not result["skip_claude"] and ticker:
+        pct_from_high = tech.get("pct_from_high")
+        # Also trigger on longBusinessSummary M&A keywords (via already-fetched info)
+        _ma_keyword = False
+        try:
+            import yfinance as _yf
+            _info    = _yf.Ticker(ticker).info
+            _summary = (_info.get("longBusinessSummary") or "").lower()
+            _ma_keyword = any(
+                kw in _summary
+                for kw in ["acquired by", "merger with", "no longer traded", "acquisition by"]
+            )
+        except Exception:
+            pass
+
+        _near_52wk_high = pct_from_high is not None and pct_from_high >= -1.0
+        if _near_52wk_high or _ma_keyword:
+            try:
+                import yfinance as _yf
+                _hist5d = _yf.Ticker(ticker).history(period="5d")
+                if _hist5d.empty or _ma_keyword:
+                    result["net_direction"] = "NEUTRAL"
+                    result["skip_claude"]   = True
+                    _reason = "ma_keyword" if _ma_keyword else "price_pinned_at_52wk_high_no_5d_data"
+                    result["override_flags"].append(
+                        f"override: ma_acquisition_pin ({_reason})"
+                    )
+                    logger.info(
+                        "[%s] Override 5: ma_acquisition_pin fired (pct_from_high=%.2f%%, keyword=%s)",
+                        ticker, pct_from_high or 0.0, _ma_keyword,
+                    )
+            except Exception as _e:
+                logger.debug("[%s] Override 5: yfinance check failed: %s", ticker, _e)
 
     return result
 
@@ -608,7 +659,9 @@ def main():
             results.append({
                 "ticker":                  ticker,
                 "direction":               r["pre_resolved_direction"],
+                "pre_resolved_direction":  r["pre_resolved_direction"],
                 "confidence":              round(r["pre_resolved_confidence"], 4),
+                "pre_resolved_confidence": round(r["pre_resolved_confidence"], 4),
                 "signal_agreement_score":  round(r["signal_agreement_score"], 4),
                 "override_flags":          r["override_flags"],
                 "skip_claude":             r["skip_claude"],
@@ -617,7 +670,8 @@ def main():
             })
         except Exception as exc:
             logger.warning("resolve failed for %s: %s", ticker, exc)
-            results.append({"ticker": ticker, "direction": "NEUTRAL", "confidence": 0.0,
+            results.append({"ticker": ticker, "direction": "NEUTRAL", "pre_resolved_direction": "NEUTRAL",
+                            "confidence": 0.0, "pre_resolved_confidence": 0.0,
                             "signal_agreement_score": 0.0, "override_flags": [], "skip_claude": False,
                             "bull_weight": 0.0, "bear_weight": 0.0})
 

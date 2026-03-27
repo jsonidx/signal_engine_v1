@@ -3,7 +3,7 @@
 ================================================================================
 AI QUANT ANALYST v1.0 — Claude-Powered Signal Synthesis
 ================================================================================
-Uses claude-opus-4-6 with adaptive thinking to analyze aggregated signals for
+Uses claude-sonnet-4-6 with adaptive thinking to analyze aggregated signals for
 a ticker and produce a structured quant thesis.
 
 WHAT IT DOES:
@@ -36,8 +36,8 @@ REQUIREMENTS:
     pip install anthropic
     export ANTHROPIC_API_KEY="your-key"
 
-NOTE: Costs ~$0.02-0.04 per ticker with adaptive thinking on Opus 4.6.
-      Watchlist of 10 tickers + portfolio briefing ≈ $0.40-0.50 per run.
+NOTE: Costs ~$0.005-0.01 per ticker with adaptive thinking on Sonnet 4.6.
+      Watchlist of 10 tickers + portfolio briefing ≈ $0.10-0.15 per run.
 
 IMPORTANT: This is NOT investment advice. Claude is analyzing the same
            signals you have — it doesn't have secret alpha. Use as a
@@ -92,6 +92,25 @@ try:
 except ImportError:
     _cr = None
     _RESOLVER_AVAILABLE = False
+
+
+# === NEW: UNIVERSE RANK EXPORT FOR AI QUANT ===
+_RANKED_UNIVERSE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ranked_universe.json")
+
+def _inject_universe_rank(signals: dict, ticker: str) -> dict:
+    """Inject universe rank/status from ranked_universe.json into the signals dict."""
+    default = {"rank": "N/A", "total": 215, "status": "Dynamic only"}
+    try:
+        if not os.path.exists(_RANKED_UNIVERSE_PATH):
+            signals["universe_rank"] = default
+            return signals
+        with open(_RANKED_UNIVERSE_PATH) as f:
+            ranked = json.load(f)
+        signals["universe_rank"] = ranked.get(ticker.upper(), default)
+    except Exception as exc:
+        logger.warning("Could not load ranked_universe.json for %s: %s", ticker, exc)
+        signals["universe_rank"] = default
+    return signals
 
 
 # ==============================================================================
@@ -665,6 +684,103 @@ def _collect_squeeze_signals(ticker: str) -> dict:
         return {}
 
 
+def _collect_dcf_signals(ticker: str) -> dict:
+    """
+    Pull DCF valuation, WACC, ROIC vs WACC spread from utils/dcf_model.
+    Degrades gracefully if module unavailable or data insufficient.
+    """
+    try:
+        from utils.dcf_model import run_dcf
+        result = run_dcf(ticker)
+        if result.get("data_quality") == "INSUFFICIENT":
+            return {"dcf_available": False}
+        return {
+            "dcf_available": True,
+            "dcf_intrinsic_value": result.get("intrinsic_value"),
+            "dcf_current_price": result.get("current_price"),
+            "dcf_upside_pct": result.get("upside_pct"),
+            "dcf_wacc": result.get("wacc"),
+            "dcf_roic": result.get("roic"),
+            "dcf_roic_wacc_spread": result.get("roic_wacc_spread"),
+            "dcf_fcf_yield": result.get("fcf_yield"),
+            "dcf_data_quality": result.get("data_quality"),
+            "dcf_flags": result.get("flags", []),
+        }
+    except Exception:
+        return {"dcf_available": False}
+
+
+def _collect_peer_benchmarking_signals(ticker: str) -> dict:
+    """
+    Pull sector peer comparison and historical multiple context.
+    """
+    try:
+        from utils.peer_benchmarking import run_peer_benchmarking
+        result = run_peer_benchmarking(ticker)
+        return {
+            "peer_available": True,
+            "peer_relative_valuation": result.get("relative_valuation"),
+            "peer_pe_vs_history_pct": result.get("pe_vs_history_pct"),
+            "peer_pe_vs_peers_pct": result.get("pe_vs_peers_pct"),
+            "peer_sector": result.get("sector"),
+            "peer_median_pe": result.get("peer_median_pe"),
+            "peer_stock_pe": result.get("stock_pe"),
+            "peer_median_ev_ebitda": result.get("peer_median_ev_ebitda"),
+            "peer_historical_pe_avg": result.get("historical_pe_avg"),
+            "peer_flags": result.get("flags", []),
+        }
+    except Exception:
+        return {"peer_available": False}
+
+
+def _collect_red_flag_signals(ticker: str) -> dict:
+    """
+    Pull accounting red flags and financial quality risk score.
+    Uses skip_edgar=True for speed (avoids EDGAR network calls in batch mode).
+    """
+    try:
+        from red_flag_screener import run_red_flag_screener
+        result = run_red_flag_screener(ticker, skip_edgar=True)
+        return {
+            "red_flag_available": True,
+            "red_flag_score": result.get("red_flag_score"),
+            "red_flag_risk_level": result.get("risk_level"),
+            "red_flag_accruals_ratio": result.get("checks", {}).get("accruals", {}).get("ratio"),
+            "red_flag_payout_ratio_fcf": result.get("checks", {}).get("payout_risk", {}).get("payout_ratio_fcf"),
+            "red_flag_flags": result.get("flags", []),
+        }
+    except Exception:
+        return {"red_flag_available": False}
+
+
+def _collect_transcript_signals(ticker: str) -> dict:
+    """
+    Pull earnings call transcript analysis from earnings_transcript module.
+    Uses cache (7-day TTL) — live Claude call only on cache miss.
+    """
+    try:
+        from earnings_transcript import get_transcript_signals
+        result = get_transcript_signals(ticker, use_cache=True)
+        if not result.get("transcript_available"):
+            return {"transcript_available": False}
+        return {
+            "transcript_available": True,
+            "transcript_filing_date": result.get("filing_date"),
+            "transcript_tone_score": result.get("tone_score"),
+            "transcript_tone_label": result.get("tone_label"),
+            "transcript_guidance_direction": result.get("guidance_direction"),
+            "transcript_guidance_confidence": result.get("guidance_confidence"),
+            "transcript_capex_signal": result.get("capex_signal"),
+            "transcript_buyback_signal": result.get("buyback_signal"),
+            "transcript_management_summary": result.get("management_summary"),
+            "transcript_key_quotes": result.get("key_quotes", []),
+            "transcript_risks": result.get("risks_mentioned", []),
+            "transcript_catalysts": result.get("catalysts_mentioned", []),
+        }
+    except Exception:
+        return {"transcript_available": False}
+
+
 def compute_signal_agreement(signals_dict: dict) -> float:
     """
     Pre-compute a 0.0–1.0 signal agreement score across all directional modules.
@@ -846,6 +962,38 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     signals["dark_pool_flow"] = dp
     if verbose:
         print(f"done ({dp.get('signal', 'no data')})")
+
+    if verbose:
+        print(f"  [{ticker}]   → DCF valuation...", end=" ", flush=True)
+    dcf = _collect_dcf_signals(ticker)
+    signals["dcf"] = dcf
+    if verbose:
+        dq = dcf.get("dcf_data_quality", "N/A") if dcf.get("dcf_available") else "N/A"
+        print(f"done (quality={dq})")
+
+    if verbose:
+        print(f"  [{ticker}]   → peer benchmarking...", end=" ", flush=True)
+    peers = _collect_peer_benchmarking_signals(ticker)
+    signals["peer_benchmarking"] = peers
+    if verbose:
+        verdict = peers.get("peer_relative_valuation", "N/A") if peers.get("peer_available") else "N/A"
+        print(f"done ({verdict})")
+
+    if verbose:
+        print(f"  [{ticker}]   → red flag screener...", end=" ", flush=True)
+    red_flags = _collect_red_flag_signals(ticker)
+    signals["red_flags"] = red_flags
+    if verbose:
+        level = red_flags.get("red_flag_risk_level", "N/A") if red_flags.get("red_flag_available") else "N/A"
+        print(f"done ({level})")
+
+    if verbose:
+        print(f"  [{ticker}]   → earnings transcript...", end=" ", flush=True)
+    transcript = _collect_transcript_signals(ticker)
+    signals["transcript"] = transcript
+    if verbose:
+        tone = transcript.get("transcript_tone_label", "N/A") if transcript.get("transcript_available") else "N/A"
+        print(f"done (tone={tone})")
 
     # ── Macro + sector regime ─────────────────────────────────────────────────
     if _REGIME_AVAILABLE:
@@ -1055,7 +1203,10 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
         print("         API costs apply (~€0.03 per ticker).")
         wl = _read_watchlist_tickers(tier_filter=["TIER 1", "TIER 2"])
         if not wl:
-            print("  No TIER 1/TIER 2 tickers found in watchlist.txt")
+            print("  [WARN] No TIER 1/TIER 2 headers in watchlist.txt — falling back to all tickers")
+            wl = _read_watchlist_tickers()
+        if not wl:
+            print("  ERROR: watchlist.txt is empty or missing")
             sys.exit(1)
         resolved_all = _generate_resolved_signals_file(
             wl, resolved_signals_path, verbose=args.verbose
@@ -1074,9 +1225,22 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
     else:
         wl = _read_watchlist_tickers(tier_filter=["TIER 1", "TIER 2"])
         if not wl:
-            print("  No TIER 1/TIER 2 tickers found in watchlist.txt")
+            print("  [WARN] No TIER 1/TIER 2 headers in watchlist.txt — falling back to all tickers")
+            wl = _read_watchlist_tickers()
+        if not wl:
+            print("  ERROR: watchlist.txt is empty or missing")
             sys.exit(1)
-        _generate_resolved_signals_file(wl, resolved_signals_path, verbose=args.verbose)
+        # Reuse today's resolved_signals.json if Step 12 already built it — skip
+        # the expensive per-ticker re-fetch (congressional trades, SEC, etc.)
+        from datetime import date as _date
+        _rs_today = (
+            os.path.exists(resolved_signals_path)
+            and _date.fromtimestamp(os.path.getmtime(resolved_signals_path)) == _date.today()
+        )
+        if _rs_today:
+            print("  Reusing today's resolved_signals.json from Step 12 (skipping pre-screen)")
+        else:
+            _generate_resolved_signals_file(wl, resolved_signals_path, verbose=args.verbose)
         equity_path = _find_latest_equity_signals_file()
         selected = select_top_tickers(
             resolved_signals_path=resolved_signals_path,
@@ -1179,20 +1343,51 @@ def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
     }
 
 
-SYSTEM_PROMPT = """You are a senior quant analyst at a top-tier hedge fund.
-You think rigorously, quantitatively, and concisely. You have expertise in:
-- Technical analysis and momentum factors
-- Options market microstructure and flow interpretation
-- Fundamental valuation across sectors
-- Event-driven catalysts (earnings, regulatory, insider activity)
-- Risk management and position sizing
+SYSTEM_PROMPT = """You are an elite institutional quant analyst running a global multi-factor signal engine.
+You are given a single ticker from a carefully curated ~215-ticker watchlist built with a 5-factor
+prescreen (20d momentum rank 35%, volume surge 20%, near 52wk high 15%, earnings momentum proxy 15%,
+sector-relative strength 15%) + liquidity filter + volatility/beta quality gate.
+Your job: produce a concise, high-conviction, actionable trading synthesis for the next 1-4 weeks.
+Never hallucinate data. Use only the signals provided.
 
-Your task: analyze a structured signal packet for a stock and produce
-a precise, actionable quant thesis. Be specific about price levels.
-Always flag if signal data is thin or contradictory.
-Do not hedge everything — give a clear directional view with conviction.
+═══════════════════════════════════════════
+ANALYSIS RULES (strictly follow)
+═══════════════════════════════════════════
 
-Output MUST be in JSON format with this exact structure:
+Insider / SEC signal
+Always distinguish net buying vs net selling.
+Only call it "informed accumulation" if net shares purchased > net shares sold in the last 90 days
+(after excluding routine 10b5-1 sales). If net selling or only grants/10b5-1, say "net insider
+selling" or "routine filings only".
+
+Universe context
+Always populate universe_rank and universe_status using the rank data passed to you. Use
+"Persistent favorite" if the ticker has been in top-50 for 3+ consecutive days; "Tier-1" if
+currently top-50; otherwise "Dynamic only".
+
+Regime & circuit-breaker logic
+Macro regime and weekly regime have override power.
+If RISK_OFF or strong bearish weekly regime → cap conviction at 2/5 and position_size_pct ≤ 3
+unless dark-pool / options / insider signals are overwhelmingly bullish.
+High-beta names (crypto, small-cap biotech, semiconductors) get extra conservative sizing in RISK_OFF.
+
+Signal weighting priority (highest → lowest)
+1. Macro + weekly regime
+2. Dark pool + options flow + max pain
+3. Technical regime & volume profile
+4. Insider + SEC + earnings transcript tone
+5. Fundamentals / DCF / peer benchmarking
+6. Congress / Polymarket (lowest weight)
+
+Tone & style
+Clinical, no hype. Always give a clear Primary vs Counter thesis.
+Thesis should be 3-4 sentences explaining why the final conviction and sizing were chosen.
+Be brutally honest when signals conflict.
+
+═══════════════════════════════════════════
+OUTPUT FORMAT (JSON — exact structure below)
+═══════════════════════════════════════════
+Output MUST be valid JSON with this exact structure:
 {
   "ticker": "...",
   "direction": "BULL | BEAR | NEUTRAL",
@@ -1201,8 +1396,8 @@ Output MUST be in JSON format with this exact structure:
   "neutral_probability": 0.0-1.0,
   "conviction": 1-5,
   "time_horizon": "days | weeks | months",
-  "primary_scenario": "one sentence describing the bull/bear case",
-  "bear_scenario": "one sentence describing the opposing scenario",
+  "primary_scenario": "1-2 sentence bull case",
+  "bear_scenario": "1-2 sentence bear case",
   "key_invalidation": "specific price level or event that breaks the thesis",
   "entry_low": price,
   "entry_high": price,
@@ -1213,9 +1408,11 @@ Output MUST be in JSON format with this exact structure:
   "signal_agreement_score": float (echo back the pre-computed value, or 0.0 if not provided),
   "catalysts": ["...", "..."],
   "risks": ["...", "..."],
-  "thesis": "2-3 sentence narrative",
+  "thesis": "3-4 sentence balanced synthesis explaining conviction and sizing",
   "data_quality": "HIGH|MEDIUM|LOW",
-  "notes": "any caveats or data gaps",
+  "notes": "any caveats, data gaps, or forward-looking assumptions",
+  "universe_rank": "Ranked #NN / 215 in global multi-factor prescreen (factors: mom/vol-surge/near-high/earnings/sector-RS)",
+  "universe_status": "Persistent favorite | Tier-1 | Dynamic only",
   "expected_moves": [
     {
       "horizon": "today",
@@ -1607,9 +1804,13 @@ def _validate_probabilities(thesis: dict) -> None:
         )
 
 
-def _call_claude(prompt: str, verbose: bool = False) -> Optional[str]:
+THINKING_AGREEMENT_THRESHOLD = 0.70  # signal_agreement_score >= this → enable extended thinking
+THINKING_BUDGET_TOKENS = 3000        # token budget for thinking (billed separately)
+
+def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False) -> Optional[str]:
     """
-    Call claude-opus-4-6 with adaptive thinking and streaming.
+    Call claude-sonnet-4-6 with streaming.
+    use_thinking=True enables extended thinking (higher quality, ~3x cost).
     Returns the response text, or None on failure.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -1621,19 +1822,29 @@ def _call_claude(prompt: str, verbose: bool = False) -> Optional[str]:
     client = anthropic.Anthropic(api_key=api_key)
 
     if verbose:
-        print("  Calling Claude API (opus-4-6 + adaptive thinking)...", flush=True)
+        mode = "extended thinking" if use_thinking else "standard"
+        print(f"  Calling Claude API (sonnet-4-6, {mode})...", flush=True)
+    elif use_thinking:
+        print("  [thinking enabled — high-conviction setup]", flush=True)
 
     full_text = ""
     thinking_shown = False
 
+    extra_kwargs: dict = {}
+    if use_thinking:
+        extra_kwargs["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}
+        # thinking requires a higher max_tokens to accommodate budget + response
+        extra_kwargs["max_tokens"] = 8192 + THINKING_BUDGET_TOKENS
+    else:
+        extra_kwargs["max_tokens"] = 8192
+
     try:
         # Use streaming to handle long responses and avoid timeouts
         with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            thinking={"type": "adaptive"},
+            model="claude-sonnet-4-6",
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
+            **extra_kwargs,
         ) as stream:
             for event in stream:
                 if event.type == "content_block_start":
@@ -1663,7 +1874,7 @@ def _call_claude(prompt: str, verbose: bool = False) -> Optional[str]:
 
 
 def _parse_response(raw: str) -> Optional[dict]:
-    """Extract JSON from Claude's response."""
+    """Extract JSON from Claude's response, with truncation recovery."""
     if not raw:
         return None
 
@@ -1673,20 +1884,45 @@ def _parse_response(raw: str) -> Optional[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Try to extract JSON block
     import re
-    patterns = [
-        r"```json\s*([\s\S]+?)\s*```",
-        r"```\s*([\s\S]+?)\s*```",
-        r"(\{[\s\S]+\})",
-    ]
-    for pattern in patterns:
+
+    # Extract the JSON candidate string from various fence patterns
+    candidates = []
+    for pattern in [r"```json\s*([\s\S]+?)\s*```", r"```\s*([\s\S]+?)\s*```", r"(\{[\s\S]+\})"]:
         m = re.search(pattern, raw)
         if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                continue
+            candidates.append(m.group(1))
+
+    # If no closed fence found, the response was truncated — grab everything after ```json
+    if not candidates:
+        m = re.search(r"```json\s*([\s\S]+)", raw)
+        if m:
+            candidates.append(m.group(1))
+
+    for candidate in candidates:
+        # Try as-is first
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Try truncation recovery: strip trailing partial key/value, then close open brackets
+        try:
+            text = candidate.strip().rstrip(",")
+            # Count unclosed braces/brackets
+            depth_curly = text.count("{") - text.count("}")
+            depth_square = text.count("[") - text.count("]")
+            # Close open string if we're inside one (odd number of unescaped quotes in last line)
+            last_line = text.rsplit("\n", 1)[-1]
+            if last_line.count('"') % 2 == 1:
+                text += '"'
+            # Close open array/object chains
+            text += "]" * max(0, depth_square) + "}" * max(0, depth_curly)
+            result = json.loads(text)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, Exception):
+            pass
 
     return None
 
@@ -1969,24 +2205,26 @@ def update_watchlist_from_screen(
         # Below min_tier3 → not written
 
     today = _dt.now().strftime("%Y-%m-%d")
-    lines = [
-        "# ============================================================",
-        f"# WATCHLIST — AI Quant screener  |  updated {today}",
-        "# Scored by 10-module signal quality (max 28, weekly regime ±3)",
-        "# TIER 1 ≥18  TIER 2 ≥13  TIER 3 ≥8  (below 8 excluded)",
-        "# ============================================================",
-        "",
-        "# TIER 1 — High conviction (Grade A, score ≥18)",
-    ] + tier1 + [
-        "",
-        "# TIER 2 — Monitor (Grade B, score ≥13)",
-    ] + tier2 + [
-        "",
-        "# TIER 3 — Weak signal (Grade C, score ≥8)",
-    ] + tier3 + [""],
+    lines = (
+        [
+            "# ============================================================",
+            f"# WATCHLIST — AI Quant screener  |  updated {today}",
+            "# Scored by 10-module signal quality (max 28, weekly regime ±3)",
+            "# TIER 1 ≥18  TIER 2 ≥13  TIER 3 ≥8  (below 8 excluded)",
+            "# ============================================================",
+            "",
+            "# TIER 1 — High conviction (Grade A, score ≥18)",
+        ] + tier1 + [
+            "",
+            "# TIER 2 — Monitor (Grade B, score ≥13)",
+        ] + tier2 + [
+            "",
+            "# TIER 3 — Weak signal (Grade C, score ≥8)",
+        ] + tier3 + [""]
+    )
 
     with open(watchlist_path, "w") as f:
-        f.write("\n".join(lines[0]))  # lines is a tuple due to trailing comma
+        f.write("\n".join(lines))
 
     dropped = len(results) - len(tier1) - len(tier2) - len(tier3)
     print(f"  Watchlist updated: {len(tier1)} TIER 1 | {len(tier2)} TIER 2 | {len(tier3)} TIER 3 | {dropped} dropped")
@@ -2019,6 +2257,9 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     # Collect signals
     signals = collect_all_signals(ticker, verbose=verbose)
 
+    # === NEW: UNIVERSE RANK EXPORT FOR AI QUANT ===
+    signals = _inject_universe_rank(signals, ticker)
+
     # Pre-compute agreement score (kept for backward compat; may be overridden by resolver)
     signals["signal_agreement_score"] = compute_signal_agreement(signals)
 
@@ -2050,8 +2291,12 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print(prompt)
         print("--- END PROMPT ---\n")
 
+    # Enable extended thinking for high-conviction setups (strong signal agreement)
+    agreement = signals.get("signal_agreement_score", 0.0) or 0.0
+    use_thinking = agreement >= THINKING_AGREEMENT_THRESHOLD
+
     # Call Claude
-    raw = _call_claude(prompt, verbose=verbose)
+    raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
     if raw is None:
         return None
 
@@ -2246,6 +2491,14 @@ def print_thesis(t: dict) -> None:
     # Thesis
     print(f"  Thesis: {t.get('thesis', 'N/A')}")
     print()
+
+    # Universe rank
+    u_rank   = t.get("universe_rank")
+    u_status = t.get("universe_status")
+    if u_rank:
+        status_str = f"  Status: {u_status}" if u_status else ""
+        print(f"  {u_rank}.{status_str}")
+        print()
 
     # Catalysts
     catalysts = t.get("catalysts", [])

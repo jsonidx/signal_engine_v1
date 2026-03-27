@@ -9,6 +9,8 @@ import {
   BarChart2,
   FileText,
   RefreshCw,
+  Bitcoin,
+  Target,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useRegime } from '../../hooks/useRegime'
@@ -25,6 +27,8 @@ const NAV_ITEMS = [
   { path: '/darkpool', label: 'Dark Pool', icon: Activity, shortcut: 'd' },
   { path: '/backtest', label: 'Backtest', icon: BarChart2, shortcut: 'b' },
   { path: '/resolution', label: 'Resolution Log', icon: FileText, shortcut: 'r' },
+  { path: '/crypto',     label: 'Crypto',         icon: Bitcoin,  shortcut: 'c' },
+  { path: '/accuracy',  label: 'Claude Accuracy', icon: Target,   shortcut: 'a' },
 ]
 
 function ETClock() {

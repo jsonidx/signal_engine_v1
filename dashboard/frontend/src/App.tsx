@@ -8,6 +8,8 @@ import { ScreenersPage } from './pages/ScreenersPage'
 import { DarkPoolPage } from './pages/DarkPoolPage'
 import { BacktestPage } from './pages/BacktestPage'
 import { ResolutionPage } from './pages/ResolutionPage'
+import { CryptoPage } from './pages/CryptoPage'
+import { AccuracyPage } from './pages/AccuracyPage'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
 // ─── Keyboard shortcut handler (inside router context) ────────────────────────
@@ -30,6 +32,8 @@ function KeyboardShortcuts() {
         case 'd': navigate('/darkpool'); break
         case 'b': navigate('/backtest'); break
         case 'r': navigate('/resolution'); break
+        case 'c': navigate('/crypto'); break
+        case 'a': navigate('/accuracy'); break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -107,6 +111,22 @@ export default function App() {
           element={
             <ErrorBoundary pageName="Resolution Log">
               <ResolutionPage />
+            </ErrorBoundary>
+          }
+        />
+        <Route
+          path="/crypto"
+          element={
+            <ErrorBoundary pageName="Crypto Signals">
+              <CryptoPage />
+            </ErrorBoundary>
+          }
+        />
+        <Route
+          path="/accuracy"
+          element={
+            <ErrorBoundary pageName="Claude Accuracy">
+              <AccuracyPage />
             </ErrorBoundary>
           }
         />

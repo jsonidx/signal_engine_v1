@@ -315,6 +315,12 @@ def select_top_tickers(
             resolved_all = {r["ticker"]: r for r in raw if "ticker" in r}
         else:
             resolved_all = raw
+        # Normalize field name aliases from conflict_resolver.py list format
+        for r in resolved_all.values():
+            if "pre_resolved_direction" not in r and "direction" in r:
+                r["pre_resolved_direction"] = r["direction"]
+            if "pre_resolved_confidence" not in r and "confidence" in r:
+                r["pre_resolved_confidence"] = r["confidence"]
     except Exception as exc:
         logger.error("Cannot load resolved signals from %s: %s", resolved_signals_path, exc)
         return []

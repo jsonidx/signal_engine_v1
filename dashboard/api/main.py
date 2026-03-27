@@ -22,6 +22,7 @@ USAGE:
 ================================================================================
 """
 
+import asyncio
 import csv
 import glob
 import json
@@ -37,6 +38,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -70,6 +72,12 @@ except ImportError:
     PORTFOLIO_NAV = 50_000
     EQUITY_ALLOCATION = 0.65
     CRYPTO_ALLOCATION = 0.25
+
+try:
+    from fx_rates import convert_to_eur as _convert_to_eur
+except ImportError:
+    def _convert_to_eur(amount: float, currency: str = "USD") -> float:  # type: ignore[misc]
+        return round(amount / 1.09, 4)
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 SIGNALS_DIR      = BASE_DIR / "signals_output"
@@ -574,6 +582,99 @@ async def portfolio_positions():
 
 
 # ==============================================================================
+# SECTION 4b: CASH MANAGEMENT ENDPOINTS
+# ==============================================================================
+
+def _ensure_cash_table(conn: sqlite3.Connection) -> None:
+    """Create portfolio_settings table if it doesn't exist (write connection)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def _get_cash_eur(conn: sqlite3.Connection) -> tuple[float, str | None]:
+    """Return (cash_eur, updated_at) from portfolio_settings, or (0.0, None)."""
+    row = conn.execute(
+        "SELECT value, updated_at FROM portfolio_settings WHERE key = 'cash_eur'"
+    ).fetchone()
+    if row is None:
+        return 0.0, None
+    return float(row[0]), row[1]
+
+
+@app.get("/api/portfolio/cash")
+async def get_cash():
+    """Return the manually-set cash balance from paper_trades.db."""
+    if not PAPER_TRADES_DB.exists():
+        return {"cash_eur": 0.0, "updated_at": None}
+    conn = sqlite3.connect(str(PAPER_TRADES_DB))
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_cash_table(conn)
+        cash, updated_at = _get_cash_eur(conn)
+        return {"cash_eur": round(cash, 2), "updated_at": updated_at}
+    finally:
+        conn.close()
+
+
+from pydantic import BaseModel
+
+
+class CashUpdateRequest(BaseModel):
+    action: str   # "set" | "add" | "reduce"
+    amount: float
+
+
+@app.post("/api/portfolio/cash")
+async def update_cash(req: CashUpdateRequest):
+    """
+    Set, add to, or reduce the manual cash balance.
+    Body: { "action": "set"|"add"|"reduce", "amount": <float> }
+    """
+    if req.action not in ("set", "add", "reduce"):
+        raise HTTPException(status_code=400, detail="action must be 'set', 'add', or 'reduce'")
+    if req.amount < 0:
+        raise HTTPException(status_code=400, detail="amount must be >= 0")
+
+    if not PAPER_TRADES_DB.exists():
+        raise HTTPException(status_code=503, detail="paper_trades.db not found")
+
+    conn = sqlite3.connect(str(PAPER_TRADES_DB))
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_cash_table(conn)
+        current_cash, _ = _get_cash_eur(conn)
+
+        if req.action == "set":
+            new_cash = req.amount
+        elif req.action == "add":
+            new_cash = current_cash + req.amount
+        else:  # reduce
+            new_cash = max(0.0, current_cash - req.amount)
+
+        now = datetime.utcnow().isoformat() + "Z"
+        conn.execute("""
+            INSERT INTO portfolio_settings (key, value, updated_at)
+            VALUES ('cash_eur', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """, (str(new_cash), now))
+        conn.commit()
+
+        # Invalidate portfolio summary cache so next call reflects new cash
+        _cache.invalidate("portfolio_summary")
+
+        log.info("Cash updated: %s %.2f → new balance %.2f", req.action, req.amount, new_cash)
+        return {"cash_eur": round(new_cash, 2), "updated_at": now}
+    finally:
+        conn.close()
+
+
+# ==============================================================================
 # SECTION 5: SIGNALS ENDPOINTS
 # ==============================================================================
 
@@ -988,8 +1089,151 @@ async def signals_ticker(ticker: str):
 
 @app.get("/api/deepdive/tickers")
 async def deepdive_tickers():
-    """All tickers analyzed by Claude, most recent first. Powers the Deep Dive list page."""
+    """All universe tickers for the Deep Dive list. Claude-analyzed tickers have has_thesis=True;
+    unanalyzed tickers from the fundamental CSV appear with has_thesis=False."""
     cache_key = "deepdive_tickers"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    # ── Load fundamental universe for name/sector/price enrichment ──────────────
+    fund_map: dict[str, dict] = {}
+    fund_files = sorted(glob.glob(str(SIGNALS_DIR / "fundamental_*.csv")))
+    if fund_files:
+        try:
+            with open(fund_files[-1], newline="") as fh:
+                for row in csv.DictReader(fh):
+                    t = row.get("ticker", "").strip().upper()
+                    if t:
+                        fund_map[t] = {
+                            "name":   row.get("name", ""),
+                            "sector": row.get("sector", ""),
+                            "price":  _safe_float(row.get("price")),
+                        }
+        except Exception:
+            pass
+
+    conn = _db_connect(AI_QUANT_DB)
+    seen: set = set()
+    tickers = []
+
+    if conn is not None:
+        try:
+            rows = conn.execute("""
+                SELECT ticker, date, direction, conviction, signal_agreement_score,
+                       time_horizon, data_quality, thesis, bull_probability,
+                       bear_probability, neutral_probability, created_at,
+                       entry_low, entry_high, target_1, target_2, stop_loss
+                FROM thesis_cache
+                ORDER BY date DESC, created_at DESC
+            """).fetchall()
+            conn.close()
+
+            for r in rows:
+                t = r["ticker"]
+                if t in seen:
+                    continue
+                seen.add(t)
+                fd = fund_map.get(t, {})
+                tickers.append({
+                    "ticker":                 t,
+                    "has_thesis":             True,
+                    "name":                   fd.get("name", ""),
+                    "sector":                 fd.get("sector", ""),
+                    "date":                   r["date"],
+                    "direction":              r["direction"],
+                    "conviction":             r["conviction"],
+                    "signal_agreement_score": r["signal_agreement_score"],
+                    "time_horizon":           r["time_horizon"],
+                    "data_quality":           r["data_quality"],
+                    "thesis_short":           (r["thesis"] or "")[:160],
+                    "bull_probability":       r["bull_probability"],
+                    "bear_probability":       r["bear_probability"],
+                    "neutral_probability":    r["neutral_probability"],
+                    "entry_low":              r["entry_low"],
+                    "entry_high":             r["entry_high"],
+                    "target_1":               r["target_1"],
+                    "target_2":               r["target_2"],
+                    "stop_loss":              r["stop_loss"],
+                })
+        except Exception:
+            log.exception("deepdive_tickers: thesis_cache read error")
+
+    # ── Always include open positions from trade_journal ─────────────────────────
+    tj_conn = _db_connect(TRADE_JOURNAL_DB)
+    if tj_conn is not None:
+        try:
+            open_rows = tj_conn.execute(
+                "SELECT DISTINCT ticker FROM trades WHERE status='open'"
+            ).fetchall()
+            tj_conn.close()
+            for r in open_rows:
+                t = r["ticker"]
+                if t not in seen:
+                    seen.add(t)
+                    fd = fund_map.get(t, {})
+                    tickers.insert(0, {
+                        "ticker":                 t,
+                        "has_thesis":             False,
+                        "name":                   fd.get("name", ""),
+                        "sector":                 fd.get("sector", ""),
+                        "date":                   None,
+                        "direction":              None,
+                        "conviction":             None,
+                        "signal_agreement_score": None,
+                        "time_horizon":           None,
+                        "data_quality":           None,
+                        "thesis_short":           None,
+                        "bull_probability":       None,
+                        "bear_probability":       None,
+                        "neutral_probability":    None,
+                        "entry_low":              None,
+                        "entry_high":             None,
+                        "target_1":               None,
+                        "target_2":               None,
+                        "stop_loss":              None,
+                    })
+        except Exception:
+            pass
+
+    # ── Add all remaining fundamental universe tickers (unanalyzed) ──────────────
+    for t, fd in fund_map.items():
+        if t not in seen:
+            seen.add(t)
+            tickers.append({
+                "ticker":                 t,
+                "has_thesis":             False,
+                "name":                   fd.get("name", ""),
+                "sector":                 fd.get("sector", ""),
+                "date":                   None,
+                "direction":              None,
+                "conviction":             None,
+                "signal_agreement_score": None,
+                "time_horizon":           None,
+                "data_quality":           None,
+                "thesis_short":           None,
+                "bull_probability":       None,
+                "bear_probability":       None,
+                "neutral_probability":    None,
+                "entry_low":              None,
+                "entry_high":             None,
+                "target_1":               None,
+                "target_2":               None,
+                "stop_loss":              None,
+            })
+
+    result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
+    _cache.set(cache_key, result, TTL_SHORT)
+    return result
+
+
+@app.get("/api/signals/outcomes")
+async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
+    """
+    Claude thesis outcome history — direction accuracy, target hit rate,
+    return % vs entry, % gap vs targets. Powered by thesis_outcomes table.
+    """
+    cache_key = f"signals_outcomes:{days}"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
@@ -1001,43 +1245,203 @@ async def deepdive_tickers():
         return result
 
     try:
+        conn.execute("SELECT id FROM thesis_outcomes LIMIT 1")
+    except Exception:
+        result = _no_data("thesis_outcomes table not yet populated — run thesis_checker.py")
+        _cache.set(cache_key, result, TTL_SHORT)
+        conn.close()
+        return result
+
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         rows = conn.execute("""
-            SELECT ticker, date, direction, conviction, signal_agreement_score,
-                   time_horizon, data_quality, thesis, bull_probability,
-                   bear_probability, neutral_probability, created_at
-            FROM thesis_cache
-            ORDER BY date DESC, created_at DESC
-        """).fetchall()
+            SELECT o.ticker, o.thesis_date, o.direction, o.conviction,
+                   o.entry_price, o.target_1, o.target_2, o.stop_loss,
+                   o.price_7d, o.price_14d, o.price_30d,
+                   o.return_7d, o.return_14d, o.return_30d,
+                   o.vs_target_1_pct, o.vs_target_2_pct,
+                   o.hit_target_1, o.hit_target_2, o.hit_stop,
+                   o.days_to_target_1, o.days_to_stop,
+                   o.outcome, o.claude_correct, o.was_traded,
+                   o.last_checked
+            FROM thesis_outcomes o
+            WHERE o.thesis_date >= ?
+            ORDER BY o.thesis_date DESC
+        """, (cutoff,)).fetchall()
         conn.close()
 
-        # Keep only the most recent entry per ticker
-        seen: set = set()
-        tickers = []
-        for r in rows:
-            t = r["ticker"]
-            if t in seen:
-                continue
-            seen.add(t)
-            tickers.append({
-                "ticker":                 t,
-                "date":                   r["date"],
-                "direction":              r["direction"],
-                "conviction":             r["conviction"],
-                "signal_agreement_score": r["signal_agreement_score"],
-                "time_horizon":           r["time_horizon"],
-                "data_quality":           r["data_quality"],
-                "thesis_short":           (r["thesis"] or "")[:160],
-                "bull_probability":       r["bull_probability"],
-                "bear_probability":       r["bear_probability"],
-                "neutral_probability":    r["neutral_probability"],
-            })
+        data = [dict(r) for r in rows]
 
-        result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
+        # Summary stats
+        resolved  = [r for r in data if r["outcome"] not in ("OPEN", None)]
+        correct   = [r for r in data if r["claude_correct"] == 1]
+        wrong     = [r for r in data if r["claude_correct"] == 0]
+        hit_t1    = [r for r in data if r["hit_target_1"]]
+        hit_stop  = [r for r in data if r["hit_stop"]]
+        ret30     = [r["return_30d"] for r in data if r["return_30d"] is not None]
+        vt1       = [r["vs_target_1_pct"] for r in data if r["vs_target_1_pct"] is not None]
+
+        def _avg(lst):
+            return round(sum(lst) / len(lst), 2) if lst else None
+
+        direction_accuracy = (
+            round(len(correct) / (len(correct) + len(wrong)) * 100, 1)
+            if (len(correct) + len(wrong)) > 0 else None
+        )
+
+        summary = {
+            "total":               len(data),
+            "resolved":            len(resolved),
+            "open":                len(data) - len(resolved),
+            "direction_correct":   len(correct),
+            "direction_wrong":     len(wrong),
+            "direction_accuracy_pct": direction_accuracy,
+            "hit_target_1":        len(hit_t1),
+            "hit_stop":            len(hit_stop),
+            "avg_return_30d":      _avg(ret30),
+            "avg_vs_target_1_pct": _avg(vt1),
+        }
+
+        result = {"data_available": bool(data), "days": days, "summary": summary, "data": data}
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 
     except Exception as e:
-        log.exception("deepdive_tickers error")
+        log.exception("signals_outcomes error")
+        return _no_data(str(e))
+
+
+@app.get("/api/signals/accuracy")
+async def signals_accuracy():
+    """
+    Monthly Claude precision report — proof-of-concept accuracy tracking.
+
+    Returns per-month aggregates plus an all-time summary:
+      - direction_accuracy_pct : % of theses where BULL/BEAR direction was correct at 30d
+      - target_hit_rate_pct    : % of theses that hit target_1
+      - stop_hit_rate_pct      : % of theses that hit stop_loss first
+      - avg_return_30d         : average 30d return across all theses that month
+      - avg_vs_target_1_pct    : how close price got to Claude's target (neg = fell short)
+      - total / resolved / open counts
+
+    Never deletes data — accumulates forever as proof of Claude's prediction quality.
+    """
+    cache_key = "signals_accuracy"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    conn = _db_connect(AI_QUANT_DB)
+    if conn is None:
+        result = _no_data("ai_quant_cache.db not found")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    try:
+        conn.execute("SELECT id FROM thesis_outcomes LIMIT 1")
+    except Exception:
+        result = _no_data("thesis_outcomes table not yet populated — run thesis_checker.py")
+        _cache.set(cache_key, result, TTL_SHORT)
+        conn.close()
+        return result
+
+    try:
+        rows = conn.execute("""
+            SELECT
+                strftime('%Y-%m', thesis_date)            AS month,
+                COUNT(*)                                   AS total,
+                SUM(CASE WHEN outcome != 'OPEN' THEN 1 ELSE 0 END) AS resolved,
+                SUM(CASE WHEN outcome  = 'OPEN' THEN 1 ELSE 0 END) AS open,
+                -- direction accuracy
+                SUM(CASE WHEN claude_correct = 1 THEN 1 ELSE 0 END) AS correct,
+                SUM(CASE WHEN claude_correct = 0 THEN 1 ELSE 0 END) AS wrong,
+                -- target / stop hit counts
+                SUM(CASE WHEN hit_target_1 = 1 THEN 1 ELSE 0 END)  AS hit_target_1,
+                SUM(CASE WHEN hit_stop     = 1
+                         AND (hit_target_1 = 0 OR days_to_stop < days_to_target_1)
+                         THEN 1 ELSE 0 END)                          AS hit_stop_first,
+                -- averages
+                ROUND(AVG(return_30d),        2)            AS avg_return_30d,
+                ROUND(AVG(vs_target_1_pct),   2)            AS avg_vs_target_1_pct,
+                ROUND(AVG(days_to_target_1),  1)            AS avg_days_to_target_1,
+                -- traded
+                SUM(CASE WHEN was_traded = 1 THEN 1 ELSE 0 END)     AS traded
+            FROM thesis_outcomes
+            GROUP BY month
+            ORDER BY month DESC
+        """).fetchall()
+
+        months = []
+        for r in rows:
+            total     = r["total"]    or 0
+            correct   = r["correct"]  or 0
+            wrong     = r["wrong"]    or 0
+            hit_t1    = r["hit_target_1"] or 0
+            resolved  = r["resolved"] or 0
+
+            dir_acc  = round(correct / (correct + wrong) * 100, 1) if (correct + wrong) > 0 else None
+            t1_rate  = round(hit_t1  / resolved * 100, 1)          if resolved > 0           else None
+            stop_rate= round((r["hit_stop_first"] or 0) / resolved * 100, 1) if resolved > 0 else None
+
+            months.append({
+                "month":                  r["month"],
+                "total":                  total,
+                "resolved":               resolved,
+                "open":                   r["open"] or 0,
+                "traded":                 r["traded"] or 0,
+                "correct":                correct,
+                "wrong":                  wrong,
+                "direction_accuracy_pct": dir_acc,
+                "hit_target_1":           hit_t1,
+                "hit_stop_first":         r["hit_stop_first"] or 0,
+                "target_hit_rate_pct":    t1_rate,
+                "stop_hit_rate_pct":      stop_rate,
+                "avg_return_30d":         r["avg_return_30d"],
+                "avg_vs_target_1_pct":    r["avg_vs_target_1_pct"],
+                "avg_days_to_target_1":   r["avg_days_to_target_1"],
+            })
+
+        # All-time summary
+        all_total    = sum(m["total"]    for m in months)
+        all_correct  = sum(m["correct"]  for m in months)
+        all_wrong    = sum(m["wrong"]    for m in months)
+        all_resolved = sum(m["resolved"] for m in months)
+        all_hit_t1   = sum(m["hit_target_1"]   for m in months)
+        all_hit_stop = sum(m["hit_stop_first"]  for m in months)
+        ret30_vals   = [m["avg_return_30d"]      for m in months if m["avg_return_30d"]     is not None]
+        vt1_vals     = [m["avg_vs_target_1_pct"] for m in months if m["avg_vs_target_1_pct"] is not None]
+
+        def _wavg(vals, weights):
+            pairs = [(v, w) for v, w in zip(vals, weights) if v is not None and w]
+            return round(sum(v * w for v, w in pairs) / sum(w for _, w in pairs), 2) if pairs else None
+
+        month_weights = [m["resolved"] for m in months]
+
+        all_time = {
+            "total":                  all_total,
+            "resolved":               all_resolved,
+            "correct":                all_correct,
+            "wrong":                  all_wrong,
+            "direction_accuracy_pct": round(all_correct / (all_correct + all_wrong) * 100, 1) if (all_correct + all_wrong) > 0 else None,
+            "hit_target_1":           all_hit_t1,
+            "hit_stop_first":         all_hit_stop,
+            "target_hit_rate_pct":    round(all_hit_t1   / all_resolved * 100, 1) if all_resolved > 0 else None,
+            "stop_hit_rate_pct":      round(all_hit_stop / all_resolved * 100, 1) if all_resolved > 0 else None,
+            "avg_return_30d":         _wavg(ret30_vals, month_weights),
+            "avg_vs_target_1_pct":    _wavg(vt1_vals,  month_weights),
+        }
+
+        conn.close()
+        result = {
+            "data_available": bool(months),
+            "all_time":       all_time,
+            "by_month":       months,
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("signals_accuracy error")
         return _no_data(str(e))
 
 
@@ -1241,6 +1645,164 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
         return _no_data(str(e))
 
 
+@app.get("/api/screeners/equity")
+async def screeners_equity():
+    """
+    Multi-factor equity rankings with Quarter-Kelly sizing.
+    Merges equity_signals CSV (composite_z, factor Z-scores) with equity_positions CSV
+    (weight_pct, position_eur). Returns all tickers sorted by composite_z descending.
+    """
+    cache_key = "screeners_equity"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    signals_file = get_latest_signals_file()
+    if signals_file is None:
+        result = _no_data("no equity_signals CSV found")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    try:
+        df = pd.read_csv(signals_file, index_col=0)
+        df.index.name = "ticker"
+        df = df.reset_index()
+
+        date_suffix = signals_file.stem.split("_")[-1]
+        pos_file = SIGNALS_DIR / f"equity_positions_{date_suffix}.csv"
+        pos_lookup: dict[str, Any] = {}
+        if pos_file.exists():
+            pos_df = pd.read_csv(pos_file, index_col=0)
+            pos_df.index.name = "ticker"
+            for t, p in pos_df.iterrows():
+                pos_lookup[str(t).upper()] = p
+
+        records = []
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).upper()
+            p = pos_lookup.get(ticker)  # None if not found
+            records.append({
+                "ticker":             ticker,
+                "rank":               _safe_int(row.get("rank")),
+                "composite_z":        _safe_float(row.get("composite_z")),
+                "momentum_12_1":      _safe_float(row.get("momentum_12_1_z")),
+                "momentum_6_1":       _safe_float(row.get("momentum_6_1_z")),
+                "mean_reversion_5d":  _safe_float(row.get("mean_rev_5d_z")),
+                "volatility_quality": _safe_float(row.get("vol_quality_z")),
+                "risk_adj_momentum":  _safe_float(row.get("risk_adj_mom_z")),
+                "weight_pct":         _safe_float(p.get("weight_pct"))   if p is not None else None,
+                "position_eur":       _safe_float(p.get("position_eur")) if p is not None else None,
+            })
+
+        records.sort(key=lambda x: x["composite_z"] or 0, reverse=True)
+        result = {
+            "data_available": True,
+            "count":          len(records),
+            "as_of":          date_suffix,
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "data":           records,
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("screeners_equity error")
+        return _no_data(str(e))
+
+
+@app.get("/api/screeners/crypto")
+async def screeners_crypto():
+    """
+    Crypto monitoring signals from the most recent crypto_signals_YYYYMMDD.csv.
+    Prices are converted from USD to EUR via fx_rates.
+    BTC is always pinned at index 0; remaining tickers sorted by signal_score desc.
+    Returns 404 if no file exists.
+    """
+    cache_key = "screeners_crypto"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    f = _latest_screener_file("crypto_signals")
+    if f is None:
+        return JSONResponse({"error": "no crypto signals file found"}, status_code=404)
+
+    try:
+        df = pd.read_csv(f)
+
+        # ── normalise column names ────────────────────────────────────────────
+        if df.columns[0] not in ("ticker", "Ticker"):
+            df = df.rename(columns={df.columns[0]: "ticker"})
+
+        def _norm_action(raw: str) -> str:
+            up = str(raw).strip().upper()
+            if up.startswith("SELL"):
+                return "SELL"
+            if up in ("HOLD", "REDUCE", "BUY"):
+                return up
+            return raw.strip()
+
+        def _trend_str(v: Optional[float]) -> str:
+            if v is None:
+                return "NEUTRAL"
+            return "UP" if v > 0 else ("DOWN" if v < 0 else "NEUTRAL")
+
+        def _scale_score(adj: Optional[float]) -> float:
+            """Map adjusted_signal [-1, +1] → [0, 100]."""
+            if adj is None:
+                return 50.0
+            return round(max(0.0, min(100.0, (adj + 1.0) / 2.0 * 100.0)), 1)
+
+        # ── determine BTC 200MA signal ────────────────────────────────────────
+        btc_rows = df[df["ticker"] == "BTC-USD"]
+        if not btc_rows.empty:
+            btc_adj = _safe_float(btc_rows.iloc[0].get("adjusted_signal"), 0.0)
+            btc_200ma_signal = "ACTIVE" if (btc_adj or 0.0) > 0 else "CASH"
+        else:
+            btc_200ma_signal = "CASH"
+
+        # ── build ticker records ──────────────────────────────────────────────
+        records: list[dict] = []
+        for _, row in df.iterrows():
+            price_usd = _safe_float(row.get("price"), 0.0) or 0.0
+            adj_sig   = _safe_float(row.get("adjusted_signal"))
+            trend_raw = _safe_float(row.get("trend_score"))
+            vol_ann   = _safe_float(row.get("realized_vol_ann"), 0.0) or 0.0
+
+            records.append({
+                "ticker":       str(row.get("ticker", "")),
+                "price_usd":    round(price_usd, 4),
+                "price_eur":    _convert_to_eur(price_usd, "USD"),
+                "signal_score": _scale_score(adj_sig),
+                "trend":        _trend_str(trend_raw),
+                "momentum":     _safe_float(row.get("momentum_score"), 0.0),
+                "rsi":          _safe_float(row.get("rsi"), 50.0),
+                "vol_pct":      round(vol_ann * 100.0, 2),
+                "action":       _norm_action(str(row.get("action", "HOLD"))),
+            })
+
+        # ── sort: BTC pinned first, rest by signal_score desc ─────────────────
+        btc_list   = [r for r in records if r["ticker"] == "BTC-USD"]
+        other_list = [r for r in records if r["ticker"] != "BTC-USD"]
+        other_list.sort(key=lambda x: x["signal_score"], reverse=True)
+        tickers = btc_list + other_list
+
+        # ── file mtime as generated_at ────────────────────────────────────────
+        generated_at = datetime.utcfromtimestamp(f.stat().st_mtime).isoformat() + "Z"
+
+        result = {
+            "generated_at":      generated_at,
+            "btc_200ma_signal":  btc_200ma_signal,
+            "tickers":           tickers,
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("screeners_crypto error")
+        return _no_data(str(e))
+
+
 # ==============================================================================
 # SECTION 7: REGIME & MACRO ENDPOINTS
 # ==============================================================================
@@ -1265,10 +1827,13 @@ async def regime_current():
         mr = rc.get("market_regime", {})
         sr = rc.get("sector_regimes", {})
 
+        _regime_str = mr.get("regime", "UNKNOWN")
         result = {
             "data_available":  True,
-            "regime":          mr.get("regime", "UNKNOWN"),
+            "regime":          _regime_str,
             "score":           mr.get("score", 0),
+            "size_multiplier": {"RISK_ON": 1.0, "TRANSITIONAL": 0.7, "RISK_OFF": 0.4}.get(
+                                   _regime_str, 0.7),
             "vix":             mr.get("vix"),
             "spy_vs_200ma":    mr.get("spy_vs_200ma"),
             "yield_curve_spread": mr.get("yield_curve_spread"),
@@ -1749,3 +2314,551 @@ async def cache_invalidate_post():
     """POST version — called by run_master.sh after the pipeline completes."""
     _cache._store.clear()
     return {"invalidated": True, "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+
+# ==============================================================================
+# SECTION 13: ACTION ZONES + AI ANALYSIS TRIGGER
+# ==============================================================================
+
+try:
+    from trade_journal import compute_action_zones as _compute_action_zones
+    _HAS_ACTION_ZONES = True
+except Exception:
+    _HAS_ACTION_ZONES = False
+
+try:
+    from fx_rates import get_eur_rate as _get_eur_rate, get_ticker_currency as _get_ticker_currency
+    _HAS_FX = True
+except Exception:
+    _HAS_FX = False
+
+
+@app.get("/api/ticker/{symbol}/action-zones")
+async def ticker_action_zones(symbol: str):
+    """
+    Live action zones for a ticker: buy zone, stop, targets, ATR, RSI timing.
+    R:R computed from buy zone midpoint (correct entry reference).
+    Prices returned in both USD and EUR.
+    """
+    sym = symbol.upper()
+    cache_key = f"action_zones_{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    if not _HAS_ACTION_ZONES:
+        return {"data_available": False, "error": "trade_journal not importable"}
+
+    try:
+        zones = await asyncio.get_event_loop().run_in_executor(
+            None, _compute_action_zones, sym
+        )
+    except Exception as e:
+        return {"data_available": False, "error": str(e)}
+
+    if not zones:
+        result = {"data_available": False, "error": f"No price data for {sym}"}
+        _cache.set(cache_key, result, 300)
+        return result
+
+    # FX conversion
+    fx_rate = 1.0
+    ccy = "USD"
+    try:
+        if _HAS_FX:
+            ccy = _get_ticker_currency(sym)
+            fx_rate = _get_eur_rate(ccy) if ccy != "EUR" else 1.0
+    except Exception:
+        fx_rate = 1.0 / 1.09  # fallback
+
+    def to_eur(v):
+        return round(v / fx_rate, 2) if v is not None and fx_rate > 0 else None
+
+    entry_mid_usd = (zones["buy_zone_low"] + zones["buy_zone_high"]) / 2
+    entry_mid_eur = to_eur(entry_mid_usd)
+
+    # Derive action from price vs zones
+    price_usd = zones["current_price"]
+    stop_usd   = zones["stop_loss"]
+    bzl_usd    = zones["buy_zone_low"]
+    bzh_usd    = zones["buy_zone_high"]
+    t1_usd     = zones["target_1"]
+    t2_usd     = zones["target_2"]
+
+    if price_usd < stop_usd:
+        action = "BELOW STOP — thesis invalidated"
+        action_color = "red"
+    elif bzl_usd <= price_usd <= bzh_usd:
+        action = "IN BUY ZONE — valid entry, confirm catalyst"
+        action_color = "green"
+    elif price_usd < bzl_usd:
+        action = "BELOW ZONE — wait for stabilization"
+        action_color = "amber"
+    elif price_usd >= t2_usd:
+        action = "AT/ABOVE T2 — exit or trail stop"
+        action_color = "blue"
+    elif price_usd >= t1_usd:
+        action = "AT/ABOVE T1 — take partial profits, move stop to entry"
+        action_color = "blue"
+    else:
+        action = "ABOVE ZONE — wait for pullback to buy zone"
+        action_color = "neutral"
+
+    result = {
+        "data_available":  True,
+        "ticker":          sym,
+        "currency":        ccy,
+        "fx_rate":         round(fx_rate, 4),
+        # USD prices (raw)
+        "current_price":   round(price_usd, 2),
+        "atr":             round(zones["atr"], 2),
+        "atr_pct":         round(zones["atr_pct"] * 100, 1),
+        "buy_zone_low":    round(bzl_usd, 2),
+        "buy_zone_high":   round(bzh_usd, 2),
+        "entry_mid":       round(entry_mid_usd, 2),
+        "stop_loss":       round(stop_usd, 2),
+        "target_1":        round(t1_usd, 2),
+        "target_2":        round(t2_usd, 2),
+        "rsi":             round(zones["rsi"], 1),
+        "ema21":           round(zones["ema21"], 2),
+        "ema50":           round(zones["ema50"], 2),
+        "rr_t1":           round(zones["risk_reward_t1"], 2),
+        "rr_t2":           round(zones["risk_reward_t2"], 2),
+        "timing":          zones["timing"],
+        "suggested_size_eur": zones["suggested_size_eur"],
+        "action":          action,
+        "action_color":    action_color,
+        # EUR prices
+        "eur": {
+            "current":    to_eur(price_usd),
+            "atr":        to_eur(zones["atr"]),
+            "buy_low":    to_eur(bzl_usd),
+            "buy_high":   to_eur(bzh_usd),
+            "entry_mid":  entry_mid_eur,
+            "stop":       to_eur(stop_usd),
+            "t1":         to_eur(t1_usd),
+            "t2":         to_eur(t2_usd),
+        },
+        # % from entry mid (correct reference)
+        "pct": {
+            "stop":       round((stop_usd - entry_mid_usd) / entry_mid_usd * 100, 1),
+            "t1":         round((t1_usd  - entry_mid_usd) / entry_mid_usd * 100, 1),
+            "t2":         round((t2_usd  - entry_mid_usd) / entry_mid_usd * 100, 1),
+            "current":    round((price_usd - entry_mid_usd) / entry_mid_usd * 100, 1),
+        },
+    }
+    _cache.set(cache_key, result, 15 * 60)  # 15-min cache (live data)
+    return result
+
+
+# Running analysis jobs: symbol → {"status", "started_at", "pid"}
+_analysis_jobs: dict = {}
+
+
+@app.post("/api/ticker/{symbol}/analyze")
+async def ticker_analyze(symbol: str):
+    """
+    Trigger ai_quant.py --ticker SYMBOL as a background subprocess.
+    Returns immediately. Poll /api/signals/ticker/{symbol} to see when thesis appears.
+    """
+    sym = symbol.upper()
+
+    # If already running, return current status
+    job = _analysis_jobs.get(sym)
+    if job and job.get("status") == "running":
+        proc = job.get("proc")
+        if proc and proc.returncode is None:
+            return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
+        else:
+            _analysis_jobs[sym]["status"] = "done"
+
+    ai_quant_path = BASE_DIR / "ai_quant.py"
+    python_exec   = BASE_DIR / ".venv" / "bin" / "python"
+    if not python_exec.exists():
+        python_exec = sys.executable
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(python_exec), str(ai_quant_path), "--ticker", sym,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR),
+        )
+        started = datetime.utcnow().isoformat() + "Z"
+        _analysis_jobs[sym] = {"status": "running", "started_at": started, "proc": proc}
+        log.info(f"Analysis started for {sym} (pid {proc.pid})")
+        return {"status": "running", "symbol": sym, "started_at": started, "pid": proc.pid}
+    except Exception as e:
+        log.error(f"Failed to launch analysis for {sym}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ticker/{symbol}/analyze/status")
+async def ticker_analyze_status(symbol: str):
+    """Poll whether a background analysis job has completed."""
+    sym = symbol.upper()
+    job = _analysis_jobs.get(sym)
+    if not job:
+        return {"status": "idle", "symbol": sym}
+    proc = job.get("proc")
+    if proc and proc.returncode is None:
+        return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
+    # Finished — clear cache so fresh thesis is fetched
+    _cache._store.pop(f"signals_ticker_{sym}", None)
+    return {"status": "done", "symbol": sym, "started_at": job.get("started_at")}
+
+
+# ==============================================================================
+# SECTION 14: TICKER INTELLIGENCE — SEC FILINGS, CONGRESS TRADES, EARNINGS
+# ==============================================================================
+
+_SEC_USER_AGENT = "SignalEngine/2.0 research@localhost"
+_TTL_24H = 86_400
+
+# Module-level caches for large datasets (don't use DataCache — these can be 10+ MB)
+_edgar_cik_map: dict = {}
+_edgar_cik_fetched_at: float = 0.0
+_house_trades: list = []
+_house_trades_fetched_at: float = 0.0
+_senate_trades: list = []
+_senate_trades_fetched_at: float = 0.0
+
+_IMPORTANT_FORMS = {"10-K", "10-Q", "8-K", "DEF 14A", "S-1", "424B4", "SC 13G", "SC 13D"}
+
+
+async def _fetch_edgar_cik_map() -> dict:
+    global _edgar_cik_map, _edgar_cik_fetched_at
+    if _edgar_cik_map and time.time() - _edgar_cik_fetched_at < _TTL_24H:
+        return _edgar_cik_map
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                "https://www.sec.gov/files/company_tickers.json",
+                headers={"User-Agent": _SEC_USER_AGENT},
+            )
+            data = r.json()
+            _edgar_cik_map = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in data.values()}
+            _edgar_cik_fetched_at = time.time()
+    except Exception as e:
+        log.warning(f"EDGAR CIK map fetch failed: {e}")
+    return _edgar_cik_map
+
+
+async def _fetch_house_trades() -> list:
+    global _house_trades, _house_trades_fetched_at
+    if _house_trades and time.time() - _house_trades_fetched_at < _TTL_24H:
+        return _house_trades
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get(
+                "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json"
+            )
+            _house_trades = r.json()
+            _house_trades_fetched_at = time.time()
+    except Exception as e:
+        log.warning(f"House trades fetch failed: {e}")
+    return _house_trades
+
+
+async def _fetch_senate_trades() -> list:
+    global _senate_trades, _senate_trades_fetched_at
+    if _senate_trades and time.time() - _senate_trades_fetched_at < _TTL_24H:
+        return _senate_trades
+    try:
+        async with httpx.AsyncClient(timeout=45) as c:
+            r = await c.get(
+                "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json"
+            )
+            _senate_trades = r.json()
+            _senate_trades_fetched_at = time.time()
+    except Exception as e:
+        log.warning(f"Senate trades fetch failed: {e}")
+    return _senate_trades
+
+
+@app.get("/api/ticker/{symbol}/sec-filings")
+async def ticker_sec_filings(symbol: str):
+    """Recent 10-K/10-Q/8-K filings from EDGAR for a ticker."""
+    sym = symbol.upper()
+    cache_key = f"sec_filings_{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    cik_map = await _fetch_edgar_cik_map()
+    cik = cik_map.get(sym)
+    if not cik:
+        result = {"data_available": False, "data": [], "error": f"CIK not found for {sym}"}
+        _cache.set(cache_key, result, 300)
+        return result
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                f"https://data.sec.gov/submissions/CIK{cik}.json",
+                headers={"User-Agent": _SEC_USER_AGENT},
+            )
+            sub = r.json()
+
+        recent = sub.get("filings", {}).get("recent", {})
+        forms  = recent.get("form", [])
+        dates  = recent.get("filingDate", [])
+        accs   = recent.get("accessionNumber", [])
+        descs  = recent.get("primaryDocDescription", [])
+        docs   = recent.get("primaryDocument", [])
+
+        filings = []
+        cik_int = int(cik)
+        for form, date, acc, desc, doc in zip(forms, dates, accs, descs, docs):
+            if form not in _IMPORTANT_FORMS:
+                continue
+            acc_clean = acc.replace("-", "")
+            url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}/{doc}"
+            filings.append({"form": form, "date": date, "description": desc or form, "url": url})
+            if len(filings) >= 10:
+                break
+
+        result = {"data_available": bool(filings), "data": filings}
+        _cache.set(cache_key, result, 6 * 3600)
+        return result
+
+    except Exception as e:
+        log.warning(f"SEC filings failed for {sym}: {e}")
+        result = {"data_available": False, "data": [], "error": str(e)}
+        _cache.set(cache_key, result, 300)
+        return result
+
+
+@app.get("/api/ticker/{symbol}/congress-trades")
+async def ticker_congress_trades(symbol: str):
+    """Recent House + Senate stock disclosures for a ticker."""
+    sym = symbol.upper()
+    cache_key = f"congress_{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    house_raw, senate_raw = await asyncio.gather(
+        _fetch_house_trades(), _fetch_senate_trades()
+    )
+
+    trades: list = []
+
+    if isinstance(house_raw, list):
+        for t in house_raw:
+            if (t.get("ticker") or "").upper().strip() == sym:
+                trades.append({
+                    "chamber": "House",
+                    "member":  t.get("representative", "Unknown"),
+                    "date":    t.get("transaction_date") or t.get("disclosure_date", ""),
+                    "type":    t.get("type", ""),
+                    "amount":  t.get("amount", ""),
+                    "asset":   t.get("asset_description", ""),
+                })
+
+    if isinstance(senate_raw, list):
+        for t in senate_raw:
+            if (t.get("ticker") or "").upper().strip() == sym:
+                trades.append({
+                    "chamber": "Senate",
+                    "member":  t.get("senator", "Unknown"),
+                    "date":    t.get("transaction_date") or t.get("disclosure_date", ""),
+                    "type":    t.get("type", ""),
+                    "amount":  t.get("amount", ""),
+                    "asset":   t.get("asset_description", ""),
+                })
+
+    trades.sort(key=lambda x: x.get("date") or "", reverse=True)
+    trades = trades[:25]
+
+    result = {"data_available": bool(trades), "data": trades}
+    _cache.set(cache_key, result, 3600)
+    return result
+
+
+def _quarter_label(dt) -> str:
+    """'Q4 '24' from a period-end date."""
+    q = (dt.month - 1) // 3 + 1
+    return f"Q{q} '{str(dt.year)[-2:]}"
+
+
+@app.get("/api/ticker/{symbol}/earnings")
+async def ticker_earnings(symbol: str):
+    """
+    Full earnings dataset:
+      - next_earnings date + EPS/Revenue forward estimates
+      - quarterly: last 8Q EPS (estimate, actual, surprise) + revenue actuals
+      - annual: last 5Y revenue + diluted EPS
+      - eps_growth_yoy
+    """
+    sym = symbol.upper()
+    cache_key = f"earnings_{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    quarterly: list = []
+    annual: list = []
+    next_date: Optional[str] = None
+    next_eps: Optional[dict] = None
+    next_revenue: Optional[dict] = None
+    eps_growth: Optional[float] = None
+
+    try:
+        tk = yf.Ticker(sym)
+
+        # ── Calendar → next quarter estimates ──────────────────────────────
+        try:
+            cal = tk.calendar or {}
+            raw_dates = cal.get("Earnings Date")
+            if raw_dates:
+                dates_list = list(raw_dates) if hasattr(raw_dates, "__iter__") and not isinstance(raw_dates, str) else [raw_dates]
+                if dates_list:
+                    d0 = dates_list[0]
+                    next_date = d0.strftime("%Y-%m-%d") if hasattr(d0, "strftime") else str(d0)[:10]
+            ea_avg = _safe_float(cal.get("Earnings Average"), None)
+            if ea_avg is not None:
+                next_eps = {
+                    "avg":  ea_avg,
+                    "high": _safe_float(cal.get("Earnings High"), None),
+                    "low":  _safe_float(cal.get("Earnings Low"), None),
+                }
+            ra_avg = _safe_float(cal.get("Revenue Average"), None)
+            if ra_avg is not None:
+                next_revenue = {
+                    "avg":  ra_avg,
+                    "high": _safe_float(cal.get("Revenue High"), None),
+                    "low":  _safe_float(cal.get("Revenue Low"), None),
+                }
+        except Exception:
+            pass
+
+        # ── Quarterly EPS from earnings_dates ───────────────────────────────
+        eps_map: dict = {}   # ann_datetime → {eps_estimate, eps_actual, surprise_pct}
+        try:
+            ed = tk.earnings_dates
+            if ed is not None and not ed.empty:
+                ed_reported = ed[ed["Reported EPS"].notna()].head(12)
+                for ann_ts, row in ed_reported.iterrows():
+                    ann_dt = ann_ts.replace(tzinfo=None) if hasattr(ann_ts, "replace") else ann_ts
+                    eps_map[ann_dt] = {
+                        "eps_estimate": _safe_float(row.get("EPS Estimate"), None),
+                        "eps_actual":   _safe_float(row.get("Reported EPS"), None),
+                        "surprise_pct": _safe_float(row.get("Surprise(%)"), None),
+                    }
+        except Exception:
+            pass
+
+        # ── Forward revenue estimates (0q, +1q) keyed by analyst period ────
+        # yfinance revenue_estimate only gives forward quarters, not historical.
+        # We store them by period label for potential future matching.
+        fwd_rev_estimates: dict = {}  # period_label → avg estimate
+        try:
+            re_df = tk.revenue_estimate
+            if re_df is not None and not re_df.empty and "avg" in re_df.columns:
+                for period_label, row in re_df.iterrows():
+                    avg = _safe_float(row.get("avg"), None)
+                    if avg is not None:
+                        fwd_rev_estimates[str(period_label)] = avg
+        except Exception:
+            pass
+
+        # ── Quarterly income stmt → revenue per period ──────────────────────
+        try:
+            qi = tk.quarterly_income_stmt
+            if qi is not None and not qi.empty:
+                rev_row = qi.loc["Total Revenue"] if "Total Revenue" in qi.index else None
+                eps_row = qi.loc["Diluted EPS"] if "Diluted EPS" in qi.index else None
+                periods = list(qi.columns)  # newest first
+
+                for period_col in periods[:8]:
+                    period_dt = pd.Timestamp(period_col).normalize()
+                    rev = _safe_float(rev_row[period_col] if rev_row is not None else None, None)
+                    qi_eps = _safe_float(eps_row[period_col] if eps_row is not None else None, None)
+
+                    # Match to eps_map by announcement date within [0, 90] days after period end
+                    matched_eps: dict = {}
+                    for ann_dt, eps_data in eps_map.items():
+                        delta = (ann_dt.normalize() - period_dt).days
+                        if 0 <= delta <= 90:
+                            matched_eps = eps_data
+                            break
+
+                    eps_actual    = matched_eps.get("eps_actual") or qi_eps
+                    eps_estimate  = matched_eps.get("eps_estimate")
+                    surprise_pct  = matched_eps.get("surprise_pct")
+                    eps_beat: Optional[bool] = None
+                    if eps_actual is not None and eps_estimate is not None:
+                        eps_beat = eps_actual >= eps_estimate
+
+                    # Revenue beat — historical consensus unavailable from yfinance free.
+                    # revenue_estimate only covers forward quarters (0q/+1q).
+                    rev_estimate: Optional[float] = None
+                    rev_beat: Optional[bool] = None
+                    if rev is not None and rev_estimate is not None:
+                        rev_beat = rev >= rev_estimate
+
+                    quarterly.append({
+                        "label":            _quarter_label(period_dt),
+                        "period":           str(period_col)[:10],
+                        "eps_estimate":     eps_estimate,
+                        "eps_actual":       eps_actual,
+                        "surprise_pct":     surprise_pct,
+                        "revenue":          rev,
+                        "revenue_estimate": rev_estimate,
+                        "beat":             eps_beat,
+                        "revenue_beat":     rev_beat,
+                    })
+
+                quarterly.reverse()  # oldest → newest for chart left→right
+
+                # YoY EPS growth: compare most recent Q vs same Q 1 year prior
+                if len(quarterly) >= 5:
+                    latest = quarterly[-1]["eps_actual"]
+                    year_ago = quarterly[-5]["eps_actual"]
+                    if latest is not None and year_ago not in (None, 0.0):
+                        eps_growth = round((latest - year_ago) / abs(year_ago) * 100, 1)
+        except Exception as ex:
+            log.debug(f"Quarterly income stmt failed for {sym}: {ex}")
+
+        # ── Annual income stmt → 5-year view ───────────────────────────────
+        try:
+            inc = tk.income_stmt
+            if inc is not None and not inc.empty:
+                rev_row = inc.loc["Total Revenue"] if "Total Revenue" in inc.index else None
+                eps_row = inc.loc["Diluted EPS"]   if "Diluted EPS"   in inc.index else None
+                ni_row  = inc.loc["Net Income"]    if "Net Income"    in inc.index else None
+
+                for col in list(inc.columns)[:5]:
+                    dt = pd.Timestamp(col)
+                    rev = _safe_float(rev_row[col] if rev_row is not None else None, None)
+                    eps = _safe_float(eps_row[col] if eps_row is not None else None, None)
+                    ni  = _safe_float(ni_row[col]  if ni_row  is not None else None, None)
+                    if rev is None and eps is None:
+                        continue
+                    annual.append({
+                        "label":      f"FY{dt.year}",
+                        "year":       dt.year,
+                        "revenue":    rev,
+                        "eps":        eps,
+                        "net_income": ni,
+                    })
+
+                annual.reverse()  # oldest → newest
+        except Exception as ex:
+            log.debug(f"Annual income stmt failed for {sym}: {ex}")
+
+    except Exception as e:
+        log.warning(f"Earnings fetch failed for {sym}: {e}")
+
+    result = {
+        "data_available":  bool(quarterly or annual or next_date),
+        "next_earnings":   next_date,
+        "next_eps":        next_eps,
+        "next_revenue":    next_revenue,
+        "eps_growth_yoy":  eps_growth,
+        "quarterly":       quarterly,
+        "annual":          annual,
+    }
+    _cache.set(cache_key, result, 4 * 3600)
+    return result

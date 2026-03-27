@@ -168,11 +168,16 @@ YAHOO_FINANCE_TIMEOUT = 30      # Seconds before timeout per ticker
 # ============================================================
 # UNIVERSE BUILDER PARAMETERS
 # ============================================================
-UNIVERSE_INDICES = ["russell1000", "russell2000", "sp500", "sp400"]
-UNIVERSE_PRESCREEN_TOP_N = 200
-UNIVERSE_MIN_DOLLAR_VOLUME = 3_000_000   # 30-day avg dollar volume ($)
-UNIVERSE_MIN_PRICE = 2.0                 # Minimum share price ($)
-UNIVERSE_CACHE_TTL_HOURS = 24            # Cache TTL for index constituents
+UNIVERSE_INDICES = [
+    "russell1000", "russell2000", "sp500", "sp400",   # US large/mid/small
+    "iefa", "iemg", "acwi",                            # international / global
+]
+UNIVERSE_PRESCREEN_TOP_N    = 200
+UNIVERSE_MIN_DOLLAR_VOLUME  = 3_000_000   # 30-day avg dollar volume ($)
+UNIVERSE_MIN_PRICE          = 1.5          # Minimum share price ($) — global-compatible
+UNIVERSE_CACHE_TTL_HOURS    = 24           # Cache TTL for index constituents (hours)
+UNIVERSE_ATR_PCT_MAX        = 6.0          # Drop if 20-day ATR% > this (quality gate)
+UNIVERSE_BETA_MAX           = 2.0          # Drop if 60-day beta vs SPY > this
 
 # ============================================================
 # REGIME FILTER PARAMETERS
