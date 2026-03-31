@@ -36,8 +36,22 @@ REQUIREMENTS:
     pip install anthropic
     export ANTHROPIC_API_KEY="your-key"
 
-NOTE: Costs ~$0.005-0.01 per ticker with adaptive thinking on Sonnet 4.6.
-      Watchlist of 10 tickers + portfolio briefing ≈ $0.10-0.15 per run.
+COST (claude-sonnet-4-6, $3/M input · $15/M output):
+    Prompt size : ~3,558 input tokens (system + user)
+                  └─ 5 upgrade modules add ~461 tokens vs original (~1,800 tok)
+    Per ticker  : ~$0.026 standard  |  ~$0.071 with extended thinking
+    5-ticker run: ~$0.13  standard  |  ~$0.35  with extended thinking
+    Thinking is auto-enabled when signal_agreement_score ≥ 0.70.
+
+    New section token cost breakdown:
+      Earnings & Event Calendar : ~127 tok
+      Historical Analog Score   : ~122 tok
+      Relative Strength/Sector  : ~90 tok
+      Liquidity & TC            : ~68 tok
+      Volatility Regime         : ~54 tok
+
+    NOTE: Output cost dominates (5× input rate), so doubling prompt size
+    only raised per-ticker cost by ~26% ($0.020 → $0.026 standard mode).
 
 IMPORTANT: This is NOT investment advice. Claude is analyzing the same
            signals you have — it doesn't have secret alpha. Use as a
@@ -53,7 +67,7 @@ import sqlite3
 import sys
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -93,6 +107,43 @@ except ImportError:
     _cr = None
     _RESOLVER_AVAILABLE = False
 
+# ─── IV calculator (optional — degrades gracefully) ──────────────────────────
+try:
+    from utils.iv_calculator import compute_atm_iv, get_iv_rank_and_percentile
+    _IV_AVAILABLE = True
+except ImportError:
+    _IV_AVAILABLE = False
+
+# ─── Sector ETF mapping (yfinance sector name → benchmark ETF ticker) ─────────
+SECTOR_ETF_MAP: Dict[str, str] = {
+    "Technology":              "XLK",
+    "Financial Services":      "XLF",
+    "Energy":                  "XLE",
+    "Healthcare":              "XLV",
+    "Consumer Cyclical":       "XLY",
+    "Consumer Defensive":      "XLP",
+    "Industrials":             "XLI",
+    "Basic Materials":         "XLB",
+    "Utilities":               "XLU",
+    "Real Estate":             "XLRE",
+    "Communication Services":  "XLC",
+}
+
+# ─── Feature normalization bounds for historical analog similarity ─────────────
+_FEATURE_RANGES: Dict[str, tuple] = {
+    "rsi_14":               (0.0,   100.0),
+    "above_ma200":          (0.0,     1.0),
+    "momentum_1m":          (-30.0,  30.0),
+    "momentum_3m":          (-50.0,  50.0),
+    "iv_rank":              (0.0,   100.0),
+    "heat_score":           (0.0,   100.0),
+    "short_squeeze_score":  (0.0,   100.0),
+    "vol_compression_score":(0.0,    10.0),
+    "dark_pool_score":      (0.0,   100.0),
+    "short_ratio_zscore":   (-3.0,    3.0),
+    "fundamental_score":    (0.0,   100.0),
+    "agreement_score":      (0.0,     1.0),
+}
 
 # === NEW: UNIVERSE RANK EXPORT FOR AI QUANT ===
 _RANKED_UNIVERSE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ranked_universe.json")
@@ -861,6 +912,411 @@ def compute_signal_agreement(signals_dict: dict) -> float:
     return round(plurality_count / len(votes), 4)
 
 
+# ==============================================================================
+# SECTION 1a-NEW: FIVE UPGRADE SIGNAL COLLECTORS
+# ==============================================================================
+
+def _extract_signal_features(signals: dict) -> dict:
+    """
+    Extract a normalized scalar feature vector from a signals dict.
+    All values mapped to [0,1] using _FEATURE_RANGES bounds.
+    Used by _collect_historical_analog_signals for cosine similarity.
+    """
+    tech     = signals.get("technical")     or {}
+    opts     = signals.get("options_flow")  or {}
+    catalyst = signals.get("catalyst")      or {}
+    dp       = signals.get("dark_pool_flow") or {}
+    fund     = signals.get("fundamentals")  or {}
+
+    raw: Dict[str, Optional[float]] = {
+        "rsi_14":               tech.get("rsi_14"),
+        "above_ma200":          1.0 if tech.get("above_ma200") is True else (0.0 if tech.get("above_ma200") is False else None),
+        "momentum_1m":          tech.get("momentum_1m_pct"),
+        "momentum_3m":          tech.get("momentum_3m_pct"),
+        "iv_rank":              opts.get("iv_rank"),
+        "heat_score":           opts.get("heat_score"),
+        "short_squeeze_score":  catalyst.get("short_squeeze_score"),
+        "vol_compression_score":catalyst.get("vol_compression_score"),
+        "dark_pool_score":      dp.get("dark_pool_score"),
+        "short_ratio_zscore":   dp.get("short_ratio_zscore"),
+        "fundamental_score":    fund.get("fundamental_score_pct"),
+        "agreement_score":      signals.get("signal_agreement_score"),
+    }
+
+    normalized: dict = {}
+    for key, val in raw.items():
+        if val is None:
+            continue
+        lo, hi = _FEATURE_RANGES.get(key, (0.0, 100.0))
+        span = hi - lo
+        if span == 0:
+            normalized[key] = 0.5
+        else:
+            normalized[key] = max(0.0, min(1.0, (float(val) - lo) / span))
+    return normalized
+
+
+def _cosine_similarity_features(a: dict, b: dict) -> float:
+    """
+    Cosine similarity between two normalized feature dicts.
+    Only keys present (non-None) in BOTH dicts contribute.
+    Returns 0.0 when fewer than 3 shared features are available.
+    """
+    import numpy as np
+    shared = [k for k in a if k in b]
+    if len(shared) < 3:
+        return 0.0
+    va = np.array([a[k] for k in shared], dtype=float)
+    vb = np.array([b[k] for k in shared], dtype=float)
+    na, nb = np.linalg.norm(va), np.linalg.norm(vb)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0))
+
+
+def _collect_earnings_event_signals(ticker: str) -> dict:
+    """
+    Collect earnings calendar + historical surprise data.
+
+    Returns
+    -------
+    next_earnings_date      : str  YYYY-MM-DD or None
+    days_to_next_earnings   : int or None
+    earnings_risk           : 'HIGH' (0-14d) | 'MEDIUM' (15-30d) | 'LOW' (>30d or unknown)
+    earnings_surprises_4q   : list of {date, eps_estimate, eps_actual, surprise_pct}
+    avg_surprise_magnitude  : float (mean abs surprise %, last 4Q)
+    beat_rate_4q            : float (# beats / 4; None if no data)
+    """
+    try:
+        import yfinance as yf
+        tk  = yf.Ticker(ticker)
+        cal = tk.calendar  # DataFrame or None
+
+        # ── Next earnings date ────────────────────────────────────────────────
+        next_earnings: Optional[str] = None
+        days_to: Optional[int]       = None
+        if cal is not None and not (hasattr(cal, "empty") and cal.empty):
+            try:
+                # yfinance calendar shape varies; handle both Series and DataFrame
+                if hasattr(cal, "loc"):
+                    ed = cal.loc["Earnings Date"] if "Earnings Date" in cal.index else None
+                    if ed is not None:
+                        val = ed.iloc[0] if hasattr(ed, "iloc") else ed
+                        next_earnings = str(val)[:10]
+                elif isinstance(cal, dict):
+                    ed_list = cal.get("Earnings Date", [])
+                    if ed_list:
+                        next_earnings = str(ed_list[0])[:10]
+            except Exception:
+                pass
+
+        if next_earnings:
+            try:
+                next_dt = datetime.strptime(next_earnings, "%Y-%m-%d")
+                days_to = (next_dt - datetime.now()).days
+            except Exception:
+                pass
+
+        earnings_risk: str
+        if days_to is not None and 0 <= days_to <= 14:
+            earnings_risk = "HIGH"
+        elif days_to is not None and days_to <= 30:
+            earnings_risk = "MEDIUM"
+        else:
+            earnings_risk = "LOW"
+
+        # ── Historical surprises (last 4 quarters) ────────────────────────────
+        surprises: list = []
+        try:
+            hist = tk.earnings_history
+            if hist is not None and not hist.empty:
+                for idx, row in hist.tail(4).iterrows():
+                    est = row.get("epsEstimate") if hasattr(row, "get") else None
+                    act = row.get("epsActual")   if hasattr(row, "get") else None
+                    sup = row.get("surprisePercent") if hasattr(row, "get") else None
+                    date_str = str(idx.date()) if hasattr(idx, "date") else str(idx)[:10]
+                    surprises.append({
+                        "date":         date_str,
+                        "eps_estimate": round(float(est), 2) if est is not None else None,
+                        "eps_actual":   round(float(act), 2) if act is not None else None,
+                        "surprise_pct": round(float(sup) * 100, 1) if sup is not None else None,
+                    })
+        except Exception:
+            pass
+
+        valid_surprises = [s["surprise_pct"] for s in surprises if s.get("surprise_pct") is not None]
+        avg_magnitude   = round(sum(abs(v) for v in valid_surprises) / len(valid_surprises), 1) if valid_surprises else None
+        beats           = sum(1 for v in valid_surprises if v > 0)
+        beat_rate       = round(beats / len(valid_surprises), 2) if valid_surprises else None
+
+        return {
+            "earnings_available":       True,
+            "next_earnings_date":       next_earnings,
+            "days_to_next_earnings":    days_to,
+            "earnings_risk":            earnings_risk,
+            "earnings_surprises_4q":    surprises,
+            "avg_surprise_magnitude":   avg_magnitude,
+            "beat_rate_4q":             beat_rate,
+        }
+    except Exception as exc:
+        logger.warning("[%s] Earnings event collection failed: %s", ticker, exc)
+        return {"earnings_available": False, "error": str(exc), "earnings_risk": "LOW"}
+
+
+def _collect_relative_strength_signals(ticker: str, sector: Optional[str] = None) -> dict:
+    """
+    Ticker performance vs sector ETF + RSP (equal-weight S&P 500) for 20/60/120d.
+    sector : yfinance sector string (e.g. 'Technology'); used to pick ETF from SECTOR_ETF_MAP.
+    """
+    try:
+        import yfinance as yf
+        sector_etf = SECTOR_ETF_MAP.get(sector or "", "SPY")
+        benchmark  = "RSP"
+        needed     = list({ticker, sector_etf, benchmark})
+        end        = datetime.now()
+        start      = end - timedelta(days=150)   # covers 120 trading-day lookback
+
+        raw = yf.download(needed, start=start, end=end, auto_adjust=True, progress=False, threads=False)
+        prices = raw["Close"] if "Close" in raw else raw
+        if ticker not in prices.columns or prices.empty:
+            return {"rs_available": False, "error": "price data unavailable"}
+
+        out: dict = {"rs_available": True, "sector_etf": sector_etf}
+        for label, n_days in (("20d", 20), ("60d", 60), ("120d", 120)):
+            if len(prices) < n_days:
+                continue
+            def _ret(col: str) -> Optional[float]:
+                if col not in prices.columns:
+                    return None
+                s = prices[col].dropna()
+                if len(s) < n_days:
+                    return None
+                return round((s.iloc[-1] / s.iloc[-n_days] - 1) * 100, 2)
+
+            t_ret  = _ret(ticker)
+            rsp_ret = _ret(benchmark)
+            etf_ret = _ret(sector_etf)
+
+            out[f"ticker_return_{label}"]  = t_ret
+            out[f"rsp_return_{label}"]     = rsp_ret
+            out[f"sector_return_{label}"]  = etf_ret
+            out[f"vs_rsp_{label}"]         = round(t_ret - rsp_ret, 2) if (t_ret is not None and rsp_ret is not None) else None
+            out[f"vs_sector_{label}"]      = round(t_ret - etf_ret, 2) if (t_ret is not None and etf_ret is not None) else None
+
+        # Primary RS signal: 20d vs RSP
+        vs_rsp_20 = out.get("vs_rsp_20d") or 0.0
+        if   vs_rsp_20 >=  5.0: rs_signal = "STRONG_OUTPERFORM"
+        elif vs_rsp_20 >=  1.5: rs_signal = "OUTPERFORM"
+        elif vs_rsp_20 >= -1.5: rs_signal = "INLINE"
+        elif vs_rsp_20 >= -5.0: rs_signal = "UNDERPERFORM"
+        else:                   rs_signal = "STRONG_UNDERPERFORM"
+        out["rs_signal_20d"] = rs_signal
+
+        return out
+    except Exception as exc:
+        logger.warning("[%s] Relative strength collection failed: %s", ticker, exc)
+        return {"rs_available": False, "error": str(exc)}
+
+
+def _collect_liquidity_signals(ticker: str) -> dict:
+    """
+    30-day ADV (shares + dollars), today's volume ratio vs ADV,
+    and estimated bid-ask spread (Corwin-Schultz HL proxy).
+    Position-as-%-of-ADV is computed in _build_prompt where NAV is known.
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        end   = datetime.now()
+        start = end - timedelta(days=50)   # buffer for weekends + holidays
+        hist  = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+        if hist.empty or len(hist) < 5:
+            return {"liquidity_available": False, "error": "insufficient history"}
+
+        vol_30   = hist["Volume"].tail(30)
+        price_30 = hist["Close"].tail(30)
+        adv_sh   = float(vol_30.mean())
+        cur_px   = float(price_30.iloc[-1])
+        adv_usd  = adv_sh * cur_px
+        vol_today = float(hist["Volume"].iloc[-1])
+        vol_ratio = round(vol_today / adv_sh, 2) if adv_sh > 0 else None
+
+        # Corwin-Schultz half-spread proxy (10-day rolling HL)
+        recent = hist.tail(10)
+        hl_ratio = (recent["High"] - recent["Low"]) / (recent["High"] + recent["Low"])
+        spread_bps = round(float(hl_ratio.mean()) * 10_000 / 2, 1)   # half-spread in bps
+
+        if   adv_usd >= 100_000_000: tier = "MEGA"
+        elif adv_usd >=  10_000_000: tier = "LARGE"
+        elif adv_usd >=   1_000_000: tier = "MID"
+        else:                         tier = "SMALL"
+
+        return {
+            "liquidity_available": True,
+            "adv_shares":          int(adv_sh),
+            "adv_dollars":         round(adv_usd),
+            "current_price":       round(cur_px, 2),
+            "vol_today_shares":    int(vol_today),
+            "vol_ratio_vs_adv":    vol_ratio,
+            "spread_bps":          spread_bps,
+            "liquidity_tier":      tier,
+        }
+    except Exception as exc:
+        logger.warning("[%s] Liquidity collection failed: %s", ticker, exc)
+        return {"liquidity_available": False, "error": str(exc)}
+
+
+def _collect_historical_analog_signals(
+    ticker: str,
+    current_signals: dict,
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Find the top-3 most similar past signal setups from the last 3 years
+    stored in ai_quant_cache.db.  Similarity = cosine distance on a
+    normalized 12-feature vector.  Returns weighted analog score 0-100.
+
+    db_path: override for testing (pass ':memory:' path with pre-seeded data).
+    """
+    db_path = db_path or _DB_PATH
+    try:
+        import json as _json
+
+        if not os.path.exists(db_path) and db_path != ":memory:":
+            return {"analog_available": False, "reason": "cache DB not found"}
+
+        current_features = _extract_signal_features(current_signals)
+        if len(current_features) < 3:
+            return {"analog_available": False, "reason": "insufficient current features"}
+
+        cutoff = (datetime.now() - timedelta(days=3 * 365)).strftime("%Y-%m-%d")
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """SELECT ticker, date, direction, conviction, signal_agreement_score,
+                          signals_json, entry_low, target_1
+                   FROM thesis_cache
+                   WHERE date >= ? AND signals_json IS NOT NULL
+                   ORDER BY date DESC LIMIT 500""",
+                (cutoff,),
+            ).fetchall()
+
+        if len(rows) < 5:
+            return {
+                "analog_available": False,
+                "reason": f"only {len(rows)} historical theses (need ≥5)",
+            }
+
+        scored: list = []
+        for r in rows:
+            try:
+                hist_sig  = _json.loads(r[5]) if r[5] else {}
+                hist_feat = _extract_signal_features(hist_sig)
+                sim       = _cosine_similarity_features(current_features, hist_feat)
+                scored.append({
+                    "ticker":     r[0],
+                    "date":       r[1],
+                    "direction":  r[2],
+                    "conviction": r[3],
+                    "similarity": round(sim * 100, 1),
+                })
+            except Exception:
+                continue
+
+        if not scored:
+            return {"analog_available": False, "reason": "similarity computation failed"}
+
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        top3 = scored[:3]
+
+        # Weighted composite score (50/35/15)
+        weights     = [0.50, 0.35, 0.15]
+        analog_score = sum(a["similarity"] * w for a, w in zip(top3, weights))
+
+        direction_counts: dict = {}
+        for a in top3:
+            d = a.get("direction") or "NEUTRAL"
+            direction_counts[d] = direction_counts.get(d, 0) + 1
+        modal_direction = max(direction_counts, key=direction_counts.get)
+
+        return {
+            "analog_available":    True,
+            "analog_score":        round(analog_score, 1),
+            "top_3_analogs":       top3,
+            "modal_direction":     modal_direction,
+            "n_searched":          len(scored),
+        }
+    except Exception as exc:
+        logger.warning("[%s] Historical analog failed: %s", ticker, exc)
+        return {"analog_available": False, "reason": str(exc)}
+
+
+def _collect_volatility_regime_signals(ticker: str) -> dict:
+    """
+    20d and 60d realized vol (annualized %), vol ratio, IV rank/percentile,
+    and VIX percentile vs 1-year range.
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        end   = datetime.now()
+        start = end - timedelta(days=90)   # need ~60 trading days
+
+        hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
+        if hist.empty or len(hist) < 25:
+            return {"vol_regime_available": False, "error": "insufficient history"}
+
+        log_ret = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+        rv_20   = float(log_ret.tail(20).std() * np.sqrt(252) * 100)
+        rv_60   = float(log_ret.tail(60).std() * np.sqrt(252) * 100) if len(log_ret) >= 60 else None
+        vol_ratio = round(rv_20 / rv_60, 3) if rv_60 else None
+
+        if   vol_ratio is not None and vol_ratio > 1.2: vol_regime = "EXPANDING"
+        elif vol_ratio is not None and vol_ratio < 0.8: vol_regime = "CONTRACTING"
+        elif vol_ratio is not None:                     vol_regime = "STABLE"
+        else:                                           vol_regime = "UNKNOWN"
+
+        # ── IV rank / percentile ─────────────────────────────────────────────
+        current_iv: Optional[float]  = None
+        iv_rank: Optional[float]     = None
+        iv_percentile: Optional[float] = None
+        if _IV_AVAILABLE:
+            try:
+                current_iv = compute_atm_iv(ticker)
+                if current_iv is not None:
+                    iv_rank, iv_percentile = get_iv_rank_and_percentile(ticker, current_iv)
+            except Exception:
+                pass
+
+        # ── VIX percentile (vs 252-day range) ────────────────────────────────
+        vix_current: Optional[float]     = None
+        vix_percentile: Optional[float]  = None
+        try:
+            vix_start = end - timedelta(days=400)
+            vh = yf.Ticker("^VIX").history(start=vix_start, end=end, auto_adjust=True)
+            if not vh.empty:
+                vix_current   = round(float(vh["Close"].iloc[-1]), 2)
+                vix_1y        = vh["Close"].tail(252)
+                vix_percentile = round(float((vix_1y < vix_current).mean() * 100), 1)
+        except Exception:
+            pass
+
+        return {
+            "vol_regime_available": True,
+            "rv_20d_pct":           round(rv_20, 1),
+            "rv_60d_pct":           round(rv_60, 1) if rv_60 is not None else None,
+            "vol_ratio_20_60":      vol_ratio,
+            "vol_regime":           vol_regime,
+            "current_iv_pct":       round(current_iv * 100, 1) if (current_iv and current_iv < 10) else (round(current_iv, 1) if current_iv else None),
+            "iv_rank":              round(iv_rank, 1) if iv_rank is not None else None,
+            "iv_percentile":        round(iv_percentile, 1) if iv_percentile is not None else None,
+            "vix_current":          vix_current,
+            "vix_percentile":       vix_percentile,
+        }
+    except Exception as exc:
+        logger.warning("[%s] Volatility regime collection failed: %s", ticker, exc)
+        return {"vol_regime_available": False, "error": str(exc)}
+
+
 def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     """
     Collect all available signals for a ticker.
@@ -995,6 +1451,31 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         tone = transcript.get("transcript_tone_label", "N/A") if transcript.get("transcript_available") else "N/A"
         print(f"done (tone={tone})")
 
+    if verbose:
+        print(f"  [{ticker}]   → earnings event...", end=" ", flush=True)
+    evnt = _collect_earnings_event_signals(ticker)
+    signals["earnings_event"] = evnt
+    if verbose:
+        risk = evnt.get("earnings_risk", "N/A")
+        dte  = evnt.get("days_to_next_earnings")
+        print(f"done (risk={risk}, dte={dte})")
+
+    if verbose:
+        print(f"  [{ticker}]   → liquidity...", end=" ", flush=True)
+    liq = _collect_liquidity_signals(ticker)
+    signals["liquidity"] = liq
+    if verbose:
+        tier = liq.get("liquidity_tier", "N/A") if liq.get("liquidity_available") else "N/A"
+        print(f"done (tier={tier})")
+
+    if verbose:
+        print(f"  [{ticker}]   → volatility regime...", end=" ", flush=True)
+    vr = _collect_volatility_regime_signals(ticker)
+    signals["volatility_regime"] = vr
+    if verbose:
+        regime_v = vr.get("vol_regime", "N/A") if vr.get("vol_regime_available") else "N/A"
+        print(f"done ({regime_v})")
+
     # ── Macro + sector regime ─────────────────────────────────────────────────
     if _REGIME_AVAILABLE:
         if verbose:
@@ -1034,6 +1515,24 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         signals["market_regime"]       = {}
         signals["ticker_sector"]       = None
         signals["ticker_sector_regime"] = None
+
+    # ── Relative strength (needs sector from regime step above) ──────────────
+    if verbose:
+        print(f"  [{ticker}]   → relative strength...", end=" ", flush=True)
+    rs = _collect_relative_strength_signals(ticker, sector=signals.get("ticker_sector"))
+    signals["relative_strength"] = rs
+    if verbose:
+        sig = rs.get("rs_signal_20d", "N/A") if rs.get("rs_available") else "N/A"
+        print(f"done ({sig})")
+
+    # ── Historical analog (needs all other signals collected first) ───────────
+    if verbose:
+        print(f"  [{ticker}]   → historical analog...", end=" ", flush=True)
+    analog = _collect_historical_analog_signals(ticker, signals)
+    signals["historical_analog"] = analog
+    if verbose:
+        score = analog.get("analog_score", "N/A") if analog.get("analog_available") else "N/A"
+        print(f"done (score={score})")
 
     return signals
 
@@ -1372,12 +1871,43 @@ unless dark-pool / options / insider signals are overwhelmingly bullish.
 High-beta names (crypto, small-cap biotech, semiconductors) get extra conservative sizing in RISK_OFF.
 
 Signal weighting priority (highest → lowest)
-1. Macro + weekly regime
-2. Dark pool + options flow + max pain
-3. Technical regime & volume profile
-4. Insider + SEC + earnings transcript tone
+1. Macro + weekly regime  +  Volatility regime (EXPANDING → reduce size; CONTRACTING → tighten stops)
+2. Dark pool + options flow + max pain  +  Earnings event (HIGH risk → cap conviction ≤ 3)
+3. Technical regime & volume profile  +  Liquidity (SMALL/MID tier → hard cap position_size_pct ≤ 3)
+4. Relative strength vs RSP/sector  +  Insider + SEC + earnings transcript tone
 5. Fundamentals / DCF / peer benchmarking
-6. Congress / Polymarket (lowest weight)
+6. Historical analog score (weak prior — calibrate confidence only, never override hard rules)
+7. Congress / Polymarket (lowest weight)
+
+Earnings & Event risk rules
+If earnings_risk = HIGH (≤14d): cap conviction at 3/5 unless implied straddle move ≤ 0.7× avg historical surprise
+magnitude (setup is "already priced in"). Always name the exact earnings date in key_invalidation.
+If beat_rate_4q ≥ 0.75 and avg_surprise_magnitude > 5%: note "serial earnings beat" as a catalyst.
+If beat_rate_4q ≤ 0.25: note "serial earnings miss risk" in risks array.
+
+Relative strength rules
+STRONG_OUTPERFORM (vs RSP 20d): adds +0.5 to qualitative conviction (non-integer signal, reflected in thesis).
+STRONG_UNDERPERFORM: always mention in bear_scenario; discount BULL conviction by 1 point.
+For sector rotation setups (ticker strong vs RSP but weak vs sector ETF): flag as "sector rotation laggard risk".
+
+Liquidity & transaction cost rules
+SMALL tier (<$1M ADV): maximum position_size_pct = 3. State "thin liquidity" in notes.
+MID tier ($1-10M ADV): maximum position_size_pct = 5.
+Spread > 30 bps: add spread cost to the entry friction note (e.g. "30bps spread adds ~$X round-trip cost").
+If position is >20% of ADV: flag as "market impact risk" in risks.
+
+Historical analog rules
+analog_score ≥ 70: "Strong historical precedent — past setups with similar signal confluence resolved
+[modal_direction] X% of the time." Include in thesis.
+analog_score 40-69: mention analog in notes only; do not use in conviction calculation.
+analog_score < 40 or unavailable: ignore; do not reference analogs in output.
+
+Volatility regime rules
+EXPANDING vol + RISK_ON macro: widen stop_loss by 1 ATR; reduce position_size_pct by 25%.
+EXPANDING vol + RISK_OFF macro: maximum conviction = 2; maximum position_size_pct = 2.
+CONTRACTING vol: note potential compression breakout; straddle cost context is especially relevant.
+IV rank > 80: options are expensive — prefer stock/delta position over option purchase.
+IV rank < 20: options are cheap — note straddle as an attractive hedge if directional uncertainty exists.
 
 Tone & style
 Clinical, no hype. Always give a clear Primary vs Counter thesis.
@@ -1413,6 +1943,10 @@ Output MUST be valid JSON with this exact structure:
   "notes": "any caveats, data gaps, or forward-looking assumptions",
   "universe_rank": "Ranked #NN / 215 in global multi-factor prescreen (factors: mom/vol-surge/near-high/earnings/sector-RS)",
   "universe_status": "Persistent favorite | Tier-1 | Dynamic only",
+  "earnings_risk": "HIGH | MEDIUM | LOW | NONE (HIGH = earnings ≤14d away; affects conviction cap)",
+  "vol_regime": "EXPANDING | CONTRACTING | STABLE | UNKNOWN (from 20d/60d realized vol ratio)",
+  "liquidity_note": "string or null — populate if tier is SMALL/MID or position exceeds 20% of ADV",
+  "analog_score": "float 0-100 or null — echo back the pre-computed historical analog score",
   "expected_moves": [
     {
       "horizon": "today",
@@ -1456,6 +1990,11 @@ def _build_prompt(signals: dict) -> str:
     mr       = signals.get("market_regime", {})
     sr       = signals.get("ticker_sector_regime")
     sector   = signals.get("ticker_sector")
+    evnt     = signals.get("earnings_event")   or {}
+    rs       = signals.get("relative_strength") or {}
+    liq      = signals.get("liquidity")        or {}
+    analog   = signals.get("historical_analog") or {}
+    vr       = signals.get("volatility_regime") or {}
 
     prompt_parts = [
         f"Analyze {ticker} using the following signal data collected on {datetime.now().strftime('%Y-%m-%d')}.",
@@ -1527,6 +2066,34 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Technical data: unavailable")
 
+    prompt_parts += ["", "## VOLATILITY REGIME"]
+    if vr.get("vol_regime_available"):
+        rv20  = vr.get("rv_20d_pct", "N/A")
+        rv60  = vr.get("rv_60d_pct", "N/A")
+        ratio = vr.get("vol_ratio_20_60")
+        vreg  = vr.get("vol_regime", "UNKNOWN")
+        prompt_parts += [
+            f"Realized vol — 20d: {rv20}%  |  60d: {rv60}%  "
+            f"|  ratio (20/60): {ratio:.3f} → {vreg}" if isinstance(ratio, float) else
+            f"Realized vol — 20d: {rv20}%  |  60d: {rv60}%  |  regime: {vreg}",
+        ]
+        if vr.get("iv_rank") is not None:
+            prompt_parts.append(
+                f"IV rank: {vr['iv_rank']:.0f}/100  |  IV percentile: {vr.get('iv_percentile', 'N/A')}%"
+                f"  |  Current IV: {vr.get('current_iv_pct', 'N/A')}%"
+            )
+        if vr.get("vix_current") is not None:
+            prompt_parts.append(
+                f"VIX: {vr['vix_current']}  ({vr.get('vix_percentile', 'N/A')}th percentile vs 1-year range)"
+            )
+        # Interpretation note
+        if vreg == "EXPANDING":
+            prompt_parts.append("Note: Vol is expanding — wider stops required; reduce position size vs base case.")
+        elif vreg == "CONTRACTING":
+            prompt_parts.append("Note: Vol is contracting — potential compression breakout setup; tighten targets.")
+    else:
+        prompt_parts.append("Volatility regime: unavailable")
+
     prompt_parts += ["", "## VOLUME PROFILE (Support & Resistance)"]
     if vp:
         sup  = vp.get("support_levels", [])
@@ -1550,6 +2117,38 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Volume profile: unavailable")
 
+    prompt_parts += ["", "## LIQUIDITY & TRANSACTION COST"]
+    if liq.get("liquidity_available"):
+        adv_usd   = liq.get("adv_dollars", 0)
+        adv_str   = f"${adv_usd/1e6:.1f}M" if adv_usd >= 1_000_000 else f"${adv_usd:,.0f}"
+        tier      = liq.get("liquidity_tier", "N/A")
+        spread    = liq.get("spread_bps", "N/A")
+        vol_ratio = liq.get("vol_ratio_vs_adv")
+        prompt_parts += [
+            f"ADV (30d): {liq.get('adv_shares', 'N/A'):,} shares ({adv_str}/day) — tier: {tier}",
+            f"Today's volume: {liq.get('vol_today_shares', 'N/A'):,} shares"
+            + (f"  ({vol_ratio:.1f}x vs ADV)" if isinstance(vol_ratio, float) else ""),
+            f"Implied bid-ask spread: {spread} bps (half-spread proxy)",
+        ]
+        # Compute position-as-%-of-ADV for a reference 5% position
+        try:
+            ref_pos_usd = PORTFOLIO_NAV * EQUITY_ALLOCATION * 0.05
+            pct_of_adv  = round(ref_pos_usd / adv_usd * 100, 2) if adv_usd > 0 else None
+            if pct_of_adv is not None:
+                liquidity_risk = "LOW" if pct_of_adv < 5 else ("MEDIUM" if pct_of_adv < 20 else "HIGH")
+                prompt_parts.append(
+                    f"Reference 5% position (${ref_pos_usd:,.0f}): {pct_of_adv:.1f}% of ADV "
+                    f"— liquidity risk: {liquidity_risk}"
+                )
+        except Exception:
+            pass
+        if tier in ("SMALL", "MID"):
+            prompt_parts.append(
+                "Note: Thin liquidity — cap position_size_pct ≤ 3% and use limit orders."
+            )
+    else:
+        prompt_parts.append("Liquidity data: unavailable")
+
     prompt_parts += ["", "## CROSS-ASSET DIVERGENCE (vs RSP / HYG / DXY)"]
     if cadiv:
         prompt_parts += [
@@ -1560,6 +2159,35 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Cross-asset divergence: unavailable")
+
+    prompt_parts += ["", "## RELATIVE STRENGTH / SECTOR CONTEXT"]
+    if rs.get("rs_available"):
+        etf = rs.get("sector_etf", "SPY")
+        hdr = f"{'Period':<8}  {'Ticker':>8}  {'vs RSP':>8}  {'vs Sector(' + etf + ')':>16}"
+        prompt_parts.append(hdr)
+        for label in ("20d", "60d", "120d"):
+            t_ret  = rs.get(f"ticker_return_{label}")
+            vs_rsp = rs.get(f"vs_rsp_{label}")
+            vs_etf = rs.get(f"vs_sector_{label}")
+            if t_ret is None:
+                continue
+            def _fmt(v: Optional[float]) -> str:
+                return f"{v:+.1f}%" if isinstance(v, float) else "N/A"
+            prompt_parts.append(
+                f"  {label:<6}  {_fmt(t_ret):>8}  {_fmt(vs_rsp):>8}  {_fmt(vs_etf):>16}"
+            )
+        prompt_parts.append(f"RS signal (20d vs RSP): {rs.get('rs_signal_20d', 'N/A')}")
+        sig_20 = rs.get("rs_signal_20d", "INLINE")
+        if sig_20 in ("STRONG_UNDERPERFORM", "UNDERPERFORM"):
+            prompt_parts.append(
+                "Note: Relative weakness vs market — discount long setups; confirm with regime and dark-pool flow."
+            )
+        elif sig_20 == "STRONG_OUTPERFORM":
+            prompt_parts.append(
+                "Note: Strong relative strength — momentum confirmation for BULL thesis."
+            )
+    else:
+        prompt_parts.append("Relative strength data: unavailable")
 
     prompt_parts += ["", "## OPTIONS FLOW"]
     if opts:
@@ -1575,6 +2203,43 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Options data: unavailable (possibly crypto or thin options)")
+
+    prompt_parts += ["", "## EARNINGS & EVENT CALENDAR"]
+    if evnt.get("earnings_available"):
+        dte      = evnt.get("days_to_next_earnings")
+        risk     = evnt.get("earnings_risk", "LOW")
+        dte_str  = f"{dte}d away" if dte is not None else "date unknown"
+        prompt_parts += [
+            f"Next earnings: {evnt.get('next_earnings_date', 'N/A')} ({dte_str}) — earnings risk: {risk}",
+        ]
+        # Implied move from options cross-reference
+        if opts and opts.get("expected_move_pct") is not None:
+            prompt_parts.append(
+                f"Options-implied move ({opts.get('days_to_exp', '?')}d straddle): "
+                f"±{opts.get('expected_move_pct')}%  (straddle cost: ${opts.get('straddle_cost', 'N/A')})"
+            )
+        surprises = evnt.get("earnings_surprises_4q", [])
+        if surprises:
+            prompt_parts.append("Historical EPS surprises (last 4Q):")
+            for s in surprises:
+                sup_str = f"{s['surprise_pct']:+.1f}%" if s.get("surprise_pct") is not None else "N/A"
+                prompt_parts.append(
+                    f"  {s.get('date', '?')}: est ${s.get('eps_estimate', '?')} → "
+                    f"actual ${s.get('eps_actual', '?')}  (surprise: {sup_str})"
+                )
+        mag   = evnt.get("avg_surprise_magnitude")
+        brate = evnt.get("beat_rate_4q")
+        if mag is not None or brate is not None:
+            prompt_parts.append(
+                f"Avg surprise magnitude: {mag}%  |  Beat rate: {int(brate*4) if brate is not None else '?'}/4 quarters"
+            )
+        if risk == "HIGH":
+            prompt_parts.append(
+                "CAUTION: Earnings within 14 days — binary event risk. "
+                "Cap conviction ≤ 3/5 unless implied move is already priced in vs historical magnitude."
+            )
+    else:
+        prompt_parts.append("Earnings calendar: unavailable")
 
     prompt_parts += ["", "## CATALYST SETUP (Short Squeeze / Volatility Compression)"]
     if catalyst:
@@ -1709,6 +2374,29 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Dark pool data: unavailable (FINRA file not yet published or ticker not found)")
+
+    prompt_parts += ["", "## HISTORICAL ANALOG SCORE"]
+    if analog.get("analog_available"):
+        ascore = analog.get("analog_score", 0)
+        modal  = analog.get("modal_direction", "NEUTRAL")
+        n_srch = analog.get("n_searched", 0)
+        prompt_parts += [
+            f"Analog score: {ascore:.0f}/100  (searched {n_srch} historical setups; modal direction: {modal})",
+            "Top-3 most similar past setups:",
+        ]
+        for i, a in enumerate(analog.get("top_3_analogs", []), 1):
+            prompt_parts.append(
+                f"  {i}. {a.get('ticker','?')} ({a.get('date','?')}): "
+                f"direction={a.get('direction','?')}  conviction={a.get('conviction','?')}  "
+                f"similarity={a.get('similarity','?')}%"
+            )
+        prompt_parts.append(
+            "Note: Analog score is a weak prior — use only to calibrate confidence, "
+            "never override regime or hard constraints."
+        )
+    else:
+        reason = analog.get("reason", "no historical theses cached yet")
+        prompt_parts.append(f"Historical analog: unavailable ({reason})")
 
     # Portfolio context
     prompt_parts += [
