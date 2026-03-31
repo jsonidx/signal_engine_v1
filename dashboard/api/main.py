@@ -581,6 +581,265 @@ async def portfolio_positions():
         return _no_data(str(e))
 
 
+_eur_usd_cache: dict = {"rate": 1.08, "fetched_at": 0.0}
+
+def _get_eur_usd_rate() -> float:
+    """Return current EUR/USD rate (1 EUR = X USD). Cached 10 min."""
+    import time
+    if time.time() - _eur_usd_cache["fetched_at"] < 600:
+        return _eur_usd_cache["rate"]
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("EURUSD=X").history(period="1d")
+        if not hist.empty:
+            rate = float(hist["Close"].iloc[-1])
+            _eur_usd_cache["rate"] = rate
+            _eur_usd_cache["fetched_at"] = time.time()
+            return rate
+    except Exception:
+        pass
+    return _eur_usd_cache["rate"]
+
+
+def _to_eur(price: float, currency: str, eur_usd: float) -> float:
+    """Convert price to EUR. eur_usd = 1 EUR in USD (e.g. 1.08)."""
+    if currency == "EUR":
+        return price
+    return price / eur_usd  # USD → EUR
+
+
+def _ensure_trades_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker           TEXT    NOT NULL,
+            direction        TEXT    NOT NULL DEFAULT 'LONG',
+            date             TEXT    NOT NULL,
+            price            REAL    NOT NULL,
+            price_eur        REAL    NOT NULL,
+            size_eur         REAL    NOT NULL,
+            shares           REAL,
+            currency         TEXT    NOT NULL DEFAULT 'USD',
+            fx_rate          REAL    NOT NULL DEFAULT 1.08,
+            signal_composite REAL,
+            stop_loss        REAL,
+            target_1         REAL,
+            target_2         REAL,
+            notes            TEXT,
+            action           TEXT    NOT NULL DEFAULT 'BUY',
+            status           TEXT    NOT NULL DEFAULT 'open',
+            close_date       TEXT,
+            close_price      REAL,
+            close_price_eur  REAL,
+            close_currency   TEXT,
+            close_fx_rate    REAL,
+            pnl_eur          REAL
+        )
+    """)
+    # Migrate existing tables that predate the new columns
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    for col, defn in [
+        ("direction",       "TEXT NOT NULL DEFAULT 'LONG'"),
+        ("price_eur",       "REAL NOT NULL DEFAULT 0"),
+        ("currency",        "TEXT NOT NULL DEFAULT 'USD'"),
+        ("fx_rate",         "REAL NOT NULL DEFAULT 1.08"),
+        ("close_date",      "TEXT"),
+        ("close_price",     "REAL"),
+        ("close_price_eur", "REAL"),
+        ("close_currency",  "TEXT"),
+        ("close_fx_rate",   "REAL"),
+        ("pnl_eur",         "REAL"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
+    conn.commit()
+
+
+from pydantic import BaseModel as _BaseModel  # noqa: E402 (already imported below)
+
+class AddPositionRequest(_BaseModel):
+    ticker:      str
+    direction:   str   = "LONG"
+    entry_price: float
+    currency:    str   = "USD"
+    size_eur:    float
+    conviction:  Optional[float] = None
+    stop_loss:   Optional[float] = None
+    target_1:    Optional[float] = None
+    target_2:    Optional[float] = None
+    notes:       Optional[str]   = None
+
+
+class SellPositionRequest(_BaseModel):
+    sell_price: float
+    currency:   str = "USD"
+
+
+@app.post("/api/portfolio/positions")
+async def add_position(req: AddPositionRequest):
+    """Manually insert an open position into trade_journal.db."""
+    if req.entry_price <= 0 or req.size_eur <= 0:
+        raise HTTPException(status_code=400, detail="entry_price and size_eur must be > 0")
+    if req.currency not in ("EUR", "USD"):
+        raise HTTPException(status_code=400, detail="currency must be EUR or USD")
+    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_trades_table(conn)
+        eur_usd   = _get_eur_usd_rate()
+        price_eur = _to_eur(req.entry_price, req.currency, eur_usd)
+        shares    = req.size_eur / price_eur if price_eur > 0 else 0
+        today     = datetime.utcnow().strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT INTO trades
+                (ticker, direction, date, price, price_eur, size_eur, shares,
+                 currency, fx_rate, signal_composite, stop_loss, target_1, target_2,
+                 notes, action, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BUY', 'open')
+        """, (
+            req.ticker.upper().strip(), req.direction.upper(),
+            today, req.entry_price, price_eur, req.size_eur, shares,
+            req.currency.upper(), eur_usd,
+            req.conviction, req.stop_loss, req.target_1, req.target_2, req.notes,
+        ))
+        conn.commit()
+        log.info("Position added: %s %s %.2f EUR @ %.4f %s (%.4f EUR)",
+                 req.direction, req.ticker.upper(), req.size_eur,
+                 req.entry_price, req.currency, price_eur)
+        return {"ok": True, "ticker": req.ticker.upper().strip(), "price_eur": round(price_eur, 4), "fx_rate": eur_usd}
+    except Exception as e:
+        log.exception("add_position error")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/api/portfolio/positions/{ticker}/sell")
+async def sell_position(ticker: str, req: SellPositionRequest):
+    """Close the most recent open position for ticker with sell price, computing P&L in EUR."""
+    if req.sell_price <= 0:
+        raise HTTPException(status_code=400, detail="sell_price must be > 0")
+    if req.currency not in ("EUR", "USD"):
+        raise HTTPException(status_code=400, detail="currency must be EUR or USD")
+    if not TRADE_JOURNAL_DB.exists():
+        raise HTTPException(status_code=503, detail="trade_journal.db not found — no open positions")
+    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
+    conn.row_factory = sqlite3.Row
+    try:
+        _ensure_trades_table(conn)
+        row = conn.execute(
+            "SELECT * FROM trades WHERE ticker = ? AND action = 'BUY' AND status = 'open' ORDER BY date DESC LIMIT 1",
+            (ticker.upper().strip(),),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No open position for {ticker.upper()}")
+
+        eur_usd        = _get_eur_usd_rate()
+        close_price_eur = _to_eur(req.sell_price, req.currency, eur_usd)
+        entry_price_eur = row["price_eur"] if row["price_eur"] else _to_eur(row["price"], row["currency"] or "USD", row["fx_rate"] or 1.08)
+        shares         = row["shares"] or (row["size_eur"] / entry_price_eur if entry_price_eur > 0 else 0)
+        direction      = (row["direction"] or "LONG").upper()
+
+        if direction == "LONG":
+            pnl_eur = (close_price_eur - entry_price_eur) * shares
+        else:  # SHORT
+            pnl_eur = (entry_price_eur - close_price_eur) * shares
+
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        conn.execute("""
+            UPDATE trades SET
+                status          = 'closed',
+                close_date      = ?,
+                close_price     = ?,
+                close_price_eur = ?,
+                close_currency  = ?,
+                close_fx_rate   = ?,
+                pnl_eur         = ?
+            WHERE id = ?
+        """, (today, req.sell_price, close_price_eur, req.currency.upper(), eur_usd, pnl_eur, row["id"]))
+        conn.commit()
+        log.info("Position sold: %s @ %.4f %s → P&L %.2f EUR", ticker.upper(), req.sell_price, req.currency, pnl_eur)
+        return {
+            "ok": True,
+            "ticker": ticker.upper(),
+            "pnl_eur": round(pnl_eur, 2),
+            "close_price_eur": round(close_price_eur, 4),
+            "fx_rate": eur_usd,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("sell_position error")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.delete("/api/portfolio/positions/{ticker}")
+async def close_position(ticker: str):
+    """Mark the most recent open position as closed (no P&L recorded)."""
+    if not TRADE_JOURNAL_DB.exists():
+        raise HTTPException(status_code=503, detail="trade_journal.db not found")
+    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
+    conn.row_factory = sqlite3.Row
+    try:
+        result = conn.execute(
+            "UPDATE trades SET status = 'closed' WHERE ticker = ? AND action = 'BUY' AND status = 'open'",
+            (ticker.upper().strip(),),
+        )
+        conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"No open position for {ticker.upper()}")
+        return {"ok": True, "ticker": ticker.upper().strip()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("close_position error")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/portfolio/trades")
+async def get_trades():
+    """Return all trades (open + closed) with P&L for the trades dashboard."""
+    conn = _db_connect(TRADE_JOURNAL_DB)
+    if conn is None:
+        return {"data_available": True, "data": []}
+    try:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE action = 'BUY' ORDER BY date DESC, id DESC"
+        ).fetchall()
+        conn.close()
+        trades = []
+        for r in rows:
+            trades.append({
+                "id":              r["id"],
+                "ticker":          r["ticker"],
+                "direction":       r["direction"] or "LONG",
+                "date":            r["date"],
+                "entry_price":     r["price"],
+                "entry_price_eur": r["price_eur"] or r["price"],
+                "currency":        r["currency"] or "USD",
+                "fx_rate":         r["fx_rate"] or 1.08,
+                "size_eur":        r["size_eur"],
+                "shares":          r["shares"],
+                "status":          r["status"],
+                "close_date":      r["close_date"],
+                "close_price":     r["close_price"],
+                "close_price_eur": r["close_price_eur"],
+                "close_currency":  r["close_currency"],
+                "pnl_eur":         r["pnl_eur"],
+                "stop_loss":       r["stop_loss"],
+                "target_1":        r["target_1"],
+                "notes":           r["notes"],
+            })
+        return {"data_available": True, "data": trades}
+    except Exception as e:
+        log.exception("get_trades error")
+        return _no_data(str(e))
+
+
 # ==============================================================================
 # SECTION 4b: CASH MANAGEMENT ENDPOINTS
 # ==============================================================================

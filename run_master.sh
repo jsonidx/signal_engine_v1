@@ -33,6 +33,12 @@
 
 set -e  # exit immediately if any step fails
 
+# ── Activate venv so all python3 calls use installed packages ──
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/venv/bin/activate" ]; then
+  source "$SCRIPT_DIR/venv/bin/activate"
+fi
+
 mkdir -p "data"
 mkdir -p "logs"
 

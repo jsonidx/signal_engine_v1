@@ -16,7 +16,7 @@ export function RegimeBadge({ regime, score, size = 'md' }: RegimeBadgeProps) {
 
   const sizeClass = size === 'sm' ? 'text-[10px] px-1.5 py-0.5' : 'text-xs px-2.5 py-1'
 
-  const label = regime.replace('_', ' ')
+  const label = regime?.replace('_', ' ') ?? '—'
 
   return (
     <span

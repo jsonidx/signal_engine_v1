@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../lib/api'
-import type { CashAction } from '../lib/api'
+import type { CashAction, AddPositionPayload, SellPositionPayload } from '../lib/api'
 
 export function usePortfolioSummary() {
   return useQuery({
@@ -54,5 +54,49 @@ export function useCashUpdate() {
       qc.invalidateQueries({ queryKey: ['portfolio', 'cash'] })
       qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] })
     },
+  })
+}
+
+export function useAddPosition() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: AddPositionPayload) => api.positionAdd(payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['portfolio', 'positions'] })
+      qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] })
+    },
+  })
+}
+
+export function useSellPosition() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ticker, payload }: { ticker: string; payload: SellPositionPayload }) =>
+      api.positionSell(ticker, payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['portfolio', 'positions'] })
+      qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] })
+      qc.invalidateQueries({ queryKey: ['portfolio', 'trades'] })
+    },
+  })
+}
+
+export function useClosePosition() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ticker: string) => api.positionClose(ticker),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['portfolio', 'positions'] })
+      qc.invalidateQueries({ queryKey: ['portfolio', 'summary'] })
+      qc.invalidateQueries({ queryKey: ['portfolio', 'trades'] })
+    },
+  })
+}
+
+export function useTrades() {
+  return useQuery({
+    queryKey: ['portfolio', 'trades'],
+    queryFn: api.tradesGet,
+    staleTime: 60 * 1000,
   })
 }

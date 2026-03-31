@@ -432,6 +432,46 @@ export interface CashBalance {
 
 export type CashAction = 'set' | 'add' | 'reduce'
 
+export interface AddPositionPayload {
+  ticker: string
+  direction: 'LONG' | 'SHORT'
+  entry_price: number
+  currency: 'EUR' | 'USD'
+  size_eur: number
+  conviction?: number
+  stop_loss?: number
+  target_1?: number
+  target_2?: number
+  notes?: string
+}
+
+export interface SellPositionPayload {
+  sell_price: number
+  currency: 'EUR' | 'USD'
+}
+
+export interface TradeRecord {
+  id: number
+  ticker: string
+  direction: 'LONG' | 'SHORT'
+  date: string
+  entry_price: number
+  entry_price_eur: number
+  currency: 'EUR' | 'USD'
+  fx_rate: number
+  size_eur: number
+  shares: number | null
+  status: 'open' | 'closed'
+  close_date: string | null
+  close_price: number | null
+  close_price_eur: number | null
+  close_currency: 'EUR' | 'USD' | null
+  pnl_eur: number | null
+  stop_loss: number | null
+  target_1: number | null
+  notes: string | null
+}
+
 // ─── Action Zones ─────────────────────────────────────────────────────────────
 
 export interface ActionZones {
@@ -651,6 +691,19 @@ export const api = {
 
   cashUpdate: (action: CashAction, amount: number): Promise<CashBalance> =>
     client.post('/api/portfolio/cash', { action, amount }).then(r => r.data),
+
+  // Positions (manual)
+  positionAdd: (payload: AddPositionPayload): Promise<{ ok: boolean; ticker: string; price_eur?: number; fx_rate?: number }> =>
+    client.post('/api/portfolio/positions', payload).then(r => r.data),
+
+  positionSell: (ticker: string, payload: SellPositionPayload): Promise<{ ok: boolean; ticker: string; pnl_eur: number; fx_rate: number }> =>
+    client.post(`/api/portfolio/positions/${ticker}/sell`, payload).then(r => r.data),
+
+  positionClose: (ticker: string): Promise<{ ok: boolean; ticker: string }> =>
+    client.delete(`/api/portfolio/positions/${ticker}`).then(r => r.data),
+
+  tradesGet: (): Promise<TradeRecord[]> =>
+    client.get('/api/portfolio/trades').then(r => r.data?.data ?? []),
 
   // Thesis accuracy
   thesisAccuracy: (): Promise<ThesisAccuracyResponse> =>

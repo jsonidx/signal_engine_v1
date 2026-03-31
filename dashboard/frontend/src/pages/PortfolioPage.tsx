@@ -15,7 +15,7 @@ import {
   Cell,
 } from 'recharts'
 import { format } from 'date-fns'
-import { AlertTriangle, Wallet, Plus, Minus, RefreshCw, ChevronDown, ChevronRight } from 'lucide-react'
+import { AlertTriangle, Wallet, Plus, Minus, RefreshCw, ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Shell } from '../components/layout/Shell'
 import { MetricCard } from '../components/ui/MetricCard'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
@@ -30,6 +30,10 @@ import {
   useEquityScreener,
   useCash,
   useCashUpdate,
+  useAddPosition,
+  useSellPosition,
+  useClosePosition,
+  useTrades,
 } from '../hooks/usePortfolio'
 import { useRegime } from '../hooks/useRegime'
 
@@ -265,8 +269,68 @@ export function PortfolioPage() {
   const { data: equityScreener, isLoading: equityLoading } = useEquityScreener()
   const { data: cashData, isLoading: cashLoading } = useCash()
   const cashMutation = useCashUpdate()
+  const addPositionMutation = useAddPosition()
+  const sellPositionMutation = useSellPosition()
+  const closePositionMutation = useClosePosition()
+  const { data: tradesData, isLoading: tradesLoading } = useTrades()
   const { data: regimeData } = useRegime()
   const [regimePanelOpen, setRegimePanelOpen] = useState(true)
+
+  // Add-position form state
+  const [showAddForm, setShowAddForm] = useState(false)
+  const [addForm, setAddForm] = useState({
+    ticker: '', direction: 'LONG' as 'LONG' | 'SHORT', currency: 'USD' as 'EUR' | 'USD',
+    entry_price: '', size_eur: '', conviction: '', stop_loss: '', target_1: '',
+  })
+  const [addFormError, setAddFormError] = useState<string | null>(null)
+
+  // Sell form state
+  const [sellingTicker, setSellingTicker] = useState<string | null>(null)
+  const [sellForm, setSellForm] = useState({ price: '', currency: 'USD' as 'EUR' | 'USD' })
+  const [sellError, setSellError] = useState<string | null>(null)
+  const [lastPnl, setLastPnl] = useState<{ ticker: string; pnl: number } | null>(null)
+
+  function handleAddPosition() {
+    const ticker = addForm.ticker.trim().toUpperCase()
+    const entry_price = parseFloat(addForm.entry_price)
+    const size_eur = parseFloat(addForm.size_eur)
+    if (!ticker) return setAddFormError('Ticker is required')
+    if (isNaN(entry_price) || entry_price <= 0) return setAddFormError('Entry price must be > 0')
+    if (isNaN(size_eur) || size_eur <= 0) return setAddFormError('Size must be > 0')
+    setAddFormError(null)
+    addPositionMutation.mutate(
+      {
+        ticker, direction: addForm.direction, currency: addForm.currency, entry_price, size_eur,
+        conviction: addForm.conviction ? parseFloat(addForm.conviction) : undefined,
+        stop_loss:  addForm.stop_loss  ? parseFloat(addForm.stop_loss)  : undefined,
+        target_1:   addForm.target_1   ? parseFloat(addForm.target_1)   : undefined,
+      },
+      {
+        onSuccess: () => {
+          setAddForm({ ticker: '', direction: 'LONG', currency: 'USD', entry_price: '', size_eur: '', conviction: '', stop_loss: '', target_1: '' })
+          setShowAddForm(false)
+        },
+        onError: () => setAddFormError('Failed to save — check API connection'),
+      }
+    )
+  }
+
+  function handleSell(ticker: string) {
+    const price = parseFloat(sellForm.price)
+    if (isNaN(price) || price <= 0) return setSellError('Sell price must be > 0')
+    setSellError(null)
+    sellPositionMutation.mutate(
+      { ticker, payload: { sell_price: price, currency: sellForm.currency } },
+      {
+        onSuccess: (res) => {
+          setLastPnl({ ticker, pnl: res.pnl_eur })
+          setSellingTicker(null)
+          setSellForm({ price: '', currency: 'USD' })
+        },
+        onError: () => setSellError('Failed to sell — check API connection'),
+      }
+    )
+  }
 
   // Only treat cash as "set" if it has actually been saved (updated_at is present)
   const cashUpdatedAt = cashData?.updated_at ?? null
@@ -406,7 +470,7 @@ export function PortfolioPage() {
       </div>
 
       {/* Regime Panel */}
-      {regimeData && (
+      {regimeData?.regime && (
         <RegimePanel
           open={regimePanelOpen}
           onToggle={() => setRegimePanelOpen(v => !v)}
@@ -520,10 +584,148 @@ export function PortfolioPage() {
           <span className="font-mono text-xs text-text-tertiary uppercase tracking-widest">
             Open Positions
           </span>
-          <span className="font-mono text-xs text-text-secondary">
-            {positionsArr.length} positions
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="font-mono text-xs text-text-secondary">
+              {positionsArr.length} positions
+            </span>
+            <button
+              onClick={() => { setShowAddForm(v => !v); setAddFormError(null) }}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded font-mono text-xs bg-accent-blue/15 text-accent-blue border border-accent-blue/30 hover:bg-accent-blue/25 transition-colors"
+            >
+              <Plus className="w-3 h-3" />
+              Add Position
+            </button>
+          </div>
         </div>
+
+        {/* Inline add-position form */}
+        {showAddForm && (
+          <div className="px-4 py-4 border-b border-border-subtle bg-bg-elevated">
+            <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
+              New Position
+            </div>
+            <div className="flex flex-wrap gap-2 items-end">
+              {/* Ticker */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Ticker</label>
+                <input
+                  type="text"
+                  value={addForm.ticker}
+                  onChange={e => setAddForm(f => ({ ...f, ticker: e.target.value.toUpperCase() }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="AAPL"
+                  className="w-24 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary uppercase"
+                />
+              </div>
+              {/* Direction */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Direction</label>
+                <select
+                  value={addForm.direction}
+                  onChange={e => setAddForm(f => ({ ...f, direction: e.target.value as 'LONG' | 'SHORT' }))}
+                  className="w-24 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue"
+                >
+                  <option value="LONG">LONG</option>
+                  <option value="SHORT">SHORT</option>
+                </select>
+              </div>
+              {/* Currency */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Currency</label>
+                <select
+                  value={addForm.currency}
+                  onChange={e => setAddForm(f => ({ ...f, currency: e.target.value as 'EUR' | 'USD' }))}
+                  className="w-20 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue"
+                >
+                  <option value="USD">USD $</option>
+                  <option value="EUR">EUR €</option>
+                </select>
+              </div>
+              {/* Entry Price */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">
+                  Entry ({addForm.currency === 'EUR' ? '€' : '$'})
+                </label>
+                <input
+                  type="number" min="0" step="0.01"
+                  value={addForm.entry_price}
+                  onChange={e => setAddForm(f => ({ ...f, entry_price: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="0.00"
+                  className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
+              {/* Size EUR */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Size (€)</label>
+                <input
+                  type="number" min="0" step="100"
+                  value={addForm.size_eur}
+                  onChange={e => setAddForm(f => ({ ...f, size_eur: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="0"
+                  className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
+              {/* Stop Loss */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Stop ($)</label>
+                <input
+                  type="number" min="0" step="0.01"
+                  value={addForm.stop_loss}
+                  onChange={e => setAddForm(f => ({ ...f, stop_loss: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="optional"
+                  className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
+              {/* Target 1 */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Target ($)</label>
+                <input
+                  type="number" min="0" step="0.01"
+                  value={addForm.target_1}
+                  onChange={e => setAddForm(f => ({ ...f, target_1: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="optional"
+                  className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
+              {/* Conviction */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Conv (0–5)</label>
+                <input
+                  type="number" min="0" max="5" step="0.5"
+                  value={addForm.conviction}
+                  onChange={e => setAddForm(f => ({ ...f, conviction: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="optional"
+                  className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
+              {/* Actions */}
+              <div className="flex gap-2 mb-0">
+                <button
+                  onClick={handleAddPosition}
+                  disabled={addPositionMutation.isPending}
+                  className="flex items-center gap-1.5 px-3 h-8 rounded font-mono text-xs bg-accent-green/15 text-accent-green border border-accent-green/30 hover:bg-accent-green/25 disabled:opacity-40 transition-colors"
+                >
+                  <Plus className="w-3 h-3" />
+                  {addPositionMutation.isPending ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  onClick={() => { setShowAddForm(false); setAddFormError(null) }}
+                  className="flex items-center gap-1.5 px-3 h-8 rounded font-mono text-xs text-text-tertiary border border-border-subtle hover:text-text-secondary hover:border-border-active transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+            {addFormError && (
+              <p className="mt-2 font-mono text-xs text-accent-red">{addFormError}</p>
+            )}
+          </div>
+        )}
         {positionsLoading ? (
           <div className="p-4">
             <LoadingSkeleton rows={5} />
@@ -533,7 +735,7 @@ export function PortfolioPage() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-border-subtle">
-                  {['Ticker', 'Direction', 'Entry', 'Current', 'P&L (€)', 'P&L (%)', 'Size (€)', 'Days', 'Conviction'].map(h => (
+                  {['Ticker', 'Direction', 'Entry', 'Current', 'P&L (€)', 'P&L (%)', 'Size (€)', 'Days', 'Conviction', ''].map(h => (
                     <th
                       key={h}
                       className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary"
@@ -545,6 +747,7 @@ export function PortfolioPage() {
               </thead>
               <tbody>
                 {sortedPositions.map(pos => (
+                  <>
                   <tr
                     key={pos.ticker}
                     onClick={() => navigate(`/ticker/${pos.ticker}`)}
@@ -579,11 +782,78 @@ export function PortfolioPage() {
                     <td className="px-4 py-3">
                       <ConvictionDots conviction={pos.conviction} />
                     </td>
+                    <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                      <button
+                        onClick={() => {
+                          if (sellingTicker === pos.ticker) { setSellingTicker(null); setSellError(null) }
+                          else { setSellingTicker(pos.ticker); setSellForm({ price: '', currency: 'USD' }); setSellError(null) }
+                        }}
+                        className={`px-2.5 py-1 rounded font-mono text-[10px] border transition-colors ${
+                          sellingTicker === pos.ticker
+                            ? 'bg-accent-red/20 text-accent-red border-accent-red/40'
+                            : 'bg-transparent text-text-tertiary border-border-subtle hover:text-accent-red hover:border-accent-red/40'
+                        }`}
+                      >
+                        Sell
+                      </button>
+                    </td>
                   </tr>
+                  {sellingTicker === pos.ticker && (
+                    <tr key={`${pos.ticker}-sell`} className="bg-bg-elevated border-b border-border-subtle/50">
+                      <td colSpan={10} className="px-4 py-3">
+                        <div className="flex flex-wrap items-end gap-3">
+                          <span className="font-mono text-xs text-text-tertiary uppercase tracking-wide">
+                            Sell {pos.ticker}
+                          </span>
+                          {/* Sell currency */}
+                          <div className="flex flex-col gap-1">
+                            <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Currency</label>
+                            <select
+                              value={sellForm.currency}
+                              onChange={e => setSellForm(f => ({ ...f, currency: e.target.value as 'EUR' | 'USD' }))}
+                              className="w-20 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-red"
+                            >
+                              <option value="USD">USD $</option>
+                              <option value="EUR">EUR €</option>
+                            </select>
+                          </div>
+                          {/* Sell price */}
+                          <div className="flex flex-col gap-1">
+                            <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">
+                              Sell Price ({sellForm.currency === 'EUR' ? '€' : '$'})
+                            </label>
+                            <input
+                              type="number" min="0" step="0.01" autoFocus
+                              value={sellForm.price}
+                              onChange={e => setSellForm(f => ({ ...f, price: e.target.value }))}
+                              onKeyDown={e => e.key === 'Enter' && handleSell(pos.ticker)}
+                              placeholder="0.00"
+                              className="w-32 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-red placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                            />
+                          </div>
+                          <button
+                            onClick={() => handleSell(pos.ticker)}
+                            disabled={sellPositionMutation.isPending}
+                            className="flex items-center gap-1.5 px-3 h-8 rounded font-mono text-xs bg-accent-red/15 text-accent-red border border-accent-red/30 hover:bg-accent-red/25 disabled:opacity-40 transition-colors"
+                          >
+                            {sellPositionMutation.isPending ? 'Selling…' : 'Confirm Sell'}
+                          </button>
+                          <button
+                            onClick={() => { setSellingTicker(null); setSellError(null) }}
+                            className="px-3 h-8 rounded font-mono text-xs text-text-tertiary border border-border-subtle hover:text-text-secondary hover:border-border-active transition-colors"
+                          >
+                            Cancel
+                          </button>
+                          {sellError && <span className="font-mono text-xs text-accent-red">{sellError}</span>}
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </>
                 ))}
                 {sortedPositions.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-4 py-8 text-center font-mono text-sm text-text-tertiary">
+                    <td colSpan={10} className="px-4 py-8 text-center font-mono text-sm text-text-tertiary">
                       No open positions
                     </td>
                   </tr>
@@ -593,6 +863,159 @@ export function PortfolioPage() {
           </div>
         )}
       </div>
+
+      {/* ── P&L / Trade History ─────────────────────────────────────────── */}
+      {(() => {
+        const trades = tradesData ?? []
+        const closed = trades.filter((t: any) => t.status === 'closed' && t.pnl_eur != null)
+        const totalPnl = closed.reduce((s: number, t: any) => s + (t.pnl_eur ?? 0), 0)
+        const wins = closed.filter((t: any) => (t.pnl_eur ?? 0) > 0)
+        const losses = closed.filter((t: any) => (t.pnl_eur ?? 0) <= 0)
+        const winRate = closed.length > 0 ? (wins.length / closed.length) * 100 : 0
+        const avgWin = wins.length > 0 ? wins.reduce((s: number, t: any) => s + t.pnl_eur, 0) / wins.length : 0
+        const avgLoss = losses.length > 0 ? losses.reduce((s: number, t: any) => s + t.pnl_eur, 0) / losses.length : 0
+
+        // Cumulative P&L over time
+        const byDate = [...closed].sort((a: any, b: any) => (a.close_date ?? '').localeCompare(b.close_date ?? ''))
+        let cum = 0
+        const cumulativeData = byDate.map((t: any) => {
+          cum += t.pnl_eur ?? 0
+          return { date: t.close_date, ticker: t.ticker, pnl: t.pnl_eur, cumulative: cum }
+        })
+
+        return (
+          <div className="mt-2">
+            {/* last sell flash */}
+            {lastPnl && (
+              <div className={`mb-4 px-4 py-2.5 rounded border font-mono text-sm flex items-center justify-between ${lastPnl.pnl >= 0 ? 'bg-accent-green/10 border-accent-green/30 text-accent-green' : 'bg-accent-red/10 border-accent-red/30 text-accent-red'}`}>
+                <span>{lastPnl.ticker} sold — P&L: {lastPnl.pnl >= 0 ? '+' : ''}€{lastPnl.pnl.toFixed(2)}</span>
+                <button onClick={() => setLastPnl(null)} className="opacity-60 hover:opacity-100"><X className="w-3.5 h-3.5" /></button>
+              </div>
+            )}
+
+            <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+              <div className="px-4 py-3 border-b border-border-subtle">
+                <span className="font-mono text-xs text-text-tertiary uppercase tracking-widest">Realized P&L</span>
+              </div>
+
+              {tradesLoading ? (
+                <div className="p-4"><LoadingSkeleton rows={3} /></div>
+              ) : closed.length === 0 ? (
+                <div className="px-4 py-8 text-center font-mono text-sm text-text-tertiary">No closed trades yet — sell a position to track P&L</div>
+              ) : (
+                <>
+                  {/* Summary cards */}
+                  <div className="grid grid-cols-4 divide-x divide-border-subtle border-b border-border-subtle">
+                    {[
+                      { label: 'Total Realized', value: `€${totalPnl.toFixed(2)}`, color: totalPnl >= 0 ? 'text-accent-green' : 'text-accent-red' },
+                      { label: 'Win Rate', value: `${winRate.toFixed(0)}%  (${wins.length}W / ${losses.length}L)`, color: winRate >= 50 ? 'text-accent-green' : 'text-accent-red' },
+                      { label: 'Avg Win', value: avgWin > 0 ? `+€${avgWin.toFixed(2)}` : '—', color: 'text-accent-green' },
+                      { label: 'Avg Loss', value: avgLoss < 0 ? `€${avgLoss.toFixed(2)}` : '—', color: 'text-accent-red' },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} className="px-4 py-3">
+                        <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-1">{label}</div>
+                        <div className={`font-mono text-lg font-semibold ${color}`}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Charts */}
+                  <div className="grid grid-cols-2 gap-0 divide-x divide-border-subtle border-b border-border-subtle">
+                    {/* Cumulative P&L */}
+                    <div className="p-4">
+                      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">Cumulative P&L</div>
+                      <ResponsiveContainer width="100%" height={160}>
+                        <AreaChart data={cumulativeData}>
+                          <defs>
+                            <linearGradient id="cPnlGrad" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor={totalPnl >= 0 ? '#22c55e' : '#ef4444'} stopOpacity={0.2} />
+                              <stop offset="95%" stopColor={totalPnl >= 0 ? '#22c55e' : '#ef4444'} stopOpacity={0} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                          <XAxis dataKey="date" tick={{ fill: '#52525b', fontSize: 9, fontFamily: 'IBM Plex Mono' }} tickLine={false} axisLine={{ stroke: '#27272a' }} />
+                          <YAxis tick={{ fill: '#52525b', fontSize: 9, fontFamily: 'IBM Plex Mono' }} tickLine={false} axisLine={false} tickFormatter={v => `€${v}`} />
+                          <Tooltip formatter={(v: any) => [`€${Number(v).toFixed(2)}`, 'Cumulative']} contentStyle={{ background: '#18181b', border: '1px solid #3f3f46', fontFamily: 'IBM Plex Mono', fontSize: 11 }} />
+                          <ReferenceLine y={0} stroke="#3f3f46" />
+                          <Area type="monotone" dataKey="cumulative" stroke={totalPnl >= 0 ? '#22c55e' : '#ef4444'} strokeWidth={2} fill="url(#cPnlGrad)" dot={false} />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                    {/* Per-trade P&L bars */}
+                    <div className="p-4">
+                      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">P&L per Trade</div>
+                      <ResponsiveContainer width="100%" height={160}>
+                        <BarChart data={byDate}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+                          <XAxis dataKey="ticker" tick={{ fill: '#52525b', fontSize: 9, fontFamily: 'IBM Plex Mono' }} tickLine={false} axisLine={{ stroke: '#27272a' }} />
+                          <YAxis tick={{ fill: '#52525b', fontSize: 9, fontFamily: 'IBM Plex Mono' }} tickLine={false} axisLine={false} tickFormatter={v => `€${v}`} />
+                          <Tooltip formatter={(v: any) => [`€${Number(v).toFixed(2)}`, 'P&L']} contentStyle={{ background: '#18181b', border: '1px solid #3f3f46', fontFamily: 'IBM Plex Mono', fontSize: 11 }} />
+                          <ReferenceLine y={0} stroke="#3f3f46" />
+                          <Bar dataKey="pnl_eur" radius={[2, 2, 0, 0]}>
+                            {byDate.map((t: any, i: number) => (
+                              <Cell key={i} fill={(t.pnl_eur ?? 0) >= 0 ? '#22c55e' : '#ef4444'} />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* Trade history table */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead>
+                        <tr className="border-b border-border-subtle">
+                          {['Ticker', 'Dir', 'Buy Date', 'Buy Price', 'Sell Date', 'Sell Price', 'Size (€)', 'P&L (€)', 'P&L %'].map(h => (
+                            <th key={h} className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...trades].sort((a: any, b: any) => (b.close_date ?? b.date ?? '').localeCompare(a.close_date ?? a.date ?? '')).map((t: any) => {
+                          const pnlPct = t.pnl_eur != null && t.size_eur > 0 ? (t.pnl_eur / t.size_eur) * 100 : null
+                          return (
+                            <tr key={t.id} className="border-b border-border-subtle/40 hover:bg-bg-elevated transition-colors">
+                              <td className="px-4 py-2.5">
+                                <span className="font-mono text-sm font-semibold text-accent-blue cursor-pointer hover:underline" onClick={() => navigate(`/ticker/${t.ticker}`)}>{t.ticker}</span>
+                              </td>
+                              <td className="px-4 py-2.5"><DirectionBadge direction={t.direction === 'LONG' ? 'BULL' : 'BEAR'} size="sm" /></td>
+                              <td className="px-4 py-2.5"><span className="font-mono text-xs text-text-secondary">{t.date}</span></td>
+                              <td className="px-4 py-2.5">
+                                <span className="font-mono text-xs text-text-primary">{t.currency === 'EUR' ? '€' : '$'}{t.entry_price?.toFixed(2)}</span>
+                              </td>
+                              <td className="px-4 py-2.5"><span className="font-mono text-xs text-text-secondary">{t.close_date ?? '—'}</span></td>
+                              <td className="px-4 py-2.5">
+                                {t.close_price != null
+                                  ? <span className="font-mono text-xs text-text-primary">{t.close_currency === 'EUR' ? '€' : '$'}{t.close_price?.toFixed(2)}</span>
+                                  : <span className="font-mono text-xs text-text-tertiary">open</span>
+                                }
+                              </td>
+                              <td className="px-4 py-2.5"><MonoNumber value={t.size_eur} prefix="€" /></td>
+                              <td className="px-4 py-2.5">
+                                {t.pnl_eur != null
+                                  ? <MonoNumber value={t.pnl_eur} prefix="€" colorBySign />
+                                  : <span className="font-mono text-xs text-text-tertiary">—</span>
+                                }
+                              </td>
+                              <td className="px-4 py-2.5">
+                                {pnlPct != null
+                                  ? <MonoNumber value={pnlPct} suffix="%" colorBySign />
+                                  : <span className="font-mono text-xs text-text-tertiary">—</span>
+                                }
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )
+      })()}
 
         </Tabs.Content>
 
