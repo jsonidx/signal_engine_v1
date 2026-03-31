@@ -406,9 +406,9 @@ def select_top_tickers(
                 "selection_reason":        "",
             })
 
-    # Build final top-N: guarantee all always_include, fill remainder from normal
-    n_always      = len(always_in_scored)
-    n_normal_slots = max(0, max_tickers - n_always)
+    # Build final top-N: open positions are additive — always 5 fresh signals
+    # plus every open position on top (so total = max_tickers + n_open_positions).
+    n_normal_slots = max_tickers
     top = always_in_scored + normal[:n_normal_slots]
 
     # ── Step 8: Re-sort at natural score order, cap at max_tickers ────────────
@@ -431,7 +431,7 @@ def select_top_tickers(
 
     # ── Step 10: Print summary table ──────────────────────────────────────────
     # total_input = all tickers seen before any filter (skip_claude or agreement)
-    _print_selection_table(top, total_input=total_loaded, max_tickers=max_tickers)
+    _print_selection_table(top, total_input=total_loaded, max_tickers=len(top))
 
     # Strip internal bookkeeping keys before returning
     for s in top:
