@@ -129,7 +129,26 @@ SECTOR_ETF_MAP: Dict[str, str] = {
     "Communication Services":  "XLC",
 }
 
+# ─── Historical analog: ordered feature names (cosine-similarity vector) ─────
+# Exactly 12 features in this order; _FEATURE_RANGES must contain every entry.
+# Source modules: technical(4) · options_flow(2) · catalyst(2) · dark_pool(2) · fundamentals(1) · top-level(1)
+_HISTORICAL_ANALOG_FEATURE_NAMES: List[str] = [
+    "rsi_14",               # technical   — momentum/overbought proxy
+    "above_ma200",          # technical   — structural trend (0=below, 1=above)
+    "momentum_1m",          # technical   — short-term price momentum %
+    "momentum_3m",          # technical   — medium-term price momentum %
+    "iv_rank",              # options     — options expensiveness (0-100)
+    "heat_score",           # options     — options activity heat (0-100)
+    "short_squeeze_score",  # catalyst    — squeeze setup intensity (0-100)
+    "vol_compression_score",# catalyst    — Bollinger compression (0-10)
+    "dark_pool_score",      # dark pool   — institutional routing bias (0-100)
+    "short_ratio_zscore",   # dark pool   — FINRA short ratio z-score (-3..+3)
+    "fundamental_score",    # fundamentals— composite quality/value score (0-100)
+    "agreement_score",      # top-level   — pre-computed signal consensus (0-1)
+]
+
 # ─── Feature normalization bounds for historical analog similarity ─────────────
+# Bounds define the [lo, hi] range mapped to [0, 1]; values are clipped at edges.
 _FEATURE_RANGES: Dict[str, tuple] = {
     "rsi_14":               (0.0,   100.0),
     "above_ma200":          (0.0,     1.0),
@@ -143,6 +162,19 @@ _FEATURE_RANGES: Dict[str, tuple] = {
     "short_ratio_zscore":   (-3.0,    3.0),
     "fundamental_score":    (0.0,   100.0),
     "agreement_score":      (0.0,     1.0),
+}
+
+# ─── Liquidity tier thresholds (dollar ADV) + position-sizing alignment ───────
+# Tier caps enforced in SYSTEM_PROMPT and _build_prompt liquidity note.
+#   MEGA  ≥$100M ADV → no cap beyond portfolio-level limits (up to 8% equity)
+#   LARGE $10-100M   → standard sizing, max 5% per RISK_PARAMS
+#   MID   $1-10M     → cap position_size_pct ≤ 5%; use limit orders
+#   SMALL <$1M       → cap position_size_pct ≤ 3%; flag market-impact risk
+LIQUIDITY_TIER_THRESHOLDS: Dict[str, int] = {
+    "MEGA":  100_000_000,   # ≥ $100M ADV
+    "LARGE":  10_000_000,   # $10M – $100M ADV
+    "MID":     1_000_000,   # $1M  – $10M  ADV
+    "SMALL":           0,   # < $1M ADV
 }
 
 # === NEW: UNIVERSE RANK EXPORT FOR AI QUANT ===
@@ -918,41 +950,54 @@ def compute_signal_agreement(signals_dict: dict) -> float:
 
 def _extract_signal_features(signals: dict) -> dict:
     """
-    Extract a normalized scalar feature vector from a signals dict.
-    All values mapped to [0,1] using _FEATURE_RANGES bounds.
-    Used by _collect_historical_analog_signals for cosine similarity.
-    """
-    tech     = signals.get("technical")     or {}
-    opts     = signals.get("options_flow")  or {}
-    catalyst = signals.get("catalyst")      or {}
-    dp       = signals.get("dark_pool_flow") or {}
-    fund     = signals.get("fundamentals")  or {}
+    Extract a normalized [0,1] scalar feature vector from a signals dict.
 
+    Features (12, in _HISTORICAL_ANALOG_FEATURE_NAMES order):
+      rsi_14, above_ma200, momentum_1m, momentum_3m,        ← technical (4)
+      iv_rank, heat_score,                                   ← options_flow (2)
+      short_squeeze_score, vol_compression_score,            ← catalyst (2)
+      dark_pool_score, short_ratio_zscore,                   ← dark_pool_flow (2)
+      fundamental_score,                                     ← fundamentals (1)
+      agreement_score                                        ← top-level (1)
+
+    Missing or {available: False} sub-dicts degrade gracefully — those
+    features are simply omitted from the returned dict (sparse vector).
+    Returns {} if the signals dict itself is empty or None.
+    """
+    # Guard: empty/None input → empty feature dict (caller handles <3 features)
+    if not signals:
+        return {}
+
+    tech     = signals.get("technical")      or {}
+    opts     = signals.get("options_flow")   or {}
+    catalyst = signals.get("catalyst")       or {}
+    dp       = signals.get("dark_pool_flow") or {}
+    fund     = signals.get("fundamentals")   or {}
+
+    # Raw values extracted in _HISTORICAL_ANALOG_FEATURE_NAMES order
     raw: Dict[str, Optional[float]] = {
-        "rsi_14":               tech.get("rsi_14"),
-        "above_ma200":          1.0 if tech.get("above_ma200") is True else (0.0 if tech.get("above_ma200") is False else None),
-        "momentum_1m":          tech.get("momentum_1m_pct"),
-        "momentum_3m":          tech.get("momentum_3m_pct"),
-        "iv_rank":              opts.get("iv_rank"),
-        "heat_score":           opts.get("heat_score"),
-        "short_squeeze_score":  catalyst.get("short_squeeze_score"),
-        "vol_compression_score":catalyst.get("vol_compression_score"),
-        "dark_pool_score":      dp.get("dark_pool_score"),
-        "short_ratio_zscore":   dp.get("short_ratio_zscore"),
-        "fundamental_score":    fund.get("fundamental_score_pct"),
-        "agreement_score":      signals.get("signal_agreement_score"),
+        "rsi_14":                tech.get("rsi_14"),
+        "above_ma200":           1.0 if tech.get("above_ma200") is True else (
+                                 0.0 if tech.get("above_ma200") is False else None),
+        "momentum_1m":           tech.get("momentum_1m_pct"),
+        "momentum_3m":           tech.get("momentum_3m_pct"),
+        "iv_rank":               opts.get("iv_rank"),
+        "heat_score":            opts.get("heat_score"),
+        "short_squeeze_score":   catalyst.get("short_squeeze_score"),
+        "vol_compression_score": catalyst.get("vol_compression_score"),
+        "dark_pool_score":       dp.get("dark_pool_score"),
+        "short_ratio_zscore":    dp.get("short_ratio_zscore"),
+        "fundamental_score":     fund.get("fundamental_score_pct"),
+        "agreement_score":       signals.get("signal_agreement_score"),
     }
 
     normalized: dict = {}
     for key, val in raw.items():
         if val is None:
-            continue
+            continue  # missing feature → excluded from vector (sparse OK)
         lo, hi = _FEATURE_RANGES.get(key, (0.0, 100.0))
         span = hi - lo
-        if span == 0:
-            normalized[key] = 0.5
-        else:
-            normalized[key] = max(0.0, min(1.0, (float(val) - lo) / span))
+        normalized[key] = 0.5 if span == 0 else max(0.0, min(1.0, (float(val) - lo) / span))
     return normalized
 
 
@@ -1122,39 +1167,47 @@ def _collect_liquidity_signals(ticker: str) -> dict:
     """
     30-day ADV (shares + dollars), today's volume ratio vs ADV,
     and estimated bid-ask spread (Corwin-Schultz HL proxy).
+
+    Tier → max position_size_pct cap (see LIQUIDITY_TIER_THRESHOLDS + SYSTEM_PROMPT):
+      MEGA  (≥$100M ADV) → no extra cap; standard portfolio limits apply
+      LARGE ($10-100M)   → standard sizing (up to 5% per RISK_PARAMS)
+      MID   ($1-10M)     → cap ≤ 5%; use limit orders to minimize impact
+      SMALL (<$1M)       → cap ≤ 3%; flag market-impact risk in notes
+
     Position-as-%-of-ADV is computed in _build_prompt where NAV is known.
+    adv_shares and adv_dollars are always returned for downstream logging.
     """
     try:
         import yfinance as yf
-        import numpy as np
         end   = datetime.now()
         start = end - timedelta(days=50)   # buffer for weekends + holidays
         hist  = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
         if hist.empty or len(hist) < 5:
             return {"liquidity_available": False, "error": "insufficient history"}
 
-        vol_30   = hist["Volume"].tail(30)
-        price_30 = hist["Close"].tail(30)
-        adv_sh   = float(vol_30.mean())
-        cur_px   = float(price_30.iloc[-1])
-        adv_usd  = adv_sh * cur_px
+        vol_30    = hist["Volume"].tail(30)
+        price_30  = hist["Close"].tail(30)
+        adv_sh    = float(vol_30.mean())
+        cur_px    = float(price_30.iloc[-1])
+        adv_usd   = adv_sh * cur_px
         vol_today = float(hist["Volume"].iloc[-1])
         vol_ratio = round(vol_today / adv_sh, 2) if adv_sh > 0 else None
 
-        # Corwin-Schultz half-spread proxy (10-day rolling HL)
-        recent = hist.tail(10)
-        hl_ratio = (recent["High"] - recent["Low"]) / (recent["High"] + recent["Low"])
+        # Corwin-Schultz half-spread proxy: 10-day rolling (High-Low)/(High+Low)
+        recent     = hist.tail(10)
+        hl_ratio   = (recent["High"] - recent["Low"]) / (recent["High"] + recent["Low"])
         spread_bps = round(float(hl_ratio.mean()) * 10_000 / 2, 1)   # half-spread in bps
 
-        if   adv_usd >= 100_000_000: tier = "MEGA"
-        elif adv_usd >=  10_000_000: tier = "LARGE"
-        elif adv_usd >=   1_000_000: tier = "MID"
-        else:                         tier = "SMALL"
+        # Tier derived from LIQUIDITY_TIER_THRESHOLDS (single source of truth)
+        if   adv_usd >= LIQUIDITY_TIER_THRESHOLDS["MEGA"]:  tier = "MEGA"
+        elif adv_usd >= LIQUIDITY_TIER_THRESHOLDS["LARGE"]: tier = "LARGE"
+        elif adv_usd >= LIQUIDITY_TIER_THRESHOLDS["MID"]:   tier = "MID"
+        else:                                                tier = "SMALL"
 
         return {
             "liquidity_available": True,
-            "adv_shares":          int(adv_sh),
-            "adv_dollars":         round(adv_usd),
+            "adv_shares":          int(adv_sh),       # always present for logging
+            "adv_dollars":         round(adv_usd),    # always present for logging
             "current_price":       round(cur_px, 2),
             "vol_today_shares":    int(vol_today),
             "vol_ratio_vs_adv":    vol_ratio,

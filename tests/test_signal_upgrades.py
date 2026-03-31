@@ -3,17 +3,21 @@ tests/test_signal_upgrades.py
 =============================================================================
 Tests for the 5 new signal upgrade modules added to ai_quant.py:
 
-  1. _collect_earnings_event_signals   — earnings calendar + surprise history
+  1. _collect_earnings_event_signals    — earnings calendar + surprise history
   2. _collect_relative_strength_signals — ticker vs RSP / sector ETF
   3. _collect_liquidity_signals         — ADV, spread, liquidity tier
   4. _collect_historical_analog_signals — cosine-similarity on thesis cache
   5. _collect_volatility_regime_signals — realized vol + IV rank + VIX pct
 
 Sub-helpers also tested:
-  • _extract_signal_features   — normalized feature vector
+  • _extract_signal_features    — normalized feature vector
   • _cosine_similarity_features — cosine distance between feature dicts
   • _build_prompt               — new sections appear in output text
   • SYSTEM_PROMPT               — new rule keywords are present
+
+Excellence upgrade tests (micro-improvement batch):
+  • _HISTORICAL_ANALOG_FEATURE_NAMES — 12 features, correct order, matches _FEATURE_RANGES
+  • LIQUIDITY_TIER_THRESHOLDS        — tier boundaries enforce position-sizing caps
 
 No Anthropic API calls are made. All yfinance and sqlite3 calls are mocked.
 =============================================================================
@@ -36,7 +40,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ai_quant import (
     SECTOR_ETF_MAP,
+    LIQUIDITY_TIER_THRESHOLDS,
     _FEATURE_RANGES,
+    _HISTORICAL_ANALOG_FEATURE_NAMES,
     _build_prompt,
     _collect_earnings_event_signals,
     _collect_historical_analog_signals,
@@ -955,3 +961,121 @@ class TestSystemPromptNewRules:
         assert "vol_regime" in SYSTEM_PROMPT
         assert "liquidity_note" in SYSTEM_PROMPT
         assert "analog_score" in SYSTEM_PROMPT
+
+
+# ==============================================================================
+# 10. _HISTORICAL_ANALOG_FEATURE_NAMES — excellence upgrade
+# ==============================================================================
+
+class TestHistoricalAnalogFeatureNames:
+
+    def test_exactly_12_features(self):
+        assert len(_HISTORICAL_ANALOG_FEATURE_NAMES) == 12
+
+    def test_all_names_in_feature_ranges(self):
+        """Every named feature must have a normalization bound defined."""
+        for name in _HISTORICAL_ANALOG_FEATURE_NAMES:
+            assert name in _FEATURE_RANGES, (
+                f"Feature '{name}' in _HISTORICAL_ANALOG_FEATURE_NAMES "
+                f"has no entry in _FEATURE_RANGES"
+            )
+
+    def test_feature_ranges_covers_no_extras(self):
+        """_FEATURE_RANGES should not silently contain undocumented features."""
+        for key in _FEATURE_RANGES:
+            assert key in _HISTORICAL_ANALOG_FEATURE_NAMES, (
+                f"_FEATURE_RANGES key '{key}' is not listed in "
+                f"_HISTORICAL_ANALOG_FEATURE_NAMES — add it or remove the range"
+            )
+
+    def test_order_matches_source_module_grouping(self):
+        """First 4 features must be technical; last must be agreement_score."""
+        technical_group = _HISTORICAL_ANALOG_FEATURE_NAMES[:4]
+        assert "rsi_14"      in technical_group
+        assert "above_ma200" in technical_group
+        assert "momentum_1m" in technical_group
+        assert "momentum_3m" in technical_group
+        assert _HISTORICAL_ANALOG_FEATURE_NAMES[-1] == "agreement_score"
+
+    def test_extract_features_returns_subset_of_named_features(self):
+        """_extract_signal_features output keys must be a subset of named features."""
+        signals = {
+            "technical":      {"rsi_14": 55, "above_ma200": True},
+            "options_flow":   {"iv_rank": 40, "heat_score": 60},
+            "signal_agreement_score": 0.7,
+        }
+        feats = _extract_signal_features(signals)
+        for key in feats:
+            assert key in _HISTORICAL_ANALOG_FEATURE_NAMES, (
+                f"_extract_signal_features returned undocumented key '{key}'"
+            )
+
+    def test_empty_signals_returns_empty_not_zero_vector(self):
+        """Confirmed: empty input → {} not a 12-dim zero vector."""
+        assert _extract_signal_features({}) == {}
+        assert _extract_signal_features(None or {}) == {}
+
+
+# ==============================================================================
+# 11. LIQUIDITY_TIER_THRESHOLDS — excellence upgrade
+# ==============================================================================
+
+class TestLiquidityTierThresholds:
+
+    def test_all_four_tiers_defined(self):
+        assert set(LIQUIDITY_TIER_THRESHOLDS.keys()) == {"MEGA", "LARGE", "MID", "SMALL"}
+
+    def test_thresholds_are_strictly_descending(self):
+        """MEGA > LARGE > MID > SMALL boundaries must be monotonically decreasing."""
+        assert LIQUIDITY_TIER_THRESHOLDS["MEGA"]  > LIQUIDITY_TIER_THRESHOLDS["LARGE"]
+        assert LIQUIDITY_TIER_THRESHOLDS["LARGE"] > LIQUIDITY_TIER_THRESHOLDS["MID"]
+        assert LIQUIDITY_TIER_THRESHOLDS["MID"]   > LIQUIDITY_TIER_THRESHOLDS["SMALL"]
+
+    def test_small_threshold_is_zero(self):
+        """SMALL is the catch-all floor — its threshold must be 0."""
+        assert LIQUIDITY_TIER_THRESHOLDS["SMALL"] == 0
+
+    def test_mega_threshold_is_100m(self):
+        assert LIQUIDITY_TIER_THRESHOLDS["MEGA"] == 100_000_000
+
+    def test_large_threshold_is_10m(self):
+        assert LIQUIDITY_TIER_THRESHOLDS["LARGE"] == 10_000_000
+
+    def test_mid_threshold_is_1m(self):
+        assert LIQUIDITY_TIER_THRESHOLDS["MID"] == 1_000_000
+
+    @patch("yfinance.Ticker")
+    def test_liquidity_function_uses_thresholds_mega(self, mock_ticker_cls):
+        """$750M ADV must produce MEGA tier regardless of raw if-chain."""
+        hist = _make_price_df(n_days=50, start_price=150.0)
+        hist["Volume"] = 5_000_000   # 5M × $150 = $750M → MEGA
+        tk = MagicMock()
+        tk.history.return_value = hist
+        mock_ticker_cls.return_value = tk
+        result = _collect_liquidity_signals("AAPL")
+        assert result["liquidity_tier"] == "MEGA"
+
+    @patch("yfinance.Ticker")
+    def test_liquidity_function_uses_thresholds_small(self, mock_ticker_cls):
+        """$500K ADV must produce SMALL tier (< $1M threshold)."""
+        hist = _make_price_df(n_days=50, start_price=50.0)
+        hist["Volume"] = 10_000     # 10K × $50 = $500K → SMALL
+        tk = MagicMock()
+        tk.history.return_value = hist
+        mock_ticker_cls.return_value = tk
+        result = _collect_liquidity_signals("AAPL")
+        assert result["liquidity_tier"] == "SMALL"
+
+    @patch("yfinance.Ticker")
+    def test_adv_shares_and_adv_dollars_always_returned(self, mock_ticker_cls):
+        """adv_shares and adv_dollars must always be present for downstream logging."""
+        hist = _make_price_df(n_days=50, start_price=100.0)
+        hist["Volume"] = 1_000_000
+        tk = MagicMock()
+        tk.history.return_value = hist
+        mock_ticker_cls.return_value = tk
+        result = _collect_liquidity_signals("AAPL")
+        assert "adv_shares" in result
+        assert "adv_dollars" in result
+        assert isinstance(result["adv_shares"], int)
+        assert isinstance(result["adv_dollars"], (int, float))
