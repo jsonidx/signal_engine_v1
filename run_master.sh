@@ -109,11 +109,30 @@ echo "Step 8b complete."
 # ── Step 8c: Earnings transcript analysis ────────────────
 # Fetches latest 8-K transcript from EDGAR + Claude NLP analysis.
 # Cache TTL = 7 days; only calls Claude API on cache miss.
+# Scoped to top-5 tickers only (same pool as Step 13) to avoid mass API cost.
 if [ "$SKIP_AI" = true ]; then
   echo "Step 8c: SKIPPED — transcript fetch uses cached results (--skip-ai)"
 else
-  echo "Step 8c: Fetching earnings transcripts (top watchlist equities)..."
-  python3 earnings_transcript.py --watchlist
+  echo "Step 8c: Fetching earnings transcripts (top 5 tickers)..."
+  TOP5=$(python3 -c "
+from utils.ticker_selector import select_top_tickers
+from ai_quant import _get_open_positions
+import config
+open_pos = _get_open_positions()
+selected = select_top_tickers(
+    resolved_signals_path='data/resolved_signals.json',
+    equity_signals_path=None,
+    max_tickers=config.AI_QUANT_MAX_TICKERS,
+    always_include=open_pos,
+)
+tickers = list({s['ticker'] for s in selected} | set(open_pos))
+print(','.join(tickers[:config.AI_QUANT_MAX_TICKERS]))
+" 2>/dev/null)
+  if [ -n "$TOP5" ]; then
+    python3 earnings_transcript.py --tickers "$TOP5"
+  else
+    echo "  [warn] Could not resolve top tickers — skipping transcript step"
+  fi
   echo "Step 8c complete."
 fi
 
