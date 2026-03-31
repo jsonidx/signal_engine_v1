@@ -447,8 +447,8 @@ function ExpectedMovesTable({ moves, currentPrice }: { moves: ExpectedMove[]; cu
         <span className="text-center">Prob (B/N/Be)</span>
       </div>
       {moves.map((m) => {
-        const fmtPct = (v: number) => (v >= 0 ? `+${v.toFixed(1)}%` : `${v.toFixed(1)}%`)
-        const fmtPrice = (v: number) => `$${v.toFixed(2)}`
+        const fmtPct = (v: number | null | undefined) => v == null ? '—' : (v >= 0 ? `+${v.toFixed(1)}%` : `${v.toFixed(1)}%`)
+        const fmtPrice = (v: number | null | undefined) => v == null ? '—' : `$${v.toFixed(2)}`
         const bullPct  = Math.round((m.bull_prob ?? 0) * 100)
         const neutralPct = Math.round((m.neutral_prob ?? 0) * 100)
         const bearPct  = Math.round((m.bear_prob ?? 0) * 100)
@@ -632,7 +632,7 @@ function ActionZonesCard({ zones }: { zones: ActionZones }) {
       <div className="flex items-center justify-between">
         <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Action Zones</div>
         <div className="font-mono text-[9px] text-text-tertiary">
-          ATR {fmtE(eur.atr)} ({atr_pct}%) · RSI {rsi.toFixed(0)}
+          ATR {fmtE(eur.atr)} ({atr_pct}%) · RSI {rsi != null ? rsi.toFixed(0) : '—'}
           {currency !== 'EUR' && <span className="ml-1 opacity-60">{currency}/{fx_rate}</span>}
         </div>
       </div>
@@ -650,8 +650,8 @@ function ActionZonesCard({ zones }: { zones: ActionZones }) {
         {[
           { label: 'Stop',      val: fmtE(eur.stop),      sub: fmtP(pct.stop),     color: 'text-accent-red' },
           { label: 'Buy zone',  val: `${fmtE(eur.buy_low)} – ${fmtE(eur.buy_high)}`, sub: `mid ${fmtE(eur.entry_mid)}`, color: 'text-accent-green' },
-          { label: 'T1',        val: fmtE(eur.t1),        sub: `${fmtP(pct.t1)}  R:R ${rr_t1.toFixed(1)}`, color: 'text-accent-green' },
-          { label: 'T2',        val: fmtE(eur.t2),        sub: `${fmtP(pct.t2)}  R:R ${rr_t2.toFixed(1)}`, color: 'text-accent-green' },
+          { label: 'T1',        val: fmtE(eur.t1),        sub: `${fmtP(pct.t1)}  R:R ${rr_t1 != null ? rr_t1.toFixed(1) : '—'}`, color: 'text-accent-green' },
+          { label: 'T2',        val: fmtE(eur.t2),        sub: `${fmtP(pct.t2)}  R:R ${rr_t2 != null ? rr_t2.toFixed(1) : '—'}`, color: 'text-accent-green' },
           { label: 'Current',   val: fmtE(eur.current),   sub: `${fmtP(pct.current)} vs entry`, color: pct.current >= 0 ? 'text-text-primary' : 'text-accent-amber' },
           { label: 'Size',      val: `€${suggested_size_eur.toLocaleString()}`, sub: '2% NAV', color: 'text-text-secondary' },
         ].map(({ label, val, sub, color }) => (
