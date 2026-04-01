@@ -424,9 +424,10 @@ def run_checker(verbose: bool = False) -> int:
         return 0
 
     # Separate: already-resolved outcomes don't need re-checking
+    cur.execute("SELECT thesis_id, outcome FROM thesis_outcomes")
     existing = {
         row["thesis_id"]: row["outcome"]
-        for row in cur.execute("SELECT thesis_id, outcome FROM thesis_outcomes").fetchall()
+        for row in cur.fetchall()
     }
     resolved_states = {"HIT_TARGET1", "HIT_TARGET2", "HIT_STOP", "EXPIRED"}
 
