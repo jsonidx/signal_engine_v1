@@ -2490,11 +2490,15 @@ def _validate_probabilities(thesis: dict) -> None:
 THINKING_AGREEMENT_THRESHOLD = 0.70  # signal_agreement_score >= this → enable extended thinking
 THINKING_BUDGET_TOKENS = 3000        # token budget for thinking (billed separately)
 
+_last_call_usage: dict = {"input_tokens": 0, "output_tokens": 0, "model": "claude-sonnet-4-6"}
+
+
 def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False) -> Optional[str]:
     """
     Call claude-sonnet-4-6 with streaming.
     use_thinking=True enables extended thinking (higher quality, ~3x cost).
     Returns the response text, or None on failure.
+    Token usage is stored in module-level _last_call_usage after each call.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -2539,6 +2543,16 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
                     if hasattr(event, "delta"):
                         if event.delta.type == "text_delta":
                             full_text += event.delta.text
+            # Capture real token counts for usage logging
+            try:
+                final_msg = stream.get_final_message()
+                _last_call_usage["input_tokens"]  = final_msg.usage.input_tokens
+                _last_call_usage["output_tokens"] = final_msg.usage.output_tokens
+                _last_call_usage["model"]         = "claude-sonnet-4-6"
+            except Exception:
+                _last_call_usage["input_tokens"]  = len(prompt) // 4
+                _last_call_usage["output_tokens"] = len(full_text) // 4
+                _last_call_usage["model"]         = "claude-sonnet-4-6"
 
         return full_text.strip() if full_text else None
 
@@ -2933,6 +2947,12 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         cached = get_cached_thesis(ticker)
         if cached:
             print(f"\n  [{ticker}] Using cached result from today — skipping API call.")
+            try:
+                from utils.usage import log_api_usage
+                log_api_usage(module="thesis", model="claude-sonnet-4-6",
+                              input_tokens=0, output_tokens=0, ticker=ticker, cache_hit=True)
+            except Exception:
+                pass
             return cached
 
     print(f"\n  Analyzing {ticker}...")
@@ -3050,6 +3070,20 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
     # --- Save to cache ---
     save_thesis(thesis)
+
+    # --- Log API usage ---
+    try:
+        from utils.usage import log_api_usage
+        log_api_usage(
+            module="thesis",
+            model=_last_call_usage.get("model", "claude-sonnet-4-6"),
+            input_tokens=_last_call_usage.get("input_tokens", 0),
+            output_tokens=_last_call_usage.get("output_tokens", 0),
+            ticker=ticker,
+            cache_hit=False,
+        )
+    except Exception:
+        pass
 
     return thesis
 

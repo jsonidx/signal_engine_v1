@@ -1,6 +1,18 @@
 import axios from 'axios'
+import { supabase } from './supabase'
 
 const client = axios.create({ baseURL: '/' })
+
+// Attach Supabase JWT to every request when logged in
+client.interceptors.request.use(async (config) => {
+  const { data } = await supabase.auth.getSession()
+  const token = data.session?.access_token
+  if (token) {
+    config.headers = config.headers ?? {}
+    config.headers['Authorization'] = `Bearer ${token}`
+  }
+  return config
+})
 
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,36 @@
+# fly.toml — Signal Engine API deployment
+# Deploy: fly deploy
+# Docs: https://fly.io/docs/reference/configuration/
+
+app = "signal-engine-api"
+primary_region = "ams"       # Amsterdam — adjust if you prefer a different region
+
+[build]
+  dockerfile = "dashboard/api/Dockerfile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0    # scale to zero when idle (cost saving)
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[env]
+  # Non-secret env vars (secrets set via: fly secrets set KEY=value)
+  ALLOWED_ORIGINS = "https://your-frontend-domain.com"
+  # Set these via `fly secrets set`:
+  #   DATABASE_URL
+  #   SUPABASE_JWT_SECRET
+  #   ANTHROPIC_API_KEY
+  #   ALPHA_VANTAGE_KEY   (optional)
+  #   FMP_API_KEY         (optional)

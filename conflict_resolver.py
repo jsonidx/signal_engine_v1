@@ -19,6 +19,7 @@ CALIBRATION:
 """
 
 import csv
+import json
 import logging
 import os
 from datetime import datetime
@@ -26,6 +27,40 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Lazy-loaded module weights — loaded once from Supabase strategy_config,
+# falls back to the hardcoded MODULE_WEIGHTS dict below.
+# ---------------------------------------------------------------------------
+_weights_cache: Optional[Dict[str, float]] = None
+
+
+def _load_module_weights() -> Dict[str, float]:
+    """
+    Load module weights from Supabase strategy_config (key='module_weights').
+    Falls back to the hardcoded MODULE_WEIGHTS on any error.
+    Result is cached for the lifetime of the process.
+    """
+    global _weights_cache
+    if _weights_cache is not None:
+        return _weights_cache
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM strategy_config WHERE key='module_weights'")
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            loaded = json.loads(row["value"])
+            if loaded and isinstance(loaded, dict):
+                _weights_cache = loaded
+                logger.debug("module_weights loaded from Supabase strategy_config")
+                return _weights_cache
+    except Exception as exc:
+        logger.debug("Could not load module_weights from Supabase: %s — using defaults", exc)
+    _weights_cache = MODULE_WEIGHTS
+    return MODULE_WEIGHTS
 
 
 # ==============================================================================
@@ -317,7 +352,8 @@ def compute_weighted_vote(signals_dict: dict) -> dict:
     bear_weight = 0.0
     module_votes: Dict[str, Optional[str]] = {}
 
-    for module_name, weight in MODULE_WEIGHTS.items():
+    active_weights = _load_module_weights()
+    for module_name, weight in active_weights.items():
         signals_key = _SIGNALS_KEY_MAP[module_name]
         module_output = signals_dict.get(signals_key) or {}
         direction = extract_module_direction(module_name, module_output)
@@ -534,8 +570,103 @@ def resolve(signals_dict: dict, regime: str) -> dict:
         "position_size_override":  resolved.get("position_size_pct"),
     }
 
+    today = datetime.now().strftime("%Y-%m-%d")
     _log_resolution(ticker, resolved)
+    _save_resolution_cache(ticker, today, regime, result)
     return result
+
+
+# ==============================================================================
+# RESOLUTION CACHE (Supabase — global shared cache)
+# ==============================================================================
+
+def get_cached_resolution(ticker: str, date: str) -> Optional[dict]:
+    """
+    Return the cached conflict-resolution result for ticker+date, or None.
+
+    Used to avoid re-computing the weighted vote for tickers already resolved
+    today (e.g., when multiple users request the same ticker on the same day).
+    """
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM resolution_cache WHERE ticker=%s AND date=%s",
+            (ticker.upper(), date),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            # JSONB columns are returned as already-parsed Python objects by psycopg2
+            flags = row["override_flags"]
+            votes = row["module_votes"]
+            return {
+                "pre_resolved_direction":  row["pre_resolved_direction"],
+                "pre_resolved_confidence": row["confidence"],
+                "signal_agreement_score":  row["signal_agreement_score"],
+                "override_flags":          flags if isinstance(flags, list) else json.loads(flags or "[]"),
+                "module_votes":            votes if isinstance(votes, dict) else json.loads(votes or "{}"),
+                "bull_weight":             row["bull_weight"],
+                "bear_weight":             row["bear_weight"],
+                "skip_claude":             row["skip_claude"],
+                "max_conviction_override": row["max_conviction_override"],
+                "position_size_override":  row["position_size_override"],
+            }
+    except Exception as exc:
+        logger.debug("get_cached_resolution(%s): %s", ticker, exc)
+    return None
+
+
+def _save_resolution_cache(ticker: str, date: str, regime: str, result: dict) -> None:
+    """Upsert conflict-resolution result into Supabase resolution_cache."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO resolution_cache
+                (ticker, date, regime, pre_resolved_direction, confidence,
+                 signal_agreement_score, override_flags, module_votes,
+                 bull_weight, bear_weight, skip_claude,
+                 max_conviction_override, position_size_override, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker, date) DO UPDATE SET
+                regime=excluded.regime,
+                pre_resolved_direction=excluded.pre_resolved_direction,
+                confidence=excluded.confidence,
+                signal_agreement_score=excluded.signal_agreement_score,
+                override_flags=excluded.override_flags,
+                module_votes=excluded.module_votes,
+                bull_weight=excluded.bull_weight,
+                bear_weight=excluded.bear_weight,
+                skip_claude=excluded.skip_claude,
+                max_conviction_override=excluded.max_conviction_override,
+                position_size_override=excluded.position_size_override,
+                created_at=excluded.created_at
+            """,
+            (
+                ticker.upper(),
+                date,
+                regime,
+                result.get("pre_resolved_direction"),
+                result.get("pre_resolved_confidence"),
+                result.get("signal_agreement_score"),
+                json.dumps(result.get("override_flags") or []),
+                json.dumps(result.get("module_votes") or {}),
+                result.get("bull_weight"),
+                result.get("bear_weight"),
+                result.get("skip_claude"),
+                result.get("max_conviction_override"),
+                result.get("position_size_override"),
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.debug("_save_resolution_cache(%s): %s", ticker, exc)
 
 
 # ==============================================================================

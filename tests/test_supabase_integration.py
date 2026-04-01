@@ -14,6 +14,9 @@ Tests cover:
     8.  Trade CRUD — insert a trade, read it back, delete it
     9.  utils/db helpers — managed_connection commit/rollback
     10. Local SQLite cache — get_local_connection() still works for fundamentals
+    11. Resolution cache — conflict_resolver global cache read/write
+    12. API usage — log_api_usage() inserts rows; cost computed correctly
+    13. API keys — create_api_key() and _verify_api_key() round-trip
 """
 
 import json
@@ -39,7 +42,8 @@ REQUIRED_TABLES = {
     "trades", "trade_returns", "snapshots", "equity_positions",
     "weekly_returns", "portfolio_settings", "thesis_cache",
     "transcript_cache", "iv_history", "user_watchlists",
-    "strategy_config", "thesis_outcomes",
+    "strategy_config", "thesis_outcomes", "resolution_cache",
+    "api_usage", "user_api_keys",
 }
 
 TEST_TICKER = "_TEST_INTEGRATION_"   # Dummy ticker — cleaned up after each test
@@ -374,3 +378,213 @@ def test_get_local_connection_works(tmp_path):
     row = conn.execute("SELECT v FROM t").fetchone()
     conn.close()
     assert row[0] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# 11. Resolution cache — conflict_resolver global cache
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=False)
+def cleanup_test_resolution():
+    yield
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM resolution_cache WHERE ticker = %s", (TEST_TICKER,))
+    conn.commit()
+    conn.close()
+
+
+def test_resolution_cache_write_and_read(cleanup_test_resolution):
+    """_save_resolution_cache() writes; get_cached_resolution() reads it back."""
+    from conflict_resolver import _save_resolution_cache, get_cached_resolution
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = {
+        "pre_resolved_direction":  "BULL",
+        "pre_resolved_confidence": 0.72,
+        "signal_agreement_score":  0.80,
+        "override_flags":          ["context: test_flag"],
+        "module_votes":            {"signal_engine_composite_z": "BULL"},
+        "bull_weight":             0.45,
+        "bear_weight":             0.10,
+        "skip_claude":             False,
+        "max_conviction_override": None,
+        "position_size_override":  None,
+    }
+    _save_resolution_cache(TEST_TICKER, today, "RISK_ON", result)
+
+    cached = get_cached_resolution(TEST_TICKER, today)
+    assert cached is not None, "get_cached_resolution returned None after save"
+    assert cached["pre_resolved_direction"] == "BULL"
+    assert abs(cached["pre_resolved_confidence"] - 0.72) < 0.001
+    assert "context: test_flag" in cached["override_flags"]
+    assert cached["skip_claude"] is False
+
+
+def test_resolution_cache_miss_returns_none():
+    """get_cached_resolution() returns None for unknown ticker/date."""
+    from conflict_resolver import get_cached_resolution
+    result = get_cached_resolution("ZZZNEVEREXISTS", "1900-01-01")
+    assert result is None
+
+
+def test_module_weights_loaded_from_supabase():
+    """_load_module_weights() returns weights from strategy_config (not fallback)."""
+    import importlib
+    import conflict_resolver as cr
+    # Reset the module-level cache so the next call hits Supabase
+    cr._weights_cache = None
+    weights = cr._load_module_weights()
+    assert isinstance(weights, dict)
+    assert len(weights) >= 8, "Expected at least 8 module weight entries"
+    total = sum(weights.values())
+    assert abs(total - 1.0) < 0.05, f"module_weights sum {total:.3f} should be near 1.0"
+
+
+# ---------------------------------------------------------------------------
+# 12. API usage logging
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=False)
+def cleanup_test_api_usage():
+    yield
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM api_usage WHERE ticker = %s", (TEST_TICKER,))
+    conn.commit()
+    conn.close()
+
+
+def test_api_usage_log_inserts_row(cleanup_test_api_usage):
+    """log_api_usage() inserts a row into api_usage with correct cost."""
+    from utils.usage import log_api_usage, compute_cost
+
+    log_api_usage(
+        module="thesis",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=500,
+        ticker=TEST_TICKER,
+        cache_hit=False,
+        user_id=None,
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM api_usage WHERE ticker = %s ORDER BY created_at DESC LIMIT 1",
+        (TEST_TICKER,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    assert row is not None, "api_usage row not found after log_api_usage()"
+    assert row["module"] == "thesis"
+    assert row["model"] == "claude-sonnet-4-6"
+    assert row["input_tokens"] == 1000
+    assert row["output_tokens"] == 500
+    assert row["cache_hit"] is False
+
+    expected_cost = compute_cost("claude-sonnet-4-6", 1000, 500)
+    assert abs(row["cost_usd"] - expected_cost) < 0.0001
+
+
+def test_api_usage_cache_hit_zero_cost(cleanup_test_api_usage):
+    """Cache hits (tokens=0) result in zero cost."""
+    from utils.usage import log_api_usage
+
+    log_api_usage(
+        module="transcript",
+        model="claude-sonnet-4-6",
+        input_tokens=0,
+        output_tokens=0,
+        ticker=TEST_TICKER,
+        cache_hit=True,
+        user_id=None,
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT cost_usd, cache_hit FROM api_usage WHERE ticker = %s AND cache_hit = TRUE LIMIT 1",
+        (TEST_TICKER,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row["cache_hit"] is True
+    assert row["cost_usd"] == 0.0
+
+
+def test_compute_cost_sonnet():
+    """compute_cost() returns correct USD for known model + token counts."""
+    from utils.usage import compute_cost
+    # 1M input + 1M output for sonnet: $3 + $15 = $18
+    cost = compute_cost("claude-sonnet-4-6", 1_000_000, 1_000_000)
+    assert abs(cost - 18.0) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# 13. API key create and verify
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=False)
+def cleanup_test_api_key():
+    """Track key IDs created during tests and delete them after."""
+    created_ids: list = []
+    yield created_ids
+    if created_ids:
+        conn = get_connection()
+        cur = conn.cursor()
+        for kid in created_ids:
+            cur.execute("DELETE FROM user_api_keys WHERE id = %s", (kid,))
+        conn.commit()
+        conn.close()
+
+
+def test_api_key_create_and_verify(cleanup_test_api_key):
+    """create_api_key() persists key; _verify_api_key() returns AuthUser."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dashboard", "api"))
+    from auth import create_api_key, _verify_api_key
+
+    # Use a fake UUID-style user_id (not a real Supabase user)
+    fake_user_id = "00000000-0000-0000-0000-000000000001"
+    result = create_api_key(user_id=fake_user_id, email="test@example.com", name="test key")
+    cleanup_test_api_key.append(result["id"])
+
+    assert result["raw_key"].startswith("se_")
+    assert result["key_prefix"] == result["raw_key"][:11]
+
+    auth_user = _verify_api_key(result["raw_key"])
+    assert auth_user is not None, "_verify_api_key returned None for valid key"
+    assert auth_user.user_id == fake_user_id
+    assert auth_user.auth_method == "api_key"
+
+
+def test_api_key_revoke(cleanup_test_api_key):
+    """revoke_api_key() marks key revoked; _verify_api_key returns None after."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dashboard", "api"))
+    from auth import create_api_key, revoke_api_key, _verify_api_key
+
+    fake_user_id = "00000000-0000-0000-0000-000000000002"
+    result = create_api_key(user_id=fake_user_id, email="test2@example.com", name="revoke test")
+    cleanup_test_api_key.append(result["id"])
+
+    revoked = revoke_api_key(result["id"], fake_user_id)
+    assert revoked is True
+
+    auth_user = _verify_api_key(result["raw_key"])
+    assert auth_user is None, "_verify_api_key should return None after revocation"
+
+
+def test_api_key_wrong_key_returns_none():
+    """_verify_api_key() returns None for a key that doesn't exist."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dashboard", "api"))
+    from auth import _verify_api_key
+
+    auth_user = _verify_api_key("se_" + "x" * 64)
+    assert auth_user is None

@@ -1,5 +1,8 @@
 import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom'
+import { AuthProvider } from './lib/AuthContext'
+import { PrivateRoute } from './components/PrivateRoute'
+import { LoginPage } from './pages/LoginPage'
 import { PortfolioPage } from './pages/PortfolioPage'
 import { HeatmapPage } from './pages/HeatmapPage'
 import { DeepDivePage } from './pages/DeepDivePage'
@@ -48,89 +51,115 @@ function KeyboardShortcuts() {
 export default function App() {
   return (
     <BrowserRouter>
-      <KeyboardShortcuts />
-      <Routes>
-        <Route
-          path="/"
-          element={
-            <ErrorBoundary pageName="Portfolio">
-              <PortfolioPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/heatmap"
-          element={
-            <ErrorBoundary pageName="Signal Heatmap">
-              <HeatmapPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/deepdive"
-          element={
-            <ErrorBoundary pageName="Deep Dive">
-              <DeepDivePage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/ticker/:symbol"
-          element={
-            <ErrorBoundary pageName="Ticker Deep Dive">
-              <TickerPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/screeners"
-          element={
-            <ErrorBoundary pageName="Screeners">
-              <ScreenersPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/darkpool"
-          element={
-            <ErrorBoundary pageName="Dark Pool">
-              <DarkPoolPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/backtest"
-          element={
-            <ErrorBoundary pageName="Backtest">
-              <BacktestPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/resolution"
-          element={
-            <ErrorBoundary pageName="Resolution Log">
-              <ResolutionPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/crypto"
-          element={
-            <ErrorBoundary pageName="Crypto Signals">
-              <CryptoPage />
-            </ErrorBoundary>
-          }
-        />
-        <Route
-          path="/accuracy"
-          element={
-            <ErrorBoundary pageName="Claude Accuracy">
-              <AccuracyPage />
-            </ErrorBoundary>
-          }
-        />
-      </Routes>
+      <AuthProvider>
+        <KeyboardShortcuts />
+        <Routes>
+          {/* Public */}
+          <Route path="/login" element={<LoginPage />} />
+
+          {/* Protected */}
+          <Route
+            path="/"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Portfolio">
+                  <PortfolioPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/heatmap"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Signal Heatmap">
+                  <HeatmapPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/deepdive"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Deep Dive">
+                  <DeepDivePage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/ticker/:symbol"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Ticker Deep Dive">
+                  <TickerPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/screeners"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Screeners">
+                  <ScreenersPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/darkpool"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Dark Pool">
+                  <DarkPoolPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/backtest"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Backtest">
+                  <BacktestPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/resolution"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Resolution Log">
+                  <ResolutionPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/crypto"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Crypto Signals">
+                  <CryptoPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/accuracy"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Claude Accuracy">
+                  <AccuracyPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+        </Routes>
+      </AuthProvider>
     </BrowserRouter>
   )
 }

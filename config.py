@@ -207,7 +207,7 @@ DARK_POOL_INTENSITY_HIGH = 0.45         # above this = heavy institutional off-e
 IV_RISK_FREE_RATE    = 0.05              # Fed funds rate approximation (update as rates change)
 IV_TARGET_DTE        = 30               # Target days-to-expiry for ATM IV interpolation
 IV_MIN_HISTORY_DAYS  = 60               # Min stored rows before iv_rank/percentile returns a value
-IV_HISTORY_DB        = "data/iv_history.db"  # SQLite store — grows ~1 KB per ticker per day
+IV_HISTORY_DB        = "data/iv_history.db"  # Legacy constant — iv_history is now in Supabase (iv_history table)
 
 # ============================================================
 # SOCIAL SENTIMENT PARAMETERS

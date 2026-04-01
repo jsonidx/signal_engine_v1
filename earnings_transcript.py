@@ -85,6 +85,12 @@ def _get_cached(ticker: str) -> Optional[dict]:
             data = json.loads(row['analysis_json'])
             data["filing_date"] = row['filing_date']
             data["cached"] = True
+            try:
+                from utils.usage import log_api_usage
+                log_api_usage(module="transcript", model="claude-sonnet-4-6",
+                              input_tokens=0, output_tokens=0, ticker=ticker, cache_hit=True)
+            except Exception:
+                pass
             return data
     except Exception:
         pass
@@ -357,6 +363,21 @@ def analyze_transcript_with_claude(ticker: str, transcript_text: str) -> dict:
         )
 
         raw_text = response.content[0].text.strip()
+
+        # Log usage
+        try:
+            from utils.usage import log_api_usage
+            log_api_usage(
+                module="transcript",
+                model="claude-sonnet-4-6",
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                ticker=ticker,
+                cache_hit=False,
+            )
+        except Exception:
+            pass
+
         # Extract JSON from response
         json_match = re.search(r"\{[\s\S]*\}", raw_text)
         if json_match:

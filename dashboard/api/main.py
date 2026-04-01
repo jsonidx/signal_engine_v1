@@ -44,9 +44,25 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+try:
+    from dashboard.api.auth import (
+        get_current_user, get_optional_user, AuthUser,
+        create_api_key, revoke_api_key,
+    )
+    _AUTH_AVAILABLE = True
+except ImportError:
+    _AUTH_AVAILABLE = False
+    # Fallback stubs so routes compile without the auth module
+    async def get_current_user():  # type: ignore[misc]
+        return None
+    async def get_optional_user():  # type: ignore[misc]
+        return None
+    class AuthUser:  # type: ignore[misc]
+        user_id = "anonymous"
 
 # ─── Resolve project root (two levels up from this file) ─────────────────────
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -92,9 +108,15 @@ app = FastAPI(
     description="JSON API for the Signal Engine quantitative trading system",
 )
 
+_CORS_ORIGINS_DEFAULT = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173"
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", _CORS_ORIGINS_DEFAULT).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -677,7 +699,7 @@ class SellPositionRequest(_BaseModel):
 
 
 @app.post("/api/portfolio/positions")
-async def add_position(req: AddPositionRequest):
+async def add_position(req: AddPositionRequest, user: AuthUser = Depends(get_current_user)):
     """Manually insert an open position into trade_journal.db."""
     if req.entry_price <= 0 or req.size_eur <= 0:
         raise HTTPException(status_code=400, detail="entry_price and size_eur must be > 0")
@@ -715,7 +737,7 @@ async def add_position(req: AddPositionRequest):
 
 
 @app.post("/api/portfolio/positions/{ticker}/sell")
-async def sell_position(ticker: str, req: SellPositionRequest):
+async def sell_position(ticker: str, req: SellPositionRequest, user: AuthUser = Depends(get_current_user)):
     """Close the most recent open position for ticker with sell price, computing P&L in EUR."""
     if req.sell_price <= 0:
         raise HTTPException(status_code=400, detail="sell_price must be > 0")
@@ -772,7 +794,7 @@ async def sell_position(ticker: str, req: SellPositionRequest):
 
 
 @app.delete("/api/portfolio/positions/{ticker}")
-async def close_position(ticker: str):
+async def close_position(ticker: str, user: AuthUser = Depends(get_current_user)):
     """Mark the most recent open position as closed (no P&L recorded)."""
     try:
         result = conn.execute(
@@ -871,7 +893,7 @@ class CashUpdateRequest(BaseModel):
 
 
 @app.post("/api/portfolio/cash")
-async def update_cash(req: CashUpdateRequest):
+async def update_cash(req: CashUpdateRequest, user: AuthUser = Depends(get_current_user)):
     """
     Set, add to, or reduce the manual cash balance.
     Body: { "action": "set"|"add"|"reduce", "amount": <float> }
@@ -2692,7 +2714,7 @@ _analysis_jobs: dict = {}
 
 
 @app.post("/api/ticker/{symbol}/analyze")
-async def ticker_analyze(symbol: str):
+async def ticker_analyze(symbol: str, user: AuthUser = Depends(get_current_user)):
     """
     Trigger ai_quant.py --ticker SYMBOL as a background subprocess.
     Returns immediately. Poll /api/signals/ticker/{symbol} to see when thesis appears.
@@ -3098,3 +3120,120 @@ async def ticker_earnings(symbol: str):
     }
     _cache.set(cache_key, result, 4 * 3600)
     return result
+
+
+# ==============================================================================
+# AUTH ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/auth/me")
+async def auth_me(user: AuthUser = Depends(get_current_user)):
+    """Return current authenticated user info."""
+    return {"user_id": user.user_id, "email": user.email, "auth_method": user.auth_method}
+
+
+@app.post("/api/auth/keys")
+async def auth_create_key(
+    name: str = Query(default="Default key", description="Friendly label for this key"),
+    user: AuthUser = Depends(get_current_user),
+):
+    """
+    Generate a new API key for the authenticated user.
+    The raw key is returned ONCE — store it securely. It cannot be recovered.
+    """
+    if not _AUTH_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Auth module not available")
+    result = create_api_key(user_id=user.user_id, email=user.email, name=name)
+    return result
+
+
+@app.get("/api/auth/keys")
+async def auth_list_keys(user: AuthUser = Depends(get_current_user)):
+    """List all active API keys for the authenticated user (prefixes only, no raw keys)."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, key_prefix, name, created_at, last_used
+               FROM user_api_keys
+               WHERE user_id = %s AND revoked = FALSE
+               ORDER BY created_at DESC""",
+            (user.user_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return {"keys": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/auth/keys/{key_id}")
+async def auth_revoke_key(key_id: int, user: AuthUser = Depends(get_current_user)):
+    """Revoke an API key by ID. Only the owner can revoke their own keys."""
+    if not _AUTH_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Auth module not available")
+    ok = revoke_api_key(key_id, user.user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Key not found or already revoked")
+    return {"revoked": True, "key_id": key_id}
+
+
+# ==============================================================================
+# USAGE ENDPOINTS
+# ==============================================================================
+
+@app.get("/api/usage/summary")
+async def usage_summary(
+    days: int = Query(default=30, ge=1, le=365),
+    user: AuthUser = Depends(get_current_user),
+):
+    """
+    Return API usage stats for the authenticated user over the last N days.
+    Includes total calls, tokens, cost, and per-module breakdown.
+    """
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        cur.execute(
+            """SELECT
+                   module,
+                   COUNT(*) AS calls,
+                   SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END) AS cache_hits,
+                   SUM(input_tokens)  AS input_tokens,
+                   SUM(output_tokens) AS output_tokens,
+                   SUM(cost_usd)      AS cost_usd
+               FROM api_usage
+               WHERE created_at >= %s
+                 AND (user_id = %s OR user_id IS NULL)
+               GROUP BY module
+               ORDER BY cost_usd DESC""",
+            (since, user.user_id),
+        )
+        by_module = [dict(r) for r in cur.fetchall()]
+
+        cur.execute(
+            """SELECT
+                   COUNT(*) AS total_calls,
+                   SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END) AS cache_hits,
+                   SUM(input_tokens)  AS total_input_tokens,
+                   SUM(output_tokens) AS total_output_tokens,
+                   SUM(cost_usd)      AS total_cost_usd
+               FROM api_usage
+               WHERE created_at >= %s
+                 AND (user_id = %s OR user_id IS NULL)""",
+            (since, user.user_id),
+        )
+        totals = dict(cur.fetchone() or {})
+        conn.close()
+
+        return {
+            "period_days":  days,
+            "totals":       totals,
+            "by_module":    by_module,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
