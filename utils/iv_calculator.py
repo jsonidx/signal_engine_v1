@@ -406,15 +406,21 @@ def _store_iv(
     near_expiry: Optional[str] = None,
     far_expiry: Optional[str] = None,
 ) -> None:
-    """Upsert today's ATM IV for a ticker.  INSERT OR REPLACE is idempotent."""
+    """Upsert today's ATM IV for a ticker."""
     today_str = date.today().isoformat()
     computed_at = datetime.utcnow().isoformat(timespec="seconds")
     with managed_connection(db_path) as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO iv_history
+            INSERT INTO iv_history
                 (ticker, date, iv30, atm_strike, near_expiry, far_expiry, computed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker, date) DO UPDATE SET
+                iv30        = EXCLUDED.iv30,
+                atm_strike  = EXCLUDED.atm_strike,
+                near_expiry = EXCLUDED.near_expiry,
+                far_expiry  = EXCLUDED.far_expiry,
+                computed_at = EXCLUDED.computed_at
             """,
             (ticker, today_str, iv30, atm_strike, near_expiry, far_expiry, computed_at),
         )
@@ -450,9 +456,9 @@ def _get_iv_metrics(
         rows = conn.execute(
             """
             SELECT iv30 FROM iv_history
-            WHERE ticker = ?
+            WHERE ticker = %s
             ORDER BY date DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (ticker, lookback_days),
         ).fetchall()

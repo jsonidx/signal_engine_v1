@@ -69,7 +69,7 @@ def _connect(path: str) -> Optional[sqlite3.Connection]:
 def _init_outcomes_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS thesis_outcomes (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                  SERIAL PRIMARY KEY,
             thesis_id           INTEGER NOT NULL,
             ticker              TEXT    NOT NULL,
             thesis_date         TEXT    NOT NULL,
@@ -96,10 +96,10 @@ def _init_outcomes_table(conn: sqlite3.Connection) -> None:
             vs_target_1_pct     REAL,
             vs_target_2_pct     REAL,
             vs_stop_pct         REAL,
-            -- hit flags (1 = yes, 0 = no, checked using OHLC highs/lows)
-            hit_target_1        INTEGER DEFAULT 0,
-            hit_target_2        INTEGER DEFAULT 0,
-            hit_stop            INTEGER DEFAULT 0,
+            -- hit flags (checked using OHLC highs/lows)
+            hit_target_1        BOOLEAN DEFAULT FALSE,
+            hit_target_2        BOOLEAN DEFAULT FALSE,
+            hit_stop            BOOLEAN DEFAULT FALSE,
             -- days from thesis_date to first hit (trading days in price history)
             days_to_target_1    INTEGER,
             days_to_target_2    INTEGER,
@@ -108,7 +108,7 @@ def _init_outcomes_table(conn: sqlite3.Connection) -> None:
             outcome             TEXT,   -- HIT_TARGET1/HIT_TARGET2/HIT_STOP/OPEN/EXPIRED
             claude_correct      INTEGER, -- 1=direction right at 30d, 0=wrong, NULL=neutral/open
             -- trade linkage
-            was_traded          INTEGER DEFAULT 0,
+            was_traded          BOOLEAN DEFAULT FALSE,
             trade_id            INTEGER,
             -- metadata
             last_checked        TEXT,
@@ -391,9 +391,11 @@ def _find_linked_trade(ticker: str, thesis_date: str) -> Tuple[int, Optional[int
         lo = (d - timedelta(days=TRADE_LINK_WINDOW)).strftime("%Y-%m-%d")
         hi = (d + timedelta(days=TRADE_LINK_WINDOW)).strftime("%Y-%m-%d")
         row = conn.execute(
+            # NOTE: julianday() is SQLite-only — replace with a PostgreSQL date
+            # expression such as ABS(date::date - %s::date) after migration.
             """SELECT id FROM trades
-               WHERE ticker=? AND action='BUY' AND date BETWEEN ? AND ?
-               ORDER BY ABS(julianday(date) - julianday(?)) LIMIT 1""",
+               WHERE ticker=%s AND action='BUY' AND date BETWEEN %s AND %s
+               ORDER BY ABS(julianday(date) - julianday(%s)) LIMIT 1""",
             (ticker, lo, hi, thesis_date),
         ).fetchone()
         if row:
@@ -473,7 +475,7 @@ def run_checker(verbose: bool = False) -> int:
 
         # Upsert
         cols = ", ".join(out.keys())
-        placeholders = ", ".join("?" for _ in out)
+        placeholders = ", ".join("%s" for _ in out)
         updates = ", ".join(
             f"{k}=excluded.{k}"
             for k in out
@@ -528,7 +530,7 @@ def print_accuracy_report(days: int = 90) -> None:
         """SELECT o.*, c.bull_probability, c.signal_agreement_score
            FROM thesis_outcomes o
            JOIN thesis_cache c ON o.thesis_id = c.id
-           WHERE o.thesis_date >= ?
+           WHERE o.thesis_date >= %s
            ORDER BY o.thesis_date DESC""",
         (cutoff,),
     ).fetchall()

@@ -128,7 +128,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             ticker TEXT NOT NULL,
             action TEXT NOT NULL,
             price REAL NOT NULL,
@@ -151,7 +151,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS trade_returns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             trade_id INTEGER NOT NULL,
             check_date TEXT NOT NULL,
             days_held INTEGER,
@@ -411,7 +411,7 @@ def log_buy(conn, ticker: str, price: float, size_eur: float, notes: str = ""):
         INSERT INTO trades (ticker, action, price, size_eur, shares, date,
                             created_at, buy_zone_low, buy_zone_high,
                             target_1, target_2, stop_loss, notes, status)
-        VALUES (?, 'BUY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+        VALUES (%s, 'BUY', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
     """, (
         ticker.upper(), price, size_eur, shares, today, now,
         zones["buy_zone_low"] if zones else None,
@@ -440,7 +440,7 @@ def log_sell(conn, ticker: str, price: float, size_eur: float = None, notes: str
     # Find open buy for this ticker
     c.execute("""
         SELECT id, price, size_eur, shares, date FROM trades
-        WHERE ticker = ? AND action = 'BUY' AND status = 'open'
+        WHERE ticker = %s AND action = 'BUY' AND status = 'open'
         ORDER BY date DESC LIMIT 1
     """, (ticker.upper(),))
     buy = c.fetchone()
@@ -463,12 +463,12 @@ def log_sell(conn, ticker: str, price: float, size_eur: float = None, notes: str
     c.execute("""
         INSERT INTO trades (ticker, action, price, size_eur, shares, date,
                             created_at, notes, linked_buy_id, status)
-        VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, ?, 'closed')
+        VALUES (%s, 'SELL', %s, %s, %s, %s, %s, %s, %s, 'closed')
     """, (ticker.upper(), price, buy_size + pnl_eur, buy_shares,
           today, now, notes, buy_id))
 
     # Close the buy
-    c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (buy_id,))
+    c.execute("UPDATE trades SET status = 'closed' WHERE id = %s", (buy_id,))
     conn.commit()
 
     emoji = "🟢" if pnl_eur >= 0 else "🔴"
@@ -612,15 +612,16 @@ def show_status(conn):
 
         # Log return checkpoint
         c.execute("""
-            SELECT id FROM trades WHERE ticker = ? AND action = 'BUY' AND status = 'open'
+            SELECT id FROM trades WHERE ticker = %s AND action = 'BUY' AND status = 'open'
             ORDER BY date ASC LIMIT 1
         """, (ticker,))
         first_buy = c.fetchone()
         if first_buy:
             c.execute("""
-                INSERT OR IGNORE INTO trade_returns
+                INSERT INTO trade_returns
                 (trade_id, check_date, days_held, current_price, return_pct, unrealized_pnl_eur)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
             """, (first_buy[0], datetime.now().strftime("%Y-%m-%d"), days, current, pnl_pct, pnl_eur))
 
     conn.commit()

@@ -72,7 +72,7 @@ def _init_cache() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transcript_cache (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            SERIAL PRIMARY KEY,
             ticker        TEXT NOT NULL,
             filing_date   TEXT NOT NULL,
             analysis_json TEXT,
@@ -92,7 +92,7 @@ def _get_cached(ticker: str) -> Optional[dict]:
         cutoff = (datetime.now() - timedelta(days=CACHE_TTL_DAYS)).isoformat()
         row = conn.execute(
             "SELECT analysis_json, filing_date FROM transcript_cache "
-            "WHERE ticker=? AND created_at>? ORDER BY filing_date DESC LIMIT 1",
+            "WHERE ticker=%s AND created_at>%s ORDER BY filing_date DESC LIMIT 1",
             (ticker.upper(), cutoff),
         ).fetchone()
         conn.close()
@@ -112,7 +112,7 @@ def _save_cache(ticker: str, filing_date: str, analysis: dict, snippet: str) -> 
         conn.execute(
             """INSERT INTO transcript_cache
                (ticker, filing_date, analysis_json, transcript_snippet, created_at)
-               VALUES (?,?,?,?,?)
+               VALUES (%s,%s,%s,%s,%s)
                ON CONFLICT(ticker, filing_date) DO UPDATE SET
                    analysis_json=excluded.analysis_json,
                    transcript_snippet=excluded.transcript_snippet,

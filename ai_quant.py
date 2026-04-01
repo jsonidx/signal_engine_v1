@@ -208,7 +208,7 @@ def _init_db() -> sqlite3.Connection:
     conn = get_connection(_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS thesis_cache (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            SERIAL PRIMARY KEY,
             ticker        TEXT    NOT NULL,
             date          TEXT    NOT NULL,
             direction     TEXT,
@@ -269,7 +269,7 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
     try:
         conn = _init_db()
         row = conn.execute(
-            "SELECT * FROM thesis_cache WHERE ticker=? AND date=?",
+            "SELECT * FROM thesis_cache WHERE ticker=%s AND date=%s",
             (ticker.upper(), date),
         ).fetchone()
         conn.close()
@@ -310,7 +310,7 @@ def save_thesis(thesis: dict) -> None:
                  bull_probability, bear_probability, neutral_probability,
                  signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
                  expected_moves_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
@@ -1248,7 +1248,7 @@ def _collect_historical_analog_signals(
                 """SELECT ticker, date, direction, conviction, signal_agreement_score,
                           signals_json, entry_low, target_1
                    FROM thesis_cache
-                   WHERE date >= ? AND signals_json IS NOT NULL
+                   WHERE date >= %s AND signals_json IS NOT NULL
                    ORDER BY date DESC LIMIT 500""",
                 (cutoff,),
             ).fetchall()

@@ -100,7 +100,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             date TEXT NOT NULL,
             created_at TEXT NOT NULL,
             portfolio_nav REAL NOT NULL,
@@ -117,7 +117,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS equity_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             snapshot_id INTEGER NOT NULL,
             ticker TEXT NOT NULL,
             rank INTEGER,
@@ -137,7 +137,7 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_returns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             snapshot_id INTEGER NOT NULL,
             week_ending TEXT NOT NULL,
             portfolio_return REAL,
@@ -258,7 +258,7 @@ def record_snapshot(conn: sqlite3.Connection):
 
     # Check if already recorded today
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM snapshots WHERE date = ?", (today,))
+    c.execute("SELECT COUNT(*) FROM snapshots WHERE date = %s", (today,))
     if c.fetchone()[0] > 0:
         print(f"  [WARN] Snapshot already exists for {today}.")
         print(f"  To re-record, first run: python3 paper_trader.py --delete-today")
@@ -298,7 +298,7 @@ def record_snapshot(conn: sqlite3.Connection):
         INSERT INTO snapshots (date, created_at, portfolio_nav, equity_allocation,
                                crypto_allocation, cash_allocation, spy_price,
                                btc_price, btc_ma200, btc_signal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (today, now, PORTFOLIO_NAV, equity_alloc, crypto_alloc, cash_alloc,
           spy_price, btc_data["price"], btc_data["ma200"], btc_data["signal"]))
 
@@ -334,7 +334,7 @@ def record_snapshot(conn: sqlite3.Connection):
             INSERT INTO equity_positions (snapshot_id, ticker, rank, composite_z,
                                           weight_pct, position_eur, entry_price,
                                           transaction_cost_eur)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (snapshot_id, ticker, rank, composite, weight, pos_eur, price, tc_eur))
 
     conn.commit()
@@ -380,7 +380,7 @@ def compute_returns(conn: sqlite3.Connection):
         curr_id, curr_date = curr[0], curr[1]
 
         # Check if return already computed
-        c.execute("SELECT COUNT(*) FROM weekly_returns WHERE snapshot_id = ?", (curr_id,))
+        c.execute("SELECT COUNT(*) FROM weekly_returns WHERE snapshot_id = %s", (curr_id,))
         if c.fetchone()[0] > 0:
             continue
 
@@ -396,7 +396,7 @@ def compute_returns(conn: sqlite3.Connection):
         # Equity return — compute from position prices
         c.execute("""
             SELECT ticker, weight_pct, entry_price FROM equity_positions
-            WHERE snapshot_id = ?
+            WHERE snapshot_id = %s
         """, (prev_id,))
         prev_positions = c.fetchall()
 
@@ -421,7 +421,7 @@ def compute_returns(conn: sqlite3.Connection):
             INSERT INTO weekly_returns (snapshot_id, week_ending, portfolio_return,
                                         benchmark_return, equity_return,
                                         crypto_return, btc_return)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (curr_id, curr_date, port_ret, spy_ret, equity_ret,
               crypto_port_ret, btc_ret))
 
@@ -549,7 +549,7 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
         SELECT COALESCE(SUM(ep.transaction_cost_eur), 0)
         FROM equity_positions ep
         JOIN snapshots s ON ep.snapshot_id = s.id
-        WHERE substr(s.date, 1, 4) = ?
+        WHERE substr(s.date, 1, 4) = %s
     """, (str(datetime.now().year),))
     ytd_tc_eur = float(c.fetchone()[0] or 0)
     equity_deployed = PORTFOLIO_NAV * EQUITY_ALLOCATION
@@ -590,7 +590,7 @@ def show_positions(conn: sqlite3.Connection):
 
     c.execute("""
         SELECT ticker, rank, composite_z, weight_pct, position_eur, entry_price
-        FROM equity_positions WHERE snapshot_id = ?
+        FROM equity_positions WHERE snapshot_id = %s
         ORDER BY rank ASC
     """, (snapshot_id,))
 
@@ -605,7 +605,7 @@ def show_positions(conn: sqlite3.Connection):
         print(f"\n  Total equity exposure: €{total_eur:,.0f}")
 
     # BTC
-    c.execute("SELECT btc_signal, btc_price, btc_ma200 FROM snapshots WHERE id = ?",
+    c.execute("SELECT btc_signal, btc_price, btc_ma200 FROM snapshots WHERE id = %s",
               (snapshot_id,))
     btc = c.fetchone()
     if btc:

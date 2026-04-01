@@ -34,5 +34,8 @@ polymarket_cache.json
 dashboard/frontend/node_modules/
 dashboard/frontend/dist/
 
+# Generated launchd plists (machine-specific, created by setup_schedules.sh)
+*.plist
+
 # OS
 .DS_Store

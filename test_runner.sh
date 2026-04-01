@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
 
-PROJECT_ROOT="/Users/jason/Documents/GitHub/signal_engine_v1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR"
 cd "$PROJECT_ROOT"
+
 source venv/bin/activate
 
 echo "Python: $(which python3)"

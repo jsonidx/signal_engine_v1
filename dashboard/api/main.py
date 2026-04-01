@@ -611,7 +611,7 @@ def _to_eur(price: float, currency: str, eur_usd: float) -> float:
 def _ensure_trades_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               SERIAL PRIMARY KEY,
             ticker           TEXT    NOT NULL,
             direction        TEXT    NOT NULL DEFAULT 'LONG',
             date             TEXT    NOT NULL,
@@ -695,7 +695,7 @@ async def add_position(req: AddPositionRequest):
                 (ticker, direction, date, price, price_eur, size_eur, shares,
                  currency, fx_rate, signal_composite, stop_loss, target_1, target_2,
                  notes, action, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BUY', 'open')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'BUY', 'open')
         """, (
             req.ticker.upper().strip(), req.direction.upper(),
             today, req.entry_price, price_eur, req.size_eur, shares,
@@ -728,7 +728,7 @@ async def sell_position(ticker: str, req: SellPositionRequest):
     try:
         _ensure_trades_table(conn)
         row = conn.execute(
-            "SELECT * FROM trades WHERE ticker = ? AND action = 'BUY' AND status = 'open' ORDER BY date DESC LIMIT 1",
+            "SELECT * FROM trades WHERE ticker = %s AND action = 'BUY' AND status = 'open' ORDER BY date DESC LIMIT 1",
             (ticker.upper().strip(),),
         ).fetchone()
         if row is None:
@@ -749,13 +749,13 @@ async def sell_position(ticker: str, req: SellPositionRequest):
         conn.execute("""
             UPDATE trades SET
                 status          = 'closed',
-                close_date      = ?,
-                close_price     = ?,
-                close_price_eur = ?,
-                close_currency  = ?,
-                close_fx_rate   = ?,
-                pnl_eur         = ?
-            WHERE id = ?
+                close_date      = %s,
+                close_price     = %s,
+                close_price_eur = %s,
+                close_currency  = %s,
+                close_fx_rate   = %s,
+                pnl_eur         = %s
+            WHERE id = %s
         """, (today, req.sell_price, close_price_eur, req.currency.upper(), eur_usd, pnl_eur, row["id"]))
         conn.commit()
         log.info("Position sold: %s @ %.4f %s → P&L %.2f EUR", ticker.upper(), req.sell_price, req.currency, pnl_eur)
@@ -784,7 +784,7 @@ async def close_position(ticker: str):
     conn.row_factory = sqlite3.Row
     try:
         result = conn.execute(
-            "UPDATE trades SET status = 'closed' WHERE ticker = ? AND action = 'BUY' AND status = 'open'",
+            "UPDATE trades SET status = 'closed' WHERE ticker = %s AND action = 'BUY' AND status = 'open'",
             (ticker.upper().strip(),),
         )
         conn.commit()
@@ -919,7 +919,7 @@ async def update_cash(req: CashUpdateRequest):
         now = datetime.utcnow().isoformat() + "Z"
         conn.execute("""
             INSERT INTO portfolio_settings (key, value, updated_at)
-            VALUES ('cash_eur', ?, ?)
+            VALUES ('cash_eur', %s, %s)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
         """, (str(new_cash), now))
         conn.commit()
@@ -1204,7 +1204,7 @@ async def signals_ticker(ticker: str):
     try:
         row = conn.execute("""
             SELECT * FROM thesis_cache
-            WHERE ticker = ?
+            WHERE ticker = %s
             ORDER BY date DESC LIMIT 1
         """, (ticker,)).fetchone()
         conn.close()

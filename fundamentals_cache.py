@@ -83,7 +83,7 @@ def get_cached(ticker: str, ttl_days: int = DEFAULT_TTL_DAYS) -> Optional[dict]:
     try:
         conn = _connect()
         row = conn.execute(
-            "SELECT data_json, fetched_at FROM fundamentals WHERE ticker = ?",
+            "SELECT data_json, fetched_at FROM fundamentals WHERE ticker = %s",
             (ticker.upper(),)
         ).fetchone()
         conn.close()
@@ -111,7 +111,7 @@ def save_to_cache(ticker: str, data: dict) -> None:
         conn.execute(
             """
             INSERT INTO fundamentals (ticker, data_json, fetched_at)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             ON CONFLICT(ticker) DO UPDATE SET
                 data_json  = excluded.data_json,
                 fetched_at = excluded.fetched_at
@@ -128,7 +128,7 @@ def clear_ticker(ticker: str) -> None:
     """Remove one ticker from the cache (forces re-fetch on next run)."""
     try:
         conn = _connect()
-        conn.execute("DELETE FROM fundamentals WHERE ticker = ?", (ticker.upper(),))
+        conn.execute("DELETE FROM fundamentals WHERE ticker = %s", (ticker.upper(),))
         conn.commit()
         conn.close()
     except Exception:
