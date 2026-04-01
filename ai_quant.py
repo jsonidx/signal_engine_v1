@@ -63,7 +63,6 @@ import argparse
 import json
 import logging
 import os
-import sqlite3
 import sys
 import time
 import warnings
@@ -197,66 +196,12 @@ def _inject_universe_rank(signals: dict, ticker: str) -> dict:
 
 
 # ==============================================================================
-# SECTION 0: RESULT CACHE (SQLite)
+# SECTION 0: RESULT CACHE (Supabase — global shared cache)
 # ==============================================================================
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_quant_cache.db")
-
-
-def _init_db() -> sqlite3.Connection:
-    """Open (and if needed, create) the cache database."""
-    conn = get_connection(_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS thesis_cache (
-            id            SERIAL PRIMARY KEY,
-            ticker        TEXT    NOT NULL,
-            date          TEXT    NOT NULL,
-            direction     TEXT,
-            conviction    INTEGER,
-            time_horizon  TEXT,
-            entry_low     REAL,
-            entry_high    REAL,
-            stop_loss     REAL,
-            target_1      REAL,
-            target_2      REAL,
-            position_size_pct REAL,
-            thesis        TEXT,
-            data_quality  TEXT,
-            notes         TEXT,
-            catalysts_json TEXT,
-            risks_json    TEXT,
-            raw_response  TEXT,
-            signals_json  TEXT,
-            created_at    TEXT,
-            bull_probability       REAL,
-            bear_probability       REAL,
-            neutral_probability    REAL,
-            signal_agreement_score REAL,
-            key_invalidation       TEXT,
-            primary_scenario       TEXT,
-            bear_scenario          TEXT,
-            expected_moves_json    TEXT,
-            UNIQUE(ticker, date)
-        )
-    """)
-    # Migrate existing databases that pre-date the probabilistic schema
-    _new_columns = [
-        ("bull_probability",       "REAL"),
-        ("bear_probability",       "REAL"),
-        ("neutral_probability",    "REAL"),
-        ("signal_agreement_score", "REAL"),
-        ("key_invalidation",       "TEXT"),
-        ("primary_scenario",       "TEXT"),
-        ("bear_scenario",          "TEXT"),
-        ("expected_moves_json",    "TEXT"),
-    ]
-    for col, coltype in _new_columns:
-        try:
-            conn.execute(f"ALTER TABLE thesis_cache ADD COLUMN {col} {coltype}")
-        except Exception:
-            pass  # Column already exists — safe to ignore
-    conn.commit()
-    return conn
+def _init_db():
+    """Return a Supabase connection (thesis_cache table already exists)."""
+    return get_connection()
 
 
 def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
@@ -268,23 +213,16 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
         date = datetime.now().strftime("%Y-%m-%d")
     try:
         conn = _init_db()
-        row = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT * FROM thesis_cache WHERE ticker=%s AND date=%s",
             (ticker.upper(), date),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         conn.close()
         if row is None:
             return None
-        cols = [
-            "id", "ticker", "date", "direction", "conviction", "time_horizon",
-            "entry_low", "entry_high", "stop_loss", "target_1", "target_2",
-            "position_size_pct", "thesis", "data_quality", "notes",
-            "catalysts_json", "risks_json", "raw_response", "signals_json", "created_at",
-            "bull_probability", "bear_probability", "neutral_probability",
-            "signal_agreement_score", "key_invalidation", "primary_scenario", "bear_scenario",
-            "expected_moves_json",
-        ]
-        d = dict(zip(cols, row))
+        d = dict(row)
         # Expand JSON fields back to lists/dicts
         d["catalysts"]      = json.loads(d.pop("catalysts_json")      or "[]")
         d["risks"]          = json.loads(d.pop("risks_json")          or "[]")
@@ -301,7 +239,8 @@ def save_thesis(thesis: dict) -> None:
     try:
         date = datetime.now().strftime("%Y-%m-%d")
         conn = _init_db()
-        conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             INSERT INTO thesis_cache
                 (ticker, date, direction, conviction, time_horizon,
                  entry_low, entry_high, stop_loss, target_1, target_2,
@@ -376,13 +315,15 @@ def print_cache_table(days: int = 7) -> None:
     """Print cached theses from the last N days."""
     try:
         conn = _init_db()
-        rows = conn.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             SELECT ticker, date, direction, conviction, time_horizon,
                    entry_low, target_1, stop_loss, thesis
             FROM thesis_cache
             ORDER BY date DESC, conviction DESC
             LIMIT 200
-        """).fetchall()
+        """)
+        rows = cur.fetchall()
         conn.close()
     except Exception as e:
         print(f"  [cache] ERROR: {e}")
@@ -397,9 +338,11 @@ def print_cache_table(days: int = 7) -> None:
     print("=" * 90)
     print(f"  {'DATE':<12} {'TICKER':<8} {'DIR':<7} {'CONV':>5}  {'ENTRY':>8}  {'TARGET':>8}  THESIS")
     print("  " + "-" * 84)
-    for date, ticker, direction, conviction, horizon, entry, target, stop, thesis_text in [
-        (r[1], r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in rows
-    ]:
+    for r in rows:
+        date, ticker, direction, conviction, horizon, entry, target, stop, thesis_text = (
+            r['date'], r['ticker'], r['direction'], r['conviction'], r['time_horizon'],
+            r['entry_low'], r['target_1'], r['stop_loss'], r['thesis']
+        )
         icon = DIRECTION_ICON.get(direction or "NEUTRAL", "◯")
         entry_s  = f"${entry:.2f}"  if entry  else "   N/A"
         target_s = f"${target:.2f}" if target else "   N/A"
@@ -1231,27 +1174,26 @@ def _collect_historical_analog_signals(
 
     db_path: override for testing (pass ':memory:' path with pre-seeded data).
     """
-    db_path = db_path or _DB_PATH
     try:
         import json as _json
-
-        if not os.path.exists(db_path) and db_path != ":memory:":
-            return {"analog_available": False, "reason": "cache DB not found"}
 
         current_features = _extract_signal_features(current_signals)
         if len(current_features) < 3:
             return {"analog_available": False, "reason": "insufficient current features"}
 
         cutoff = (datetime.now() - timedelta(days=3 * 365)).strftime("%Y-%m-%d")
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                """SELECT ticker, date, direction, conviction, signal_agreement_score,
-                          signals_json, entry_low, target_1
-                   FROM thesis_cache
-                   WHERE date >= %s AND signals_json IS NOT NULL
-                   ORDER BY date DESC LIMIT 500""",
-                (cutoff,),
-            ).fetchall()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT ticker, date, direction, conviction, signal_agreement_score,
+                      signals_json, entry_low, target_1
+               FROM thesis_cache
+               WHERE date >= %s AND signals_json IS NOT NULL
+               ORDER BY date DESC LIMIT 500""",
+            (cutoff,),
+        )
+        rows = cur.fetchall()
+        conn.close()
 
         if len(rows) < 5:
             return {
@@ -1262,14 +1204,14 @@ def _collect_historical_analog_signals(
         scored: list = []
         for r in rows:
             try:
-                hist_sig  = _json.loads(r[5]) if r[5] else {}
+                hist_sig  = _json.loads(r['signals_json']) if r['signals_json'] else {}
                 hist_feat = _extract_signal_features(hist_sig)
                 sim       = _cosine_similarity_features(current_features, hist_feat)
                 scored.append({
-                    "ticker":     r[0],
-                    "date":       r[1],
-                    "direction":  r[2],
-                    "conviction": r[3],
+                    "ticker":     r['ticker'],
+                    "date":       r['date'],
+                    "direction":  r['direction'],
+                    "conviction": r['conviction'],
                     "similarity": round(sim * 100, 1),
                 })
             except Exception:
@@ -3469,16 +3411,15 @@ def main():
     # --backfill-agreement: recompute agreement scores from stored signals_json, no Claude calls
     if args.backfill_agreement:
         conn = _init_db()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT ticker, signals_json FROM thesis_cache"
-        ).fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT ticker, signals_json FROM thesis_cache")
+        rows = cur.fetchall()
         updated = 0
         for r in rows:
             sigs = json.loads(r["signals_json"]) if r["signals_json"] else {}
             score = compute_signal_agreement(sigs)
-            conn.execute(
-                "UPDATE thesis_cache SET signal_agreement_score=? WHERE ticker=?",
+            cur.execute(
+                "UPDATE thesis_cache SET signal_agreement_score=%s WHERE ticker=%s",
                 (score, r["ticker"]),
             )
             updated += 1

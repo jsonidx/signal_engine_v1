@@ -333,50 +333,66 @@ class TestRedFlagScreener:
 
 class TestEarningsTranscript:
 
-    def test_cache_init(self):
-        from earnings_transcript import _init_cache
-        conn = _init_cache()
-        assert conn is not None
-        conn.close()
-
     def test_cache_save_and_retrieve(self):
         from earnings_transcript import _save_cache, _get_cached
-        import time as _time
-        ticker = "TESTXYZ"
+        from utils.db import get_connection
+        ticker = "_TEST_TRANSCRIPT_"
         analysis = {
             "tone_score": 2,
             "tone_label": "BULLISH",
             "guidance_direction": "RAISED",
             "guidance_confidence": "HIGH",
         }
-        _save_cache(ticker, "2026-01-01", analysis, "test transcript text")
-        retrieved = _get_cached(ticker)
-        assert retrieved is not None
-        assert retrieved["tone_score"] == 2
-        assert retrieved["tone_label"] == "BULLISH"
+        try:
+            _save_cache(ticker, "2026-01-01", analysis, "test transcript text")
+            retrieved = _get_cached(ticker)
+            assert retrieved is not None
+            assert retrieved["tone_score"] == 2
+            assert retrieved["tone_label"] == "BULLISH"
+        finally:
+            # Clean up test data
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM transcript_cache WHERE ticker = %s", (ticker,))
+            conn.commit()
+            conn.close()
 
     def test_cache_returns_none_when_expired(self):
         """Cache older than TTL should not be returned."""
-        from earnings_transcript import _init_cache, _get_cached
-        import sqlite3
-        conn = _init_cache()
-        # Insert an old entry
-        conn.execute(
-            "INSERT OR REPLACE INTO transcript_cache "
-            "(ticker, filing_date, analysis_json, transcript_snippet, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (
-                "EXPIREDTEST",
-                "2025-01-01",
-                '{"tone_score": 3}',
-                "snippet",
-                "2025-01-01T00:00:00",  # very old
-            ),
-        )
-        conn.commit()
-        conn.close()
-        result = _get_cached("EXPIREDTEST")
-        assert result is None  # Should be expired
+        from earnings_transcript import _get_cached
+        from utils.db import get_connection
+        ticker = "_TEST_EXPIRED_TRANSCRIPT_"
+        # Insert an old entry directly into Supabase
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO transcript_cache
+                   (ticker, filing_date, analysis_json, transcript_snippet, created_at)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (ticker, filing_date) DO UPDATE SET
+                       analysis_json = excluded.analysis_json,
+                       created_at = excluded.created_at""",
+                (
+                    ticker,
+                    "2025-01-01",
+                    '{"tone_score": 3}',
+                    "snippet",
+                    "2025-01-01T00:00:00",  # very old — should be expired
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            result = _get_cached(ticker)
+            assert result is None, "Expired cache entry should not be returned"
+        finally:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM transcript_cache WHERE ticker = %s", (ticker,))
+            conn.commit()
+            conn.close()
 
     def test_strip_html_removes_tags(self):
         from earnings_transcript import _strip_html

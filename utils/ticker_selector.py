@@ -406,14 +406,13 @@ def select_top_tickers(
                 "selection_reason":        "",
             })
 
-    # Build final top-N: open positions are additive — always 5 fresh signals
-    # plus every open position on top (so total = max_tickers + n_open_positions).
+    # Build final top-N: open positions are additive — always max_tickers fresh
+    # signals plus every open position on top (total = max_tickers + n_open).
     n_normal_slots = max_tickers
-    top = always_in_scored + normal[:n_normal_slots]
+    top = normal[:n_normal_slots] + always_in_scored
 
-    # ── Step 8: Re-sort at natural score order, cap at max_tickers ────────────
+    # ── Step 8: Re-sort by priority; no cap — open positions are additive ─────
     top.sort(key=lambda x: x["priority_score"], reverse=True)
-    top = top[:max_tickers]
 
     # ── Step 9: Generate selection reasons ────────────────────────────────────
     for rank, s in enumerate(top, 1):

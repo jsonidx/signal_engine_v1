@@ -602,16 +602,18 @@ def _load_watchlist(path: str = "./watchlist.txt") -> list:
     return list(dict.fromkeys(tickers))
 
 
-def _load_ai_quant_signals(ticker: str, db_path: str = "./ai_quant_cache.db") -> dict:
-    """Pull latest signals_json for a ticker from ai_quant_cache.db."""
+def _load_ai_quant_signals(ticker: str, db_path: str = None) -> dict:
+    """Pull latest signals_json for a ticker from thesis_cache (Supabase)."""
     try:
-        import sqlite3, json as _json
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT signals_json FROM thesis_cache WHERE ticker=? ORDER BY date DESC LIMIT 1",
+        import json as _json
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT signals_json FROM thesis_cache WHERE ticker=%s ORDER BY date DESC LIMIT 1",
             (ticker,)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         conn.close()
         if row and row["signals_json"]:
             return _json.loads(row["signals_json"])

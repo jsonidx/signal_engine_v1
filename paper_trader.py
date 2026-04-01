@@ -36,7 +36,6 @@ IMPORTANT: This is NOT investment advice. Paper trading only.
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -46,7 +45,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from utils.db import get_connection
+from utils.db import get_connection, managed_connection
 
 warnings.filterwarnings("ignore")
 
@@ -64,24 +63,19 @@ except ImportError:
 def _load_saved_nav() -> float | None:
     """Read cash_eur saved via the dashboard; returns it as a NAV override or None."""
     try:
-        db = Path(__file__).resolve().parent / "paper_trades.db"
-        if not db.exists():
-            return None
-        import sqlite3 as _sqlite3
-        con = _sqlite3.connect(str(db))
-        row = con.execute(
-            "SELECT value FROM portfolio_settings WHERE key='cash_eur'"
-        ).fetchone()
-        con.close()
-        if row and float(row[0]) > 0:
-            return float(row[0])
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM portfolio_settings WHERE key='cash_eur'")
+        row = cur.fetchone()
+        conn.close()
+        if row and float(row['value']) > 0:
+            return float(row['value'])
     except Exception:
         pass
     return None
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-DB_PATH = "paper_trades.db"
 TRADING_DAYS_YEAR = 252
 ANNUALIZE = np.sqrt(TRADING_DAYS_YEAR)
 BTC_TICKER = "BTC-USD"
@@ -94,61 +88,8 @@ BTC_MA_PERIOD = 200  # 200-day moving average for BTC signal
 # ==============================================================================
 
 def init_db():
-    """Initialize SQLite database with required tables."""
-    conn = get_connection(DB_PATH)
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id SERIAL PRIMARY KEY,
-            date TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            portfolio_nav REAL NOT NULL,
-            equity_allocation REAL,
-            crypto_allocation REAL,
-            cash_allocation REAL,
-            spy_price REAL,
-            btc_price REAL,
-            btc_ma200 REAL,
-            btc_signal TEXT,
-            notes TEXT
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS equity_positions (
-            id SERIAL PRIMARY KEY,
-            snapshot_id INTEGER NOT NULL,
-            ticker TEXT NOT NULL,
-            rank INTEGER,
-            composite_z REAL,
-            weight_pct REAL,
-            position_eur REAL,
-            entry_price REAL,
-            transaction_cost_eur REAL DEFAULT 0,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-        )
-    """)
-    # Migrate: add transaction_cost_eur column if it doesn't exist yet
-    try:
-        c.execute("ALTER TABLE equity_positions ADD COLUMN transaction_cost_eur REAL DEFAULT 0")
-    except Exception:
-        pass  # Column already exists
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS weekly_returns (
-            id SERIAL PRIMARY KEY,
-            snapshot_id INTEGER NOT NULL,
-            week_ending TEXT NOT NULL,
-            portfolio_return REAL,
-            benchmark_return REAL,
-            equity_return REAL,
-            crypto_return REAL,
-            btc_return REAL,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-        )
-    """)
-
+    """Return a PostgreSQL connection (tables already exist in Supabase)."""
+    conn = get_connection()
     conn.commit()
     return conn
 
@@ -247,7 +188,7 @@ def fetch_current_prices(tickers: list) -> dict:
     return prices
 
 
-def record_snapshot(conn: sqlite3.Connection):
+def record_snapshot(conn):
     """Record current signals, positions, and prices as a snapshot."""
     today = datetime.now().strftime("%Y-%m-%d")
     now = datetime.now().isoformat()
@@ -259,7 +200,7 @@ def record_snapshot(conn: sqlite3.Connection):
     # Check if already recorded today
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM snapshots WHERE date = %s", (today,))
-    if c.fetchone()[0] > 0:
+    if list(c.fetchone().values())[0] > 0:
         print(f"  [WARN] Snapshot already exists for {today}.")
         print(f"  To re-record, first run: python3 paper_trader.py --delete-today")
         return
@@ -360,7 +301,7 @@ def record_snapshot(conn: sqlite3.Connection):
 # SECTION 4: COMPUTE WEEKLY RETURNS
 # ==============================================================================
 
-def compute_returns(conn: sqlite3.Connection):
+def compute_returns(conn):
     """Compute returns between consecutive snapshots."""
     c = conn.cursor()
     c.execute("""
@@ -376,22 +317,22 @@ def compute_returns(conn: sqlite3.Connection):
     for i in range(1, len(snapshots)):
         prev = snapshots[i - 1]
         curr = snapshots[i]
-        prev_id, prev_date = prev[0], prev[1]
-        curr_id, curr_date = curr[0], curr[1]
+        prev_id, prev_date = prev['id'], prev['date']
+        curr_id, curr_date = curr['id'], curr['date']
 
         # Check if return already computed
         c.execute("SELECT COUNT(*) FROM weekly_returns WHERE snapshot_id = %s", (curr_id,))
-        if c.fetchone()[0] > 0:
+        if list(c.fetchone().values())[0] > 0:
             continue
 
         # Benchmark return (SPY)
-        spy_ret = (curr[2] / prev[2] - 1) if prev[2] > 0 else 0
+        spy_ret = (curr['spy_price'] / prev['spy_price'] - 1) if prev['spy_price'] else 0
 
         # BTC return
-        btc_ret = (curr[3] / prev[3] - 1) if prev[3] > 0 else 0
+        btc_ret = (curr['btc_price'] / prev['btc_price'] - 1) if prev['btc_price'] else 0
 
         # Crypto portfolio return (BTC if LONG, 0 if CASH)
-        crypto_port_ret = btc_ret if prev[4] == "LONG" else 0
+        crypto_port_ret = btc_ret if prev['btc_signal'] == "LONG" else 0
 
         # Equity return — compute from position prices
         c.execute("""
@@ -402,17 +343,18 @@ def compute_returns(conn: sqlite3.Connection):
 
         equity_ret = 0
         if prev_positions:
-            tickers = [p[0] for p in prev_positions]
+            tickers = [p['ticker'] for p in prev_positions]
             current_prices = fetch_current_prices(tickers)
 
-            for ticker, weight, entry_price in prev_positions:
+            for pos in prev_positions:
+                ticker, weight, entry_price = pos['ticker'], pos['weight_pct'], pos['entry_price']
                 if entry_price > 0 and ticker in current_prices:
                     ret = current_prices[ticker] / entry_price - 1
                     equity_ret += (weight / 100) * ret
 
         # Combined portfolio return
-        eq_alloc = prev[5] or EQUITY_ALLOCATION
-        cr_alloc = prev[6] or 0
+        eq_alloc = prev['equity_allocation'] or EQUITY_ALLOCATION
+        cr_alloc = prev['crypto_allocation'] or 0
         cash_alloc = 1.0 - eq_alloc - cr_alloc
 
         port_ret = eq_alloc * equity_ret + cr_alloc * crypto_port_ret
@@ -432,7 +374,7 @@ def compute_returns(conn: sqlite3.Connection):
 # SECTION 5: REPORTING
 # ==============================================================================
 
-def show_report(conn: sqlite3.Connection, weeks: int = None):
+def show_report(conn, weeks: int = None):
     """Display paper trading performance report."""
     compute_returns(conn)
 
@@ -440,7 +382,7 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
 
     # Get snapshots
     c.execute("SELECT COUNT(*) FROM snapshots")
-    n_snapshots = c.fetchone()[0]
+    n_snapshots = list(c.fetchone().values())[0]
 
     if n_snapshots == 0:
         print("\n  No snapshots recorded yet.")
@@ -536,7 +478,8 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
     print(f"\n  BTC 200-DAY MA SIGNAL HISTORY:")
     print(f"  {'Date':>12}{'Signal':>10}{'Price':>14}{'MA200':>14}{'Gap':>10}")
     print(f"  {'─' * 60}")
-    for date, signal, price, ma200 in btc_history:
+    for row_b in btc_history:
+        date, signal, price, ma200 = row_b['date'], row_b['btc_signal'], row_b['btc_price'], row_b['btc_ma200']
         gap = ((price / ma200) - 1) * 100 if ma200 > 0 else 0
         emoji = "🟢" if signal == "LONG" else "⚪"
         print(f"  {date:>12}{emoji} {signal:>7}"
@@ -551,7 +494,7 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
         JOIN snapshots s ON ep.snapshot_id = s.id
         WHERE substr(s.date, 1, 4) = %s
     """, (str(datetime.now().year),))
-    ytd_tc_eur = float(c.fetchone()[0] or 0)
+    ytd_tc_eur = float(list(c.fetchone().values())[0] or 0)
     equity_deployed = PORTFOLIO_NAV * EQUITY_ALLOCATION
     tc_bps_drag = (ytd_tc_eur / equity_deployed * 10_000) if equity_deployed > 0 else 0
 
@@ -574,7 +517,7 @@ def show_report(conn: sqlite3.Connection, weeks: int = None):
         print(f"     Continue recording every Sunday.")
 
 
-def show_positions(conn: sqlite3.Connection):
+def show_positions(conn):
     """Show current (latest) positions."""
     c = conn.cursor()
     c.execute("SELECT id, date FROM snapshots ORDER BY date DESC LIMIT 1")
@@ -584,7 +527,7 @@ def show_positions(conn: sqlite3.Connection):
         print("\n  No snapshots recorded. Run: python3 paper_trader.py --record")
         return
 
-    snapshot_id, date = row
+    snapshot_id, date = row['id'], row['date']
 
     print(f"\n  CURRENT POSITIONS (as of {date}):")
 
@@ -599,7 +542,8 @@ def show_positions(conn: sqlite3.Connection):
         print(f"\n  {'Rank':<6}{'Ticker':<10}{'Z-Score':>10}{'Weight':>10}{'EUR':>12}{'Entry$':>12}")
         print(f"  {'─' * 60}")
         total_eur = 0
-        for ticker, rank, z, weight, eur, price in positions:
+        for pos in positions:
+            ticker, rank, z, weight, eur, price = pos['ticker'], pos['rank'], pos['composite_z'], pos['weight_pct'], pos['position_eur'], pos['entry_price']
             print(f"  {rank:<6}{ticker:<10}{z:>10.3f}{weight:>9.1f}%{eur:>11,.0f}  ${price:>10,.2f}")
             total_eur += eur
         print(f"\n  Total equity exposure: €{total_eur:,.0f}")
@@ -609,13 +553,13 @@ def show_positions(conn: sqlite3.Connection):
               (snapshot_id,))
     btc = c.fetchone()
     if btc:
-        signal, price, ma200 = btc
+        signal, price, ma200 = btc['btc_signal'], btc['btc_price'], btc['btc_ma200']
         gap = ((price / ma200) - 1) * 100 if ma200 > 0 else 0
         emoji = "🟢" if signal == "LONG" else "⚪"
         print(f"\n  BTC: {emoji} {signal} (${price:,.2f}, MA200=${ma200:,.2f}, {gap:+.1f}%)")
 
 
-def reset_db(conn: sqlite3.Connection):
+def reset_db(conn):
     """Reset all paper trading history."""
     c = conn.cursor()
     c.execute("DELETE FROM weekly_returns")

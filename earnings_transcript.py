@@ -38,13 +38,14 @@ import argparse
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 import urllib.request
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional
+
+from utils.db import get_connection
 
 warnings.filterwarnings("ignore")
 
@@ -59,46 +60,30 @@ SEC_HEADERS = {
 }
 SEC_RATE_LIMIT = 0.15
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcript_cache.db")
 CACHE_TTL_DAYS = 7    # Re-fetch after each earnings cycle
 MAX_TRANSCRIPT_CHARS = 18_000  # ~4K tokens — enough for key sections
 
 
 # ==============================================================================
-# SECTION 0: CACHE
+# SECTION 0: CACHE (Supabase — global shared cache)
 # ==============================================================================
-
-def _init_cache() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transcript_cache (
-            id            SERIAL PRIMARY KEY,
-            ticker        TEXT NOT NULL,
-            filing_date   TEXT NOT NULL,
-            analysis_json TEXT,
-            transcript_snippet TEXT,
-            created_at    TEXT,
-            UNIQUE(ticker, filing_date)
-        )
-    """)
-    conn.commit()
-    return conn
-
 
 def _get_cached(ticker: str) -> Optional[dict]:
     """Return cached analysis if less than CACHE_TTL_DAYS old."""
     try:
-        conn = _init_cache()
+        conn = get_connection()
+        cur = conn.cursor()
         cutoff = (datetime.now() - timedelta(days=CACHE_TTL_DAYS)).isoformat()
-        row = conn.execute(
+        cur.execute(
             "SELECT analysis_json, filing_date FROM transcript_cache "
             "WHERE ticker=%s AND created_at>%s ORDER BY filing_date DESC LIMIT 1",
             (ticker.upper(), cutoff),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         conn.close()
-        if row and row[0]:
-            data = json.loads(row[0])
-            data["filing_date"] = row[1]
+        if row and row['analysis_json']:
+            data = json.loads(row['analysis_json'])
+            data["filing_date"] = row['filing_date']
             data["cached"] = True
             return data
     except Exception:
@@ -108,8 +93,9 @@ def _get_cached(ticker: str) -> Optional[dict]:
 
 def _save_cache(ticker: str, filing_date: str, analysis: dict, snippet: str) -> None:
     try:
-        conn = _init_cache()
-        conn.execute(
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
             """INSERT INTO transcript_cache
                (ticker, filing_date, analysis_json, transcript_snippet, created_at)
                VALUES (%s,%s,%s,%s,%s)

@@ -471,23 +471,14 @@ class TestCollectLiquiditySignals:
 # 6. _collect_historical_analog_signals
 # ==============================================================================
 
-def _seed_in_memory_db(db_path: str, n_rows: int = 20) -> None:
-    """Seed an in-memory or temp SQLite DB with synthetic thesis rows."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS thesis_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT, date TEXT, direction TEXT, conviction INTEGER,
-            signal_agreement_score REAL, signals_json TEXT,
-            entry_low REAL, target_1 REAL
-        )
-    """)
-    base_date = datetime.now() - timedelta(days=365)
+def _make_fake_thesis_rows(n_rows: int = 20) -> list:
+    """Create fake thesis_cache rows as dicts (as Supabase RealDictCursor returns)."""
     directions = ["BULL", "BEAR", "NEUTRAL"]
     rng = np.random.default_rng(7)
+    base_date = datetime.now() - timedelta(days=365)
+    rows = []
     for i in range(n_rows):
-        d       = (base_date + timedelta(days=i * 10)).strftime("%Y-%m-%d")
-        direc   = directions[i % 3]
+        d = (base_date + timedelta(days=i * 10)).strftime("%Y-%m-%d")
         sig_vec = {
             "signal_agreement_score": float(rng.uniform(0.4, 0.9)),
             "technical": {
@@ -501,14 +492,26 @@ def _seed_in_memory_db(db_path: str, n_rows: int = 20) -> None:
             "dark_pool_flow": {"dark_pool_score": float(rng.uniform(20, 80)), "short_ratio_zscore": float(rng.uniform(-2, 2))},
             "fundamentals":   {"fundamental_score_pct": float(rng.uniform(30, 90))},
         }
-        conn.execute(
-            "INSERT INTO thesis_cache (ticker, date, direction, conviction, signal_agreement_score, signals_json, entry_low, target_1) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (f"T{i:02d}", d, direc, int(rng.integers(1, 6)), float(rng.uniform(0.4, 0.9)),
-             json.dumps(sig_vec), 100.0 + i, 110.0 + i),
-        )
-    conn.commit()
-    conn.close()
+        rows.append({
+            "ticker":                 f"T{i:02d}",
+            "date":                   d,
+            "direction":              directions[i % 3],
+            "conviction":             int(rng.integers(1, 6)),
+            "signal_agreement_score": float(rng.uniform(0.4, 0.9)),
+            "signals_json":           json.dumps(sig_vec),
+            "entry_low":              100.0 + i,
+            "target_1":               110.0 + i,
+        })
+    return rows
+
+
+def _make_mock_conn(rows: list) -> MagicMock:
+    """Build a mock psycopg2 connection whose cursor returns the given rows."""
+    mock_cur = MagicMock()
+    mock_cur.fetchall.return_value = rows
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cur
+    return mock_conn
 
 
 def _make_current_signals() -> dict:
@@ -525,71 +528,69 @@ def _make_current_signals() -> dict:
 class TestCollectHistoricalAnalogSignals:
 
     @pytest.fixture
-    def tmp_db(self, tmp_path):
-        db_path = str(tmp_path / "test_cache.db")
-        _seed_in_memory_db(db_path, n_rows=20)
-        return db_path
+    def fake_rows(self):
+        return _make_fake_thesis_rows(20)
 
-    def test_basic_structure(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_basic_structure(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert result["analog_available"] is True
         assert "analog_score" in result
         assert "top_3_analogs" in result
         assert "modal_direction" in result
         assert "n_searched" in result
 
-    def test_top3_analogs_length(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_top3_analogs_length(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert len(result["top_3_analogs"]) == 3
 
-    def test_analog_score_in_range(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_analog_score_in_range(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert 0.0 <= result["analog_score"] <= 100.0
 
-    def test_top3_sorted_by_similarity_descending(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_top3_sorted_by_similarity_descending(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         sims = [a["similarity"] for a in result["top_3_analogs"]]
         assert sims == sorted(sims, reverse=True)
 
-    def test_modal_direction_is_valid(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_modal_direction_is_valid(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert result["modal_direction"] in {"BULL", "BEAR", "NEUTRAL"}
 
-    def test_identical_current_signals_get_high_score(self, tmp_db):
-        """Searching with signals very similar to DB rows should return analog_score > 50."""
-        # Use a signals dict matching one of the seeded rows
-        conn = sqlite3.connect(tmp_db)
-        row  = conn.execute(
-            "SELECT signals_json FROM thesis_cache ORDER BY id LIMIT 1"
-        ).fetchone()
-        conn.close()
-        hist_sigs = json.loads(row[0])
-        result    = _collect_historical_analog_signals("AAPL", hist_sigs, db_path=tmp_db)
+    def test_identical_current_signals_get_high_score(self, fake_rows):
+        """Searching with signals identical to a DB row should return analog_score > 60."""
+        hist_sigs = json.loads(fake_rows[0]["signals_json"])
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", hist_sigs)
         assert result["analog_available"] is True
-        # Exact match → score should be high (>60)
         assert result["analog_score"] > 60.0
 
-    def test_missing_db_returns_unavailable(self):
-        result = _collect_historical_analog_signals(
-            "AAPL", _make_current_signals(), db_path="/tmp/nonexistent_xyz_123.db"
-        )
+    def test_db_error_returns_unavailable(self):
+        """If the DB connection fails, the function returns analog_available=False."""
+        with patch("ai_quant.get_connection", side_effect=Exception("connection refused")):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert result["analog_available"] is False
         assert "reason" in result
 
     def test_insufficient_features_returns_unavailable(self):
-        """Empty signals → fewer than 3 features → unavailable."""
-        result = _collect_historical_analog_signals("AAPL", {}, db_path="/tmp/nonexistent.db")
+        """Empty signals → fewer than 3 features → unavailable (no DB call needed)."""
+        result = _collect_historical_analog_signals("AAPL", {})
         assert result["analog_available"] is False
 
-    def test_fewer_than_5_rows_returns_unavailable(self, tmp_path):
-        db_path = str(tmp_path / "sparse.db")
-        _seed_in_memory_db(db_path, n_rows=3)
-        result  = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=db_path)
+    def test_fewer_than_5_rows_returns_unavailable(self):
+        sparse_rows = _make_fake_thesis_rows(3)
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(sparse_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert result["analog_available"] is False
         assert "only 3 historical theses" in result["reason"]
 
-    def test_n_searched_matches_row_count(self, tmp_db):
-        result = _collect_historical_analog_signals("AAPL", _make_current_signals(), db_path=tmp_db)
+    def test_n_searched_matches_row_count(self, fake_rows):
+        with patch("ai_quant.get_connection", return_value=_make_mock_conn(fake_rows)):
+            result = _collect_historical_analog_signals("AAPL", _make_current_signals())
         assert result["n_searched"] == 20
 
 

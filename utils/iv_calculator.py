@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 
 import yfinance as yf
 
-from utils.db import managed_connection
+from utils.db import managed_connection, get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -362,55 +362,25 @@ def compute_atm_iv(ticker: str, target_dte: int = None) -> Optional[float]:
 # SECTION 3: IV HISTORY DATABASE
 # ===========================================================================
 
-def _ensure_db(db_path: str) -> None:
-    """
-    Create the iv_history table if it doesn't exist.  Idempotent — safe to
-    call on every access.  Also creates the parent directory if needed.
-
-    Schema
-    ------
-    ticker      TEXT  — ticker symbol (uppercase)
-    date        TEXT  — ISO date YYYY-MM-DD (one row per ticker per day)
-    iv30        REAL  — 30-day ATM IV as a decimal (0.25 = 25%)
-    atm_strike  REAL  — ATM strike used for the computation (informational)
-    near_expiry TEXT  — Near expiration used
-    far_expiry  TEXT  — Far expiration used (NULL if only one was available)
-    computed_at TEXT  — UTC timestamp of computation
-    PRIMARY KEY (ticker, date)  — one row per ticker per day, upsert-safe
-    """
-    dir_part = os.path.dirname(os.path.abspath(db_path))
-    if dir_part:
-        os.makedirs(dir_part, exist_ok=True)
-
-    with managed_connection(db_path) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS iv_history (
-                ticker      TEXT NOT NULL,
-                date        TEXT NOT NULL,
-                iv30        REAL NOT NULL,
-                atm_strike  REAL,
-                near_expiry TEXT,
-                far_expiry  TEXT,
-                computed_at TEXT,
-                PRIMARY KEY (ticker, date)
-            )
-        """)
-        conn.commit()
+def _ensure_db(db_path: str = None) -> None:
+    """Idempotent — iv_history table already exists in Supabase."""
+    pass  # Table created in schema migration
 
 
 def _store_iv(
     ticker: str,
     iv30: float,
-    db_path: str,
+    db_path: str = None,
     atm_strike: Optional[float] = None,
     near_expiry: Optional[str] = None,
     far_expiry: Optional[str] = None,
 ) -> None:
-    """Upsert today's ATM IV for a ticker."""
+    """Upsert today's ATM IV for a ticker into Supabase iv_history."""
     today_str = date.today().isoformat()
     computed_at = datetime.utcnow().isoformat(timespec="seconds")
-    with managed_connection(db_path) as conn:
-        conn.execute(
+    with managed_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO iv_history
                 (ticker, date, iv30, atm_strike, near_expiry, far_expiry, computed_at)
@@ -424,7 +394,6 @@ def _store_iv(
             """,
             (ticker, today_str, iv30, atm_strike, near_expiry, far_expiry, computed_at),
         )
-        conn.commit()
 
 
 def _get_iv_metrics(
@@ -446,14 +415,12 @@ def _get_iv_metrics(
 
     Returns (iv_rank, iv_percentile) each in [0.0, 1.0], or (None, None).
     """
-    if db_path is None:
-        db_path = IV_HISTORY_DB
+    _ensure_db()
+    _store_iv(ticker, current_iv)
 
-    _ensure_db(db_path)
-    _store_iv(ticker, current_iv, db_path)
-
-    with managed_connection(db_path) as conn:
-        rows = conn.execute(
+    with managed_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
             """
             SELECT iv30 FROM iv_history
             WHERE ticker = %s
@@ -461,12 +428,13 @@ def _get_iv_metrics(
             LIMIT %s
             """,
             (ticker, lookback_days),
-        ).fetchall()
+        )
+        rows = cur.fetchall()
 
     if len(rows) < IV_MIN_HISTORY_DAYS:
         return None, None
 
-    values = [r[0] for r in rows]
+    values = [r['iv30'] for r in rows]
 
     min_iv = min(values)
     max_iv = max(values)
@@ -503,7 +471,7 @@ def get_iv_rank(
     """
     if db_path is None:
         db_path = IV_HISTORY_DB
-    rank, _ = _get_iv_metrics(ticker, current_iv, lookback_days, db_path)
+    rank, _ = _get_iv_metrics(ticker, current_iv, lookback_days)
     return rank
 
 
@@ -544,7 +512,7 @@ def get_iv_rank_and_percentile(
     """
     if db_path is None:
         db_path = IV_HISTORY_DB
-    return _get_iv_metrics(ticker, current_iv, lookback_days, db_path)
+    return _get_iv_metrics(ticker, current_iv, lookback_days)
 
 
 # ===========================================================================

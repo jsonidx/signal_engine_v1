@@ -29,7 +29,6 @@ import json
 import logging
 import math
 import os
-import sqlite3
 import sys
 import time
 import warnings
@@ -83,9 +82,6 @@ except ImportError:
 SIGNALS_DIR      = BASE_DIR / "signals_output"
 DATA_DIR         = BASE_DIR / "data"
 LOGS_DIR         = BASE_DIR / "logs"
-PAPER_TRADES_DB  = BASE_DIR / "paper_trades.db"
-TRADE_JOURNAL_DB = BASE_DIR / "trade_journal.db"
-AI_QUANT_DB      = BASE_DIR / "ai_quant_cache.db"
 REGIME_CACHE     = DATA_DIR / "regime_cache.json"
 SECTOR_CACHE     = DATA_DIR / "sector_cache.json"
 
@@ -171,14 +167,41 @@ def cached(key_fn, ttl: int = TTL_MEDIUM):
 # SECTION 2: SHARED HELPERS
 # ==============================================================================
 
-def _db_connect(path: Path) -> Optional[sqlite3.Connection]:
-    """Return a read-only SQLite connection, or None if file missing."""
-    if not path.exists():
-        log.warning("DB not found: %s", path)
-        return None
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+class _PGConn:
+    """
+    Thin wrapper around psycopg2 that adds SQLite-compatible conn.execute() so
+    existing dashboard code doesn't need to be rewritten call-site by call-site.
+    execute() returns the cursor (with fetchone/fetchall). RealDictCursor is used
+    so rows behave like dicts.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        import psycopg2.extras
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def cursor(self, **kw):
+        import psycopg2.extras
+        return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+def _db_connect() -> _PGConn:
+    """Return a Supabase PostgreSQL connection wrapped for SQLite-compat API."""
+    sys.path.insert(0, str(BASE_DIR))
+    from utils.db import get_connection
+    return _PGConn(get_connection())
 
 
 def _no_data(reason: str = "data not available") -> dict:
@@ -340,9 +363,6 @@ def _json_safe(obj: Any) -> Any:
 async def startup_event():
     """Log warnings for expected data files that are missing."""
     expected = {
-        "paper_trades.db":   PAPER_TRADES_DB,
-        "trade_journal.db":  TRADE_JOURNAL_DB,
-        "ai_quant_cache.db": AI_QUANT_DB,
         "regime_cache.json": REGIME_CACHE,
         "signals_output/":   SIGNALS_DIR,
     }
@@ -351,6 +371,12 @@ async def startup_event():
             log.warning("MISSING: %s → %s", name, path)
         else:
             log.info("OK: %s", name)
+    try:
+        conn = _db_connect()
+        conn.close()
+        log.info("OK: Supabase connection")
+    except Exception as e:
+        log.warning("MISSING: Supabase connection — %s", e)
     log.info("Signal Engine API v2.0 ready on http://0.0.0.0:8000")
 
 
@@ -364,7 +390,7 @@ async def portfolio_summary():
     Aggregate performance summary from paper_trades.db.
     Returns NAV, weekly return, SPY benchmark, Sharpe, drawdown, hit rate.
     """
-    conn = _db_connect(PAPER_TRADES_DB)
+    conn = _db_connect()
     if conn is None:
         return _no_data("paper_trades.db not found")
 
@@ -383,7 +409,7 @@ async def portfolio_summary():
 
         # Open positions count
         open_pos = 0
-        tj_conn = _db_connect(TRADE_JOURNAL_DB)
+        tj_conn = _db_connect()
         if tj_conn:
             row = tj_conn.execute(
                 "SELECT COUNT(*) as cnt FROM trades WHERE action='BUY' AND status='open'"
@@ -454,7 +480,7 @@ async def portfolio_summary():
 @app.get("/api/portfolio/history")
 async def portfolio_history(weeks: int = Query(52, ge=1, le=260)):
     """Weekly portfolio vs SPY history from paper_trades.db."""
-    conn = _db_connect(PAPER_TRADES_DB)
+    conn = _db_connect()
     if conn is None:
         return _no_data("paper_trades.db not found")
 
@@ -476,7 +502,7 @@ async def portfolio_history(weeks: int = Query(52, ge=1, le=260)):
         df["cumulative_pnl_eur"] = (cum_port - 1) * PORTFOLIO_NAV
 
         # Position count per snapshot
-        conn2 = _db_connect(PAPER_TRADES_DB)
+        conn2 = _db_connect()
         pos_counts = {}
         if conn2:
             rows = conn2.execute(
@@ -510,7 +536,7 @@ async def portfolio_positions():
     Open positions from trade_journal.db enriched with current prices via yfinance.
     Prices are cached 15 min.
     """
-    conn = _db_connect(TRADE_JOURNAL_DB)
+    conn = _db_connect()
     if conn is None:
         return {"data_available": True, "data": []}
 
@@ -608,41 +634,14 @@ def _to_eur(price: float, currency: str, eur_usd: float) -> float:
     return price / eur_usd  # USD → EUR
 
 
-def _ensure_trades_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id               SERIAL PRIMARY KEY,
-            ticker           TEXT    NOT NULL,
-            direction        TEXT    NOT NULL DEFAULT 'LONG',
-            date             TEXT    NOT NULL,
-            price            REAL    NOT NULL,
-            price_eur        REAL    NOT NULL,
-            size_eur         REAL    NOT NULL,
-            shares           REAL,
-            currency         TEXT    NOT NULL DEFAULT 'USD',
-            fx_rate          REAL    NOT NULL DEFAULT 1.08,
-            signal_composite REAL,
-            stop_loss        REAL,
-            target_1         REAL,
-            target_2         REAL,
-            notes            TEXT,
-            action           TEXT    NOT NULL DEFAULT 'BUY',
-            status           TEXT    NOT NULL DEFAULT 'open',
-            close_date       TEXT,
-            close_price      REAL,
-            close_price_eur  REAL,
-            close_currency   TEXT,
-            close_fx_rate    REAL,
-            pnl_eur          REAL
-        )
-    """)
-    # Migrate existing tables that predate the new columns
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+def _ensure_trades_table(conn) -> None:
+    """Tables exist in Supabase — add any missing columns idempotently."""
+    cur = conn.cursor()
     for col, defn in [
-        ("direction",       "TEXT NOT NULL DEFAULT 'LONG'"),
-        ("price_eur",       "REAL NOT NULL DEFAULT 0"),
-        ("currency",        "TEXT NOT NULL DEFAULT 'USD'"),
-        ("fx_rate",         "REAL NOT NULL DEFAULT 1.08"),
+        ("direction",       "TEXT"),
+        ("price_eur",       "REAL"),
+        ("currency",        "TEXT"),
+        ("fx_rate",         "REAL"),
         ("close_date",      "TEXT"),
         ("close_price",     "REAL"),
         ("close_price_eur", "REAL"),
@@ -650,9 +649,11 @@ def _ensure_trades_table(conn: sqlite3.Connection) -> None:
         ("close_fx_rate",   "REAL"),
         ("pnl_eur",         "REAL"),
     ]:
-        if col not in existing:
-            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
-    conn.commit()
+        try:
+            cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 
 from pydantic import BaseModel as _BaseModel  # noqa: E402 (already imported below)
@@ -682,8 +683,7 @@ async def add_position(req: AddPositionRequest):
         raise HTTPException(status_code=400, detail="entry_price and size_eur must be > 0")
     if req.currency not in ("EUR", "USD"):
         raise HTTPException(status_code=400, detail="currency must be EUR or USD")
-    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db_connect()
     try:
         _ensure_trades_table(conn)
         eur_usd   = _get_eur_usd_rate()
@@ -721,10 +721,6 @@ async def sell_position(ticker: str, req: SellPositionRequest):
         raise HTTPException(status_code=400, detail="sell_price must be > 0")
     if req.currency not in ("EUR", "USD"):
         raise HTTPException(status_code=400, detail="currency must be EUR or USD")
-    if not TRADE_JOURNAL_DB.exists():
-        raise HTTPException(status_code=503, detail="trade_journal.db not found — no open positions")
-    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
-    conn.row_factory = sqlite3.Row
     try:
         _ensure_trades_table(conn)
         row = conn.execute(
@@ -778,10 +774,6 @@ async def sell_position(ticker: str, req: SellPositionRequest):
 @app.delete("/api/portfolio/positions/{ticker}")
 async def close_position(ticker: str):
     """Mark the most recent open position as closed (no P&L recorded)."""
-    if not TRADE_JOURNAL_DB.exists():
-        raise HTTPException(status_code=503, detail="trade_journal.db not found")
-    conn = sqlite3.connect(str(TRADE_JOURNAL_DB))
-    conn.row_factory = sqlite3.Row
     try:
         result = conn.execute(
             "UPDATE trades SET status = 'closed' WHERE ticker = %s AND action = 'BUY' AND status = 'open'",
@@ -803,7 +795,7 @@ async def close_position(ticker: str):
 @app.get("/api/portfolio/trades")
 async def get_trades():
     """Return all trades (open + closed) with P&L for the trades dashboard."""
-    conn = _db_connect(TRADE_JOURNAL_DB)
+    conn = _db_connect()
     if conn is None:
         return {"data_available": True, "data": []}
     try:
@@ -844,37 +836,26 @@ async def get_trades():
 # SECTION 4b: CASH MANAGEMENT ENDPOINTS
 # ==============================================================================
 
-def _ensure_cash_table(conn: sqlite3.Connection) -> None:
-    """Create portfolio_settings table if it doesn't exist (write connection)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio_settings (
-            key        TEXT PRIMARY KEY,
-            value      TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
+def _ensure_cash_table(conn) -> None:
+    """portfolio_settings table exists in Supabase — no-op."""
+    pass
 
 
-def _get_cash_eur(conn: sqlite3.Connection) -> tuple[float, str | None]:
+def _get_cash_eur(conn) -> tuple[float, str | None]:
     """Return (cash_eur, updated_at) from portfolio_settings, or (0.0, None)."""
-    row = conn.execute(
-        "SELECT value, updated_at FROM portfolio_settings WHERE key = 'cash_eur'"
-    ).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT value, updated_at FROM portfolio_settings WHERE key = 'cash_eur'")
+    row = cur.fetchone()
     if row is None:
         return 0.0, None
-    return float(row[0]), row[1]
+    return float(row['value']), row.get('updated_at')
 
 
 @app.get("/api/portfolio/cash")
 async def get_cash():
-    """Return the manually-set cash balance from paper_trades.db."""
-    if not PAPER_TRADES_DB.exists():
-        return {"cash_eur": 0.0, "updated_at": None}
-    conn = sqlite3.connect(str(PAPER_TRADES_DB))
-    conn.row_factory = sqlite3.Row
+    """Return the manually-set cash balance from Supabase portfolio_settings."""
+    conn = _db_connect()
     try:
-        _ensure_cash_table(conn)
         cash, updated_at = _get_cash_eur(conn)
         return {"cash_eur": round(cash, 2), "updated_at": updated_at}
     finally:
@@ -900,11 +881,7 @@ async def update_cash(req: CashUpdateRequest):
     if req.amount < 0:
         raise HTTPException(status_code=400, detail="amount must be >= 0")
 
-    if not PAPER_TRADES_DB.exists():
-        raise HTTPException(status_code=503, detail="paper_trades.db not found")
-
-    conn = sqlite3.connect(str(PAPER_TRADES_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db_connect()
     try:
         _ensure_cash_table(conn)
         current_cash, _ = _get_cash_eur(conn)
@@ -1062,7 +1039,7 @@ async def signals_heatmap():
 
         # ── 3. Claude cache: per-ticker module signals_json ───────────────────
         claude_cache: dict = {}   # ticker → {direction, conviction, agreement, sigs}
-        conn = _db_connect(AI_QUANT_DB)
+        conn = _db_connect()
         if conn:
             rows = conn.execute("""
                 SELECT ticker, direction, conviction, signal_agreement_score, signals_json
@@ -1197,7 +1174,7 @@ async def signals_ticker(ticker: str):
     if hit is not None:
         return hit
 
-    conn = _db_connect(AI_QUANT_DB)
+    conn = _db_connect()
     if conn is None:
         return _no_data("ai_quant_cache.db not found")
 
@@ -1372,7 +1349,7 @@ async def deepdive_tickers():
         except Exception:
             pass
 
-    conn = _db_connect(AI_QUANT_DB)
+    conn = _db_connect()
     seen: set = set()
     tickers = []
 
@@ -1419,7 +1396,7 @@ async def deepdive_tickers():
             log.exception("deepdive_tickers: thesis_cache read error")
 
     # ── Always include open positions from trade_journal ─────────────────────────
-    tj_conn = _db_connect(TRADE_JOURNAL_DB)
+    tj_conn = _db_connect()
     if tj_conn is not None:
         try:
             open_rows = tj_conn.execute(
@@ -1497,7 +1474,7 @@ async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
     if hit is not None:
         return hit
 
-    conn = _db_connect(AI_QUANT_DB)
+    conn = _db_connect()
     if conn is None:
         result = _no_data("ai_quant_cache.db not found")
         _cache.set(cache_key, result, TTL_SHORT)
@@ -1590,7 +1567,7 @@ async def signals_accuracy():
     if hit is not None:
         return hit
 
-    conn = _db_connect(AI_QUANT_DB)
+    conn = _db_connect()
     if conn is None:
         result = _no_data("ai_quant_cache.db not found")
         _cache.set(cache_key, result, TTL_SHORT)
@@ -1846,7 +1823,7 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
     if hit is not None:
         return hit
 
-    conn = _db_connect(AI_QUANT_DB)
+    conn = _db_connect()
     if conn is None:
         result = _no_data("ai_quant_cache.db not found")
         _cache.set(cache_key, result, TTL_SHORT)

@@ -53,21 +53,18 @@ except ImportError:
 
 def _load_saved_nav() -> float | None:
     """
-    Read cash_eur saved via the dashboard from paper_trades.db.
+    Read cash_eur saved via the dashboard from Supabase portfolio_settings.
     Returns the value as the NAV override, or None if not set.
     """
     try:
-        import sqlite3 as _sqlite3
-        db = Path(__file__).resolve().parent / "paper_trades.db"
-        if not db.exists():
-            return None
-        con = _sqlite3.connect(str(db))
-        row = con.execute(
-            "SELECT value FROM portfolio_settings WHERE key='cash_eur'"
-        ).fetchone()
+        from utils.db import get_connection
+        con = get_connection()
+        cur = con.cursor()
+        cur.execute("SELECT value FROM portfolio_settings WHERE key='cash_eur'")
+        row = cur.fetchone()
         con.close()
-        if row and float(row[0]) > 0:
-            return float(row[0])
+        if row and float(row['value']) > 0:
+            return float(row['value'])
     except Exception:
         pass
     return None
@@ -1134,16 +1131,14 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Always include open positions from trade_journal.db
     open_positions: list = []
     try:
-        import sqlite3 as _sqlite3
-        _db = Path(__file__).parent / "trade_journal.db"
-        if _db.exists():
-            _conn = _sqlite3.connect(str(_db))
-            open_positions = [r[0] for r in _conn.execute(
-                "SELECT DISTINCT ticker FROM trades WHERE status='open'"
-            ).fetchall()]
-            _conn.close()
+        from utils.db import get_connection as _get_conn
+        _conn = _get_conn()
+        _cur = _conn.cursor()
+        _cur.execute("SELECT DISTINCT ticker FROM trades WHERE status='open'")
+        open_positions = [r['ticker'] for r in _cur.fetchall()]
+        _conn.close()
     except Exception as _e:
-        print(f"  [WARN] Could not read open positions from trade_journal.db: {_e}")
+        print(f"  [WARN] Could not read open positions from Supabase: {_e}")
 
     universe = list(set(base + CUSTOM_WATCHLIST + open_positions))
     if open_positions:

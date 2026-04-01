@@ -186,9 +186,10 @@ class TestAlwaysInclude(unittest.TestCase):
 
         returned_tickers = {r["ticker"] for r in result}
         self.assertIn("T01", returned_tickers,
-                      "always_include ticker T01 must appear in top 10")
-        self.assertEqual(len(result), 10,
-                         "Total count must still be max_tickers=10, not 11")
+                      "always_include ticker T01 must appear in results")
+        # Open positions are additive: max_tickers fresh signals + all always_include
+        self.assertEqual(len(result), 11,
+                         "Total = max_tickers(10) + 1 always_include = 11")
 
     def test_always_include_selection_reason(self):
         resolved = _build_20_ticker_resolved()

@@ -40,7 +40,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from utils.db import get_connection
+from utils.db import get_local_connection
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CACHE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fundamentals_cache.db")
@@ -50,7 +50,7 @@ DEFAULT_TTL_DAYS = 30   # Refresh at most once per month
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _connect() -> sqlite3.Connection:
-    conn = get_connection(CACHE_DB)
+    conn = get_local_connection(CACHE_DB)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS fundamentals (
             ticker      TEXT PRIMARY KEY,

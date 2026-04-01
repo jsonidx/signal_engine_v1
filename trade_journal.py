@@ -32,7 +32,6 @@ IMPORTANT: This is NOT investment advice. All zones are informational.
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -41,7 +40,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from utils.db import get_connection
+from utils.db import get_connection, managed_connection
 
 from fx_rates import (
     get_eur_rate, convert_to_eur, get_all_rates,
@@ -57,35 +56,29 @@ except ImportError:
     RISK_PARAMS = {"max_position_equity_pct": 0.08}
     OUTPUT_DIR = "./signals_output"
 
-DB_PATH = "trade_journal.db"
 REPORTS_DIR = "./weekly_reports"
 
 
 def get_open_positions() -> list:
     """
-    Returns all open (not yet closed) positions from trade_journal.db as a
+    Returns all open (not yet closed) positions from Supabase as a
     list of dicts, each guaranteed to have a 'ticker' key.
 
     A position is open if action = 'BUY' AND status = 'open'.
-    (Schema uses action/status — no exit_date column exists.)
 
-    Returns [] if the database does not exist, has no open positions, or
-    on any error so callers can degrade gracefully.
+    Returns [] on any error so callers can degrade gracefully.
     """
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
-    if not os.path.exists(db_path):
-        return []
     try:
-        conn = get_connection(db_path)
-        cursor = conn.execute("""
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
             SELECT ticker, date AS entry_date, price AS entry_price,
                    shares AS quantity, action AS direction, status
             FROM trades
             WHERE action = 'BUY' AND status = 'open'
             ORDER BY date DESC
         """)
-        cols = [d[0] for d in cursor.description]
-        rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
         conn.close()
         return rows
     except Exception as e:
@@ -101,19 +94,17 @@ def get_open_position_tickers() -> list:
     open positions always receive a fresh Claude synthesis regardless of their
     priority score.
 
-    Returns [] if the database does not exist or has no open positions.
-    Falls back to [] (not an exception) so callers can degrade gracefully.
+    Returns [] on any error so callers can degrade gracefully.
     """
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_PATH)
-    if not os.path.exists(db_path):
-        return []
     try:
-        conn = get_connection(db_path)
-        rows = conn.execute(
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
             "SELECT DISTINCT ticker FROM trades WHERE action = 'BUY' AND status = 'open' ORDER BY ticker"
-        ).fetchall()
+        )
+        rows = cur.fetchall()
         conn.close()
-        return [row[0].upper() for row in rows]
+        return [row['ticker'].upper() for row in rows]
     except Exception:
         return []
 
@@ -123,45 +114,7 @@ def get_open_position_tickers() -> list:
 # ==============================================================================
 
 def init_db():
-    conn = get_connection(DB_PATH)
-    c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            ticker TEXT NOT NULL,
-            action TEXT NOT NULL,
-            price REAL NOT NULL,
-            size_eur REAL,
-            shares REAL,
-            date TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            signal_composite REAL,
-            signal_type TEXT,
-            buy_zone_low REAL,
-            buy_zone_high REAL,
-            target_1 REAL,
-            target_2 REAL,
-            stop_loss REAL,
-            notes TEXT,
-            linked_buy_id INTEGER,
-            status TEXT DEFAULT 'open'
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trade_returns (
-            id SERIAL PRIMARY KEY,
-            trade_id INTEGER NOT NULL,
-            check_date TEXT NOT NULL,
-            days_held INTEGER,
-            current_price REAL,
-            return_pct REAL,
-            unrealized_pnl_eur REAL,
-            FOREIGN KEY (trade_id) REFERENCES trades(id)
-        )
-    """)
-
+    conn = get_connection()
     conn.commit()
     return conn
 
@@ -501,7 +454,8 @@ def show_status(conn):
 
     # Consolidate by ticker
     consolidated = {}
-    for ticker, price, size, shares, date in raw_positions:
+    for row in raw_positions:
+        ticker, price, size, shares, date = row['ticker'], row['price'], row['size_eur'], row['shares'], row['date']
         if ticker not in consolidated:
             consolidated[ticker] = {
                 "total_shares": 0,
@@ -700,7 +654,7 @@ def show_history(conn):
     losses = 0
 
     for t in trades:
-        ticker, entry, size, buy_date, exit_price, sell_date = t
+        ticker, entry, size, buy_date, exit_price, sell_date = t['ticker'], t['entry'], t['size_eur'], t['buy_date'], t['exit_price'], t['sell_date']
         pnl_pct = (exit_price / entry - 1)
         pnl_eur = size * pnl_pct
         days = (datetime.strptime(sell_date, "%Y-%m-%d") -
@@ -794,7 +748,7 @@ def generate_report_section(conn) -> str:
         lines.append("|--------|-------|------|------|---------|-----|------|----|----|")
 
         for pos in open_pos:
-            ticker, entry, size, date, t1, t2, stop = pos
+            ticker, entry, size, date, t1, t2, stop = pos['ticker'], pos['price'], pos['size_eur'], pos['date'], pos['target_1'], pos['target_2'], pos['stop_loss']
             try:
                 data = yf.download(ticker, period="2d", auto_adjust=True, progress=False)
                 close_col = data["Close"]
@@ -823,8 +777,8 @@ def generate_report_section(conn) -> str:
         WHERE b.action = 'BUY' AND s.action = 'SELL'
     """)
     row = c.fetchone()
-    if row and row[0] and row[0] > 0:
-        total, wins, total_pnl = row
+    if row and row['count'] and row['count'] > 0:
+        total, wins, total_pnl = row['count'], row['sum'], row['sum_1']
         lines.append(f"### Closed Trades: {total} trades | {wins}/{total} wins ({wins/total*100:.0f}%) | Total P&L: €{total_pnl:+,.2f}")
         lines.append("")
 

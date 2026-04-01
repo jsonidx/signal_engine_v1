@@ -26,7 +26,6 @@ IMPORTANT: This is NOT investment advice. For research/educational purposes only
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -47,7 +46,6 @@ except ImportError:
     PORTFOLIO_NAV = 50_000
 
 REPORT_DIR = "./weekly_reports"
-DB_PATH = "paper_trades.db"
 
 
 # ==============================================================================
@@ -153,11 +151,9 @@ def print_pulse(pulse: dict):
 def check_sunday_positions() -> list:
     """Load Sunday's positions and check midweek movement."""
     alerts = []
-    if not os.path.exists(DB_PATH):
-        return alerts
-
     try:
-        conn = sqlite3.connect(DB_PATH)
+        from utils.db import get_connection
+        conn = get_connection()
         c = conn.cursor()
         c.execute("SELECT id, date FROM snapshots ORDER BY date DESC LIMIT 1")
         row = c.fetchone()
@@ -165,10 +161,10 @@ def check_sunday_positions() -> list:
             conn.close()
             return alerts
 
-        snapshot_id, snap_date = row
+        snapshot_id, snap_date = row['id'], row['date']
         c.execute("""
             SELECT ticker, entry_price, composite_z, rank
-            FROM equity_positions WHERE snapshot_id = ?
+            FROM equity_positions WHERE snapshot_id = %s
             ORDER BY rank ASC
         """, (snapshot_id,))
         positions = c.fetchall()
@@ -177,14 +173,15 @@ def check_sunday_positions() -> list:
         if not positions:
             return alerts
 
-        tickers = [p[0] for p in positions]
+        tickers = [p['ticker'] for p in positions]
         data = yf.download(tickers, period="5d", auto_adjust=True, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             close = data["Close"]
         else:
             close = data[["Close"]].rename(columns={"Close": tickers[0]})
 
-        for ticker, entry_price, z_score, rank in positions:
+        for pos in positions:
+            ticker, entry_price, z_score, rank = pos['ticker'], pos['entry_price'], pos['composite_z'], pos['rank']
             if ticker in close.columns and entry_price > 0:
                 current = close[ticker].dropna()
                 if not current.empty:

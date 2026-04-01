@@ -26,9 +26,23 @@ signal_reports/
 # Logs
 logs/
 
-# Cache JSON files
+# Cache JSON files (all local, ephemeral — never commit)
 fx_cache.json
 polymarket_cache.json
+congress_cache.json
+quant_report_cache.json
+data/regime_cache.json
+data/sector_cache.json
+data/trends_cache.json
+data/twits_cache.json
+data/dark_pool_latest.json
+
+# Report outputs (generated on demand)
+quant_reports/
+weekly_reports/
+
+# FINRA raw data cache (large, rebuilt from API)
+data/finra_cache/
 
 # Dashboard frontend build artifacts
 dashboard/frontend/node_modules/

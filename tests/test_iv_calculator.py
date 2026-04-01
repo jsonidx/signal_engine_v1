@@ -26,13 +26,15 @@ Tests
 import math
 import os
 import sys
-import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from utils.iv_calculator import (
     _get_iv_metrics,
@@ -46,53 +48,54 @@ from utils.iv_calculator import (
     get_iv_percentile,
     implied_vol,
 )
+from utils.db import get_connection
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_temp_db():
-    """Return path to a temporary SQLite file (caller must clean up)."""
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    return path
-
-
-def _cleanup_db(path: str) -> None:
-    for suffix in ("", "-wal", "-shm"):
-        p = path + suffix
-        if os.path.exists(p):
-            os.unlink(p)
-
-
-def _seed_iv_history(db_path: str, ticker: str, iv_values: list, start_offset_days: int = 1) -> None:
+def _seed_iv_history(ticker: str, iv_values: list, start_offset_days: int = 1) -> None:
     """
-    Insert synthetic IV history rows into db_path.
+    Insert synthetic IV history rows directly into Supabase iv_history.
 
     iv_values[0] maps to (today - start_offset_days - len + 1), so the most
     recent artificial entry is (today - start_offset_days).  This ensures none
-    of the seeded rows fall on today's date (avoiding INSERT OR REPLACE
-    collisions with the row _get_iv_metrics writes for current_iv).
+    of the seeded rows fall on today's date, avoiding upsert collisions with
+    the row _get_iv_metrics writes for current_iv.
     """
-    _ensure_db(db_path)
-    from utils.db import managed_connection
-    from datetime import datetime
-
-    today = date.today()
-    n = len(iv_values)
-    with managed_connection(db_path) as conn:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        today = date.today()
+        n = len(iv_values)
         for i, iv in enumerate(iv_values):
             row_date = today - timedelta(days=start_offset_days + (n - 1 - i))
-            conn.execute(
+            cur.execute(
                 """
-                INSERT OR REPLACE INTO iv_history
-                    (ticker, date, iv30, computed_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO iv_history (ticker, date, iv30, computed_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (ticker, date) DO UPDATE SET
+                    iv30        = EXCLUDED.iv30,
+                    computed_at = EXCLUDED.computed_at
                 """,
-                (ticker, row_date.isoformat(), iv, datetime.utcnow().isoformat()),
+                (ticker, row_date.isoformat(), float(iv), datetime.utcnow().isoformat()),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _cleanup_iv_ticker(*tickers: str) -> None:
+    """Delete all iv_history rows for the given test tickers."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        for ticker in tickers:
+            cur.execute("DELETE FROM iv_history WHERE ticker = %s", (ticker,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ===========================================================================
@@ -197,7 +200,7 @@ class TestImpliedVol:
 
 
 # ===========================================================================
-# 10-13: IV rank and percentile with synthetic history
+# 10-13: IV rank and percentile with Supabase history
 # ===========================================================================
 
 class TestIvRank:
@@ -206,47 +209,49 @@ class TestIvRank:
         Insert 100 synthetic IV days (range 0.10 to 0.50).
         current_iv=0.30 → rank = (0.30-0.10)/(0.50-0.10) = 0.50 exactly.
         """
-        db = _make_temp_db()
+        ticker = "_TEST_IVRANK1_"
+        _cleanup_iv_ticker(ticker)
         try:
-            ticker = "TESTRANK"
             # 100 evenly spaced values: 0.10, 0.1040, ..., 0.50
             values = [0.10 + 0.40 * i / 99 for i in range(100)]
-            _seed_iv_history(db, ticker, values)
+            _seed_iv_history(ticker, values)
 
-            rank = get_iv_rank(ticker, current_iv=0.30, lookback_days=252, db_path=db)
+            rank = get_iv_rank(ticker, current_iv=0.30, lookback_days=252)
             assert rank is not None
             assert abs(rank - 0.50) < 0.02, f"Expected rank≈0.50, got {rank:.4f}"
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_iv_rank_returns_none_below_min_history(self):
         """
         With only 10 days of history (< IV_MIN_HISTORY_DAYS=60), rank must be None.
         """
-        db = _make_temp_db()
+        ticker = "_TEST_IVRANK2_"
+        _cleanup_iv_ticker(ticker)
         try:
-            _seed_iv_history(db, "THINHISTORY", [0.25] * 10)
-            rank = get_iv_rank("THINHISTORY", current_iv=0.25, lookback_days=252, db_path=db)
+            _seed_iv_history(ticker, [0.25] * 10)
+            rank = get_iv_rank(ticker, current_iv=0.25, lookback_days=252)
             assert rank is None, f"Expected None for thin history, got {rank}"
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_iv_rank_clamped_at_extremes(self):
         """
         IV above the historical max → rank clamped to 1.0.
         IV below the historical min → rank clamped to 0.0.
         """
-        db = _make_temp_db()
+        ticker = "_TEST_IVRANK3_"
+        _cleanup_iv_ticker(ticker)
         try:
             values = [0.20 + 0.30 * i / 99 for i in range(100)]  # 0.20 → 0.50
-            _seed_iv_history(db, "CLAMP", values)
+            _seed_iv_history(ticker, values)
 
-            rank_high = get_iv_rank("CLAMP", current_iv=0.80, lookback_days=252, db_path=db)
-            rank_low = get_iv_rank("CLAMP", current_iv=0.01, lookback_days=252, db_path=db)
+            rank_high = get_iv_rank(ticker, current_iv=0.80, lookback_days=252)
+            rank_low = get_iv_rank(ticker, current_iv=0.01, lookback_days=252)
             assert rank_high == pytest.approx(1.0)
             assert rank_low == pytest.approx(0.0)
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
 
 class TestIvPercentile:
@@ -255,39 +260,42 @@ class TestIvPercentile:
         Uniform distribution 0.01..1.00 in 1-cent steps (100 values).
         current_iv=0.50 → percentile ≈ 0.49-0.51.
         """
-        db = _make_temp_db()
+        ticker = "_TEST_IVPCT1_"
+        _cleanup_iv_ticker(ticker)
         try:
             values = [round(0.01 * (i + 1), 4) for i in range(100)]  # 0.01 to 1.00
-            _seed_iv_history(db, "UNIFORM", values)
+            _seed_iv_history(ticker, values)
 
-            pct = get_iv_percentile("UNIFORM", current_iv=0.50, lookback_days=252, db_path=db)
+            pct = get_iv_percentile(ticker, current_iv=0.50, lookback_days=252)
             assert pct is not None
             assert abs(pct - 0.50) < 0.05, f"Expected percentile≈0.50, got {pct:.4f}"
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_iv_percentile_returns_none_below_min_history(self):
         """< 60 days of data → percentile returns None."""
-        db = _make_temp_db()
+        ticker = "_TEST_IVPCT2_"
+        _cleanup_iv_ticker(ticker)
         try:
-            _seed_iv_history(db, "THIN2", [0.30] * 10)
-            pct = get_iv_percentile("THIN2", current_iv=0.30, lookback_days=252, db_path=db)
+            _seed_iv_history(ticker, [0.30] * 10)
+            pct = get_iv_percentile(ticker, current_iv=0.30, lookback_days=252)
             assert pct is None
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_iv_percentile_all_below(self):
         """IV above all history → percentile should be ~1.0."""
-        db = _make_temp_db()
+        ticker = "_TEST_IVPCT3_"
+        _cleanup_iv_ticker(ticker)
         try:
             values = [0.20] * 100
-            _seed_iv_history(db, "ALLBELOW", values)
-            pct = get_iv_percentile("ALLBELOW", current_iv=0.99, lookback_days=252, db_path=db)
+            _seed_iv_history(ticker, values)
+            pct = get_iv_percentile(ticker, current_iv=0.99, lookback_days=252)
             # After storing 0.99 for today, we have 101 rows; 100 are below 0.99
             assert pct is not None
             assert pct > 0.95
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
 
 # ===========================================================================
@@ -297,32 +305,34 @@ class TestIvPercentile:
 class TestGetIvRankAndPercentile:
     def test_returns_both_values(self):
         """Combined call returns (rank, percentile) both non-None when history exists."""
-        db = _make_temp_db()
+        ticker = "_TEST_IVCOMB1_"
+        _cleanup_iv_ticker(ticker)
         try:
             values = [0.15 + 0.40 * i / 99 for i in range(100)]
-            _seed_iv_history(db, "COMBO", values)
+            _seed_iv_history(ticker, values)
             rank, pct = get_iv_rank_and_percentile(
-                "COMBO", current_iv=0.35, lookback_days=252, db_path=db
+                ticker, current_iv=0.35, lookback_days=252
             )
             assert rank is not None
             assert pct is not None
             assert 0.0 <= rank <= 1.0
             assert 0.0 <= pct <= 1.0
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_returns_none_none_for_thin_history(self):
         """(None, None) when fewer than IV_MIN_HISTORY_DAYS rows exist."""
-        db = _make_temp_db()
+        ticker = "_TEST_IVCOMB2_"
+        _cleanup_iv_ticker(ticker)
         try:
-            _seed_iv_history(db, "THIN3", [0.25] * 5)
+            _seed_iv_history(ticker, [0.25] * 5)
             rank, pct = get_iv_rank_and_percentile(
-                "THIN3", current_iv=0.25, lookback_days=252, db_path=db
+                ticker, current_iv=0.25, lookback_days=252
             )
             assert rank is None
             assert pct is None
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
 
 # ===========================================================================
@@ -332,43 +342,50 @@ class TestGetIvRankAndPercentile:
 class TestStoreIv:
     def test_store_then_retrieve(self):
         """
-        _store_iv writes a row; reading the table directly should return it.
+        _store_iv writes a row to Supabase; reading the table should return it.
         """
-        db = _make_temp_db()
+        ticker = "_TEST_STOREIV1_"
+        _cleanup_iv_ticker(ticker)
         try:
-            _ensure_db(db)
-            _store_iv("SPY", 0.175, db)
+            _store_iv(ticker, 0.175)
 
-            from utils.db import managed_connection
-            with managed_connection(db) as conn:
-                rows = conn.execute(
-                    "SELECT iv30 FROM iv_history WHERE ticker='SPY'"
-                ).fetchall()
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT iv30 FROM iv_history WHERE ticker = %s", (ticker,)
+            )
+            rows = cur.fetchall()
+            conn.close()
+
             assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
-            assert abs(rows[0][0] - 0.175) < 1e-9
+            assert abs(rows[0]["iv30"] - 0.175) < 1e-9
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
     def test_upsert_idempotent(self):
         """
         Two consecutive _store_iv calls on the same (ticker, date) must result
-        in exactly one row (INSERT OR REPLACE behaviour).
+        in exactly one row (ON CONFLICT DO UPDATE behaviour).
         """
-        db = _make_temp_db()
+        ticker = "_TEST_STOREIV2_"
+        _cleanup_iv_ticker(ticker)
         try:
-            _ensure_db(db)
-            _store_iv("AAPL", 0.20, db)
-            _store_iv("AAPL", 0.22, db)  # Same date → replace
+            _store_iv(ticker, 0.20)
+            _store_iv(ticker, 0.22)  # Same date → upsert
 
-            from utils.db import managed_connection
-            with managed_connection(db) as conn:
-                rows = conn.execute(
-                    "SELECT iv30 FROM iv_history WHERE ticker='AAPL'"
-                ).fetchall()
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT iv30 FROM iv_history WHERE ticker = %s AND date = %s",
+                (ticker, date.today().isoformat()),
+            )
+            rows = cur.fetchall()
+            conn.close()
+
             assert len(rows) == 1, "Upsert must yield exactly one row per date"
-            assert abs(rows[0][0] - 0.22) < 1e-9, "Second write must overwrite first"
+            assert abs(rows[0]["iv30"] - 0.22) < 1e-9, "Second write must overwrite first"
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(ticker)
 
 
 # ===========================================================================
@@ -496,44 +513,42 @@ class TestCollectAndStoreIv:
         Crypto tickers (ending in -USD) must be silently skipped.
         No yfinance call should be attempted for them.
         """
-        db = _make_temp_db()
-        try:
-            with patch("utils.iv_calculator.compute_atm_iv", return_value=None) as mock_compute:
-                result = collect_and_store_iv(
-                    ["AAPL", "BTC-USD", "ETH-USD", "NVDA"],
-                    db_path=db,
-                )
-            # compute_atm_iv should be called for AAPL and NVDA only
-            called_tickers = [call.args[0] for call in mock_compute.call_args_list]
-            assert "BTC-USD" not in called_tickers, "BTC-USD must be filtered out"
-            assert "ETH-USD" not in called_tickers, "ETH-USD must be filtered out"
-            assert "AAPL" in called_tickers
-            assert "NVDA" in called_tickers
-        finally:
-            _cleanup_db(db)
+        with patch("utils.iv_calculator.compute_atm_iv", return_value=None) as mock_compute:
+            with patch("utils.iv_calculator._store_iv"):
+                collect_and_store_iv(["AAPL", "BTC-USD", "ETH-USD", "NVDA"])
+
+        called_tickers = [call.args[0] for call in mock_compute.call_args_list]
+        assert "BTC-USD" not in called_tickers, "BTC-USD must be filtered out"
+        assert "ETH-USD" not in called_tickers, "ETH-USD must be filtered out"
+        assert "AAPL" in called_tickers
+        assert "NVDA" in called_tickers
 
     def test_stores_successful_results(self):
         """
         collect_and_store_iv stores IVs for tickers that compute_atm_iv succeeds.
         """
-        db = _make_temp_db()
+        t1, t2, t3 = "_TEST_COLL1_", "_TEST_COLL2_", "_TEST_COLL3_"
+        _cleanup_iv_ticker(t1, t2, t3)
         try:
             def fake_compute_atm_iv(ticker, target_dte=None):
-                return {"AAPL": 0.22, "MSFT": 0.19}.get(ticker)
+                return {t1: 0.22, t2: 0.19}.get(ticker)
 
             with patch("utils.iv_calculator.compute_atm_iv", side_effect=fake_compute_atm_iv):
-                result = collect_and_store_iv(["AAPL", "MSFT", "THIN"], db_path=db)
+                result = collect_and_store_iv([t1, t2, t3])
 
-            assert result == {"AAPL": 0.22, "MSFT": 0.19}
+            assert result == {t1: 0.22, t2: 0.19}
 
-            from utils.db import managed_connection
-            with managed_connection(db) as conn:
-                rows = conn.execute(
-                    "SELECT ticker, iv30 FROM iv_history ORDER BY ticker"
-                ).fetchall()
-            tickers_stored = [r[0] for r in rows]
-            assert "AAPL" in tickers_stored
-            assert "MSFT" in tickers_stored
-            assert "THIN" not in tickers_stored
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT ticker FROM iv_history WHERE ticker IN %s",
+                ((t1, t2, t3),),
+            )
+            tickers_stored = {r["ticker"] for r in cur.fetchall()}
+            conn.close()
+
+            assert t1 in tickers_stored
+            assert t2 in tickers_stored
+            assert t3 not in tickers_stored
         finally:
-            _cleanup_db(db)
+            _cleanup_iv_ticker(t1, t2, t3)

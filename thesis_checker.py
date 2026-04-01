@@ -32,7 +32,6 @@ DIRECTION LOGIC:
 ================================================================================
 """
 
-import sqlite3
 import os
 import sys
 import argparse
@@ -40,16 +39,15 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 
+import psycopg2.extras
 import yfinance as yf
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-_DIR             = os.path.dirname(os.path.abspath(__file__))
-DB_PATH          = os.path.join(_DIR, "ai_quant_cache.db")
-TRADE_JOURNAL_DB = os.path.join(_DIR, "trade_journal.db")
+from utils.db import get_connection
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 OUTCOME_WINDOW_DAYS = 30   # mark EXPIRED after this many calendar days
 TRADE_LINK_WINDOW   = 3    # trade within N days of thesis counts as linked
 
@@ -58,15 +56,12 @@ TRADE_LINK_WINDOW   = 3    # trade within N days of thesis counts as linked
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _connect(path: str) -> Optional[sqlite3.Connection]:
-    if not os.path.exists(path):
-        return None
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _connect():
+    """Return a Supabase connection (thesis_cache and trades tables exist)."""
+    return get_connection()
 
 
-def _init_outcomes_table(conn: sqlite3.Connection) -> None:
+def _init_outcomes_table(conn) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS thesis_outcomes (
             id                  SERIAL PRIMARY KEY,
@@ -241,7 +236,7 @@ def _find_hit(
 # Core outcome computation
 # ---------------------------------------------------------------------------
 
-def _compute_outcome(thesis: sqlite3.Row, df: Optional[pd.DataFrame]) -> dict:
+def _compute_outcome(thesis, df: Optional[pd.DataFrame]) -> dict:
     """
     Compute all outcome fields for one thesis row. Returns a dict ready for
     INSERT/UPDATE into thesis_outcomes.
@@ -383,21 +378,20 @@ def _find_linked_trade(ticker: str, thesis_date: str) -> Tuple[int, Optional[int
     Check trade_journal.db for a BUY trade on ticker within TRADE_LINK_WINDOW
     days of thesis_date. Returns (was_traded, trade_id).
     """
-    conn = _connect(TRADE_JOURNAL_DB)
-    if conn is None:
-        return 0, None
+    conn = _connect()
     try:
         d = datetime.strptime(thesis_date, "%Y-%m-%d")
         lo = (d - timedelta(days=TRADE_LINK_WINDOW)).strftime("%Y-%m-%d")
         hi = (d + timedelta(days=TRADE_LINK_WINDOW)).strftime("%Y-%m-%d")
-        row = conn.execute(
-            # NOTE: julianday() is SQLite-only — replace with a PostgreSQL date
-            # expression such as ABS(date::date - %s::date) after migration.
+        cur = conn.cursor()
+        cur.execute(
             """SELECT id FROM trades
                WHERE ticker=%s AND action='BUY' AND date BETWEEN %s AND %s
-               ORDER BY ABS(julianday(date) - julianday(%s)) LIMIT 1""",
+               ORDER BY ABS(date::date - %s::date) LIMIT 1""",
             (ticker, lo, hi, thesis_date),
-        ).fetchone()
+        )
+        row = cur.fetchone()
+        conn.close()
         if row:
             return 1, row["id"]
         return 0, None
@@ -415,17 +409,13 @@ def run_checker(verbose: bool = False) -> int:
     """
     Update thesis_outcomes for all theses. Returns count of records updated.
     """
-    conn = _connect(DB_PATH)
-    if conn is None:
-        print(f"  [checker] ai_quant_cache.db not found at {DB_PATH}")
-        return 0
-
+    conn = _connect()
     _init_outcomes_table(conn)
 
     # Load all theses
-    theses = conn.execute(
-        "SELECT * FROM thesis_cache ORDER BY date DESC"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM thesis_cache ORDER BY date DESC")
+    theses = cur.fetchall()
 
     if not theses:
         print("  [checker] No theses in cache yet.")
@@ -435,7 +425,7 @@ def run_checker(verbose: bool = False) -> int:
     # Separate: already-resolved outcomes don't need re-checking
     existing = {
         row["thesis_id"]: row["outcome"]
-        for row in conn.execute("SELECT thesis_id, outcome FROM thesis_outcomes").fetchall()
+        for row in cur.execute("SELECT thesis_id, outcome FROM thesis_outcomes").fetchall()
     }
     resolved_states = {"HIT_TARGET1", "HIT_TARGET2", "HIT_STOP", "EXPIRED"}
 
@@ -513,27 +503,24 @@ def run_checker(verbose: bool = False) -> int:
 
 def print_accuracy_report(days: int = 90) -> None:
     """Print a summary of Claude's prediction accuracy over the last N days."""
-    conn = _connect(DB_PATH)
-    if conn is None:
-        print("ai_quant_cache.db not found.")
-        return
+    conn = _connect()
+    cur = conn.cursor()
 
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     try:
-        conn.execute("SELECT id FROM thesis_outcomes LIMIT 1")
-    except sqlite3.OperationalError:
+        cur.execute(
+            """SELECT o.*, c.bull_probability, c.signal_agreement_score
+               FROM thesis_outcomes o
+               JOIN thesis_cache c ON o.thesis_id = c.id
+               WHERE o.thesis_date >= %s
+               ORDER BY o.thesis_date DESC""",
+            (cutoff,),
+        )
+        rows = cur.fetchall()
+    except Exception:
         print("No thesis_outcomes table yet — run thesis_checker.py first.")
         conn.close()
         return
-
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    rows = conn.execute(
-        """SELECT o.*, c.bull_probability, c.signal_agreement_score
-           FROM thesis_outcomes o
-           JOIN thesis_cache c ON o.thesis_id = c.id
-           WHERE o.thesis_date >= %s
-           ORDER BY o.thesis_date DESC""",
-        (cutoff,),
-    ).fetchall()
     conn.close()
 
     if not rows:
