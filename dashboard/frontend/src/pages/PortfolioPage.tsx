@@ -365,7 +365,7 @@ export function PortfolioPage() {
 
   // Position Sizes section data
   const equityArr = equityScreener?.data ?? []
-  const positionMap = new Map(positionsArr.map((p: any) => [p.ticker, p.size_eur as number]))
+  const positionMap = new Map<string, number>(positionsArr.map((p: any) => [p.ticker, p.size_eur as number]))
 
   const isZeroRow = (r: any) =>
     (r.weight_pct ?? 0) === 0 &&
@@ -477,7 +477,7 @@ export function PortfolioPage() {
           regime={regimeData.regime}
           score={regimeData.score}
           sizeMultiplier={regimeData.size_multiplier ?? 0.7}
-          components={regimeData.components as Record<string, number> | undefined}
+          components={regimeData.components as unknown as Record<string, number> | undefined}
           sectorRegimes={regimeData.sector_regimes}
           computedAt={regimeData.computed_at}
         />

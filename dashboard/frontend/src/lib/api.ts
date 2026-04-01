@@ -8,8 +8,7 @@ client.interceptors.request.use(async (config) => {
   const { data } = await supabase.auth.getSession()
   const token = data.session?.access_token
   if (token) {
-    config.headers = config.headers ?? {}
-    config.headers['Authorization'] = `Bearer ${token}`
+    config.headers.set('Authorization', `Bearer ${token}`)
   }
   return config
 })
@@ -142,6 +141,8 @@ export interface TickerDetail extends TickerSignal {
   max_pain?: number
   // Override flags
   override_flags?: string[]
+  time_horizon?: string
+  data_quality?: string
   // Squeeze
   squeeze_score?: number
   float_short_pct?: number

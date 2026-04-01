@@ -47,6 +47,11 @@ data/finra_cache/
 # Dashboard frontend build artifacts
 dashboard/frontend/node_modules/
 dashboard/frontend/dist/
+# Allow frontend config files (overrides *.json rule above)
+!dashboard/frontend/package.json
+!dashboard/frontend/package-lock.json
+!dashboard/frontend/tsconfig.json
+!dashboard/frontend/tsconfig.node.json
 
 # Generated launchd plists (machine-specific, created by setup_schedules.sh)
 *.plist
