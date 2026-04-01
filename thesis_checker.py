@@ -62,7 +62,8 @@ def _connect():
 
 
 def _init_outcomes_table(conn) -> None:
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS thesis_outcomes (
             id                  SERIAL PRIMARY KEY,
             thesis_id           INTEGER NOT NULL,
@@ -471,7 +472,8 @@ def run_checker(verbose: bool = False) -> int:
             for k in out
             if k not in ("thesis_id", "created_at")
         )
-        conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             f"""INSERT INTO thesis_outcomes ({cols}) VALUES ({placeholders})
                 ON CONFLICT(thesis_id) DO UPDATE SET {updates}""",
             list(out.values()),
