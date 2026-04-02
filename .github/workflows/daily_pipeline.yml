@@ -1,0 +1,33 @@
+name: Daily Signal Pipeline (no AI cost)
+
+on:
+  schedule:
+    - cron: '0 5 * * 1-5'   # 07:00 Berlin (CEST, UTC+2) = 05:00 UTC — before Xetra open
+  workflow_dispatch:            # manual trigger from GitHub UI
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run master pipeline (--skip-ai, €0.00)
+        run: bash run_master.sh --skip-ai
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
