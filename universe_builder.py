@@ -35,6 +35,7 @@ FALLBACK CHAIN (per index):
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -297,6 +298,38 @@ def _save_cache(index: str, tickers: list, sector_map: dict = None) -> None:
         logger.warning("Failed to write cache for %s: %s", index, exc)
 
 
+_LIQUIDITY_CACHE_PATH = _CACHE_DIR / "liquidity_passed.json"
+
+
+def _load_liquidity_cache(ticker_hash: str, max_age_hours: float = 24.0) -> Optional[list]:
+    """Return cached liquidity-passed list if hash matches and cache is fresh."""
+    if not _LIQUIDITY_CACHE_PATH.exists():
+        return None
+    try:
+        with open(_LIQUIDITY_CACHE_PATH) as fh:
+            data = json.load(fh)
+        if data.get("ticker_hash") != ticker_hash:
+            return None
+        age_h = (datetime.now() - datetime.fromisoformat(data["cached_at"])).total_seconds() / 3600
+        if age_h > max_age_hours:
+            return None
+        logger.info("Liquidity cache hit (%.1fh old, %d passed)", age_h, len(data["passed"]))
+        return data["passed"]
+    except Exception as exc:
+        logger.warning("Failed to read liquidity cache: %s", exc)
+        return None
+
+
+def _save_liquidity_cache(ticker_hash: str, passed: list) -> None:
+    """Write liquidity-passed list to disk cache."""
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(_LIQUIDITY_CACHE_PATH, "w") as fh:
+            json.dump({"cached_at": datetime.now().isoformat(), "ticker_hash": ticker_hash, "passed": passed}, fh)
+    except Exception as exc:
+        logger.warning("Failed to write liquidity cache: %s", exc)
+
+
 def _parse_ishares_csv(text: str) -> tuple:
     """
     Parse an iShares ETF holdings CSV.
@@ -443,8 +476,15 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 250) -> list:
     Strong NaN resilience: uses a joint valid-row mask so partial data from
     international names (many gaps, late IPOs) still scores correctly.
     Writes failed tickers to liquidity_failed.log for debugging.
+    Results are cached to disk for 24 hours keyed by the input ticker set.
     """
     _MIN_BARS = 20
+
+    ticker_hash = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()
+    cached = _load_liquidity_cache(ticker_hash)
+    if cached is not None:
+        print(f"  Liquidity filter: cache hit — {len(cached)} passed (skipping downloads)")
+        return cached
 
     passed:   list = []
     fail_price: int = 0
@@ -567,6 +607,7 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 250) -> list:
     except Exception:
         pass
 
+    _save_liquidity_cache(ticker_hash, passed)
     return passed
 
 

@@ -114,6 +114,45 @@ def _init_outcomes_table(conn) -> None:
         )
     """)
     conn.commit()
+    _migrate_outcomes_table(cur, conn)
+
+
+def _migrate_outcomes_table(cur, conn) -> None:
+    """Add any columns that exist in the CREATE TABLE but are missing from the live table."""
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'thesis_outcomes'
+    """)
+    existing = {row["column_name"] for row in cur.fetchall()}
+    needed = {
+        "time_horizon":     "TEXT",
+        "entry_price":      "REAL",
+        "price_1d":         "REAL",
+        "price_7d":         "REAL",
+        "price_14d":        "REAL",
+        "price_30d":        "REAL",
+        "return_1d":        "REAL",
+        "return_7d":        "REAL",
+        "return_14d":       "REAL",
+        "return_30d":       "REAL",
+        "vs_target_1_pct":  "REAL",
+        "vs_target_2_pct":  "REAL",
+        "vs_stop_pct":      "REAL",
+        "hit_target_1":     "BOOLEAN DEFAULT FALSE",
+        "hit_target_2":     "BOOLEAN DEFAULT FALSE",
+        "hit_stop":         "BOOLEAN DEFAULT FALSE",
+        "days_to_target_1": "INTEGER",
+        "days_to_target_2": "INTEGER",
+        "days_to_stop":     "INTEGER",
+        "claude_correct":   "INTEGER",
+        "last_checked":     "TEXT",
+        "resolved_at":      "TEXT",
+        "created_at":       "TEXT",
+    }
+    for col, col_type in needed.items():
+        if col not in existing:
+            cur.execute(f"ALTER TABLE thesis_outcomes ADD COLUMN {col} {col_type}")
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +350,9 @@ def _compute_outcome(thesis, df: Optional[pd.DataFrame]) -> dict:
     hit_t2   = days_to_t2   is not None
     hit_stop = days_to_stop is not None
 
-    out["hit_target_1"]    = int(hit_t1)
-    out["hit_target_2"]    = int(hit_t2)
-    out["hit_stop"]        = int(hit_stop)
+    out["hit_target_1"]    = bool(hit_t1)
+    out["hit_target_2"]    = bool(hit_t2)
+    out["hit_stop"]        = bool(hit_stop)
     out["days_to_target_1"] = days_to_t1
     out["days_to_target_2"] = days_to_t2
     out["days_to_stop"]     = days_to_stop

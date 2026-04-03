@@ -240,10 +240,11 @@ def record_snapshot(conn):
                                crypto_allocation, cash_allocation, spy_price,
                                btc_price, btc_ma200, btc_signal)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
     """, (today, now, PORTFOLIO_NAV, equity_alloc, crypto_alloc, cash_alloc,
           spy_price, btc_data["price"], btc_data["ma200"], btc_data["signal"]))
 
-    snapshot_id = c.lastrowid
+    snapshot_id = c.fetchone()["id"]
 
     # Insert equity positions
     top_n = min(RISK_PARAMS["max_equity_positions"], len(signals))

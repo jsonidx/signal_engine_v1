@@ -3439,6 +3439,17 @@ def main():
         "--backfill-agreement", action="store_true",
         help="Recompute signal_agreement_score for all cached tickers (no API calls)",
     )
+    parser.add_argument(
+        "--dump-prompt",
+        action="store_true",
+        help="Collect signals and print prompt for Claude Code analysis (no API call needed)",
+    )
+    parser.add_argument(
+        "--inject-response",
+        type=str,
+        metavar="FILE",
+        help="Read Claude Code thesis response from FILE and save to cache (use with --ticker)",
+    )
     args = parser.parse_args()
     use_cache = not args.no_cache
 
@@ -3478,6 +3489,154 @@ def main():
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("================================================================")
     print()
+
+    # ── --dump-prompt: collect signals, print for Claude Code analysis ──────────
+    if args.dump_prompt:
+        tickers = []
+        if args.ticker:
+            tickers = [args.ticker.upper()]
+        elif args.tickers:
+            tickers = [t.upper() for t in args.tickers]
+        else:
+            print("  ERROR: --dump-prompt requires --ticker or --tickers")
+            sys.exit(1)
+
+        os.makedirs(os.path.join("data", "prompts"), exist_ok=True)
+
+        for ticker in tickers:
+            print(f"\n  Collecting signals for {ticker}...")
+            signals = collect_all_signals(ticker, verbose=args.verbose)
+            signals = _inject_universe_rank(signals, ticker)
+            signals["signal_agreement_score"] = compute_signal_agreement(signals)
+
+            # Run conflict resolver — may skip Claude entirely
+            skip_claude = False
+            if _RESOLVER_AVAILABLE:
+                try:
+                    mr_dict    = signals.get("market_regime") or {}
+                    regime_str = mr_dict.get("regime", "TRANSITIONAL") if mr_dict else "TRANSITIONAL"
+                    resolved   = _cr.resolve(signals, regime_str)
+                    signals["conflict_resolution"] = resolved
+                    signals["signal_agreement_score"] = resolved["signal_agreement_score"]
+                    if resolved["skip_claude"]:
+                        flags  = resolved.get("override_flags", [])
+                        flag0  = flags[0] if flags else "pre-resolved block"
+                        print(f"  [{ticker}] Claude skipped — {flag0} (neutral thesis saved)")
+                        thesis = _make_neutral_thesis(ticker, signals, resolved)
+                        save_thesis(thesis)
+                        skip_claude = True
+                except Exception as exc:
+                    logger.warning("Conflict resolver failed for %s: %s", ticker, exc)
+
+            if skip_claude:
+                continue
+
+            prompt    = _build_prompt(signals)
+            dump_path = os.path.join("data", "prompts", f"{ticker}_prompt.json")
+            with open(dump_path, "w") as fh:
+                json.dump(
+                    {"ticker": ticker, "system_prompt": SYSTEM_PROMPT,
+                     "user_prompt": prompt,
+                     "agreement_score": signals.get("signal_agreement_score", 0.0),
+                     "signals": signals},
+                    fh, indent=2, default=str,
+                )
+
+            print(f"\n{'='*70}")
+            print(f"  SIGNAL DUMP: {ticker}  (agreement={signals.get('signal_agreement_score', 0.0):.2f})")
+            print(f"  Prompt saved to: {dump_path}")
+            print(f"{'='*70}")
+            print(f"\n[SYSTEM PROMPT]\n")
+            print(SYSTEM_PROMPT)
+            print(f"\n[SIGNAL DATA]\n")
+            print(prompt)
+            print(f"\n{'='*70}")
+            print(f"  After Claude Code analysis, save thesis to cache:")
+            print(f"  python3 ai_quant.py --ticker {ticker} --inject-response <response_file>")
+            print(f"{'='*70}")
+        return
+
+    # ── --inject-response: save Claude Code thesis to Supabase cache ────────────
+    if args.inject_response:
+        if not args.ticker:
+            print("  ERROR: --inject-response requires --ticker")
+            sys.exit(1)
+
+        ticker        = args.ticker.upper()
+        response_file = args.inject_response
+
+        if not os.path.exists(response_file):
+            print(f"  ERROR: Response file not found: {response_file}")
+            sys.exit(1)
+
+        with open(response_file, "r") as fh:
+            raw = fh.read().strip()
+
+        # Reload signals from the dump so caps can be applied
+        signals   = {}
+        dump_path = os.path.join("data", "prompts", f"{ticker}_prompt.json")
+        if os.path.exists(dump_path):
+            with open(dump_path, "r") as fh:
+                signals = json.load(fh).get("signals", {})
+
+        thesis = _parse_response(raw)
+        if thesis is None:
+            print(f"  ERROR: Could not parse JSON from: {response_file}")
+            print(f"  Preview: {raw[:300]}")
+            sys.exit(1)
+
+        thesis["ticker"]                = ticker
+        thesis["signals"]               = signals
+        thesis["raw_response"]          = raw
+        thesis["signal_agreement_score"] = signals.get("signal_agreement_score", 0.0)
+
+        # Apply conflict resolver hard caps
+        if _RESOLVER_AVAILABLE:
+            try:
+                cr_data      = signals.get("conflict_resolution") or {}
+                max_conv_cap = cr_data.get("max_conviction_override")
+                pos_size_cap = cr_data.get("position_size_override")
+                if max_conv_cap is not None:
+                    raw_conv = thesis.get("conviction", 5)
+                    if isinstance(raw_conv, (int, float)) and raw_conv > max_conv_cap:
+                        thesis["conviction"] = max_conv_cap
+                        thesis["notes"] = (
+                            f"[Conviction capped at {max_conv_cap} — conflict resolver] "
+                            + (thesis.get("notes") or "")
+                        ).strip()
+                if pos_size_cap is not None:
+                    raw_pos = thesis.get("position_size_pct", 0) or 0
+                    if isinstance(raw_pos, (int, float)) and raw_pos > pos_size_cap:
+                        thesis["position_size_pct"] = pos_size_cap
+                        thesis["notes"] = (
+                            f"[Position capped at {pos_size_cap:.1f}% — conflict resolver] "
+                            + (thesis.get("notes") or "")
+                        ).strip()
+            except Exception:
+                pass
+
+        # Apply regime conviction cap
+        if _REGIME_AVAILABLE:
+            try:
+                mr_cached  = signals.get("market_regime", {})
+                mkt_regime = mr_cached.get("regime") if mr_cached else None
+                if mkt_regime:
+                    max_conv = _rf.get_max_conviction(mkt_regime)
+                    raw_conv = thesis.get("conviction", 5)
+                    if isinstance(raw_conv, (int, float)) and raw_conv > max_conv:
+                        thesis["conviction"] = max_conv
+                        thesis["notes"] = (
+                            f"[Conviction capped at {max_conv} — {mkt_regime} regime] "
+                            + (thesis.get("notes") or "")
+                        ).strip()
+            except Exception:
+                pass
+
+        _validate_probabilities(thesis)
+        save_thesis(thesis)
+        print(f"\n  [{ticker}] Thesis saved to cache.")
+        print_thesis(thesis)
+        return
 
     # --screen does NOT need the API key for signal collection
     if args.screen:

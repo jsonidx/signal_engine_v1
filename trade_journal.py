@@ -365,6 +365,7 @@ def log_buy(conn, ticker: str, price: float, size_eur: float, notes: str = ""):
                             created_at, buy_zone_low, buy_zone_high,
                             target_1, target_2, stop_loss, notes, status)
         VALUES (%s, 'BUY', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+        RETURNING id
     """, (
         ticker.upper(), price, size_eur, shares, today, now,
         zones["buy_zone_low"] if zones else None,
@@ -376,7 +377,7 @@ def log_buy(conn, ticker: str, price: float, size_eur: float, notes: str = ""):
     ))
     conn.commit()
 
-    trade_id = c.lastrowid
+    trade_id = c.fetchone()["id"]
     print(f"\n  ✅ BUY logged: {ticker} @ €{price:.2f} | €{size_eur:.0f} | {shares:.2f} shares")
     if zones:
         print(f"     Stop: €{zones['stop_loss']:.2f} | T1: €{zones['target_1']:.2f} | T2: €{zones['target_2']:.2f}")
@@ -576,7 +577,7 @@ def show_status(conn):
                 (trade_id, check_date, days_held, current_price, return_pct, unrealized_pnl_eur)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
-            """, (first_buy[0], datetime.now().strftime("%Y-%m-%d"), days, current, pnl_pct, pnl_eur))
+            """, (first_buy["id"], datetime.now().strftime("%Y-%m-%d"), days, current, pnl_pct, pnl_eur))
 
     conn.commit()
 
@@ -585,13 +586,13 @@ def show_status(conn):
         SELECT COALESCE(SUM(size_eur), 0) FROM trades
         WHERE action = 'SELL'
     """)
-    total_cash_in = c.fetchone()[0]
+    total_cash_in = list(c.fetchone().values())[0]
 
     c.execute("""
         SELECT COALESCE(SUM(size_eur), 0) FROM trades
         WHERE action = 'BUY'
     """)
-    total_cash_out = c.fetchone()[0]
+    total_cash_out = list(c.fetchone().values())[0]
 
     net_deployed = total_cash_out - total_cash_in
     realized_pnl = total_invested - net_deployed  # cost basis - net deployed = realized gains funding positions

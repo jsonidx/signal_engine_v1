@@ -18,7 +18,9 @@ CALIBRATION:
 ================================================================================
 """
 
+import contextlib
 import csv
+import io
 import json
 import logging
 import os
@@ -498,7 +500,8 @@ def apply_hard_overrides(
         _ma_keyword = False
         try:
             import yfinance as _yf
-            _info    = _yf.Ticker(ticker).info
+            with contextlib.redirect_stderr(io.StringIO()):
+                _info = _yf.Ticker(ticker).info
             _summary = (_info.get("longBusinessSummary") or "").lower()
             _ma_keyword = any(
                 kw in _summary
