@@ -3462,7 +3462,11 @@ def main():
 
     # --backfill-agreement: recompute agreement scores from stored signals_json, no Claude calls
     if args.backfill_agreement:
-        conn = _init_db()
+        try:
+            conn = _init_db()
+        except Exception as exc:
+            print(f"Backfill skipped — DB unreachable: {exc}")
+            return
         cur = conn.cursor()
         cur.execute("SELECT ticker, signals_json FROM thesis_cache")
         rows = cur.fetchall()
