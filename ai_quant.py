@@ -77,10 +77,10 @@ warnings.filterwarnings("ignore")
 
 try:
     import anthropic
+    _ANTHROPIC_AVAILABLE = True
 except ImportError:
-    print("ERROR: anthropic package not installed.")
-    print("       Run: pip install anthropic")
-    sys.exit(1)
+    anthropic = None  # type: ignore[assignment]
+    _ANTHROPIC_AVAILABLE = False
 
 try:
     from config import OUTPUT_DIR, PORTFOLIO_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION
@@ -2500,6 +2500,9 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
     Returns the response text, or None on failure.
     Token usage is stored in module-level _last_call_usage after each call.
     """
+    if not _ANTHROPIC_AVAILABLE:
+        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        return None
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("  ERROR: ANTHROPIC_API_KEY environment variable not set.")
@@ -3317,6 +3320,10 @@ def analyze_report_file(report_path: str, verbose: bool = False) -> Optional[str
     Send an existing signal report file to Claude for portfolio-level analysis.
     Useful for analyzing the output of run_master.sh.
     """
+    if not _ANTHROPIC_AVAILABLE:
+        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        return None
+
     if not os.path.exists(report_path):
         print(f"  ERROR: Report file not found: {report_path}")
         return None
