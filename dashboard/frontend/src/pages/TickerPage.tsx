@@ -671,6 +671,246 @@ function ActionZonesCard({ zones }: { zones: ActionZones }) {
   )
 }
 
+// ─── Prompt builder ────────────────────────────────────────────────────────────
+
+function buildPrompt(
+  signal: TickerDetail,
+  actionZones: ActionZones | null | undefined,
+  earningsData: EarningsData | null | undefined,
+  dpLatest: any,
+): string {
+  const n = (v: number | null | undefined, decimals = 2) =>
+    v != null ? v.toFixed(decimals) : '—'
+  const pct = (v: number | null | undefined) =>
+    v != null ? `${v >= 0 ? '+' : ''}${v.toFixed(1)}%` : '—'
+
+  const az = actionZones
+  const fx = az?.fx_rate
+
+  const usd = (v: number | null | undefined) => v != null ? `$${v.toFixed(2)}` : '—'
+  const eur = (v: number | null | undefined) =>
+    v != null && fx ? `€${(v / fx).toFixed(2)}` : v != null ? `$${v.toFixed(2)}` : '—'
+
+  const today = new Date().toISOString().slice(0, 10)
+
+  const lines: string[] = []
+
+  lines.push(`You are an expert quantitative analyst and highly experienced trader with deep knowledge of technical analysis, options flow, dark pool activity, and fundamental valuation. Analyze the following deep dive data for ${signal.ticker} and provide:`)
+  lines.push(``)
+  lines.push(`1. Critical assessment of the current trade setup — does the technical price action confirm or conflict with the AI thesis?`)
+  lines.push(`2. Key entry decision: is now the right time to enter, wait for a pullback, or avoid entirely?`)
+  lines.push(`3. Specific price levels to watch — where would you set your entry, stop, and scale-out targets?`)
+  lines.push(`4. Risk assessment — what are the top 2-3 things that could make this trade fail?`)
+  lines.push(`5. Overall conviction (1–10) and your directional bias with reasoning.`)
+  lines.push(``)
+  lines.push(`Be direct and specific. No generic advice. Think like a prop trader with real capital at risk.`)
+  lines.push(``)
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(`DEEP DIVE: ${signal.ticker}  |  ${today}`)
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(``)
+
+  // ── AI Thesis ──
+  lines.push(`## AI THESIS`)
+  lines.push(`Direction:         ${signal.direction ?? '—'}`)
+  lines.push(`Conviction:        ${signal.conviction ?? '—'}/5`)
+  lines.push(`Signal Agreement:  ${signal.signal_agreement_score != null ? `${(signal.signal_agreement_score * 100).toFixed(0)}%` : '—'}`)
+  lines.push(`Time Horizon:      ${signal.time_horizon ?? '—'}`)
+  lines.push(`Data Quality:      ${signal.data_quality ?? '—'}`)
+  lines.push(`Bull Probability:  ${signal.bull_probability != null ? `${signal.bull_probability}%` : '—'}`)
+  lines.push(`Bear Probability:  ${signal.bear_probability != null ? `${signal.bear_probability}%` : '—'}`)
+  lines.push(``)
+  if (signal.thesis) {
+    lines.push(`Thesis:`)
+    lines.push(signal.thesis)
+    lines.push(``)
+  }
+  if (signal.primary_scenario) {
+    lines.push(`Primary Scenario:`)
+    lines.push(signal.primary_scenario)
+    lines.push(``)
+  }
+  if (signal.bear_scenario) {
+    lines.push(`Bear Scenario:`)
+    lines.push(signal.bear_scenario)
+    lines.push(``)
+  }
+  if (signal.key_invalidation) {
+    lines.push(`Key Invalidation: ${signal.key_invalidation}`)
+    lines.push(``)
+  }
+  if (signal.catalysts?.length) {
+    lines.push(`Catalysts:`)
+    signal.catalysts.forEach(c => lines.push(`  • ${c}`))
+    lines.push(``)
+  }
+  if (signal.risks?.length) {
+    lines.push(`Risks:`)
+    signal.risks.forEach(r => lines.push(`  • ${r}`))
+    lines.push(``)
+  }
+
+  // ── AI Price Levels ──
+  lines.push(`## AI PRICE LEVELS`)
+  lines.push(`Entry Zone:  ${usd(signal.entry_low)} – ${usd(signal.entry_high)}  (${eur(signal.entry_low)} – ${eur(signal.entry_high)})`)
+  lines.push(`Target 1:    ${usd(signal.target_1)}  (${eur(signal.target_1)})`)
+  lines.push(`Target 2:    ${usd(signal.target_2)}  (${eur(signal.target_2)})`)
+  lines.push(`Stop Loss:   ${usd(signal.stop_loss)}  (${eur(signal.stop_loss)})`)
+  if (signal.current_price != null && signal.entry_low != null && signal.entry_high != null) {
+    const mid = (signal.entry_low + signal.entry_high) / 2
+    const drift = ((signal.current_price - mid) / mid * 100).toFixed(1)
+    lines.push(`Current vs AI Entry Mid: ${drift}%`)
+  }
+  lines.push(``)
+
+  // ── Live Action Zones ──
+  if (az) {
+    lines.push(`## LIVE ACTION ZONES  (ATR-based, refreshed every 15 min)`)
+    lines.push(`Current Price:  ${usd(az.current_price)}  (${eur(az.current_price)})`)
+    lines.push(`ATR 14:         ${usd(az.atr)}  (${az.atr_pct}%)`)
+    lines.push(`RSI 14:         ${n(az.rsi, 1)}`)
+    lines.push(`EMA 21:         ${usd(az.ema21)}`)
+    lines.push(`EMA 50:         ${usd(az.ema50)}`)
+    lines.push(``)
+    lines.push(`Buy Zone:       ${usd(az.buy_zone_low)} – ${usd(az.buy_zone_high)}  (${eur(az.buy_zone_low)} – ${eur(az.buy_zone_high)})`)
+    lines.push(`Entry Mid:      ${usd(az.entry_mid)}  (${eur(az.entry_mid)})`)
+    lines.push(`Stop Loss:      ${usd(az.stop_loss)}  (${eur(az.stop_loss)})`)
+    lines.push(`Target 1:       ${usd(az.target_1)}  (${eur(az.target_1)})  R:R ${n(az.rr_t1, 1)}x`)
+    lines.push(`Target 2:       ${usd(az.target_2)}  (${eur(az.target_2)})  R:R ${n(az.rr_t2, 1)}x`)
+    lines.push(``)
+    lines.push(`Action Signal:  ${az.action}`)
+    lines.push(`Timing:         ${az.timing}`)
+    lines.push(``)
+  }
+
+  // ── Module Scores ──
+  if (signal.modules && Object.keys(signal.modules).length > 0) {
+    lines.push(`## MODULE SCORES  (-1 bearish → +1 bullish)`)
+    Object.entries(signal.modules).forEach(([k, v]) => {
+      const bar = v != null ? `${v >= 0 ? '+' : ''}${(v as number).toFixed(2)}` : '—'
+      lines.push(`  ${k.padEnd(16)} ${bar}`)
+    })
+    lines.push(``)
+  }
+
+  // ── Options Flow ──
+  const hasOptions = signal.iv_rank != null || signal.put_call_ratio != null ||
+    signal.expected_move_pct != null || signal.heat_score != null
+  if (hasOptions) {
+    lines.push(`## OPTIONS FLOW`)
+    if (signal.iv_rank != null)          lines.push(`IV Rank:        ${signal.iv_rank.toFixed(0)}%`)
+    if (signal.heat_score != null)       lines.push(`Heat Score:     ${signal.heat_score.toFixed(0)}/100`)
+    if (signal.put_call_ratio != null)   lines.push(`Put/Call Ratio: ${signal.put_call_ratio.toFixed(2)}`)
+    if (signal.expected_move_pct != null) lines.push(`Expected Move:  ±${signal.expected_move_pct.toFixed(1)}%`)
+    if (signal.max_pain != null)         lines.push(`Max Pain:       ${usd(signal.max_pain)}`)
+    if (signal.poc != null)              lines.push(`POC (Vol Profile): ${usd(signal.poc)}`)
+    if (signal.vwap != null)             lines.push(`VWAP 20d:       ${usd(signal.vwap)}`)
+    lines.push(``)
+  }
+
+  // ── Dark Pool ──
+  if (dpLatest) {
+    lines.push(`## DARK POOL`)
+    if (dpLatest.dark_pool_score != null) lines.push(`Score:          ${dpLatest.dark_pool_score.toFixed(0)}/100`)
+    if (dpLatest.signal != null)          lines.push(`Signal:         ${dpLatest.signal}`)
+    if (dpLatest.short_ratio_trend != null) lines.push(`Short Ratio Trend: ${dpLatest.short_ratio_trend}`)
+    lines.push(``)
+  }
+
+  // ── Squeeze ──
+  if ((signal.squeeze_score ?? 0) > 0) {
+    lines.push(`## SHORT SQUEEZE`)
+    lines.push(`Squeeze Score:  ${signal.squeeze_score}/100`)
+    if (signal.float_short_pct != null) lines.push(`Float Short:    ${signal.float_short_pct.toFixed(1)}%`)
+    if (signal.days_to_cover != null)   lines.push(`Days to Cover:  ${signal.days_to_cover.toFixed(1)}`)
+    if (signal.volume_surge != null)    lines.push(`Volume Surge:   ${signal.volume_surge.toFixed(1)}x`)
+    lines.push(``)
+  }
+
+  // ── Earnings ──
+  if (earningsData) {
+    lines.push(`## EARNINGS`)
+    if (earningsData.next_earnings) {
+      const q = earningsData.next_earnings_quarter ? ` (${earningsData.next_earnings_quarter})` : ''
+      lines.push(`Next Report:    ${earningsData.next_earnings}${q}`)
+    }
+    if (earningsData.eps_growth_yoy != null) lines.push(`EPS Growth YoY: ${pct(earningsData.eps_growth_yoy)}`)
+    if (earningsData.next_eps?.avg != null)   lines.push(`EPS Estimate:   $${earningsData.next_eps.avg.toFixed(2)}`)
+    if (earningsData.next_revenue?.avg != null) {
+      const rev = earningsData.next_revenue.avg
+      lines.push(`Revenue Est:    $${(rev / 1e9).toFixed(2)}B`)
+    }
+    const recent = (earningsData.quarterly ?? []).slice(-4)
+    if (recent.length > 0) {
+      lines.push(``)
+      lines.push(`Recent Quarters (oldest → newest):`)
+      recent.forEach(q => {
+        const beat = q.beat === true ? '✓ beat' : q.beat === false ? '✗ miss' : ''
+        const surp = q.surprise_pct != null ? ` (${pct(q.surprise_pct)} surprise)` : ''
+        const eps = q.eps_actual != null ? `EPS $${q.eps_actual.toFixed(2)}` : ''
+        const est = q.eps_estimate != null ? ` vs est $${q.eps_estimate.toFixed(2)}` : ''
+        const rev = q.revenue != null ? `  Rev $${(q.revenue / 1e9).toFixed(2)}B` : ''
+        lines.push(`  ${(q.label ?? '').padEnd(8)} ${eps}${est}${surp} ${beat}${rev}`)
+      })
+    }
+    lines.push(``)
+  }
+
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(`END OF DATA — provide your expert quant trader analysis now.`)
+
+  return lines.join('\n')
+}
+
+function CopyPromptButton({
+  signal, actionZones, earningsData, dpLatest,
+}: {
+  signal: TickerDetail
+  actionZones: ActionZones | null | undefined
+  earningsData: EarningsData | null | undefined
+  dpLatest: any
+}) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    const prompt = buildPrompt(signal, actionZones, earningsData, dpLatest)
+    await navigator.clipboard.writeText(prompt)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="space-y-0.5">
+          <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+            LLM Prompt
+          </div>
+          <div className="font-mono text-[9px] text-text-tertiary">
+            Full deep dive data formatted for ChatGPT, Grok, Claude, etc.
+          </div>
+        </div>
+        <button
+          onClick={handleCopy}
+          className={clsx(
+            'flex items-center gap-1.5 font-mono text-xs px-3 py-1.5 rounded border transition-all',
+            copied
+              ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+              : 'bg-bg-elevated text-text-secondary border-border-subtle hover:text-text-primary hover:border-border-active'
+          )}
+        >
+          {copied ? '✓ Copied' : '⎘ Copy Prompt'}
+        </button>
+      </div>
+      {copied && (
+        <div className="font-mono text-[9px] text-accent-green/80">
+          Paste into ChatGPT, Grok, Claude, or any LLM to get expert quant analysis.
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Analyze button ────────────────────────────────────────────────────────────
 
 function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boolean }) {
@@ -925,7 +1165,7 @@ function EarningsCard({ data }: { data: EarningsData }) {
 
   const quarterly = data.quarterly ?? []
   const annual    = data.annual    ?? []
-  const { next_earnings, next_eps, next_revenue, eps_growth_yoy } = data
+  const { next_earnings, next_earnings_quarter, next_eps, next_revenue, eps_growth_yoy } = data
 
   if (!quarterly.length && !annual.length && !next_earnings) return null
 
@@ -969,6 +1209,11 @@ function EarningsCard({ data }: { data: EarningsData }) {
           <div className="flex items-center gap-2">
             <span className="font-mono text-[9px] uppercase text-accent-amber tracking-wide">Next</span>
             <span className="font-mono text-sm font-semibold text-accent-amber">{next_earnings}</span>
+            {next_earnings_quarter && (
+              <span className="font-mono text-xs text-accent-amber/70 border border-accent-amber/30 rounded px-1.5 py-0.5">
+                {next_earnings_quarter}
+              </span>
+            )}
           </div>
           <div className="flex gap-4">
             {next_eps?.avg != null && (
@@ -1372,7 +1617,6 @@ export function TickerPage() {
                     poc={signal.poc}
                     vwap={signal.vwap}
                     maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
-                    height={280}
                     azBuyLow={actionZones?.buy_zone_low}
                     azBuyHigh={actionZones?.buy_zone_high}
                     azStop={actionZones?.stop_loss}
@@ -1383,6 +1627,14 @@ export function TickerPage() {
                 </div>
               )
             })()}
+
+            {/* LLM Prompt copy */}
+            <CopyPromptButton
+              signal={signal}
+              actionZones={actionZones}
+              earningsData={earningsData}
+              dpLatest={dpLatest}
+            />
 
             {/* Expected Moves */}
             {signal.current_price != null && (() => {

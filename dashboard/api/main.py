@@ -2940,6 +2940,23 @@ def _quarter_label(dt) -> str:
     return f"Q{q} '{str(dt.year)[-2:]}"
 
 
+def _next_quarter_label(last_label: str) -> str:
+    """Advance the most-recent reported quarter label by one.
+    e.g. 'Q4 '25' → 'Q1 '26',  'Q2 '26' → 'Q3 '26'
+    Falls back to '' if the label doesn't match the expected format.
+    """
+    import re
+    m = re.match(r"Q(\d) '(\d{2})", last_label)
+    if not m:
+        return ""
+    q, yr = int(m.group(1)), int(m.group(2))
+    q += 1
+    if q > 4:
+        q = 1
+        yr = (yr + 1) % 100
+    return f"Q{q} '{yr:02d}"
+
+
 @app.get("/api/ticker/{symbol}/earnings")
 async def ticker_earnings(symbol: str):
     """
@@ -3109,14 +3126,20 @@ async def ticker_earnings(symbol: str):
     except Exception as e:
         log.warning(f"Earnings fetch failed for {sym}: {e}")
 
+    # Infer next quarter label from last reported quarter
+    next_quarter: Optional[str] = None
+    if quarterly:
+        next_quarter = _next_quarter_label(quarterly[-1]["label"]) or None
+
     result = {
-        "data_available":  bool(quarterly or annual or next_date),
-        "next_earnings":   next_date,
-        "next_eps":        next_eps,
-        "next_revenue":    next_revenue,
-        "eps_growth_yoy":  eps_growth,
-        "quarterly":       quarterly,
-        "annual":          annual,
+        "data_available":       bool(quarterly or annual or next_date),
+        "next_earnings":        next_date,
+        "next_earnings_quarter": next_quarter,
+        "next_eps":             next_eps,
+        "next_revenue":         next_revenue,
+        "eps_growth_yoy":       eps_growth,
+        "quarterly":            quarterly,
+        "annual":               annual,
     }
     _cache.set(cache_key, result, 4 * 3600)
     return result

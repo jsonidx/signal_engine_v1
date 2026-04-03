@@ -565,6 +565,7 @@ export interface EarningsAnnual {
 export interface EarningsData {
   data_available: boolean
   next_earnings: string | null
+  next_earnings_quarter: string | null
   next_eps: { avg: number | null; high: number | null; low: number | null } | null
   next_revenue: { avg: number | null; high: number | null; low: number | null } | null
   eps_growth_yoy: number | null
