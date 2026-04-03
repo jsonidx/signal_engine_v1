@@ -573,6 +573,41 @@ export interface EarningsData {
   annual: EarningsAnnual[]      // oldest → newest
 }
 
+// ─── Daily Top-20 Rankings ────────────────────────────────────────────────────
+
+export interface Top20RankingRow {
+  run_date:       string
+  rank:           number
+  ticker:         string
+  priority_score: number | null
+  final_score:    number | null
+  weight:         number | null
+  raw_weight:     number | null
+  cap_hit:        boolean
+  sector:         string
+  hist_vol_60d:   number | null
+  adv_20d:        number | null
+  rank_change:    string
+  rank_yesterday: number | null
+}
+
+export interface RankingsLatestResponse {
+  data_available: boolean
+  count:          number
+  as_of:          string | null
+  generated_at:   string
+  data:           Top20RankingRow[]
+}
+
+export interface RankingsHistoryResponse {
+  data_available: boolean
+  count:          number
+  ticker:         string | null
+  days:           number
+  generated_at:   string
+  data:           Top20RankingRow[]
+}
+
 // ─── Universe ─────────────────────────────────────────────────────────────────
 
 export interface UniverseStats {
@@ -745,6 +780,13 @@ export const api = {
 
   tickerEarnings: (symbol: string): Promise<EarningsData | null> =>
     client.get(`/api/ticker/${symbol}/earnings`).then(r => r.data).catch(() => null),
+
+  // Daily Top-20 Rankings
+  rankingsLatest: (): Promise<RankingsLatestResponse> =>
+    client.get('/api/rankings/latest').then(r => r.data),
+
+  rankingsHistory: (ticker?: string, days = 30): Promise<RankingsHistoryResponse> =>
+    client.get('/api/rankings/history', { params: { ticker, days } }).then(r => r.data),
 
   // Universe
   universeStats: (): Promise<UniverseStats> =>

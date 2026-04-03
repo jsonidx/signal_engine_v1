@@ -176,6 +176,58 @@ else
   echo "Step 13 complete — theses saved to ai_quant_cache.db"
 fi
 
+# ── Step 13a: Archive candidates snapshot (no API cost) ───────────────────────
+# Saves full priority-scored candidate list to Supabase candidate_snapshots.
+# Accumulates historical data for future backtesting with real priority scores.
+echo "Step 13a: Archiving candidate snapshot to Supabase..."
+python3 -c "
+from utils.ticker_selector import select_top_tickers
+from utils.candidate_archive import archive_candidates
+from ai_quant import _get_open_positions
+import sys, traceback
+try:
+    open_pos = _get_open_positions()
+    candidates = select_top_tickers(
+        resolved_signals_path='data/resolved_signals.json',
+        equity_signals_path=None,
+        max_tickers=50,
+        min_agreement=0.0,
+        always_include=open_pos,
+    )
+    n = archive_candidates(candidates, open_positions=open_pos)
+    print(f'  Archived {n} candidates to candidate_snapshots')
+except Exception as e:
+    print(f'  Archive skipped: {e}', file=sys.stderr)
+    traceback.print_exc()
+"
+echo "Step 13a complete."
+
+# ── Step 13c: Daily Top-20 ranking ───────────────────────
+# Loads yesterday's top-20 from Supabase, generates today's ranking,
+# and upserts 20 rows into daily_rankings. No API cost.
+echo "Step 13c: Generating daily Top-20 ranking and saving to Supabase..."
+python3 -c "
+from utils.ticker_selector import select_top_tickers
+from utils.trade_selector_4w import run_daily_top20_pipeline
+from ai_quant import _get_open_positions
+import sys, traceback
+try:
+    open_pos = _get_open_positions()
+    candidates = select_top_tickers(
+        resolved_signals_path='data/resolved_signals.json',
+        equity_signals_path=None,
+        max_tickers=50,
+        min_agreement=0.0,
+        always_include=open_pos,
+    )
+    top20 = run_daily_top20_pipeline(candidates)
+    print(f'  Top-20 ranking complete ({len(top20)} names)')
+except Exception as e:
+    print(f'  Top-20 ranking skipped: {e}', file=sys.stderr)
+    traceback.print_exc()
+"
+echo "Step 13c complete."
+
 # ── Step 13b: Thesis outcome checker ─────────────────────
 # Checks if prior Claude predictions (targets / stops) were hit.
 # Updates thesis_outcomes in ai_quant_cache.db — no API cost.

@@ -27,6 +27,7 @@
 6. [Live Configuration](#6-live-configuration)
 7. [Output & Reporting](#7-output--reporting)
 8. [Known Issues](#8-known-issues)
+9. [Daily Top-20 Ranking Feature](#9-daily-top-20-ranking-feature)
 
 ---
 
@@ -692,6 +693,71 @@ There is no automated conflict resolution. Contradictory signals are passed raw 
 ### No Frontend Dashboard
 
 No React or web frontend exists in this codebase. All output is terminal, CSV, and flat text/markdown report files.
+
+---
+
+## 9. Daily Top-20 Ranking Feature
+
+> Added 2026-04-03. Covers backend, API, and dashboard end-to-end.
+
+### What it does
+
+Every morning, Step 13c in `run_master.sh` calls `run_daily_top20_pipeline()` which:
+
+1. Pulls the full 50+ candidate universe (same pool as Step 13a) from `select_top_tickers()`.
+2. Applies hard filters: ADV ≥ $12M, price ≥ $8, volatility cap (ATR or hist-vol), optional event-risk exclusion.
+3. Clusters survivors via greedy selection: max 2 names per GICS sector, pairwise 60-day correlation < 0.65.
+4. Ranks the top 20 survivors by `priority_score` and computes volatility-parity weights (1.5% portfolio vol target, 2% hard cap).
+5. Compares to the previous day's ranking to produce `rank_change` strings (`+3`, `-2`, `NEW`, `—`).
+6. Upserts 20 rows into the Supabase `daily_rankings` table (primary key: `run_date, rank`).
+
+### Files changed / added
+
+| File | Change |
+|------|--------|
+| `utils/trade_selector_4w.py` | Added `generate_daily_top20_ranking()`, `run_daily_top20_pipeline()`, `get_latest_top20()`, `get_top20_history()` |
+| `run_master.sh` | Added Step 13c (after Step 13a, before 13b) |
+| `dashboard/api/main.py` | Added `GET /api/rankings/latest` and `GET /api/rankings/history` |
+| `dashboard/frontend/src/lib/api.ts` | Added `Top20RankingRow`, `RankingsLatestResponse`, `RankingsHistoryResponse` interfaces + `rankingsLatest()`, `rankingsHistory()` methods |
+| `dashboard/frontend/src/components/Top20RankingTable.tsx` | New component — table, rank-change pills, weight tooltip, side panel with Recharts rank-history chart, CSV export |
+| `dashboard/frontend/src/pages/RankingsPage.tsx` | New page wrapper |
+| `dashboard/frontend/src/App.tsx` | Route `/rankings`, keyboard shortcut `k` |
+| `dashboard/frontend/src/components/layout/Shell.tsx` | Nav item "Daily Top-20" with `ListOrdered` icon |
+| `test_rankings_endpoints.sh` | Smoke-test script for the two new endpoints |
+
+### Supabase table
+
+```sql
+CREATE TABLE IF NOT EXISTS daily_rankings (
+  run_date       date     NOT NULL,
+  rank           smallint NOT NULL,
+  ticker         text     NOT NULL,
+  priority_score real, final_score real,
+  weight real, raw_weight real, cap_hit boolean,
+  sector text, hist_vol_60d real, adv_20d real,
+  rank_change text, rank_yesterday smallint,
+  PRIMARY KEY (run_date, rank)
+);
+```
+
+### API endpoints
+
+| Endpoint | Cache | Description |
+|----------|-------|-------------|
+| `GET /api/rankings/latest` | 5 min | Full 20-row snapshot for the most recent `run_date` |
+| `GET /api/rankings/history?ticker=NVDA&days=30` | 5 min | Rank history, optionally filtered to one ticker |
+
+Force-flush both after a backfill: `curl -X POST http://localhost:8000/api/cache/invalidate`
+
+### Dashboard usage
+
+Navigate to `/rankings` (sidebar shortcut `k`). Click any row to open a side panel with a 30/60/90-day rank-history line chart (rank 1 at top). Hover the **Weight** cell to see uncapped raw weight; amber **CAP** badge appears when the 2% hard limit was hit. Use the download icon to export the current snapshot as CSV.
+
+### Monitoring
+
+- `SELECT MAX(run_date), COUNT(*) FROM daily_rankings;` — should advance by one date each morning with exactly 20 rows.
+- If `rank_change` is `—` for all rows after day 2, the `WHERE run_date < %s` date comparison may have a timezone mismatch — cast with `::date` in the query.
+- All DB errors in the pipeline are non-fatal: the ranking is returned regardless and a `WARNING` is logged to `logs/`.
 
 ---
 

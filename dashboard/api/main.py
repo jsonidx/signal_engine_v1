@@ -1968,6 +1968,161 @@ async def screeners_equity():
         return _no_data(str(e))
 
 
+@app.get("/api/rankings/latest")
+async def rankings_latest():
+    """
+    Latest Top-20 daily ranking.
+
+    Returns all 20 rows for the most recent run_date in daily_rankings,
+    sorted by rank ascending.  Cached for 5 minutes (data updates once daily).
+    """
+    cache_key = "rankings_latest"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        conn = _db_connect()
+        cur  = conn.cursor()
+        cur.execute(
+            """
+            SELECT *
+            FROM   daily_rankings
+            WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
+            ORDER  BY rank ASC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            result = _no_data("daily_rankings table is empty")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        records = []
+        for r in rows:
+            records.append({
+                "run_date":       str(r["run_date"]),
+                "rank":           _safe_int(r["rank"]),
+                "ticker":         str(r["ticker"]),
+                "priority_score": _safe_float(r["priority_score"]),
+                "final_score":    _safe_float(r["final_score"]),
+                "weight":         _safe_float(r["weight"]),
+                "raw_weight":     _safe_float(r["raw_weight"]),
+                "cap_hit":        bool(r["cap_hit"]) if r["cap_hit"] is not None else False,
+                "sector":         str(r["sector"] or "Unknown"),
+                "hist_vol_60d":   _safe_float(r["hist_vol_60d"]),
+                "adv_20d":        _safe_float(r["adv_20d"]),
+                "rank_change":    str(r["rank_change"] or "—"),
+                "rank_yesterday": _safe_int(r["rank_yesterday"]),
+            })
+
+        result = {
+            "data_available": True,
+            "count":          len(records),
+            "as_of":          records[0]["run_date"] if records else None,
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("rankings_latest error")
+        return _no_data(str(e))
+
+
+@app.get("/api/rankings/history")
+async def rankings_history(
+    ticker: Optional[str] = Query(None, description="Filter to a single ticker (e.g. NVDA)"),
+    days:   int           = Query(30,   ge=1, le=365, description="Look-back window in calendar days"),
+):
+    """
+    Top-20 rank history for the last N calendar days.
+
+    - Omit ``ticker`` to get the full rolling table (all tickers × all dates).
+    - Pass ``?ticker=NVDA`` to get a single ticker's rank history — ideal for
+      the rank-over-time chart in the ticker detail panel.
+
+    Sorted by run_date DESC, then rank ASC.
+    """
+    cache_key = f"rankings_history:{ticker or 'all'}:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from datetime import date, timedelta
+        cutoff = date.today() - timedelta(days=days)
+
+        conn = _db_connect()
+        cur  = conn.cursor()
+
+        if ticker is None:
+            cur.execute(
+                """
+                SELECT *
+                FROM   daily_rankings
+                WHERE  run_date >= %s
+                ORDER  BY run_date DESC, rank ASC
+                """,
+                (cutoff,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT *
+                FROM   daily_rankings
+                WHERE  run_date >= %s
+                  AND  UPPER(ticker) = UPPER(%s)
+                ORDER  BY run_date DESC, rank ASC
+                """,
+                (cutoff, ticker.upper()),
+            )
+
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            result = _no_data(f"no ranking history found (ticker={ticker}, days={days})")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        records = []
+        for r in rows:
+            records.append({
+                "run_date":       str(r["run_date"]),
+                "rank":           _safe_int(r["rank"]),
+                "ticker":         str(r["ticker"]),
+                "priority_score": _safe_float(r["priority_score"]),
+                "final_score":    _safe_float(r["final_score"]),
+                "weight":         _safe_float(r["weight"]),
+                "raw_weight":     _safe_float(r["raw_weight"]),
+                "cap_hit":        bool(r["cap_hit"]) if r["cap_hit"] is not None else False,
+                "sector":         str(r["sector"] or "Unknown"),
+                "hist_vol_60d":   _safe_float(r["hist_vol_60d"]),
+                "adv_20d":        _safe_float(r["adv_20d"]),
+                "rank_change":    str(r["rank_change"] or "—"),
+                "rank_yesterday": _safe_int(r["rank_yesterday"]),
+            })
+
+        result = {
+            "data_available": True,
+            "count":          len(records),
+            "ticker":         ticker,
+            "days":           days,
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("rankings_history error")
+        return _no_data(str(e))
+
+
 @app.get("/api/screeners/crypto")
 async def screeners_crypto():
     """

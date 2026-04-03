@@ -13,6 +13,7 @@ import { BacktestPage } from './pages/BacktestPage'
 import { ResolutionPage } from './pages/ResolutionPage'
 import { CryptoPage } from './pages/CryptoPage'
 import { AccuracyPage } from './pages/AccuracyPage'
+import { RankingsPage } from './pages/RankingsPage'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
 // ─── Keyboard shortcut handler (inside router context) ────────────────────────
@@ -37,6 +38,7 @@ function KeyboardShortcuts() {
         case 'r': navigate('/resolution'); break
         case 'c': navigate('/crypto'); break
         case 'a': navigate('/accuracy'); break
+        case 'k': navigate('/rankings'); break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -154,6 +156,16 @@ export default function App() {
               <PrivateRoute>
                 <ErrorBoundary pageName="Claude Accuracy">
                   <AccuracyPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/rankings"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Daily Top-20">
+                  <RankingsPage />
                 </ErrorBoundary>
               </PrivateRoute>
             }
