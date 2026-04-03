@@ -1317,25 +1317,72 @@ export function TickerPage() {
             })()}
 
             {/* Price Ladder */}
-            {signal.current_price != null && (
-              <div className="bg-bg-surface border border-border-subtle rounded p-4">
-                <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
-                  Price Levels
+            {signal.current_price != null && (() => {
+              const aiMid = signal.entry_low != null && signal.entry_high != null
+                ? (signal.entry_low + signal.entry_high) / 2 : null
+              const thesisDate = signal.as_of ? new Date(signal.as_of) : null
+              const daysSince = thesisDate
+                ? Math.floor((Date.now() - thesisDate.getTime()) / 86400000) : null
+              const priceDrift = aiMid && signal.current_price
+                ? ((signal.current_price - aiMid) / aiMid * 100) : null
+              const isStale = (daysSince ?? 0) > 7 && Math.abs(priceDrift ?? 0) > 10
+
+              return (
+                <div className="bg-bg-surface border border-border-subtle rounded p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                      Price Levels
+                    </div>
+                    {daysSince != null && (
+                      <div className="font-mono text-[9px] text-text-tertiary">
+                        thesis {daysSince}d ago
+                      </div>
+                    )}
+                  </div>
+                  {isStale && (
+                    <div className="mb-3 flex items-start gap-2 bg-accent-amber/10 border border-accent-amber/30 rounded px-2.5 py-2">
+                      <span className="text-accent-amber text-xs mt-0.5">⚠</span>
+                      <div className="font-mono text-[10px] text-accent-amber leading-relaxed">
+                        AI levels are {daysSince}d old — price has moved{' '}
+                        <span className="font-semibold">{priceDrift! >= 0 ? '+' : ''}{priceDrift!.toFixed(1)}%</span>{' '}
+                        from AI entry mid (${aiMid!.toFixed(2)}). Re-run analysis for fresh levels.
+                      </div>
+                    </div>
+                  )}
+                  {/* Legend */}
+                  {actionZones && signal.entry_low != null && (
+                    <div className="flex items-center gap-4 mb-2">
+                      <span className="flex items-center gap-1 font-mono text-[9px] text-[#3b82f6]">
+                        <span className="inline-block w-3 h-2 rounded-sm bg-[#3b82f620] border border-[#3b82f640]" />
+                        AI entry
+                      </span>
+                      <span className="flex items-center gap-1 font-mono text-[9px] text-[#f59e0b]">
+                        <span className="inline-block w-3 h-2 rounded-sm bg-[#f59e0b18] border border-[#f59e0b50]" />
+                        Live zone
+                      </span>
+                    </div>
+                  )}
+                  <PriceLadder
+                    currentPrice={signal.current_price}
+                    target1={signal.target_1}
+                    target2={signal.target_2}
+                    entryLow={signal.entry_low}
+                    entryHigh={signal.entry_high}
+                    stopLoss={signal.stop_loss}
+                    poc={signal.poc}
+                    vwap={signal.vwap}
+                    maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
+                    height={280}
+                    azBuyLow={actionZones?.buy_zone_low}
+                    azBuyHigh={actionZones?.buy_zone_high}
+                    azStop={actionZones?.stop_loss}
+                    azTarget1={actionZones?.target_1}
+                    azTarget2={actionZones?.target_2}
+                    fxRate={actionZones?.fx_rate}
+                  />
                 </div>
-                <PriceLadder
-                  currentPrice={signal.current_price}
-                  target1={signal.target_1}
-                  target2={signal.target_2}
-                  entryLow={signal.entry_low}
-                  entryHigh={signal.entry_high}
-                  stopLoss={signal.stop_loss}
-                  poc={signal.poc}
-                  vwap={signal.vwap}
-                  maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
-                  height={280}
-                />
-              </div>
-            )}
+              )
+            })()}
 
             {/* Expected Moves */}
             {signal.current_price != null && (() => {
@@ -1368,6 +1415,46 @@ export function TickerPage() {
 
           {/* ── RIGHT COLUMN ── */}
           <div className="space-y-4 min-w-0">
+            {/* Conflict flags — shown when AI thesis and live price action disagree */}
+            {(() => {
+              const flags: { text: string; severity: 'red' | 'amber' }[] = []
+              const { direction, stop_loss, entry_low, entry_high, current_price } = signal
+
+              // Hard: price has blown through AI stop loss
+              if (direction === 'BULL' && stop_loss != null && current_price != null && current_price < stop_loss)
+                flags.push({ text: `Price $${current_price.toFixed(2)} is below AI stop $${stop_loss.toFixed(2)} — thesis invalidated by price action`, severity: 'red' })
+              if (direction === 'BEAR' && stop_loss != null && current_price != null && current_price > stop_loss)
+                flags.push({ text: `Price $${current_price.toFixed(2)} is above AI stop $${stop_loss.toFixed(2)} — bear thesis invalidated`, severity: 'red' })
+
+              // Soft: live buy zone and AI entry zone diverge significantly
+              const aiMid = entry_low != null && entry_high != null ? (entry_low + entry_high) / 2 : null
+              const azMid = actionZones?.entry_mid
+              if (aiMid != null && azMid != null) {
+                const driftPct = (azMid - aiMid) / aiMid * 100
+                if (Math.abs(driftPct) > 15) {
+                  const dir = driftPct > 0 ? 'above' : 'below'
+                  flags.push({ text: `Live buy zone ($${azMid.toFixed(2)}) is ${Math.abs(driftPct).toFixed(0)}% ${dir} AI entry ($${aiMid.toFixed(2)}) — re-run analysis for current levels`, severity: 'amber' })
+                }
+              }
+
+              if (flags.length === 0) return null
+              return (
+                <div className="space-y-2">
+                  {flags.map((f, i) => (
+                    <div key={i} className={clsx(
+                      'flex items-start gap-2 rounded px-2.5 py-2 border font-mono text-[10px] leading-relaxed',
+                      f.severity === 'red'
+                        ? 'bg-accent-red/10 border-accent-red/30 text-accent-red'
+                        : 'bg-accent-amber/10 border-accent-amber/30 text-accent-amber'
+                    )}>
+                      <span className="mt-0.5 flex-shrink-0">{f.severity === 'red' ? '✕' : '⚠'}</span>
+                      {f.text}
+                    </div>
+                  ))}
+                </div>
+              )
+            })()}
+
             {/* Action Zones */}
             {actionZones && <ActionZonesCard zones={actionZones} />}
 

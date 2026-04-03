@@ -163,8 +163,16 @@ def compute_action_zones(ticker: str) -> dict:
         # Volume-weighted price (VWAP proxy) as support
         vwap_20d = float((close.iloc[-20:] * volume.iloc[-20:]).sum() / volume.iloc[-20:].sum())
 
-        # Key support = highest of recent lows (strongest floor)
-        key_support = max(lows_20d, vwap_20d * 0.98)
+        # Key support = highest floor that is still BELOW the current price.
+        # VWAP is only useful as support when price is trading above it; if the
+        # stock has been falling and VWAP > current, using VWAP as support would
+        # push key_support above the current price, corrupting stop-loss and R:R.
+        support_candidates = [lows_20d, lows_40d]
+        vwap_support = vwap_20d * 0.98
+        if vwap_support < current:
+            support_candidates.append(vwap_support)
+        valid_supports = [s for s in support_candidates if s < current]
+        key_support = max(valid_supports) if valid_supports else current * 0.92
 
         # ── Resistance Levels ──
         highs_20d = float(high.iloc[-20:].max())
@@ -198,8 +206,9 @@ def compute_action_zones(ticker: str) -> dict:
             target_2 = round(target_1 * 1.15, 2)
 
         # ── Stop Loss ──
-        # Below key support by 1 ATR (room for noise)
-        stop_loss = round(key_support - atr, 2)
+        # Below key support by 1 ATR (room for noise).
+        # Always cap below buy_zone_low so stop is never inside or above the entry zone.
+        stop_loss = round(min(key_support - atr, buy_zone_low - 0.5 * atr), 2)
 
         # Risk/Reward ratio — from buy zone midpoint (intended entry), not current price.
         # Using current price inflates risk when price is above the zone and understates
