@@ -9,6 +9,10 @@ import { MonoNumber } from '../components/ui/MonoNumber'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
 import { PriceLadder } from '../components/charts/PriceLadder'
+import { RiskRewardBar } from '../components/RiskRewardBar'
+import { HistoricalAnalogs } from '../components/HistoricalAnalogs'
+import { PriceChart } from '../components/charts/PriceChart'
+import { EarningsReactionModel } from '../components/EarningsReactionModel'
 import { useQuery } from '@tanstack/react-query'
 import { useSignalsTicker } from '../hooks/useHeatmap'
 import { useDarkPoolTicker } from '../hooks/useDarkPool'
@@ -94,7 +98,10 @@ function TickerSearch({ current, tickers }: { current: string; tickers: string[]
 // ─── Trade Setup Strip ────────────────────────────────────────────────────────
 
 function TradeSetupStrip({ signal }: { signal: TickerDetail }) {
-  const { entry_low, entry_high, target_1, target_2, stop_loss, current_price } = signal
+  const {
+    entry_low, entry_high, target_1, target_2, stop_loss, current_price,
+    bull_probability, bear_probability, neutral_probability,
+  } = signal
 
   const entry =
     entry_low != null && entry_high != null
@@ -109,13 +116,9 @@ function TradeSetupStrip({ signal }: { signal: TickerDetail }) {
   const fmtPct = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`
   const fmtPrice = (v: number) => `$${v.toFixed(2)}`
 
-  const t1Pct = target_1 != null ? pct(target_1) : null
-  const t2Pct = target_2 != null ? pct(target_2) : null
+  const t1Pct   = target_1  != null ? pct(target_1)  : null
+  const t2Pct   = target_2  != null ? pct(target_2)  : null
   const stopPct = stop_loss != null ? pct(stop_loss) : null
-  const rr =
-    t1Pct != null && stopPct != null && Math.abs(stopPct) > 0
-      ? Math.abs(t1Pct / stopPct)
-      : null
 
   return (
     <div className="mt-3 pt-3 border-t border-border-subtle">
@@ -174,13 +177,18 @@ function TradeSetupStrip({ signal }: { signal: TickerDetail }) {
           )}
         </div>
       </div>
-      {rr != null && (
-        <div className="font-mono text-[9px] text-text-tertiary mt-2">
-          R:R {rr.toFixed(1)}:1
-          {rr >= 2 && <span className="text-accent-green ml-1">✓ favorable</span>}
-          {rr < 1 && <span className="text-accent-amber ml-1">⚠ poor setup</span>}
-        </div>
-      )}
+
+      {/* Visual Risk-Reward bar with EV calculation */}
+      <RiskRewardBar
+        entry={entry}
+        target1={target_1}
+        target2={target_2}
+        stopLoss={stop_loss}
+        currentPrice={current_price}
+        bullPct={bull_probability}
+        bearPct={bear_probability}
+        neutralPct={neutral_probability}
+      />
     </div>
   )
 }
@@ -215,29 +223,114 @@ function ProbBar({
   )
 }
 
-// ─── Module mini-heatmap ───────────────────────────────────────────────────────
+// ─── Module descriptions (shown in hover tooltips) ────────────────────────────
+
+const MODULE_DESCRIPTIONS: Record<string, string> = {
+  signal_engine: 'Core momentum + mean-reversion model. Combines 12-1 momentum, 5d reversal, and volatility-quality factor scores.',
+  squeeze:       'Short-squeeze pressure index. Uses float short %, days-to-cover, cost-to-borrow, and recent volume surge.',
+  options:       'Options flow heat score. IV rank, put/call ratio, unusual volume spikes, and expected move vs historical.',
+  dark_pool:     'Dark pool accumulation/distribution signal. Off-exchange print volume trend and short-ratio direction.',
+  fundamentals:  'Fundamental quality score. Revenue growth, EPS surprise history, valuation vs sector, and balance sheet strength.',
+  social:        'Social sentiment composite. Google Trends interest level, StockTwits bull/bear ratio, and message volume trend.',
+  polymarket:    'Prediction market signal. Polymarket probability vs current price implied move (where available).',
+  cross_asset:   'Cross-asset divergence. Correlation of equity signal vs sector ETF, bond yield, and VIX regime.',
+}
+
+const WEIGHT_STORAGE_KEY = 'signal_engine:module_weights_v1'
+
+const DEFAULT_WEIGHTS: Record<string, number> = {
+  signal_engine: 1.0,
+  squeeze:       1.0,
+  options:       1.0,
+  dark_pool:     1.0,
+  fundamentals:  1.0,
+  social:        0.5,
+  polymarket:    0.5,
+  cross_asset:   0.75,
+}
+
+function loadWeights(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(WEIGHT_STORAGE_KEY)
+    return raw ? { ...DEFAULT_WEIGHTS, ...JSON.parse(raw) } : { ...DEFAULT_WEIGHTS }
+  } catch {
+    return { ...DEFAULT_WEIGHTS }
+  }
+}
+
+function saveWeights(w: Record<string, number>) {
+  try {
+    localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(w))
+  } catch {
+    // localStorage unavailable — silently skip
+  }
+}
+
+// ─── Module mini-heatmap with tooltips + weight editor ────────────────────────
 
 function ModuleMiniHeatmap({ modules }: { modules: Record<string, number> }) {
+  const [weights, setWeights] = useState<Record<string, number>>(loadWeights)
+  const [editing, setEditing] = useState(false)
+
+  const handleWeightChange = (key: string, val: number) => {
+    const next = { ...weights, [key]: val }
+    setWeights(next)
+    saveWeights(next)
+  }
+
+  // Weighted agreement score — how many modules agree after applying weights
+  const weightedScores = MODULE_KEYS.map(({ key }) => {
+    const score = modules[key] ?? 0
+    return score * (weights[key] ?? 1.0)
+  })
+  const bullish  = weightedScores.filter(s => s > 0.1).length
+  const bearish  = weightedScores.filter(s => s < -0.1).length
+  const totalW   = MODULE_KEYS.length
+
   return (
     <div className="bg-bg-surface border border-border-subtle rounded p-3">
-      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
-        Module Scores
+      <div className="flex items-center justify-between mb-3">
+        <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+          Module Scores
+          <span className="ml-2 text-accent-green">{bullish}↑</span>
+          <span className="ml-1 text-accent-red">{bearish}↓</span>
+          <span className="ml-1 text-text-tertiary/60">/ {totalW}</span>
+        </div>
+        {/* Weight editor toggle */}
+        <button
+          onClick={() => setEditing(v => !v)}
+          title="Adjust module weights"
+          className={clsx(
+            'font-mono text-[9px] px-1.5 py-0.5 rounded border transition-colors',
+            editing
+              ? 'bg-accent-blue/20 text-accent-blue border-accent-blue/40'
+              : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+          )}
+        >
+          {editing ? '× weights' : '⚙ weights'}
+        </button>
       </div>
-      <div className="flex gap-1.5">
+
+      {/* Score tiles */}
+      <div className="flex gap-1.5 flex-wrap">
         {MODULE_KEYS.map(({ key, label }) => {
           const score = modules[key] ?? null
-          const color = score !== null ? getModuleColor(score) : '#27272a'
+          const weighted = score !== null ? score * (weights[key] ?? 1.0) : null
+          const color = weighted !== null ? getModuleColor(weighted) : '#27272a'
+          const desc = MODULE_DESCRIPTIONS[key] ?? key
           return (
-            <div key={key} className="flex flex-col items-center gap-1">
+            <div
+              key={key}
+              className="flex flex-col items-center gap-1"
+              title={`${label}: ${desc}`}
+            >
               <div
                 style={{
-                  width: 40,
-                  height: 40,
-                  background: color,
-                  borderRadius: 4,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
+                  width: 40, height: 40,
+                  background: color, borderRadius: 4,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'help',
+                  opacity: (weights[key] ?? 1.0) < 0.5 ? 0.5 : 1,
                 }}
               >
                 <span className="font-mono text-[9px] text-white/90 font-bold">
@@ -249,6 +342,38 @@ function ModuleMiniHeatmap({ modules }: { modules: Record<string, number> }) {
           )
         })}
       </div>
+
+      {/* Weight sliders — shown when editing */}
+      {editing && (
+        <div className="mt-3 pt-3 border-t border-border-subtle space-y-2">
+          <div className="font-mono text-[9px] text-text-tertiary mb-1">
+            Drag to adjust weight (stored locally). Affects weighted agreement count only — does not re-run AI.
+          </div>
+          {MODULE_KEYS.map(({ key, label }) => (
+            <div key={key} className="flex items-center gap-2">
+              <span className="font-mono text-[9px] text-text-tertiary w-12 flex-shrink-0">{label}</span>
+              <input
+                type="range"
+                min={0}
+                max={2}
+                step={0.25}
+                value={weights[key] ?? 1.0}
+                onChange={e => handleWeightChange(key, parseFloat(e.target.value))}
+                className="flex-1 accent-accent-blue"
+              />
+              <span className="font-mono text-[9px] text-text-secondary w-8 text-right">
+                {(weights[key] ?? 1.0).toFixed(2)}×
+              </span>
+            </div>
+          ))}
+          <button
+            onClick={() => { setWeights({ ...DEFAULT_WEIGHTS }); saveWeights({ ...DEFAULT_WEIGHTS }) }}
+            className="font-mono text-[9px] text-text-tertiary hover:text-text-secondary mt-1"
+          >
+            reset to defaults
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -987,6 +1112,144 @@ function deriveAction(signal: TickerDetail): { text: string; color: string } | n
   return null
 }
 
+// ─── Position Sizer ───────────────────────────────────────────────────────────
+// Calculates shares, notional, and dollar risk for a given portfolio risk %.
+// Preferred risk % is persisted to localStorage.
+
+const RISK_PCT_KEY = 'signal_engine:position_risk_pct_v1'
+
+function loadRiskPct(): number {
+  try {
+    const v = localStorage.getItem(RISK_PCT_KEY)
+    const n = v != null ? parseFloat(v) : NaN
+    return isNaN(n) ? 1.0 : Math.min(5, Math.max(0.1, n))
+  } catch {
+    return 1.0
+  }
+}
+
+interface PositionSizerProps {
+  entry:       number        // midpoint of entry zone
+  stopLoss:    number | null | undefined
+  portfolioNav?: number      // optional total portfolio size (EUR)
+}
+
+function PositionSizer({ entry, stopLoss, portfolioNav }: PositionSizerProps) {
+  const [riskPct, setRiskPct] = useState<number>(loadRiskPct)
+
+  if (stopLoss == null || Math.abs(entry - stopLoss) < 0.001) return null
+
+  const stopDist    = Math.abs(entry - stopLoss)
+  const stopDistPct = (stopDist / entry) * 100
+
+  // With a given portfolio risk %:
+  //   dollar_risk = nav * (risk_pct / 100)
+  //   shares      = dollar_risk / stop_distance_per_share
+  //   notional    = shares * entry
+  const dollarRisk = portfolioNav != null
+    ? portfolioNav * (riskPct / 100)
+    : null   // can't compute without NAV
+
+  const shares   = dollarRisk != null ? Math.floor(dollarRisk / stopDist) : null
+  const notional = shares != null ? shares * entry : null
+  const pctOfNav = notional != null && portfolioNav != null
+    ? (notional / portfolioNav) * 100 : null
+
+  const handleChange = (v: number) => {
+    const clamped = Math.min(5, Math.max(0.1, v))
+    setRiskPct(clamped)
+    try { localStorage.setItem(RISK_PCT_KEY, String(clamped)) } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t border-border-subtle space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
+          Position Sizer
+        </span>
+        <span className="font-mono text-[9px] text-text-tertiary">
+          stop dist {stopDistPct.toFixed(1)}%
+        </span>
+      </div>
+
+      {/* Risk % input */}
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-[9px] text-text-tertiary w-20 flex-shrink-0">
+          Portfolio risk
+        </span>
+        <input
+          type="number"
+          min={0.1}
+          max={5}
+          step={0.1}
+          value={riskPct}
+          onChange={e => handleChange(parseFloat(e.target.value) || 1)}
+          className="w-16 px-2 py-0.5 bg-bg-elevated border border-border-subtle rounded font-mono text-xs text-text-primary focus:outline-none focus:border-border-active text-center"
+        />
+        <span className="font-mono text-xs text-text-secondary">%</span>
+        {/* Quick preset buttons */}
+        {[0.5, 1, 2].map(p => (
+          <button
+            key={p}
+            onClick={() => handleChange(p)}
+            className={clsx(
+              'font-mono text-[9px] px-1.5 py-0.5 rounded border transition-colors',
+              riskPct === p
+                ? 'bg-accent-blue/20 text-accent-blue border-accent-blue/40'
+                : 'text-text-tertiary border-border-subtle hover:text-text-secondary'
+            )}
+          >
+            {p}%
+          </button>
+        ))}
+      </div>
+
+      {/* Output grid */}
+      {portfolioNav != null ? (
+        <div className="grid grid-cols-4 gap-2">
+          {[
+            {
+              label: 'Dollar Risk',
+              value: dollarRisk != null ? `$${dollarRisk.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—',
+              color: 'text-accent-red',
+            },
+            {
+              label: 'Shares',
+              value: shares != null ? shares.toLocaleString() : '—',
+              color: 'text-text-primary',
+            },
+            {
+              label: 'Notional',
+              value: notional != null ? `$${notional.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '—',
+              color: 'text-text-secondary',
+            },
+            {
+              label: '% of NAV',
+              value: pctOfNav != null ? `${pctOfNav.toFixed(1)}%` : '—',
+              color: pctOfNav != null && pctOfNav > 15
+                ? 'text-accent-amber'  // warn if > 15% concentration
+                : 'text-text-secondary',
+            },
+          ].map(({ label, value, color }) => (
+            <div key={label} className="space-y-0.5">
+              <div className="font-mono text-[9px] text-text-tertiary uppercase">{label}</div>
+              <div className={clsx('font-mono text-xs font-semibold', color)}>{value}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        // No NAV — show formula only
+        <div className="font-mono text-[9px] text-text-tertiary space-y-0.5">
+          <div>Risk per share: <span className="text-text-secondary">${stopDist.toFixed(2)}</span></div>
+          <div className="text-text-tertiary/60">
+            Connect portfolio NAV to calculate shares and notional.
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── SEC Filings card ─────────────────────────────────────────────────────────
 
 const FORM_COLOR: Record<string, string> = {
@@ -1464,6 +1727,22 @@ export function TickerPage() {
                 </div>
               </div>
               <TradeSetupStrip signal={signal} />
+
+              {/* Position Sizer — inline in header card, below the R:R bar */}
+              {(() => {
+                const entry =
+                  signal.entry_low != null && signal.entry_high != null
+                    ? (signal.entry_low + signal.entry_high) / 2
+                    : signal.entry_low ?? signal.entry_high ?? signal.current_price
+                return entry != null ? (
+                  <PositionSizer
+                    entry={entry}
+                    stopLoss={signal.stop_loss}
+                    // TODO: wire portfolioNav from /api/portfolio/summary when needed
+                    portfolioNav={undefined}
+                  />
+                ) : null
+              })()}
             </div>
 
             {/* AI Thesis card — action-first layout */}
@@ -1627,6 +1906,29 @@ export function TickerPage() {
                 </div>
               )
             })()}
+
+            {/* Interactive candlestick chart with all key level overlays */}
+            {signal.current_price != null && (
+              <PriceChart
+                symbol={symbol}
+                aiEntryLow={signal.entry_low}
+                aiEntryHigh={signal.entry_high}
+                aiTarget1={signal.target_1}
+                aiTarget2={signal.target_2}
+                aiStop={signal.stop_loss}
+                vwap={signal.vwap}
+                maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
+                azBuyLow={actionZones?.buy_zone_low}
+                azBuyHigh={actionZones?.buy_zone_high}
+                azTarget1={actionZones?.target_1}
+                azTarget2={actionZones?.target_2}
+                azStop={actionZones?.stop_loss}
+                currentPrice={signal.current_price}
+              />
+            )}
+
+            {/* Historical Analogs — similar past setups with win rate / expectancy stats */}
+            <HistoricalAnalogs symbol={symbol} />
 
             {/* LLM Prompt copy */}
             <CopyPromptButton
@@ -1825,6 +2127,13 @@ export function TickerPage() {
             {earningsData && (earningsData.quarterly?.length || earningsData.annual?.length || earningsData.next_earnings) && (
               <EarningsCard data={earningsData} />
             )}
+
+            {/* Earnings Reaction Model — historical move distribution + implied vs actual */}
+            <EarningsReactionModel
+              symbol={symbol}
+              earningsData={earningsData}
+              impliedMove={signal.expected_move_pct}
+            />
 
             {/* Congress Trades */}
             <CongressTradesCard trades={congressTrades} />

@@ -608,6 +608,98 @@ export interface RankingsHistoryResponse {
   data:           Top20RankingRow[]
 }
 
+// ─── OHLCV (candlestick chart) ────────────────────────────────────────────────
+
+export type OHLCVPeriod = '1M' | '3M' | '6M' | '1Y'
+
+export interface OHLCVBar {
+  date:   string
+  open:   number
+  high:   number
+  low:    number
+  close:  number
+  volume: number
+}
+
+export interface OHLCVResponse {
+  data_available: boolean
+  ticker: string
+  period: OHLCVPeriod
+  data:   OHLCVBar[]
+}
+
+// ─── Earnings Reactions ───────────────────────────────────────────────────────
+
+export interface EarningsReaction {
+  date:             string
+  eps_actual:       number | null
+  eps_estimate:     number | null
+  eps_surprise_pct: number | null
+  beat:             boolean | null
+  pre_close:        number
+  post_close:       number
+  reaction_pct:     number
+  drift_5d_pct:     number | null
+}
+
+export interface EarningsReactionSummary {
+  total:                    number
+  beat_count:               number
+  miss_count:               number
+  beat_rate_pct:            number | null
+  median_abs_move_pct:      number | null
+  avg_abs_move_pct:         number | null
+  std_move_pct:             number | null
+  plus_1sd_pct:             number | null
+  minus_1sd_pct:            number | null
+  median_beat_reaction_pct: number | null
+  median_miss_reaction_pct: number | null
+}
+
+export interface EarningsReactionsResponse {
+  data_available: boolean
+  ticker:  string
+  summary: EarningsReactionSummary
+  data:    EarningsReaction[]
+}
+
+// ─── Historical Analogs ───────────────────────────────────────────────────────
+
+export interface HistoricalAnalog {
+  ticker: string
+  date: string
+  direction: string
+  conviction: number | null
+  signal_agreement: number | null
+  hit_t1: boolean
+  hit_t2: boolean
+  hit_stop: boolean
+  return_30d: number | null
+  days_to_t1: number | null
+  days_to_stop: number | null
+  outcome: string
+  t1_r: number | null
+  t2_r: number | null
+}
+
+export interface AnalogSummary {
+  total: number
+  direction: string
+  win_rate_t1_pct: number | null
+  win_rate_t2_pct: number | null
+  stop_rate_pct: number | null
+  avg_hold_days: number | null
+  avg_t1_r: number | null
+  expectancy_r: number | null
+}
+
+export interface HistoricalAnalogsResponse {
+  data_available: boolean
+  ticker: string
+  summary: AnalogSummary
+  data: HistoricalAnalog[]
+}
+
 // ─── Universe ─────────────────────────────────────────────────────────────────
 
 export interface UniverseStats {
@@ -780,6 +872,19 @@ export const api = {
 
   tickerEarnings: (symbol: string): Promise<EarningsData | null> =>
     client.get(`/api/ticker/${symbol}/earnings`).then(r => r.data).catch(() => null),
+
+  tickerAnalogs: (symbol: string): Promise<HistoricalAnalogsResponse | null> =>
+    client.get(`/api/ticker/${symbol}/analogs`).then(r => r.data).catch(() => null),
+
+  tickerOHLCV: (symbol: string, period: OHLCVPeriod = '3M'): Promise<OHLCVResponse | null> =>
+    client.get(`/api/ticker/${symbol}/ohlcv`, { params: { period } })
+      .then(r => r.data?.data_available ? r.data : null)
+      .catch(() => null),
+
+  tickerEarningsReactions: (symbol: string): Promise<EarningsReactionsResponse | null> =>
+    client.get(`/api/ticker/${symbol}/earnings-reactions`)
+      .then(r => r.data?.data_available ? r.data : null)
+      .catch(() => null),
 
   // Daily Top-20 Rankings
   rankingsLatest: (): Promise<RankingsLatestResponse> =>

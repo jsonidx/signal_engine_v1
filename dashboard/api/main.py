@@ -3300,6 +3300,367 @@ async def ticker_earnings(symbol: str):
     return result
 
 
+@app.get("/api/ticker/{symbol}/analogs")
+async def ticker_analogs(symbol: str, limit: int = Query(12, ge=1, le=50)):
+    """
+    Historical analog setups from thesis_outcomes for the same direction as this
+    ticker's current thesis.  Returns per-row stats (hit T1/T2/stop, 30d return,
+    hold days) plus a summary with win rates, stop rate, and expectancy in R.
+
+    Data source: thesis_outcomes table (populated by thesis_checker.py).
+    If the table is empty the endpoint returns data_available=False gracefully.
+    """
+    sym = symbol.upper()
+    cache_key = f"analogs:{sym}:{limit}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    conn = _db_connect()
+    if conn is None:
+        result = _no_data("ai_quant_cache.db not found")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    # Graceful no-op when thesis_outcomes hasn't been created yet
+    try:
+        conn.execute("SELECT id FROM thesis_outcomes LIMIT 1")
+    except Exception:
+        result = _no_data("thesis_outcomes table not yet populated — run thesis_checker.py")
+        _cache.set(cache_key, result, TTL_SHORT)
+        conn.close()
+        return result
+
+    try:
+        # Determine this ticker's current direction from thesis_cache
+        current = conn.execute("""
+            SELECT direction, conviction, signal_agreement_score
+            FROM thesis_cache WHERE ticker = ?
+            ORDER BY date DESC, created_at DESC LIMIT 1
+        """, (sym,)).fetchone()
+        direction = current["direction"] if current else "BULL"
+
+        # Fetch resolved analogs universe-wide for the same direction
+        rows = conn.execute("""
+            SELECT ticker, thesis_date, direction, conviction,
+                   signal_agreement_score,
+                   entry_price, target_1, target_2, stop_loss,
+                   hit_target_1, hit_target_2, hit_stop,
+                   return_30d, days_to_target_1, days_to_stop,
+                   outcome, claude_correct
+            FROM thesis_outcomes
+            WHERE outcome NOT IN ('OPEN', 'EXPIRED')
+              AND direction = ?
+            ORDER BY thesis_date DESC
+            LIMIT ?
+        """, (direction, limit)).fetchall()
+        conn.close()
+
+        analogs = []
+        for r in rows:
+            d = dict(r)
+            entry = d.get("entry_price")
+            t1    = d.get("target_1")
+            t2    = d.get("target_2")
+            sl    = d.get("stop_loss")
+
+            # R-multiple for T1 and T2 relative to the risk (entry→stop)
+            t1_r = t2_r = None
+            if entry and sl and abs(entry - sl) > 0:
+                risk = abs(entry - sl)
+                if t1: t1_r = round((t1 - entry) / risk, 2)
+                if t2: t2_r = round((t2 - entry) / risk, 2)
+
+            analogs.append({
+                "ticker":           d["ticker"],
+                "date":             d["thesis_date"],
+                "direction":        d["direction"],
+                "conviction":       d["conviction"],
+                "signal_agreement": d["signal_agreement_score"],
+                "hit_t1":           bool(d["hit_target_1"]),
+                "hit_t2":           bool(d["hit_target_2"]),
+                "hit_stop":         bool(d["hit_stop"]),
+                "return_30d":       d["return_30d"],
+                "days_to_t1":       d["days_to_target_1"],
+                "days_to_stop":     d["days_to_stop"],
+                "outcome":          d["outcome"],
+                "t1_r":             t1_r,
+                "t2_r":             t2_r,
+            })
+
+        n = len(analogs)
+
+        # Aggregate summary
+        win_t1  = sum(1 for a in analogs if a["hit_t1"])
+        win_t2  = sum(1 for a in analogs if a["hit_t2"])
+        stopped = sum(1 for a in analogs if a["hit_stop"])
+
+        hold_days = [a["days_to_t1"] for a in analogs if a["hit_t1"] and a["days_to_t1"] is not None]
+        avg_hold = round(sum(hold_days) / len(hold_days), 1) if hold_days else None
+
+        # Average T1 R-multiple across winning trades
+        t1_rs = [a["t1_r"] for a in analogs if a["hit_t1"] and a["t1_r"] is not None]
+        avg_t1_r = round(sum(t1_rs) / len(t1_rs), 2) if t1_rs else None
+
+        # Expectancy = win_rate × avg_win_R + (1 - win_rate) × (-1R)
+        win_rate_t1  = round(win_t1  / n * 100, 1) if n > 0 else None
+        win_rate_t2  = round(win_t2  / n * 100, 1) if n > 0 else None
+        stop_rate    = round(stopped / n * 100, 1) if n > 0 else None
+        expectancy_r = None
+        if win_rate_t1 is not None and avg_t1_r is not None:
+            w = win_rate_t1 / 100
+            expectancy_r = round(w * avg_t1_r + (1 - w) * (-1.0), 2)
+
+        summary = {
+            "total":           n,
+            "direction":       direction,
+            "win_rate_t1_pct": win_rate_t1,
+            "win_rate_t2_pct": win_rate_t2,
+            "stop_rate_pct":   stop_rate,
+            "avg_hold_days":   avg_hold,
+            "avg_t1_r":        avg_t1_r,
+            "expectancy_r":    expectancy_r,
+        }
+
+        result = {
+            "data_available": bool(analogs),
+            "ticker":  sym,
+            "summary": summary,
+            "data":    analogs,
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("ticker_analogs error for %s", sym)
+        return _no_data(str(e))
+
+
+@app.get("/api/ticker/{symbol}/ohlcv")
+async def ticker_ohlcv(
+    symbol: str,
+    period: str = Query("3M", pattern="^(1M|3M|6M|1Y)$"),
+):
+    """
+    Daily OHLCV price history for the interactive candlestick chart.
+    Powered by yfinance. Cached 15 min (intraday freshness).
+
+    period: 1M | 3M | 6M | 1Y
+    Returns list of { date, open, high, low, close, volume }.
+    """
+    sym = symbol.upper()
+    cache_key = f"ohlcv:{sym}:{period}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    period_map = {"1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y"}
+    yf_period = period_map.get(period, "3mo")
+
+    try:
+        tk = yf.Ticker(sym)
+        hist = tk.history(period=yf_period, interval="1d", auto_adjust=True)
+        if hist is None or hist.empty:
+            result = _no_data(f"No OHLCV data available for {sym}")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        bars = []
+        for dt, row in hist.iterrows():
+            bars.append({
+                "date":   dt.strftime("%Y-%m-%d"),
+                "open":   round(float(row["Open"]),  2),
+                "high":   round(float(row["High"]),  2),
+                "low":    round(float(row["Low"]),   2),
+                "close":  round(float(row["Close"]), 2),
+                "volume": int(row["Volume"]),
+            })
+
+        result = {
+            "data_available": True,
+            "ticker": sym,
+            "period": period,
+            "data":   bars,
+        }
+        _cache.set(cache_key, result, 15 * 60)
+        return result
+
+    except Exception as e:
+        log.exception("ticker_ohlcv error for %s", sym)
+        return _no_data(str(e))
+
+
+@app.get("/api/ticker/{symbol}/earnings-reactions")
+async def ticker_earnings_reactions(symbol: str):
+    """
+    Historical post-earnings price reactions for the last 8 quarters.
+
+    For each reported quarter:
+      - Looks up the announcement timestamp from yfinance earnings_dates
+      - Computes day-before-close → day-of/after-close price change
+      - Returns raw reactions + summary statistics
+
+    Summary includes: median move, +1SD, beat/miss split,
+    avg beat reaction vs avg miss reaction.
+    Cached 4 h (earnings dates don't change intraday).
+    """
+    sym = symbol.upper()
+    cache_key = f"earnings_reactions:{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    _empty = {"data_available": False, "ticker": sym, "summary": {}, "data": []}
+
+    try:
+        tk = yf.Ticker(sym)
+
+        # ── Earnings announcement dates ──────────────────────────────────────
+        ed = tk.earnings_dates
+        if ed is None or ed.empty:
+            _cache.set(cache_key, _empty, 3600)
+            return _empty
+
+        # Keep only reported quarters (not forward estimates), most recent 8
+        try:
+            reported = ed[ed["Reported EPS"].notna()].head(8)
+        except (KeyError, TypeError):
+            _cache.set(cache_key, _empty, 3600)
+            return _empty
+
+        if reported.empty:
+            _cache.set(cache_key, _empty, 3600)
+            return _empty
+
+        # ── 2-year price history for reaction lookups ────────────────────────
+        hist = tk.history(period="2y", interval="1d", auto_adjust=True)
+        if hist is None or hist.empty:
+            _cache.set(cache_key, _empty, 3600)
+            return _empty
+
+        # Normalize history index to naive UTC dates
+        try:
+            hist.index = hist.index.normalize()
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_localize(None)
+        except Exception:
+            pass
+
+        reactions = []
+        for ann_ts, row in reported.iterrows():
+            try:
+                # Normalize announcement timestamp → naive date
+                ann_dt = ann_ts
+                if hasattr(ann_dt, "normalize"):
+                    ann_dt = ann_dt.normalize()
+                if hasattr(ann_dt, "tz_localize") and ann_dt.tzinfo is not None:
+                    ann_dt = ann_dt.tz_localize(None)
+
+                ann_str = ann_dt.strftime("%Y-%m-%d")
+
+                # Prices before announcement (use previous close as baseline)
+                prices_before = hist[hist.index < ann_dt]["Close"]
+                # Prices from announcement day forward
+                prices_from   = hist[hist.index >= ann_dt]["Close"]
+
+                if len(prices_before) == 0 or len(prices_from) == 0:
+                    continue
+
+                pre_close  = float(prices_before.iloc[-1])
+                post_close = float(prices_from.iloc[0])
+
+                if pre_close == 0:
+                    continue
+
+                reaction_pct = (post_close - pre_close) / pre_close * 100
+
+                # 5-day drift after the announcement day
+                drift_5d_pct = None
+                if len(prices_from) >= 5:
+                    close_5d = float(prices_from.iloc[4])
+                    drift_5d_pct = round((close_5d - post_close) / post_close * 100, 2)
+
+                eps_actual   = _safe_float(row.get("Reported EPS"))
+                eps_estimate = _safe_float(row.get("EPS Estimate"))
+                surprise_pct = _safe_float(row.get("Surprise(%)"))
+                beat = (
+                    bool(eps_actual > eps_estimate)
+                    if eps_actual is not None and eps_estimate is not None
+                    else None
+                )
+
+                reactions.append({
+                    "date":             ann_str,
+                    "eps_actual":       eps_actual,
+                    "eps_estimate":     eps_estimate,
+                    "eps_surprise_pct": surprise_pct,
+                    "beat":             beat,
+                    "pre_close":        round(pre_close,  2),
+                    "post_close":       round(post_close, 2),
+                    "reaction_pct":     round(reaction_pct, 2),
+                    "drift_5d_pct":     drift_5d_pct,
+                })
+            except Exception:
+                continue
+
+        if not reactions:
+            _cache.set(cache_key, _empty, 3600)
+            return _empty
+
+        # ── Summary statistics ───────────────────────────────────────────────
+        def _median(lst: list):
+            if not lst:
+                return None
+            s = sorted(lst)
+            m = len(s) // 2
+            return round(s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2, 2)
+
+        def _std(lst: list):
+            if len(lst) < 2:
+                return None
+            mean = sum(lst) / len(lst)
+            return round((sum((x - mean) ** 2 for x in lst) / (len(lst) - 1)) ** 0.5, 2)
+
+        all_moves  = [r["reaction_pct"]     for r in reactions]
+        abs_moves  = [abs(r["reaction_pct"]) for r in reactions]
+        beats      = [r for r in reactions if r["beat"] is True]
+        misses     = [r for r in reactions if r["beat"] is False]
+        beat_moves = [r["reaction_pct"]  for r in beats]
+        miss_moves = [r["reaction_pct"]  for r in misses]
+
+        n = len(reactions)
+        std_val = _std(all_moves)
+        med_abs = _median(abs_moves)
+        avg_abs = round(sum(abs_moves) / len(abs_moves), 2) if abs_moves else None
+
+        summary = {
+            "total":                    n,
+            "beat_count":               len(beats),
+            "miss_count":               len(misses),
+            "beat_rate_pct":            round(len(beats) / n * 100, 1) if n else None,
+            "median_abs_move_pct":      med_abs,
+            "avg_abs_move_pct":         avg_abs,
+            "std_move_pct":             std_val,
+            "plus_1sd_pct":             round((med_abs or 0) + (std_val or 0), 2),
+            "minus_1sd_pct":            round((med_abs or 0) - (std_val or 0), 2),
+            "median_beat_reaction_pct": _median(beat_moves),
+            "median_miss_reaction_pct": _median(miss_moves),
+        }
+
+        result = {
+            "data_available": True,
+            "ticker":  sym,
+            "summary": summary,
+            "data":    list(reversed(reactions)),  # oldest → newest for chart
+        }
+        _cache.set(cache_key, result, 4 * 3600)
+        return result
+
+    except Exception as e:
+        log.exception("ticker_earnings_reactions error for %s", sym)
+        return {**_empty, "error": str(e)}
+
+
 # ==============================================================================
 # AUTH ENDPOINTS
 # ==============================================================================
