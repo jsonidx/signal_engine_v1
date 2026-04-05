@@ -3120,7 +3120,7 @@ def print_full_report(results: List[dict]) -> None:
     """Print complete AI quant analysis."""
     print()
     print("================================================================")
-    print("  AI QUANT ANALYSIS — POWERED BY CLAUDE OPUS 4.6")
+    print(f"  AI QUANT ANALYSIS — POWERED BY {AI_MODEL_DEFAULT.upper()} / {AI_MODEL_PREMIUM.upper()}")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("================================================================")
 
@@ -3339,7 +3339,7 @@ def main():
     if args.cache_show:
         print()
         print("================================================================")
-        print("  AI QUANT ANALYST — POWERED BY CLAUDE OPUS 4.6")
+        print(f"  AI QUANT ANALYST — POWERED BY {AI_MODEL_DEFAULT.upper()} / {AI_MODEL_PREMIUM.upper()}")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         print("================================================================")
         print_cache_table()
