@@ -55,15 +55,21 @@ log = logging.getLogger(__name__)
 TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def tg_send(text: str, chat_id: str = CHAT_ID) -> None:
-    """Send a message to the configured chat."""
-    try:
-        requests.post(
-            f"{TG_BASE}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as exc:
-        log.warning("tg_send failed: %s", exc)
+    """Send a message to the configured chat. Retries once on failure."""
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                f"{TG_BASE}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return
+            log.warning("tg_send HTTP %d: %s", r.status_code, r.text[:200])
+        except Exception as exc:
+            log.warning("tg_send attempt %d failed: %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(3)
 
 
 def tg_get_updates(offset: int) -> list:
@@ -99,11 +105,12 @@ def gh_trigger(skip_ai: bool = True) -> bool:
     try:
         r = requests.post(url, json=payload, headers=GH_HEADERS, timeout=15)
         if r.status_code == 204:
+            log.info("gh_trigger OK — workflow dispatched (skip_ai=%s)", skip_ai)
             return True
-        log.warning("gh_trigger HTTP %d: %s", r.status_code, r.text)
+        log.error("gh_trigger HTTP %d: %s", r.status_code, r.text)
         return False
     except Exception as exc:
-        log.warning("gh_trigger failed: %s", exc)
+        log.error("gh_trigger failed: %s", exc)
         return False
 
 
