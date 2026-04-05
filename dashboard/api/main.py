@@ -3925,3 +3925,98 @@ async def usage_summary(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================================================================
+# FAVORITES ENDPOINTS
+# ==============================================================================
+
+def _ensure_favorites_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_favorites (
+                id        SERIAL PRIMARY KEY,
+                symbol    TEXT NOT NULL UNIQUE,
+                added_at  TIMESTAMPTZ DEFAULT NOW(),
+                notes     TEXT DEFAULT ''
+            )
+        """)
+    conn.commit()
+
+
+@app.get("/api/favorites")
+async def get_favorites():
+    """Return all user-pinned favorite tickers."""
+    try:
+        conn = _db_connect()
+        if conn is None:
+            return {"favorites": []}
+        _ensure_favorites_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, added_at, notes FROM user_favorites ORDER BY added_at")
+            rows = cur.fetchall()
+        conn.close()
+        return {"favorites": [
+            {"symbol": r["symbol"], "added_at": str(r["added_at"]), "notes": r.get("notes", "")}
+            for r in rows
+        ]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/favorites/{symbol}")
+async def add_favorite(symbol: str, user: AuthUser = Depends(get_current_user)):
+    """Add a ticker to favorites."""
+    symbol = symbol.upper().strip()
+    if not symbol or len(symbol) > 10:
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    try:
+        conn = _db_connect()
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        _ensure_favorites_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_favorites (symbol) VALUES (%s) ON CONFLICT (symbol) DO NOTHING",
+                (symbol,),
+            )
+        conn.commit()
+        conn.close()
+        # Sync to watchlist.txt in the background
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from favorites import sync_to_watchlist
+            sync_to_watchlist()
+        except Exception:
+            pass
+        return {"ok": True, "symbol": symbol}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/favorites/{symbol}")
+async def remove_favorite(symbol: str, user: AuthUser = Depends(get_current_user)):
+    """Remove a ticker from favorites."""
+    symbol = symbol.upper().strip()
+    try:
+        conn = _db_connect()
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        _ensure_favorites_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_favorites WHERE symbol = %s", (symbol,))
+        conn.commit()
+        conn.close()
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from favorites import sync_to_watchlist
+            sync_to_watchlist()
+        except Exception:
+            pass
+        return {"ok": True, "symbol": symbol}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

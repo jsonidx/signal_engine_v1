@@ -86,25 +86,43 @@ except ImportError:
 # UNIVERSES
 # ==============================================================================
 
-SQUEEZE_UNIVERSE = [
-    # Classic meme / retail favorites with historically high short interest
-    "GME", "AMC", "BB", "CLOV", "SOFI", "PLTR", "RIVN", "LCID",
-    "NIO", "MARA", "RIOT", "COIN", "HOOD", "DKNG", "UPST", "AFRM",
-    # AI/semiconductor with ongoing short interest
-    "SMCI", "ARM", "MRVL", "SOUN", "BBAI", "AI", "IONQ", "RGTI", "QUBT",
-    # Space / defense / EV with high retail interest
-    "JOBY", "LILM", "LUNR", "RKLB", "ASTS", "ACHR",
-    # Biotech (binary events + high short interest typical)
-    "NVAX", "SAVA", "ATOS", "OCGN",
-    # Others with chronic squeeze potential
-    "SPCE", "NKLA", "WKHS", "GOEV", "PAYO",
-]
+# No hardcoded universes — loaded dynamically at runtime.
+# Backward-compat aliases kept as empty lists.
+SQUEEZE_UNIVERSE: list = []
+MEME_UNIVERSE:    list = []
 
-MEME_UNIVERSE = [
-    "GME", "AMC", "BB", "SOFI", "PLTR", "RIVN", "LCID", "NIO",
-    "MARA", "RIOT", "COIN", "HOOD", "DKNG", "IONQ", "RGTI", "QUBT",
-    "SMCI", "SOUN", "BBAI", "RKLB", "ASTS", "LUNR", "AFRM", "UPST",
-]
+
+def _load_squeeze_universe() -> list:
+    """
+    Return the dynamic squeeze screening universe.
+    Priority: watchlist.txt → user_favorites fallback.
+    """
+    tickers: list = []
+
+    # watchlist.txt
+    wl_paths = [
+        os.path.join(os.path.dirname(__file__), "watchlist.txt"),
+        "./watchlist.txt",
+    ]
+    for wl_path in wl_paths:
+        if os.path.exists(wl_path):
+            with open(wl_path) as f:
+                for line in f:
+                    tok = line.split("#")[0].strip().upper()
+                    if tok and "." not in tok and not tok.startswith("TIER") and not tok.startswith("MANUALLY"):
+                        tickers.append(tok)
+            break
+
+    if not tickers:
+        try:
+            from favorites import load_favorites
+            tickers = load_favorites()
+        except Exception:
+            pass
+
+    # Exclude crypto
+    tickers = [t for t in tickers if not t.endswith("-USD")]
+    return list(dict.fromkeys(tickers))
 
 
 # ==============================================================================
@@ -770,7 +788,7 @@ def run_screener(
         List[SqueezeScore] sorted by chosen key descending.
     """
     if tickers is None:
-        tickers = SQUEEZE_UNIVERSE
+        tickers = _load_squeeze_universe()
 
     tickers = [t.upper().strip() for t in tickers if t.strip()]
 
@@ -998,10 +1016,8 @@ Examples:
     # Resolve ticker list
     if args.ticker:
         tickers = args.ticker
-    elif args.universe == "meme":
-        tickers = MEME_UNIVERSE
     else:
-        tickers = None  # uses SQUEEZE_UNIVERSE default
+        tickers = _load_squeeze_universe()  # dynamic universe (all modes)
 
     results = run_screener(
         tickers=tickers,

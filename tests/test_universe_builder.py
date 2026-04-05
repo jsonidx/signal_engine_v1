@@ -647,12 +647,13 @@ class TestBuildMasterUniverse:
 
     def test_fallback_when_all_indices_fail(self):
         """
-        If every index falls back to hardcoded, build_master_universe still
-        returns a non-empty list.
+        If every index falls back to the dynamic fallback, build_master_universe
+        still returns a non-empty list.
         """
+        dummy_tickers = ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA"]
         with (
             patch("universe_builder.fetch_index_constituents",
-                  return_value=list(ub._HARDCODED_FALLBACK)),
+                  return_value=dummy_tickers),
             patch("universe_builder._apply_liquidity_filter",
                   side_effect=lambda t, **kw: t),
             patch("universe_builder.LIQUID_ADRS", []),

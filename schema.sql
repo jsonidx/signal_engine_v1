@@ -182,6 +182,13 @@ CREATE TABLE IF NOT EXISTS user_watchlists (
     UNIQUE (ticker, category)
 );
 
+CREATE TABLE IF NOT EXISTS user_favorites (
+    id        SERIAL PRIMARY KEY,
+    symbol    TEXT NOT NULL UNIQUE,
+    added_at  TIMESTAMPTZ DEFAULT NOW(),
+    notes     TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS strategy_config (
     key         TEXT PRIMARY KEY,
     value       TEXT,

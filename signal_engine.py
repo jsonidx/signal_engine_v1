@@ -1113,7 +1113,7 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
         print("  [INFO] regime_filter not available — using config.py defaults")
 
     # ── Combine universes ─────────────────────────────────────────────────────
-    # Read dynamic watchlist.txt if present, fall back to hardcoded EQUITY_WATCHLIST
+    # Primary: watchlist.txt (auto-updated by universe_builder.py)
     watchlist_path = Path(__file__).parent / "watchlist.txt"
     dynamic_tickers: list = []
     if watchlist_path.exists():
@@ -1122,13 +1122,18 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not line or line.startswith("#"):
                 continue
             ticker = line.split()[0].upper()
-            # Skip tickers with dots (non-US exchanges — yfinance format incompatible)
             if "." not in ticker:
                 dynamic_tickers.append(ticker)
 
-    base = dynamic_tickers if dynamic_tickers else EQUITY_WATCHLIST
+    # Favorites: Supabase user_favorites (force-include)
+    favorites: list = []
+    try:
+        from favorites import load_favorites
+        favorites = load_favorites()
+    except Exception as _e:
+        print(f"  [WARN] Could not load favorites: {_e}")
 
-    # Always include open positions from trade_journal.db
+    # Open positions: Supabase trades table (force-include)
     open_positions: list = []
     try:
         from utils.db import get_connection as _get_conn
@@ -1140,11 +1145,18 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     except Exception as _e:
         print(f"  [WARN] Could not read open positions from Supabase: {_e}")
 
-    universe = list(set(base + CUSTOM_WATCHLIST + open_positions))
+    if not dynamic_tickers:
+        print("  [WARN] watchlist.txt empty — using favorites + open positions only")
+
+    universe = list(dict.fromkeys(dynamic_tickers + favorites + open_positions + CUSTOM_WATCHLIST))
+    sources = []
+    if dynamic_tickers:
+        sources.append(f"watchlist.txt ({len(dynamic_tickers)})")
+    if favorites:
+        sources.append(f"favorites ({len(favorites)})")
     if open_positions:
-        print(f"  Universe: {len(universe)} tickers (from {'watchlist.txt' if dynamic_tickers else 'config.py'} + open positions: {open_positions})")
-    else:
-        print(f"  Universe: {len(universe)} tickers (from {'watchlist.txt' if dynamic_tickers else 'config.py'})")
+        sources.append(f"open positions: {open_positions}")
+    print(f"  Universe: {len(universe)} tickers from {', '.join(sources) or 'no source'}")
 
     # Fetch data
     prices = fetch_price_data(universe, label="equity universe")
@@ -1186,8 +1198,26 @@ def run_crypto_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     print("  MODULE 2: CRYPTO TREND / MOMENTUM")
     print("█" * 60)
 
+    # Load crypto tickers dynamically from Supabase user_watchlists (category='crypto')
+    crypto_tickers: list = list(CRYPTO_TICKERS)  # may be [] if config stripped
+    if not crypto_tickers:
+        try:
+            from utils.db import get_connection as _gc
+            _c = _gc()
+            with _c.cursor() as _cur:
+                _cur.execute("SELECT ticker FROM user_watchlists WHERE category='crypto' ORDER BY added_at")
+                crypto_tickers = [r["ticker"] for r in _cur.fetchall()]
+            _c.close()
+        except Exception as _e:
+            print(f"  [WARN] Could not load crypto tickers from Supabase: {_e}")
+
+    if not crypto_tickers:
+        print("  [WARN] No crypto tickers configured — skipping crypto module.")
+        print("  Seed via: INSERT INTO user_watchlists (ticker, category) VALUES ('BTC-USD','crypto');")
+        return pd.DataFrame(), pd.DataFrame()
+
     # Fetch data
-    prices = fetch_price_data(CRYPTO_TICKERS, label="crypto universe")
+    prices = fetch_price_data(crypto_tickers, label="crypto universe")
     if prices.empty:
         return pd.DataFrame(), pd.DataFrame()
 

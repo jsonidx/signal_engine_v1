@@ -21,43 +21,26 @@ CASH_BUFFER = 0.10              # 10% cash reserve (dry powder)
 # ============================================================
 # EQUITY UNIVERSE
 # ============================================================
-# Core universe — S&P 500 and STOXX 600 proxies via sector ETFs
-# We pull constituents' top holdings. For a proper screener you'd
-# use a full constituent list — see note below.
+# No hardcoded tickers.  Universe is 100% dynamic:
+#   Primary  : watchlist.txt (auto-updated by universe_builder.py)
+#   Favorites: Supabase user_favorites table (via favorites.py)
+#   Positions: Supabase trades table (status='open')
 #
-# In practice: provide your own ticker list or use the SP500/STOXX
-# scraper function included in the engine.
+# To seed your favorites run:
+#   python3 -c "from favorites import add_favorite; add_favorite('AAPL')"
+# Or use the Favorites panel in the dashboard.
 
-# Fallback: curated large-cap universe if scraping fails
-EQUITY_WATCHLIST = [
-    # US Mega/Large Cap
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
-    "JPM", "JNJ", "V", "UNH", "XOM", "PG", "MA", "HD", "CVX", "MRK",
-    "ABBV", "PEP", "KO", "COST", "LLY", "AVGO", "WMT", "MCD", "CSCO",
-    "TMO", "ACN", "ABT", "CRM", "DHR", "NEE", "LIN", "TXN", "PM",
-    "UPS", "MS", "RTX", "HON", "INTC", "QCOM", "AMGN", "CAT", "BA",
-    "GE", "DE", "IBM", "GS", "BLK",
-    # EU Large Cap (traded as ADRs or directly)
-    "ASML", "NVO", "SAP", "AZN", "SHEL", "TTE", "NESN.SW", "ROG.SW",
-    "NOVN.SW", "SIE.DE", "AIR.PA", "MC.PA", "OR.PA", "SAN.PA", "BNP.PA",
-    "ALV.DE", "DTE.DE", "BAS.DE", "BMW.DE", "VOW3.DE",
-]
-
-# Your custom watchlist — add any tickers you're tracking
-CUSTOM_WATCHLIST = [
-    # Add your own tickers here, e.g.:
-    # "PLTR", "SOFI", "RIVN",
-]
+# Kept for CLI --watchlist arg compatibility; populated at runtime only.
+EQUITY_WATCHLIST: list = []
+CUSTOM_WATCHLIST: list = []
 
 # ============================================================
 # CRYPTO UNIVERSE
 # ============================================================
-CRYPTO_TICKERS = [
-    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
-    "ADA-USD", "AVAX-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
-    "ATOM-USD", "UNI-USD", "LTC-USD", "NEAR-USD", "APT-USD",
-    "ARB-USD", "OP-USD", "FIL-USD", "INJ-USD",
-]
+# Loaded dynamically from user_watchlists (category='crypto') in Supabase.
+# If that table is empty the crypto module is skipped with a warning.
+# Seed via: INSERT INTO user_watchlists (ticker, category) VALUES ('BTC-USD','crypto');
+CRYPTO_TICKERS: list = []
 
 # ============================================================
 # EQUITY FACTOR PARAMETERS
@@ -235,9 +218,7 @@ AI_PREMIUM_THRESHOLD = 0.85                       # signal_agreement_score ≥ t
 AI_QUANT_MAX_TICKERS = 5            # Hard cap on Grok API calls per run
 AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
 AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
-AI_QUANT_ALWAYS_INCLUDE = [         # Always process regardless of rank (open positions)
-    "GME", "COIN", "SAP",
-]
+AI_QUANT_ALWAYS_INCLUDE: list = []  # Populated at runtime from trade_journal open positions
 
 # Paths
 import pathlib

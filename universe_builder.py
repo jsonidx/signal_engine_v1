@@ -186,26 +186,41 @@ _INDEX_URLS: dict = {
 }
 
 # ==============================================================================
-# Hardcoded fallback (used when network + cache both fail)
+# Dynamic fallback helpers (replaces old _HARDCODED_FALLBACK list)
 # ==============================================================================
 
-_HARDCODED_FALLBACK: list = [
-    # Meme / retail
-    "GME", "AMC", "BB", "CLOV", "SOFI", "PLTR", "RIVN", "LCID", "NIO",
-    "MARA", "RIOT", "COIN", "HOOD", "DKNG", "SKLZ",
-    # Biotech
-    "MRNA", "BNTX", "NVAX", "SAVA", "ATOS",
-    # Tech growth
-    "SNOW", "NET", "CRWD", "DDOG", "ZS", "BILL", "HUBS", "CFLT",
-    "PATH", "U", "RBLX", "AFRM", "UPST", "IONQ", "RGTI", "QUBT",
-    # AI / Semi
-    "SMCI", "ARM", "MRVL", "ON", "SOUN", "BBAI", "AI",
-    # Space / EV
-    "JOBY", "LILM", "LUNR", "RKLB", "ASTS",
-    # Large-cap
-    "NVDA", "TSLA", "AMD", "META", "NFLX", "GOOGL", "AMZN", "AAPL",
-    "MSFT", "CRM", "SHOP", "SQ", "ROKU", "SNAP", "PINS", "ABNB",
-]
+def _dynamic_fallback() -> list:
+    """
+    Called when network + cache both fail for an index.
+
+    Priority:
+      1. watchlist.txt (all non-comment, non-dot tickers)
+      2. Supabase user_favorites (via favorites.py)
+
+    Returns [] if both sources are unavailable — callers must handle that.
+    """
+    tickers: list[str] = []
+
+    # 1. watchlist.txt
+    if _WATCHLIST_PATH.exists():
+        try:
+            for line in _WATCHLIST_PATH.read_text().splitlines():
+                tok = line.split("#")[0].strip().upper()
+                if tok and "." not in tok:
+                    tickers.append(tok)
+        except Exception as exc:
+            logger.warning("_dynamic_fallback: could not read watchlist.txt: %s", exc)
+
+    # 2. Supabase favorites (deduplicate)
+    if not tickers:
+        try:
+            from favorites import load_favorites
+            favs = load_favorites()
+            tickers = favs
+        except Exception as exc:
+            logger.warning("_dynamic_fallback: could not load favorites: %s", exc)
+
+    return list(dict.fromkeys(tickers))  # preserves order, deduplicates
 
 # ==============================================================================
 # Paths
@@ -965,10 +980,16 @@ def fetch_index_constituents(index: str) -> list:
         print(f"  [WARN] Network failed for {index} — using stale cache ({len(stale)} tickers)")
         return stale
 
-    # 4. Hardcoded fallback
-    logger.warning("[WARN] No usable cache for %s — falling back to hardcoded universe", index)
-    print(f"  [WARN] No cache for {index} — falling back to hardcoded universe")
-    return list(_HARDCODED_FALLBACK)
+    # 4. Dynamic fallback (watchlist.txt + favorites)
+    fallback = _dynamic_fallback()
+    if fallback:
+        logger.warning("[WARN] No cache for %s — falling back to watchlist.txt/favorites (%d tickers)", index, len(fallback))
+        print(f"  [WARN] No cache for {index} — falling back to watchlist.txt/favorites ({len(fallback)} tickers)")
+        return fallback
+
+    logger.error("[ERROR] No usable data for %s and no fallback available — returning empty list", index)
+    print(f"  [ERROR] No cache for {index} and no fallback — returning empty list")
+    return []
 
 
 # ==============================================================================

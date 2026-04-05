@@ -64,24 +64,12 @@ except ImportError:
 
 
 # ==============================================================================
-# SECTION 1: UNIVERSE
+# SECTION 1: UNIVERSE — 100% dynamic
 # ==============================================================================
 
-# Core options-active universe — high vol, retail favorites, large-cap movers
-OPTIONS_UNIVERSE = [
-    # Crypto / meme / high-vol
-    "COIN", "MARA", "RIOT", "HOOD", "MSTR",
-    # Retail / meme
-    "GME", "AMC", "PLTR", "SOFI", "RIVN", "LCID", "NIO",
-    # AI / tech growth
-    "AI", "NVDA", "AMD", "SMCI", "TSLA", "MSFT", "META",
-    # Large-cap with active options
-    "AMZN", "GOOGL", "AAPL", "NFLX", "UBER",
-    # Macro-sensitive
-    "SPY", "QQQ", "ARKK", "IWM",
-    # Biotech / binary events
-    "MRNA", "BNTX",
-]
+# No hardcoded OPTIONS_UNIVERSE. Universe is loaded dynamically from
+# watchlist.txt + Supabase user_favorites at runtime.
+OPTIONS_UNIVERSE: List[str] = []  # backward-compat alias; callers should use _get_options_universe()
 
 
 def _read_watchlist_tickers() -> List[str]:
@@ -96,10 +84,25 @@ def _read_watchlist_tickers() -> List[str]:
             with open(path) as f:
                 for line in f:
                     clean = line.split("#")[0].strip().upper()
-                    if clean and not clean.startswith("TIER") and not clean.startswith("MANUALLY"):
+                    if clean and not clean.startswith("TIER") and not clean.startswith("MANUALLY") and "." not in clean:
                         tickers.append(clean)
             return tickers
     return []
+
+
+def _get_options_universe() -> List[str]:
+    """
+    Return the dynamic options screening universe.
+    Priority: watchlist.txt → user_favorites fallback.
+    """
+    tickers = _read_watchlist_tickers()
+    if not tickers:
+        try:
+            from favorites import load_favorites
+            tickers = load_favorites()
+        except Exception:
+            pass
+    return list(dict.fromkeys(t for t in tickers if t))
 
 
 # ==============================================================================
@@ -801,9 +804,11 @@ def main():
         print_results(results, top=args.top)
 
     else:
-        # Default: OPTIONS_UNIVERSE
-        print(f"  Screening {len(OPTIONS_UNIVERSE)} tickers...")
-        results = screen_universe(OPTIONS_UNIVERSE, min_heat=args.min_heat, verbose=args.verbose)
+        # Default: dynamic universe (watchlist.txt + favorites)
+        universe = _get_options_universe()
+        universe = [t for t in universe if not t.endswith("-USD")]
+        print(f"  Screening {len(universe)} tickers (dynamic universe)...")
+        results = screen_universe(universe, min_heat=args.min_heat, verbose=args.verbose)
         print_results(results, top=args.top or 15)
 
 

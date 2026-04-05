@@ -517,7 +517,7 @@ def test_get_open_positions_fallback(monkeypatch):
     monkeypatch.setattr(trade_journal, "get_open_positions", _raise)
     result = ai_quant._get_open_positions()
     assert isinstance(result, list)
-    assert len(result) > 0, "Fallback must return non-empty list"
+    # DB unavailable → empty list (no hardcoded fallback anymore; system is fully dynamic)
 
 
 def test_get_open_positions_dynamic(monkeypatch):
@@ -547,7 +547,7 @@ def test_get_open_positions_dynamic(monkeypatch):
 def test_get_open_positions_empty_db_falls_back(monkeypatch):
     """
     When trade_journal returns an empty list, _get_open_positions()
-    must fall back to config rather than returning empty always_include.
+    returns [] — the system is fully dynamic with no hardcoded fallback.
     """
     import ai_quant
     import trade_journal
@@ -555,7 +555,7 @@ def test_get_open_positions_empty_db_falls_back(monkeypatch):
     monkeypatch.setattr(trade_journal, "get_open_positions", lambda: [])
     result = ai_quant._get_open_positions()
     assert isinstance(result, list)
-    assert len(result) > 0, "Empty DB result must trigger fallback"
+    assert result == [], "Empty DB should return empty list (no hardcoded fallback)"
 
 
 def test_always_include_uses_dynamic_not_static(monkeypatch):

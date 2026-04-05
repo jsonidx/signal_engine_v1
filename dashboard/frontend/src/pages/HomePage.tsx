@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle } from 'lucide-react'
+import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus } from 'lucide-react'
 import { clsx } from 'clsx'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Shell } from '../components/layout/Shell'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
@@ -255,6 +256,95 @@ function TelegramButton() {
   )
 }
 
+// ─── Favorites panel ─────────────────────────────────────────────────────────
+
+function FavoritesPanel() {
+  const qc = useQueryClient()
+  const [input, setInput] = useState('')
+  const [addErr, setAddErr] = useState<string | null>(null)
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['favorites'],
+    queryFn: () => api.favoritesGet(),
+  })
+
+  const addMut = useMutation({
+    mutationFn: (sym: string) => api.favoriteAdd(sym),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['favorites'] })
+      setInput('')
+      setAddErr(null)
+    },
+    onError: (e: any) => setAddErr(e?.response?.data?.detail ?? 'Failed to add'),
+  })
+
+  const removeMut = useMutation({
+    mutationFn: (sym: string) => api.favoriteRemove(sym),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['favorites'] }),
+  })
+
+  const handleAdd = () => {
+    const sym = input.trim().toUpperCase()
+    if (!sym) return
+    addMut.mutate(sym)
+  }
+
+  const favs = data?.favorites ?? []
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-4">
+      <div className="flex items-center gap-1.5 mb-3">
+        <Star size={11} className="text-accent-amber" />
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Favorites</span>
+      </div>
+
+      {/* Add bar */}
+      <div className="flex gap-1.5 mb-3">
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value.toUpperCase())}
+          onKeyDown={e => e.key === 'Enter' && handleAdd()}
+          placeholder="TICKER"
+          maxLength={10}
+          className="flex-1 min-w-0 bg-bg-base border border-border-subtle rounded px-2 py-1 font-mono text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-border-active"
+        />
+        <button
+          onClick={handleAdd}
+          disabled={addMut.isPending || !input.trim()}
+          className="flex items-center gap-1 px-2 py-1 rounded border border-accent-blue/40 bg-accent-blue/10 text-accent-blue font-mono text-xs hover:bg-accent-blue/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          <Plus size={11} />
+          Add
+        </button>
+      </div>
+      {addErr && <p className="font-mono text-[10px] text-accent-red mb-2">{addErr}</p>}
+
+      {/* List */}
+      {isLoading ? (
+        <LoadingSkeleton rows={2} />
+      ) : favs.length === 0 ? (
+        <p className="font-mono text-[10px] text-text-tertiary">No favorites yet — add a ticker above.</p>
+      ) : (
+        <div className="space-y-1">
+          {favs.map(f => (
+            <div key={f.symbol} className="flex items-center justify-between py-0.5">
+              <span className="font-mono text-xs font-semibold text-accent-blue">{f.symbol}</span>
+              <button
+                onClick={() => removeMut.mutate(f.symbol)}
+                disabled={removeMut.isPending}
+                className="text-text-tertiary hover:text-accent-red transition-colors disabled:opacity-40"
+                title="Remove"
+              >
+                <X size={11} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Quick nav cards ──────────────────────────────────────────────────────────
 
 const QUICK_LINKS = [
@@ -341,9 +431,10 @@ export function HomePage() {
             )}
           </div>
 
-          {/* Right column: portfolio + telegram */}
+          {/* Right column: portfolio + favorites + telegram */}
           <div className="space-y-3">
             <PortfolioMini />
+            <FavoritesPanel />
             <TelegramButton />
           </div>
         </div>

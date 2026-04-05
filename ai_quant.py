@@ -1526,13 +1526,11 @@ def _generate_resolved_signals_file(
 
 def _get_open_positions() -> list:
     """
-    Reads open positions dynamically from trade_journal.db at runtime.
-    Falls back to config.AI_QUANT_ALWAYS_INCLUDE if the DB is unavailable
-    or returns an empty list.
+    Reads open positions dynamically from Supabase trades table at runtime.
+    Returns [] if the DB is unavailable — no hardcoded fallback.
 
-    This means newly opened positions are automatically included in the
-    top-10 AI synthesis without any manual config.py edits.
-    Closed positions are automatically excluded the next run after closing.
+    Newly opened positions are automatically always-included in AI synthesis
+    without any manual edits. Closed positions are automatically excluded.
     """
     try:
         from trade_journal import get_open_positions
@@ -1540,15 +1538,11 @@ def _get_open_positions() -> list:
         tickers = list(dict.fromkeys(
             p["ticker"] for p in positions if p.get("ticker")
         ))
-        if tickers:
-            logger.info(f"_get_open_positions: live from DB → {tickers}")
-            return tickers
-        # DB returned empty — fall back rather than passing empty always_include
-        raise ValueError("No open positions returned from trade_journal.db")
+        logger.info(f"_get_open_positions: live from DB → {tickers}")
+        return tickers
     except Exception as e:
-        logger.warning(f"_get_open_positions fallback to config: {e}")
-        from config import AI_QUANT_ALWAYS_INCLUDE
-        return list(AI_QUANT_ALWAYS_INCLUDE)
+        logger.warning(f"_get_open_positions: DB unavailable ({e}) — always_include will be empty")
+        return []
 
 
 def _run_top_n_mode(args, use_cache: bool) -> None:

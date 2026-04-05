@@ -93,45 +93,69 @@ except ImportError:
 
 
 # ==============================================================================
-# UNIVERSES
+# UNIVERSES — 100% dynamic
 # ==============================================================================
 
-# ---------------------------------------------------------------------------
-# DEPRECATED: hardcoded fallback lists — kept for --use-dynamic-universe=false
-# or when universe_builder.py / its cache is unavailable.
-# Prefer: python3 universe_builder.py --build-cache (run as Step 0)
-# ---------------------------------------------------------------------------
+def _load_dynamic_universe() -> list:
+    """
+    Load the screening universe from dynamic sources only (no hardcoded tickers).
 
-_FALLBACK_SMALL_CAP_UNIVERSE = [
-    # Meme / retail favorites
-    "GME", "AMC", "BB", "CLOV", "SOFI", "PLTR", "RIVN",
-    "LCID", "NIO", "MARA", "RIOT", "COIN", "HOOD", "DKNG", "SKLZ",
-    # Biotech (binary event plays)
-    "MRNA", "BNTX", "NVAX", "SAVA", "ATOS",
-    # Tech growth
-    "SNOW", "NET", "CRWD", "DDOG", "ZS", "BILL", "HUBS", "CFLT",
-    "PATH", "U", "RBLX", "AFRM", "UPST", "IONQ", "RGTI", "QUBT",
-    # AI / Semiconductor
-    "SMCI", "ARM", "MRVL", "ON", "SOUN", "BBAI", "AI", "PLTR",
-    # Recent IPOs / SPACs with high short interest
-    "JOBY", "LILM", "LUNR", "RKLB", "ASTS",
-]
+    Priority:
+      1. universe_builder dynamic universe (if built)
+      2. watchlist.txt
+      3. Supabase user_favorites (via favorites.py)
 
-_FALLBACK_MEME_UNIVERSE = [
-    "GME", "AMC", "BB", "SOFI", "PLTR", "RIVN", "LCID", "NIO",
-    "MARA", "RIOT", "COIN", "HOOD", "DKNG", "IONQ", "RGTI", "QUBT",
-    "SMCI", "SOUN", "BBAI", "RKLB", "ASTS", "LUNR", "AFRM", "UPST",
-]
+    Returns deduplicated list of uppercase ticker strings.
+    """
+    tickers: list[str] = []
 
-_FALLBACK_LARGE_CAP_WATCH = [
-    "NVDA", "TSLA", "AMD", "META", "NFLX", "GOOGL", "AMZN", "AAPL",
-    "MSFT", "CRM", "SHOP", "SQ", "ROKU", "SNAP", "PINS", "ABNB",
-]
+    # 1. universe_builder
+    if _UNIVERSE_BUILDER_AVAILABLE:
+        try:
+            built = _ub.build_master_universe()
+            if built:
+                tickers = list(built)
+        except Exception as exc:
+            pass  # fall through
 
-# Aliases kept so any external code that imports the old names still works
-SMALL_CAP_UNIVERSE = _FALLBACK_SMALL_CAP_UNIVERSE
-MEME_UNIVERSE      = _FALLBACK_MEME_UNIVERSE
-LARGE_CAP_WATCH    = _FALLBACK_LARGE_CAP_WATCH
+    # 2. watchlist.txt
+    if not tickers:
+        tickers = _read_watchlist_tickers()
+
+    # 3. user_favorites
+    if not tickers:
+        try:
+            from favorites import load_favorites
+            tickers = load_favorites()
+        except Exception:
+            pass
+
+    return list(dict.fromkeys(t.upper() for t in tickers if t))
+
+
+def _read_watchlist_tickers() -> list:
+    """Parse watchlist.txt, extracting ticker before any # comment."""
+    paths = [
+        os.path.join(os.path.dirname(__file__), "watchlist.txt"),
+        "./watchlist.txt",
+    ]
+    for path in paths:
+        if os.path.exists(path):
+            result = []
+            with open(path) as f:
+                for line in f:
+                    clean = line.split("#")[0].strip().upper()
+                    if clean and not clean.startswith("TIER") and not clean.startswith("MANUALLY") and "." not in clean:
+                        result.append(clean)
+            return result
+    return []
+
+
+# Backward-compat aliases — point to empty lists; callers that used
+# the old hardcoded names should call _load_dynamic_universe() instead.
+SMALL_CAP_UNIVERSE: list = []
+MEME_UNIVERSE:      list = []
+LARGE_CAP_WATCH:    list = []
 
 
 # ==============================================================================
@@ -1283,10 +1307,8 @@ def _build_universe(args) -> list:
     """
     Build the screening universe for the given CLI args.
 
-    Pass 1 (dynamic): universe_builder.build_master_universe() + fast_momentum_prescreen()
-        Requires: --use-dynamic-universe (default True) AND universe_builder importable
-                  AND data/universe_cache/ contains fresh files (< UNIVERSE_CACHE_TTL_HOURS)
-    Pass 2 (fallback): hardcoded _FALLBACK_* lists — logs a WARNING when used.
+    Pass 1: universe_builder.build_master_universe() + fast_momentum_prescreen()
+    Pass 2: _load_dynamic_universe() (watchlist.txt + user_favorites)
     """
     import time as _time
     from pathlib import Path as _Path
@@ -1313,31 +1335,16 @@ def _build_universe(args) -> list:
             except Exception as exc:
                 print(
                     f"  [WARN] universe_builder failed: {exc} "
-                    f"— falling back to hardcoded universe"
+                    f"— falling back to watchlist.txt/favorites"
                 )
 
-    # Hardcoded fallback
-    if not args.use_dynamic_universe:
-        print("  Using hardcoded universe (--no-use-dynamic-universe)")
+    # Dynamic fallback (watchlist.txt + user_favorites — no hardcoded tickers)
+    universe = _load_dynamic_universe()
+    if universe:
+        print(f"  Using dynamic fallback universe: {len(universe)} tickers (watchlist.txt + favorites)")
     else:
-        print(
-            "  [WARN] Dynamic universe unavailable "
-            "(run: python3 universe_builder.py --build-cache) "
-            "— using hardcoded universe"
-        )
-
-    if args.universe == "small":
-        return list(_FALLBACK_SMALL_CAP_UNIVERSE)
-    elif args.universe == "meme":
-        return list(_FALLBACK_MEME_UNIVERSE)
-    elif args.universe == "large":
-        return list(_FALLBACK_LARGE_CAP_WATCH)
-    else:
-        return list(set(
-            _FALLBACK_SMALL_CAP_UNIVERSE
-            + _FALLBACK_MEME_UNIVERSE
-            + _FALLBACK_LARGE_CAP_WATCH
-        ))
+        print("  [WARN] No universe available — run universe_builder.py or add favorites")
+    return universe
 
 
 def _main_continue(args, universe):

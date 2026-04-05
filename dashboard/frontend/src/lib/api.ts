@@ -902,4 +902,20 @@ export const api = {
   // Alerts
   sendTelegramAlert: (dryRun = true): Promise<{ sent: boolean; dry_run: boolean; output: string }> =>
     client.post('/api/alerts/telegram', null, { params: { dry_run: dryRun } }).then(r => r.data),
+
+  // Favorites
+  favoritesGet: (): Promise<{ favorites: FavoriteItem[] }> =>
+    client.get('/api/favorites').then(r => r.data),
+
+  favoriteAdd: (symbol: string): Promise<{ ok: boolean; symbol: string }> =>
+    client.post(`/api/favorites/${symbol.toUpperCase()}`).then(r => r.data),
+
+  favoriteRemove: (symbol: string): Promise<{ ok: boolean; symbol: string }> =>
+    client.delete(`/api/favorites/${symbol.toUpperCase()}`).then(r => r.data),
+}
+
+export interface FavoriteItem {
+  symbol: string
+  added_at: string
+  notes: string
 }
