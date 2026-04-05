@@ -112,10 +112,6 @@ echo "Step 8b: Running accounting red flag screener..."
 python3 red_flag_screener.py --watchlist --skip-edgar
 echo "Step 8b complete."
 
-# ── Step 9: Polymarket ───────────────────────────────────
-echo "Step 10: Fetching Polymarket prediction market signals..."
-python3 polymarket_screener.py
-echo "Step 10 complete."
 
 # ── Step 11: Social sentiment ─────────────────────────────
 echo "Step 11: Pre-warming social sentiment cache (Google Trends + StockTwits)..."
