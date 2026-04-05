@@ -222,9 +222,17 @@ SOCIAL_BEARISH_THRESHOLD         = 0.35 # bull_ratio below this → BEARISH sent
 # POLYMARKET PREDICTION MARKET PARAMETERS
 # ============================================================
 # ============================================================
+# AI MODEL CONFIGURATION
+# ============================================================
+AI_MODEL_DEFAULT   = "grok-4-1-fast-reasoning"   # Daily driver — fast + light reasoning
+AI_MODEL_PREMIUM   = "grok-4.20-0309-reasoning"  # High-conviction setups only (~3× cost)
+AI_MODEL_FALLBACK  = "grok-4-1-fast-reasoning"   # Retry model if premium call fails
+AI_PREMIUM_THRESHOLD = 0.85                       # signal_agreement_score ≥ this → premium
+
+# ============================================================
 # AI QUANT API CALL LIMITS
 # ============================================================
-AI_QUANT_MAX_TICKERS = 5            # Hard cap on Claude API calls per run
+AI_QUANT_MAX_TICKERS = 5            # Hard cap on Grok API calls per run
 AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
 AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
 AI_QUANT_ALWAYS_INCLUDE = [         # Always process regardless of rank (open positions)

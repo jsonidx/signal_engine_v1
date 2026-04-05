@@ -75,10 +75,10 @@ export interface HeatmapRow {
   squeeze: number
   options: number
   dark_pool: number
+  dark_pool_signal?: 'ACCUMULATION' | 'NEUTRAL'
+  dark_pool_zscore?: number | null
   fundamentals: number
   social: number
-  polymarket: number
-  cross_asset: number
   pre_resolved_direction: string
   signal_agreement_score: number
 }
@@ -138,11 +138,12 @@ export interface TickerDetail extends TickerSignal {
   stop_loss?: number
   poc?: number
   vwap?: number
-  max_pain?: number
   // Override flags
   override_flags?: string[]
   time_horizon?: string
   data_quality?: string
+  model_used?: string
+  cost_usd?: number
   // Squeeze
   squeeze_score?: number
   float_short_pct?: number
@@ -225,7 +226,6 @@ export interface OptionsScreenerRow {
   vol_spike: number
   exp_move_pct: number
   put_call_ratio: number
-  max_pain: number
   dte: number
 }
 
@@ -271,33 +271,6 @@ export interface DarkPoolCard {
   history?: Array<{ date: string; short_ratio: number }>
 }
 
-// ─── Max Pain ─────────────────────────────────────────────────────────────────
-
-export interface MaxPainExpiry {
-  expiry: string
-  days_to_expiry: number
-  max_pain: number
-  distance_pct: number
-  direction: string
-  call_oi: number
-  put_oi: number
-  total_oi: number
-  pc_ratio: number | null
-  signal_strength: string
-}
-
-export interface MaxPainData {
-  current_price: number
-  nearest_expiry: string
-  nearest_max_pain: number
-  nearest_distance_pct: number
-  nearest_direction: string
-  nearest_days_to_expiry: number
-  nearest_total_oi: number
-  nearest_signal_strength: string
-  all_expirations: MaxPainExpiry[]
-  interpretation: string
-}
 
 // ─── Backtest ─────────────────────────────────────────────────────────────────
 
@@ -359,6 +332,23 @@ export interface ResolutionStats {
   avg_agreement_score: number
   most_common_override: string
   bear_cb_hits_30d: number
+}
+
+export interface AccuracyMatrixCell {
+  regime: string
+  conviction: number
+  agreement_bucket: 'high' | 'mid' | 'low' | 'unknown'
+  sample_size: number
+  win_rate: number | null
+  hit_t1_rate: number | null
+  avg_return_30d: number | null
+}
+
+export interface AccuracyMatrix {
+  data_available: boolean
+  total_resolved: number
+  overall_win_rate: number | null
+  cells: AccuracyMatrixCell[]
 }
 
 // ─── Thesis Accuracy ──────────────────────────────────────────────────────────
@@ -522,6 +512,10 @@ export interface AnalyzeStatus {
   symbol: string
   started_at?: string
   pid?: number
+  used_model?: string
+  estimated_model?: string
+  cost_usd?: number
+  estimated_cost?: number
 }
 
 // ─── Ticker Intelligence ──────────────────────────────────────────────────────
@@ -737,6 +731,9 @@ export const api = {
       }))
     }),
 
+  portfolioSparklines: (): Promise<Record<string, number[]>> =>
+    client.get('/api/portfolio/sparklines').then(r => r.data ?? {}),
+
   // Signals
   signalsLatest: (date?: string): Promise<TickerSignal[]> =>
     client.get('/api/signals/latest', { params: date ? { date } : {} }).then(r => r.data?.data ?? []),
@@ -787,10 +784,6 @@ export const api = {
   darkpoolTop: (signal?: string, limit = 30): Promise<DarkPoolCard[]> =>
     client.get('/api/darkpool/top', { params: { ...(signal ? { signal } : {}), limit } }).then(r => r.data?.data ?? []),
 
-  // Max pain — live fetch (1h cache on server)
-  maxPainLive: (ticker: string): Promise<MaxPainData | null> =>
-    client.get(`/api/max_pain/${ticker}`).then(r => r.data?.data_available ? r.data.data : null).catch(() => null),
-
   // Backtest
   backtestResults: (): Promise<BacktestResult[]> =>
     client.get('/api/backtest/results').then(r => r.data?.windows ?? []),
@@ -825,6 +818,9 @@ export const api = {
         bear_cb_hits_30d:      d.bear_cb_hits_30d      ?? d.bear_circuit_breaker_hits ?? 0,
       }
     }),
+
+  accuracyMatrix: (days = 180): Promise<AccuracyMatrix> =>
+    client.get('/api/resolution/accuracy-matrix', { params: { days } }).then(r => r.data ?? { data_available: false, cells: [], total_resolved: 0, overall_win_rate: null }),
 
   // Cash management
   cashGet: (): Promise<CashBalance> =>
@@ -902,4 +898,8 @@ export const api = {
         total:   d.total   ?? d.total_tickers ?? 0,
       }
     }),
+
+  // Alerts
+  sendTelegramAlert: (dryRun = true): Promise<{ sent: boolean; dry_run: boolean; output: string }> =>
+    client.post('/api/alerts/telegram', null, { params: { dry_run: dryRun } }).then(r => r.data),
 }

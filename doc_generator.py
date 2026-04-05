@@ -55,10 +55,7 @@ MODULES = [
     # Analysis
     ("ai_quant.py",               "analysis",   None),
     ("sec_module.py",             "analysis",   "Tracks insider transactions (Form 4), activist stakes (13D/G), material events (8-K)"),
-    ("congress_trades.py",        "analysis",   "Tracks STOCK Act disclosures from House and Senate members and spouses"),
-    ("max_pain.py",               "analysis",   "Computes options max pain strike per expiry; identifies expiration-driven price gravity"),
     ("volume_profile.py",         "analysis",   "Volume-at-price analysis: POC, value area, HVN/LVN support/resistance, anchored VWAPs"),
-    ("cross_asset_divergence.py", "analysis",   "Macro divergence bottom/top finder using +DI/−DI relative to RSP, HYG, UUP"),
     # Paper trading
     ("paper_trader.py",           "trading",    "Records weekly signals into SQLite, tracks P&L vs SPY benchmark"),
     ("trade_journal.py",          "trading",    "Computes ATR-based buy/sell zones; logs trades and unrealized P&L"),

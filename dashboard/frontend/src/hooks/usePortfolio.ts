@@ -28,6 +28,15 @@ export function usePortfolioPositions() {
   })
 }
 
+export function usePortfolioSparklines() {
+  return useQuery({
+    queryKey: ['portfolio', 'sparklines'],
+    queryFn: api.portfolioSparklines,
+    staleTime: 10 * 60 * 1000,
+    refetchInterval: 15 * 60 * 1000,
+  })
+}
+
 export function useEquityScreener() {
   return useQuery({
     queryKey: ['screeners', 'equity'],

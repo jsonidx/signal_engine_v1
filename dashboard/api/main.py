@@ -310,16 +310,6 @@ def _normalize_score(value: float, min_val: float, max_val: float,
         return 0.0
 
 
-def _cross_asset_signal_to_score(signal: Optional[str]) -> Optional[float]:
-    """Convert cross_asset string signal to [-1, 1] score."""
-    if not signal:
-        return None
-    s = str(signal).upper()
-    if "BOTTOM" in s or "OVERSOLD" in s or "BULLISH" in s:
-        return 0.8
-    if "TOP" in s or "OVERBOUGHT" in s or "BEARISH" in s:
-        return -0.8
-    return 0.0
 
 
 def _equity_signals_composite_z(ticker: str) -> Optional[float]:
@@ -627,6 +617,63 @@ async def portfolio_positions():
     except Exception as e:
         log.exception("portfolio_positions error")
         return _no_data(str(e))
+
+
+@app.get("/api/portfolio/sparklines")
+async def portfolio_sparklines():
+    """
+    5-day closing-price series for all open positions.
+    Returns {ticker: [p0, p1, p2, p3, p4]} — oldest to newest.
+    Used for inline position sparklines on the Portfolio page.
+    """
+    cache_key = "portfolio_sparklines"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    conn = _db_connect()
+    if conn is None:
+        return {}
+
+    try:
+        rows = conn.execute(
+            "SELECT ticker FROM trades WHERE action='BUY' AND status='open'"
+        ).fetchall()
+        conn.close()
+        tickers = [r["ticker"] for r in rows]
+    except Exception:
+        return {}
+
+    if not tickers:
+        return {}
+
+    try:
+        import yfinance as yf
+        raw = yf.download(
+            tickers, period="7d", interval="1d",
+            auto_adjust=True, progress=False, threads=True,
+        )
+        result: dict = {}
+        if raw.empty:
+            return {}
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            for t in tickers:
+                try:
+                    closes = raw["Close"][t].dropna().tolist()[-5:]
+                    result[t] = [round(float(p), 4) for p in closes]
+                except Exception:
+                    pass
+        else:
+            t = tickers[0]
+            closes = raw["Close"].dropna().tolist()[-5:]
+            result[t] = [round(float(p), 4) for p in closes]
+
+        _cache.set(cache_key, result, TTL_MEDIUM)
+        return result
+    except Exception as e:
+        log.warning(f"sparklines error: {e}")
+        return {}
 
 
 _eur_usd_cache: dict = {"rate": 1.08, "fetched_at": 0.0}
@@ -1130,6 +1177,8 @@ async def signals_heatmap():
             dp_row = dp_data.get(ticker, {})
             dp_raw = _safe_float(dp_row.get("dark_pool_score") or dp_row.get("score"), 50)
             dp_score = _normalize_score(dp_raw, 0.0, 100.0) if dp_row else 0.0
+            dp_signal = dp_row.get("signal", "NEUTRAL") if dp_row else "NEUTRAL"
+            dp_zscore = _safe_float(dp_row.get("short_ratio_zscore"), None)
 
             # fundamentals: from fundamentals CSV (operating_margin, earnings growth)
             fu_row = fu_lookup.get(ticker, {})
@@ -1141,17 +1190,10 @@ async def signals_heatmap():
                 fu_pct = 50.0 + min(40.0, max(-40.0, (eg or 0) * 100)) if eg is not None else 50.0
             fu_score = _normalize_score(fu_pct, 0.0, 100.0)
 
-            # social / polymarket / cross_asset: Claude cache only
+            # social: Claude cache only
             soc = sigs.get("social") or {}
             bull_ratio = _safe_float(soc.get("bull_ratio"), 0.5)
             soc_score = _normalize_score(bull_ratio, 0.0, 1.0)
-
-            pm = sigs.get("polymarket") or {}
-            pm_score = max(-1.0, min(1.0, _safe_float(pm.get("signal_score") or pm.get("score"), 0)))
-
-            ca = sigs.get("cross_asset") or {}
-            ca_map = {"TOP": 1.0, "BOTTOM": -1.0, "NEUTRAL": 0.0}
-            ca_score = ca_map.get(str(ca.get("signal", "NEUTRAL")).upper(), 0.0)
 
             # pre_resolved_direction: Claude DB → else derive from composite_z
             direction = cc.get("direction") or (
@@ -1167,16 +1209,16 @@ async def signals_heatmap():
                 "squeeze":                 round(sq_score, 3),
                 "options":                 round(of_score, 3),
                 "dark_pool":               round(dp_score, 3),
+                "dark_pool_signal":        dp_signal,
+                "dark_pool_zscore":        round(dp_zscore, 3) if dp_zscore is not None else None,
                 "fundamentals":            round(fu_score, 3),
                 "social":                  round(soc_score, 3),
-                "polymarket":              round(pm_score, 3),
-                "cross_asset":             round(ca_score, 3),
                 "pre_resolved_direction":  direction,
                 "signal_agreement_score":  _safe_float(cc.get("agreement")),
             })
 
-        # Sort by absolute signal_engine score descending
-        heatmap.sort(key=lambda r: abs(r["signal_engine"]), reverse=True)
+        # Sort by agreement score descending (most actionable first)
+        heatmap.sort(key=lambda r: r["signal_agreement_score"], reverse=True)
 
         result = {"data_available": True, "count": len(heatmap), "data": heatmap}
         _cache.set(cache_key, result, TTL_SHORT)
@@ -1229,7 +1271,7 @@ async def signals_ticker(ticker: str):
         soc  = sigs.get("social") or {}
         sq   = sigs.get("squeeze") or sigs.get("catalyst") or {}
         vp   = sigs.get("volume_profile") or {}
-        mp   = sigs.get("max_pain") or {}
+
 
         # Build module scores dict expected by frontend ModuleMiniHeatmap
         # signal_engine: composite_z from equity_signals CSV (authoritative); no fallback
@@ -1252,7 +1294,6 @@ async def signals_ticker(ticker: str):
             "fundamentals":   round((fu_score - 50) / 50, 3) if fu_score is not None else None,
             "social":         _safe_float(soc.get("bull_bear_ratio")),
             "polymarket":     pm_score,
-            "cross_asset":    _cross_asset_signal_to_score((sigs.get("cross_asset") or {}).get("signal")),
         }
         modules = {k: v for k, v in modules.items() if v is not None}
 
@@ -1284,6 +1325,8 @@ async def signals_ticker(ticker: str):
             "neutral_probability": data.get("neutral_probability"),
             "time_horizon":       data.get("time_horizon"),
             "data_quality":       data.get("data_quality"),
+            "model_used":         data.get("model_used"),
+            "cost_usd":           data.get("cost_usd"),
             "catalysts":          data.get("catalysts_json"),
             "risks":              data.get("risks_json"),
             # ── Price levels ──────────────────────────────────────────────────
@@ -1296,7 +1339,6 @@ async def signals_ticker(ticker: str):
             "expected_moves": data.get("expected_moves_json") or [],
             "poc":          _safe_float(vp.get("poc")),
             "vwap":         _safe_float(vp.get("vwap_20d")),
-            "max_pain":     _safe_float(mp.get("nearest_max_pain") or mp.get("max_pain_strike") or mp.get("max_pain")),
             # ── Squeeze ───────────────────────────────────────────────────────
             "squeeze_score":    _safe_float(sq.get("score")),
             "float_short_pct":  _safe_float(sq.get("short_float_pct") or sq.get("float_short_pct")),
@@ -1873,7 +1915,6 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
                 heat = _safe_float(of.get("heat_score"), 0)
                 if heat < min_heat:
                     continue
-                mp = sj.get("max_pain") or {}
                 records.append({
                     "ticker":           ticker,
                     "heat_score":       heat,
@@ -1882,7 +1923,6 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
                     "volume_spike_ratio": _safe_float(of.get("total_options_vol")),
                     "expected_move_pct": _safe_float(of.get("expected_move_pct")),
                     "put_call_ratio":   _safe_float(of.get("pc_ratio")),
-                    "max_pain_strike":  _safe_float(mp.get("nearest_max_pain")),
                     "days_to_expiry":   _safe_int(of.get("days_to_exp")),
                     "as_of":            r["date"],
                 })
@@ -2407,33 +2447,6 @@ async def darkpool_ticker(ticker: str):
 
 
 # ==============================================================================
-# SECTION 8b: MAX PAIN LIVE ENDPOINT
-# ==============================================================================
-
-@app.get("/api/max_pain/{ticker}")
-async def max_pain_live(ticker: str, expirations: int = Query(4, ge=1, le=12)):
-    """Live max pain calculation — always fetches fresh options chain (1h TTL)."""
-    ticker = ticker.upper()
-    cache_key = f"max_pain:{ticker}:{expirations}"
-    hit = _cache.get(cache_key)
-    if hit is not None:
-        return hit
-
-    try:
-        from max_pain import get_max_pain
-        result = get_max_pain(ticker, n_expirations=expirations)
-        if not result:
-            out = _no_data(f"no options data for {ticker}")
-        else:
-            out = {"data_available": True, "ticker": ticker, "data": result}
-        _cache.set(cache_key, out, 3600)  # 1h TTL — options chains update intraday
-        return out
-    except Exception as e:
-        log.exception("max_pain_live error")
-        return _no_data(str(e))
-
-
-# ==============================================================================
 # SECTION 9: CONFLICT RESOLUTION ENDPOINTS
 # ==============================================================================
 
@@ -2548,6 +2561,138 @@ async def resolution_stats():
     except Exception as e:
         log.exception("resolution_stats error")
         return _no_data(str(e))
+
+
+@app.get("/api/resolution/accuracy-matrix")
+async def resolution_accuracy_matrix(
+    days: int = Query(180, ge=1, le=730),
+):
+    """
+    3D accuracy breakdown of Claude thesis outcomes, sliced by:
+      - market_regime  (RISK_ON / TRANSITIONAL / RISK_OFF)
+      - conviction     (1–5)
+      - agreement_bucket  (<0.50 / 0.50–0.70 / ≥0.70)
+
+    Returns a list of cells, each containing win_rate, avg_return_30d,
+    hit_t1_rate, sample_size for that combination. Cells with n=0 are omitted.
+    """
+    cache_key = f"accuracy_matrix:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from utils.db import get_connection as _supabase_conn
+        conn = _supabase_conn()
+    except Exception as e:
+        return _no_data(str(e))
+
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = conn.cursor()
+
+        # Graceful no-op if table doesn't exist yet
+        try:
+            cur.execute("SELECT id FROM thesis_outcomes LIMIT 1")
+        except Exception:
+            conn.close()
+            result = _no_data("thesis_outcomes not yet populated — run thesis_checker.py")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        cur.execute(
+            """SELECT o.conviction, o.outcome, o.claude_correct,
+                      o.return_30d, o.hit_target_1,
+                      c.signal_agreement_score, c.signals_json
+               FROM thesis_outcomes o
+               JOIN thesis_cache c ON o.thesis_id = c.id
+               WHERE o.thesis_date >= %s
+                 AND o.outcome NOT IN ('OPEN')
+               ORDER BY o.thesis_date DESC""",
+            (cutoff,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        log.exception("accuracy_matrix query error")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return _no_data(str(e))
+
+    if not rows:
+        result = {"data_available": False, "cells": [], "summary": {}}
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    def _agreement_bucket(score) -> str:
+        if score is None:
+            return "unknown"
+        s = float(score)
+        if s >= 0.70:
+            return "high"       # ≥0.70
+        if s >= 0.50:
+            return "mid"        # 0.50–0.70
+        return "low"            # <0.50
+
+    def _regime_from_signals(signals_json) -> str:
+        """Extract market regime from signals_json blob."""
+        if not signals_json:
+            return "unknown"
+        try:
+            sigs = json.loads(signals_json) if isinstance(signals_json, str) else signals_json
+            mr = sigs.get("market_regime") or {}
+            return (mr.get("regime") or "unknown").upper()
+        except Exception:
+            return "unknown"
+
+    # Accumulate per-cell stats
+    from collections import defaultdict
+    cells: dict = defaultdict(lambda: {"n": 0, "correct": 0, "hit_t1": 0, "return_sum": 0.0, "return_n": 0})
+
+    for row in rows:
+        regime     = _regime_from_signals(row["signals_json"])
+        conv       = int(row["conviction"] or 0)
+        bucket     = _agreement_bucket(row["signal_agreement_score"])
+        key        = (regime, conv, bucket)
+
+        c = cells[key]
+        c["n"] += 1
+        if row["claude_correct"] == 1:
+            c["correct"] += 1
+        if row["hit_target_1"]:
+            c["hit_t1"] += 1
+        if row["return_30d"] is not None:
+            c["return_sum"] += float(row["return_30d"])
+            c["return_n"] += 1
+
+    result_cells = []
+    for (regime, conv, bucket), c in sorted(cells.items()):
+        n = c["n"]
+        result_cells.append({
+            "regime":          regime,
+            "conviction":      conv,
+            "agreement_bucket": bucket,
+            "sample_size":     n,
+            "win_rate":        round(c["correct"] / n, 3) if n > 0 else None,
+            "hit_t1_rate":     round(c["hit_t1"]  / n, 3) if n > 0 else None,
+            "avg_return_30d":  round(c["return_sum"] / c["return_n"], 2) if c["return_n"] > 0 else None,
+        })
+
+    # Summary totals for each slice dimension
+    total_n   = sum(c["n"] for c in cells.values())
+    total_win = sum(c["correct"] for c in cells.values())
+
+    result = {
+        "data_available": True,
+        "filters": {"days": days},
+        "total_resolved": total_n,
+        "overall_win_rate": round(total_win / total_n, 3) if total_n > 0 else None,
+        "cells": result_cells,
+    }
+    _cache.set(cache_key, result, TTL_MEDIUM)
+    return result
 
 
 # ==============================================================================
@@ -2891,16 +3036,35 @@ async def ticker_analyze(symbol: str, user: AuthUser = Depends(get_current_user)
         python_exec = sys.executable
 
     try:
+        import os as _os
+        sub_env = dict(_os.environ)
+        # Ensure API key is forwarded to the subprocess
+        for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY"):
+            val = _os.environ.get(key)
+            if val:
+                sub_env[key] = val
         proc = await asyncio.create_subprocess_exec(
             str(python_exec), str(ai_quant_path), "--ticker", sym,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(BASE_DIR),
+            env=sub_env,
         )
         started = datetime.utcnow().isoformat() + "Z"
         _analysis_jobs[sym] = {"status": "running", "started_at": started, "proc": proc}
         log.info(f"Analysis started for {sym} (pid {proc.pid})")
-        return {"status": "running", "symbol": sym, "started_at": started, "pid": proc.pid}
+        # Report which model will likely be used (actual model stamped on thesis by ai_quant.py)
+        try:
+            from config import AI_MODEL_DEFAULT, AI_MODEL_PREMIUM, AI_PREMIUM_THRESHOLD
+            from utils.usage import compute_cost
+            est_model = AI_MODEL_DEFAULT   # premium only triggers at ≥ threshold agreement
+            est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
+        except Exception:
+            est_model, est_cost = "grok-4-1-fast-reasoning", 0.009
+        return {
+            "status": "running", "symbol": sym, "started_at": started, "pid": proc.pid,
+            "estimated_model": est_model, "estimated_cost": est_cost,
+        }
     except Exception as e:
         log.error(f"Failed to launch analysis for {sym}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2918,7 +3082,27 @@ async def ticker_analyze_status(symbol: str):
         return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
     # Finished — clear cache so fresh thesis is fetched
     _cache._store.pop(f"signals_ticker_{sym}", None)
-    return {"status": "done", "symbol": sym, "started_at": job.get("started_at")}
+    # Pull model + cost from the freshly saved thesis if available
+    model_used = cost_usd = None
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT model_used, cost_usd FROM thesis_cache WHERE ticker=%s ORDER BY created_at DESC LIMIT 1",
+            (sym,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            model_used = row["model_used"]
+            cost_usd   = row["cost_usd"]
+    except Exception:
+        pass
+    return {
+        "status": "done", "symbol": sym, "started_at": job.get("started_at"),
+        "used_model": model_used, "cost_usd": cost_usd,
+    }
 
 
 # ==============================================================================
@@ -2931,11 +3115,6 @@ _TTL_24H = 86_400
 # Module-level caches for large datasets (don't use DataCache — these can be 10+ MB)
 _edgar_cik_map: dict = {}
 _edgar_cik_fetched_at: float = 0.0
-_house_trades: list = []
-_house_trades_fetched_at: float = 0.0
-_senate_trades: list = []
-_senate_trades_fetched_at: float = 0.0
-
 _IMPORTANT_FORMS = {"10-K", "10-Q", "8-K", "DEF 14A", "S-1", "424B4", "SC 13G", "SC 13D"}
 
 
@@ -2957,36 +3136,6 @@ async def _fetch_edgar_cik_map() -> dict:
     return _edgar_cik_map
 
 
-async def _fetch_house_trades() -> list:
-    global _house_trades, _house_trades_fetched_at
-    if _house_trades and time.time() - _house_trades_fetched_at < _TTL_24H:
-        return _house_trades
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get(
-                "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json"
-            )
-            _house_trades = r.json()
-            _house_trades_fetched_at = time.time()
-    except Exception as e:
-        log.warning(f"House trades fetch failed: {e}")
-    return _house_trades
-
-
-async def _fetch_senate_trades() -> list:
-    global _senate_trades, _senate_trades_fetched_at
-    if _senate_trades and time.time() - _senate_trades_fetched_at < _TTL_24H:
-        return _senate_trades
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.get(
-                "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json"
-            )
-            _senate_trades = r.json()
-            _senate_trades_fetched_at = time.time()
-    except Exception as e:
-        log.warning(f"Senate trades fetch failed: {e}")
-    return _senate_trades
 
 
 @app.get("/api/ticker/{symbol}/sec-filings")
@@ -3040,53 +3189,6 @@ async def ticker_sec_filings(symbol: str):
         result = {"data_available": False, "data": [], "error": str(e)}
         _cache.set(cache_key, result, 300)
         return result
-
-
-@app.get("/api/ticker/{symbol}/congress-trades")
-async def ticker_congress_trades(symbol: str):
-    """Recent House + Senate stock disclosures for a ticker."""
-    sym = symbol.upper()
-    cache_key = f"congress_{sym}"
-    hit = _cache.get(cache_key)
-    if hit is not None:
-        return hit
-
-    house_raw, senate_raw = await asyncio.gather(
-        _fetch_house_trades(), _fetch_senate_trades()
-    )
-
-    trades: list = []
-
-    if isinstance(house_raw, list):
-        for t in house_raw:
-            if (t.get("ticker") or "").upper().strip() == sym:
-                trades.append({
-                    "chamber": "House",
-                    "member":  t.get("representative", "Unknown"),
-                    "date":    t.get("transaction_date") or t.get("disclosure_date", ""),
-                    "type":    t.get("type", ""),
-                    "amount":  t.get("amount", ""),
-                    "asset":   t.get("asset_description", ""),
-                })
-
-    if isinstance(senate_raw, list):
-        for t in senate_raw:
-            if (t.get("ticker") or "").upper().strip() == sym:
-                trades.append({
-                    "chamber": "Senate",
-                    "member":  t.get("senator", "Unknown"),
-                    "date":    t.get("transaction_date") or t.get("disclosure_date", ""),
-                    "type":    t.get("type", ""),
-                    "amount":  t.get("amount", ""),
-                    "asset":   t.get("asset_description", ""),
-                })
-
-    trades.sort(key=lambda x: x.get("date") or "", reverse=True)
-    trades = trades[:25]
-
-    result = {"data_available": bool(trades), "data": trades}
-    _cache.set(cache_key, result, 3600)
-    return result
 
 
 def _quarter_label(dt) -> str:
@@ -3716,6 +3818,53 @@ async def auth_revoke_key(key_id: int, user: AuthUser = Depends(get_current_user
     if not ok:
         raise HTTPException(status_code=404, detail="Key not found or already revoked")
     return {"revoked": True, "key_id": key_id}
+
+
+# ==============================================================================
+# ALERTS ENDPOINTS
+# ==============================================================================
+
+@app.post("/api/alerts/telegram")
+async def send_telegram_alert(
+    dry_run: bool = Query(True),
+    user: AuthUser = Depends(get_current_user),
+):
+    """
+    Trigger scripts/send_weekly_alert.py.
+    dry_run=True (default) prints the message without sending.
+    dry_run=False sends to Telegram/Discord.
+    """
+    script = BASE_DIR / "scripts" / "send_weekly_alert.py"
+    if not script.exists():
+        raise HTTPException(status_code=404, detail="send_weekly_alert.py not found")
+
+    import os as _os
+    sub_env = dict(_os.environ)
+
+    args = [sys.executable, str(script)]
+    if dry_run:
+        args.append("--dry-run")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+            env=sub_env,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = stdout.decode(errors="replace").strip()
+        return {
+            "sent": proc.returncode == 0 and not dry_run,
+            "dry_run": dry_run,
+            "output": output,
+            "returncode": proc.returncode,
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Alert script timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==============================================================================

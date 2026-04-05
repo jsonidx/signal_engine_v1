@@ -13,7 +13,7 @@ import { RiskRewardBar } from '../components/RiskRewardBar'
 import { HistoricalAnalogs } from '../components/HistoricalAnalogs'
 import { PriceChart } from '../components/charts/PriceChart'
 import { EarningsReactionModel } from '../components/EarningsReactionModel'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSignalsTicker } from '../hooks/useHeatmap'
 import { useDarkPoolTicker } from '../hooks/useDarkPool'
 import { useHeatmap } from '../hooks/useHeatmap'
@@ -22,7 +22,7 @@ import {
   ResponsiveContainer, Cell, ReferenceLine, Legend,
 } from 'recharts'
 import { api } from '../lib/api'
-import type { MaxPainData, ExpectedMove, TickerDetail, SecFiling, CongressTrade, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus } from '../lib/api'
+import type { ExpectedMove, TickerDetail, SecFiling, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus } from '../lib/api'
 import { clsx } from 'clsx'
 
 // ─── Module score color encoding (same as heatmap) ────────────────────────────
@@ -637,59 +637,6 @@ function ExpectedMovesTable({ moves, currentPrice }: { moves: ExpectedMove[]; cu
   )
 }
 
-// ─── Live Max Pain card ────────────────────────────────────────────────────────
-
-function MaxPainCard({ data }: { data: MaxPainData }) {
-  const nearest = data.all_expirations[0]
-  void nearest
-  return (
-    <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
-      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
-        Max Pain (live)
-      </div>
-      {/* Header row */}
-      <div className="flex items-center gap-2 font-mono text-[9px] text-text-tertiary uppercase tracking-wide border-b border-border-subtle pb-1">
-        <span className="w-24">Expiry</span>
-        <span className="w-16 text-right">Max Pain</span>
-        <span className="w-12 text-right">Dist</span>
-        <span className="w-16 text-right">OI</span>
-        <span className="w-10 text-right">P/C</span>
-        <span className="w-12 text-right">Strength</span>
-      </div>
-      <div className="space-y-1.5">
-        {data.all_expirations.map((e) => {
-          const pcColor = e.pc_ratio == null ? '#71717a'
-            : e.pc_ratio > 1.2 ? '#ef4444'
-            : e.pc_ratio < 0.8 ? '#22c55e'
-            : '#a1a1aa'
-          return (
-            <div key={e.expiry} className="flex items-center gap-2">
-              <span className="font-mono text-[10px] text-text-tertiary w-24">{e.expiry}</span>
-              <span className="font-mono text-xs font-semibold text-text-primary w-16 text-right">${e.max_pain.toFixed(2)}</span>
-              <span className="font-mono text-[10px] w-12 text-right" style={{ color: e.direction === 'UP' ? '#22c55e' : e.direction === 'DOWN' ? '#ef4444' : '#a1a1aa' }}>
-                {e.distance_pct > 0 ? '+' : ''}{e.distance_pct.toFixed(1)}%
-              </span>
-              <span className="font-mono text-[10px] text-text-tertiary w-16 text-right">{e.total_oi.toLocaleString()}</span>
-              <span className="font-mono text-[10px] w-10 text-right font-semibold" style={{ color: pcColor }}>
-                {e.pc_ratio != null ? e.pc_ratio.toFixed(2) : '—'}
-              </span>
-              <span className={clsx(
-                'font-mono text-[9px] px-1 rounded w-12 text-center',
-                e.signal_strength === 'HIGH' ? 'bg-accent-green/20 text-accent-green'
-                  : e.signal_strength === 'MEDIUM' ? 'bg-accent-amber/20 text-accent-amber'
-                  : 'bg-bg-elevated text-text-tertiary'
-              )}>{e.signal_strength}</span>
-            </div>
-          )
-        })}
-      </div>
-      <div className="font-mono text-[10px] text-text-tertiary pt-1 border-t border-border-subtle">
-        {data.interpretation}
-      </div>
-    </div>
-  )
-}
-
 // ─── Action Zones card ────────────────────────────────────────────────────────
 
 const ACTION_STYLE: Record<string, string> = {
@@ -927,7 +874,6 @@ function buildPrompt(
     if (signal.heat_score != null)       lines.push(`Heat Score:     ${signal.heat_score.toFixed(0)}/100`)
     if (signal.put_call_ratio != null)   lines.push(`Put/Call Ratio: ${signal.put_call_ratio.toFixed(2)}`)
     if (signal.expected_move_pct != null) lines.push(`Expected Move:  ±${signal.expected_move_pct.toFixed(1)}%`)
-    if (signal.max_pain != null)         lines.push(`Max Pain:       ${usd(signal.max_pain)}`)
     if (signal.poc != null)              lines.push(`POC (Vol Profile): ${usd(signal.poc)}`)
     if (signal.vwap != null)             lines.push(`VWAP 20d:       ${usd(signal.vwap)}`)
     lines.push(``)
@@ -1036,19 +982,55 @@ function CopyPromptButton({
   )
 }
 
+// ─── Model badge ──────────────────────────────────────────────────────────────
+
+const PREMIUM_MODELS = ['grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning', 'grok-4-0709']
+
+function ModelBadge({ model, cost }: { model: string; cost?: number }) {
+  const isPremium = PREMIUM_MODELS.some(m => model.includes('4.20') || model.includes('4-0709'))
+  const shortName = model
+    .replace('grok-', 'G-')
+    .replace('-reasoning', ' ✦')
+    .replace('-non-reasoning', '')
+    .replace('.20-0309', '.20')
+  const costStr = cost != null ? `~$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null
+
+  return (
+    <span
+      title={`Model: ${model}${cost != null ? ` | Cost: $${cost.toFixed(4)}` : ''} | ${isPremium ? 'Premium — used for high-conviction setups (≥85% agreement)' : 'Default — daily driver'}`}
+      className={clsx(
+        'inline-flex items-center gap-1 font-mono text-[9px] border rounded px-1.5 py-0.5 cursor-default',
+        isPremium
+          ? 'bg-accent-purple/10 border-accent-purple/40 text-accent-purple'
+          : 'bg-bg-elevated border-border-subtle text-text-tertiary'
+      )}
+    >
+      {isPremium && <span className="text-accent-purple">★</span>}
+      {shortName}
+      {costStr && <span className={isPremium ? 'text-accent-purple/70' : 'text-text-tertiary/70'}>{costStr}</span>}
+    </span>
+  )
+}
+
 // ─── Analyze button ────────────────────────────────────────────────────────────
 
 function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boolean }) {
   const [job, setJob] = useState<AnalyzeStatus | null>(null)
+  const qc = useQueryClient()
 
-  // Poll for completion when running
+  // Poll for completion when running — auto-refresh ticker data when done
   useQuery<AnalyzeStatus>({
     queryKey: ['analyze_status', symbol],
     queryFn: () => api.tickerAnalyzeStatus(symbol),
     refetchInterval: job?.status === 'running' ? 5000 : false,
     enabled: job?.status === 'running',
     onSuccess: (data: AnalyzeStatus) => {
-      if (data.status === 'done') setJob(data)
+      if (data.status === 'done') {
+        setJob(data)
+        // Invalidate ticker cache so page reloads thesis automatically
+        qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
+        qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
+      }
     },
   } as any)
 
@@ -1064,15 +1046,18 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
   if (job?.status === 'running') {
     return (
       <div className="flex items-center gap-2 font-mono text-xs text-accent-amber">
-        <span className="animate-pulse">⬤</span> Running AI analysis for {symbol}…
-        <span className="text-text-tertiary text-[10px]">refresh in ~60s</span>
+        <span className="animate-pulse">⬤</span> Running Grok analysis for {symbol}…
+        <span className="text-text-tertiary text-[10px]">auto-refreshes when done (~60s)</span>
       </div>
     )
   }
   if (job?.status === 'done') {
+    const doneModel = job.used_model ?? job.estimated_model
+    const doneCost  = job.cost_usd ?? job.estimated_cost
     return (
-      <div className="font-mono text-xs text-accent-green">
-        ✓ Analysis complete — reload page to see thesis
+      <div className="flex items-center gap-2 font-mono text-xs text-accent-green">
+        ✓ Analysis complete
+        {doneModel && <ModelBadge model={doneModel} cost={doneCost} />}
       </div>
     )
   }
@@ -1087,7 +1072,7 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
           : 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple hover:bg-accent-purple/30'
       )}
     >
-      {hasThesis ? '↻ Re-run AI analysis' : '▶ Run AI analysis'}
+      {hasThesis ? '↻ Re-run Grok analysis' : '▶ Run Grok analysis'}
     </button>
   )
 }
@@ -1293,54 +1278,6 @@ function SecFilingsCard({ filings }: { filings: SecFiling[] }) {
 }
 
 // ─── Congress Trades card ──────────────────────────────────────────────────────
-
-function CongressTradesCard({ trades }: { trades: CongressTrade[] }) {
-  if (!trades.length) return null
-  return (
-    <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
-      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
-        Congress Trades ({trades.length})
-      </div>
-      <div className="space-y-2">
-        {trades.slice(0, 10).map((t, i) => {
-          const isBuy = /purchase|buy/i.test(t.type)
-          const isSell = /sale|sell/i.test(t.type)
-          return (
-            <div key={i} className="flex items-start gap-2">
-              <span className={clsx(
-                'font-mono text-[9px] px-1 rounded flex-shrink-0 mt-0.5',
-                isBuy  ? 'bg-accent-green/20 text-accent-green'
-                  : isSell ? 'bg-accent-red/20 text-accent-red'
-                  : 'bg-bg-elevated text-text-tertiary'
-              )}>
-                {t.type || '—'}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className={clsx(
-                    'font-mono text-[9px] border rounded px-1',
-                    t.chamber === 'Senate'
-                      ? 'border-accent-purple/40 text-accent-purple'
-                      : 'border-accent-blue/40 text-accent-blue'
-                  )}>
-                    {t.chamber}
-                  </span>
-                  <span className="font-mono text-xs text-text-primary truncate">{t.member}</span>
-                </div>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className="font-mono text-[9px] text-text-tertiary">{t.date}</span>
-                  {t.amount && (
-                    <span className="font-mono text-[9px] text-text-secondary">{t.amount}</span>
-                  )}
-                </div>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </div>
-  )
-}
 
 // ─── Earnings card ─────────────────────────────────────────────────────────────
 
@@ -1624,22 +1561,10 @@ export function TickerPage() {
   const { data: signal, isLoading } = useSignalsTicker(symbol)
   const { data: dpHistory } = useDarkPoolTicker(symbol)
   const { data: heatmapRows } = useHeatmap()
-  const { data: maxPainLive } = useQuery({
-    queryKey: ['max_pain', symbol],
-    queryFn: () => api.maxPainLive(symbol),
-    staleTime: 60 * 60 * 1000,
-    enabled: !!symbol,
-  })
   const { data: secFilings = [] } = useQuery<SecFiling[]>({
     queryKey: ['sec_filings', symbol],
     queryFn: () => api.tickerSecFilings(symbol),
     staleTime: 6 * 60 * 60 * 1000,
-    enabled: !!symbol,
-  })
-  const { data: congressTrades = [] } = useQuery<CongressTrade[]>({
-    queryKey: ['congress_trades', symbol],
-    queryFn: () => api.tickerCongressTrades(symbol),
-    staleTime: 60 * 60 * 1000,
     enabled: !!symbol,
   })
   const { data: earningsData } = useQuery<EarningsData | null>({
@@ -1752,8 +1677,13 @@ export function TickerPage() {
               return (
                 <div className="bg-bg-elevated border-l-2 border-accent-purple rounded-r p-4 space-y-3">
                   {/* Header */}
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">AI Thesis</span>
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">AI Thesis</span>
+                      {signal.model_used && (
+                        <ModelBadge model={signal.model_used} cost={signal.cost_usd} />
+                      )}
+                    </div>
                     <div className="flex items-center gap-2">
                       {signal.time_horizon && (
                         <span className="font-mono text-[9px] text-text-tertiary border border-border-subtle rounded px-1.5 py-0.5">
@@ -1895,7 +1825,6 @@ export function TickerPage() {
                     stopLoss={signal.stop_loss}
                     poc={signal.poc}
                     vwap={signal.vwap}
-                    maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
                     azBuyLow={actionZones?.buy_zone_low}
                     azBuyHigh={actionZones?.buy_zone_high}
                     azStop={actionZones?.stop_loss}
@@ -1917,7 +1846,6 @@ export function TickerPage() {
                 aiTarget2={signal.target_2}
                 aiStop={signal.stop_loss}
                 vwap={signal.vwap}
-                maxPain={maxPainLive?.nearest_max_pain ?? signal.max_pain}
                 azBuyLow={actionZones?.buy_zone_low}
                 azBuyHigh={actionZones?.buy_zone_high}
                 azTarget1={actionZones?.target_1}
@@ -2051,7 +1979,7 @@ export function TickerPage() {
             )}
 
             {/* Options flow */}
-            {(signal.iv_rank != null || signal.expected_move_pct != null || signal.put_call_ratio != null || (maxPainLive?.nearest_max_pain ?? signal.max_pain) != null) && (
+            {(signal.iv_rank != null || signal.expected_move_pct != null || signal.put_call_ratio != null) && (
               <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
                 <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
                   Options Flow
@@ -2061,7 +1989,6 @@ export function TickerPage() {
                     { label: 'IV Rank', value: signal.iv_rank != null ? `${signal.iv_rank.toFixed(0)}%` : '—' },
                     { label: 'Exp Move', value: signal.expected_move_pct != null ? `±${signal.expected_move_pct.toFixed(1)}%` : '—' },
                     { label: 'P/C Ratio', value: signal.put_call_ratio != null ? signal.put_call_ratio.toFixed(2) : '—' },
-                    { label: 'Max Pain', value: (maxPainLive?.nearest_max_pain ?? signal.max_pain) != null ? `$${(maxPainLive?.nearest_max_pain ?? signal.max_pain)!.toFixed(2)}` : '—' },
                   ].map(({ label, value }) => (
                     <div key={label} className="flex justify-between">
                       <span className="font-mono text-[10px] text-text-tertiary uppercase">{label}</span>
@@ -2117,9 +2044,6 @@ export function TickerPage() {
               </div>
             )}
 
-            {/* Live max pain */}
-            {maxPainLive && <MaxPainCard data={maxPainLive} />}
-
             {/* Catalysts & Risks */}
             <CatalystsAccordion catalysts={signal.catalysts} risks={signal.risks} />
 
@@ -2134,9 +2058,6 @@ export function TickerPage() {
               earningsData={earningsData}
               impliedMove={signal.expected_move_pct}
             />
-
-            {/* Congress Trades */}
-            <CongressTradesCard trades={congressTrades} />
 
             {/* SEC Filings */}
             <SecFilingsCard filings={secFilings} />

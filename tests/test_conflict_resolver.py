@@ -36,9 +36,6 @@ def _bull_signals() -> dict:
         "fundamentals":   {"fundamental_score_pct": 72.0},
         "squeeze":        {"squeeze_score_100": 65.0, "recent_squeeze": False},
         "options_flow":   {"heat_score": 80.0, "pc_ratio": 0.5},
-        "cross_asset":    {"signal": "BOTTOM — sell pressure exhausted"},
-        "polymarket":     {"polymarket_score": 3.5, "polymarket_probability": 0.78},
-        "congress":       {"congress_score": 2, "congress_direction": "bullish"},
         "sec":            {"score": 2, "flags": ["CONGRESS BUYING: 2 purchase(s)"]},
         "technical":      {"momentum_1m_pct": 5.0},
         "market_regime":  {"regime": "RISK_ON"},
@@ -53,9 +50,6 @@ def _bear_signals() -> dict:
         "fundamentals":   {"fundamental_score_pct": 22.0},
         "squeeze":        {"squeeze_score_100": 10.0, "recent_squeeze": False},
         "options_flow":   {"heat_score": 80.0, "pc_ratio": 2.5},
-        "cross_asset":    {"signal": "TOP — rally exhausted"},
-        "polymarket":     {"polymarket_score": 0.0, "polymarket_probability": 0.18},
-        "congress":       {"congress_score": 0, "congress_direction": "bearish"},
         "sec":            {"score": 0, "flags": []},
         "technical":      {"momentum_1m_pct": -3.0},
         "market_regime":  {"regime": "RISK_OFF"},
@@ -70,9 +64,6 @@ def _neutral_signals() -> dict:
         "fundamentals":   {"fundamental_score_pct": 50.0}, # between 35 and 65
         "squeeze":        {"squeeze_score_100": 30.0, "recent_squeeze": False},
         "options_flow":   {"heat_score": 40.0, "pc_ratio": 1.0},  # heat too low
-        "cross_asset":    {"signal": "NEUTRAL"},
-        "polymarket":     {"polymarket_score": 0.5, "polymarket_probability": 0.52},
-        "congress":       {"congress_score": 0, "congress_direction": "neutral"},
         "sec":            {"score": 0, "flags": []},
         "technical":      {"momentum_1m_pct": 0.1},
         "market_regime":  {"regime": "TRANSITIONAL"},
@@ -125,35 +116,6 @@ class TestExtractModuleDirection:
     def test_options_flow_middle_pcr(self):
         # pcr between 0.7 and 1.8: no directional signal
         assert cr.extract_module_direction("options_flow", {"heat_score": 80.0, "pc_ratio": 1.0}) is None
-
-    def test_cross_asset_bull_bottom(self):
-        assert cr.extract_module_direction("cross_asset_divergence", {"signal": "BOTTOM — reversal"}) == "BULL"
-
-    def test_cross_asset_bear_top(self):
-        assert cr.extract_module_direction("cross_asset_divergence", {"signal": "TOP — exhaustion"}) == "BEAR"
-
-    def test_cross_asset_neutral(self):
-        assert cr.extract_module_direction("cross_asset_divergence", {"signal": "NEUTRAL"}) is None
-
-    def test_polymarket_bull(self):
-        assert cr.extract_module_direction("polymarket", {"polymarket_score": 3.0, "polymarket_probability": 0.72}) == "BULL"
-
-    def test_polymarket_bear_low_prob(self):
-        assert cr.extract_module_direction("polymarket", {"polymarket_score": 0.0, "polymarket_probability": 0.20}) == "BEAR"
-
-    def test_polymarket_score_too_low(self):
-        # score <= 0.6 AND prob > 0.65: no BULL signal (score insufficient)
-        assert cr.extract_module_direction("polymarket", {"polymarket_score": 0.5, "polymarket_probability": 0.70}) is None
-
-    def test_congress_bull_direction(self):
-        assert cr.extract_module_direction("congress_trades", {"congress_direction": "bullish", "congress_score": 0}) == "BULL"
-
-    def test_congress_bull_score_fallback(self):
-        # direction is neutral but score > 0 → BULL
-        assert cr.extract_module_direction("congress_trades", {"congress_direction": "neutral", "congress_score": 2}) == "BULL"
-
-    def test_congress_bear(self):
-        assert cr.extract_module_direction("congress_trades", {"congress_direction": "bearish", "congress_score": 0}) == "BEAR"
 
     def test_sec_bull_with_buy_flags(self):
         assert cr.extract_module_direction("sec_insider", {"score": 2, "flags": ["insider buying cluster"]}) == "BULL"
@@ -214,14 +176,16 @@ class TestWeightedVote:
         assert result["net_direction"] == "BULL"
 
     def test_margin_keeps_neutral_when_tied(self):
-        # signal_engine BULL (0.25) vs cross_asset BEAR (0.10) + fundamentals BEAR (0.20)
-        # bull=0.25, bear=0.30: bear > bull but margin=0.10 → bear-bull=0.05 < 0.10 → NEUTRAL
+        # Use hardcoded MODULE_WEIGHTS to make this test deterministic
+        # signal_engine BULL (0.35) vs fundamentals BEAR (0.20) + options_flow BEAR (0.15)
+        # bull=0.35, bear=0.35: diff=0.00 < margin 0.10 → NEUTRAL
         sigs = _neutral_signals()
-        sigs["signal_engine"] = {"composite_z": 0.8}         # BULL 0.25
+        sigs["signal_engine"] = {"composite_z": 0.8}         # BULL 0.35
         sigs["fundamentals"]  = {"fundamental_score_pct": 30} # BEAR 0.20
-        sigs["cross_asset"]   = {"signal": "TOP"}              # BEAR 0.10
-        result = cr.compute_weighted_vote(sigs)
-        # bear_weight=0.30, bull_weight=0.25, diff=0.05 < margin 0.10
+        sigs["options_flow"]  = {"heat_score": 80.0, "pc_ratio": 2.5}  # BEAR 0.15
+        with patch.object(cr, "_load_module_weights", return_value=cr.MODULE_WEIGHTS):
+            result = cr.compute_weighted_vote(sigs)
+        # bear_weight=0.35, bull_weight=0.35, diff=0.00 < margin 0.10
         assert result["net_direction"] == "NEUTRAL"
 
     def test_agreement_fraction_all_bull(self):
@@ -236,9 +200,6 @@ class TestWeightedVote:
             "fundamentals":  {"fundamental_score_pct": 50},  # no vote
             "squeeze":       {"squeeze_score_100": 10},      # no vote
             "options_flow":  {"heat_score": 20},              # no vote
-            "cross_asset":   {"signal": "NEUTRAL"},           # no vote
-            "polymarket":    {"polymarket_score": 0.3, "polymarket_probability": 0.52},
-            "congress":      {"congress_score": 0, "congress_direction": "neutral"},
             "sec":           {"score": 0, "flags": []},
         }
         result = cr.compute_weighted_vote(sigs)
@@ -437,16 +398,16 @@ class TestResolveEndToEnd:
 # ==============================================================================
 
 class TestIsEarningsCatalyst:
-    def test_earnings_in_polymarket_question(self):
-        sigs = {"polymarket": {"polymarket_market": "Will AAPL beat earnings estimates Q2?"}}
+    def test_earnings_keyword_in_catalyst_flags(self):
+        sigs = {"catalyst": {"short_squeeze_flags": ["earnings beat expected Q2"]}}
         assert cr._is_earnings_catalyst(sigs) is True
 
-    def test_eps_in_polymarket_question(self):
-        sigs = {"polymarket": {"polymarket_market": "Will NVDA EPS exceed $5.20?"}}
+    def test_earnings_in_vol_compression_flags(self):
+        sigs = {"catalyst": {"vol_compression_flags": ["pre-earnings vol compression"]}}
         assert cr._is_earnings_catalyst(sigs) is True
 
-    def test_no_earnings_keywords(self):
-        sigs = {"polymarket": {"polymarket_market": "Will AAPL reach $200 by June?"}}
+    def test_no_earnings_in_flags(self):
+        sigs = {"catalyst": {"short_squeeze_flags": ["high short interest"], "vol_compression_flags": []}}
         assert cr._is_earnings_catalyst(sigs) is False
 
     def test_empty_signals(self):

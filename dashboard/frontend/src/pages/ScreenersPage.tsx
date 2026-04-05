@@ -572,7 +572,6 @@ function OptionsTab() {
                   { label: 'Vol Spike', key: 'vol_spike' },
                   { label: 'Exp Move', key: 'exp_move_pct' },
                   { label: 'P/C Ratio', key: 'put_call_ratio' },
-                  { label: 'Max Pain', key: 'max_pain' },
                   { label: 'DTE', key: 'dte' },
                 ].map(({ label, key }) => (
                   <th
@@ -619,9 +618,6 @@ function OptionsTab() {
                   </td>
                   <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
                     {row.put_call_ratio?.toFixed(2) ?? '—'}
-                  </td>
-                  <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
-                    {row.max_pain !== undefined ? `$${row.max_pain.toFixed(2)}` : '—'}
                   </td>
                   <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
                     {row.dte ?? '—'}d

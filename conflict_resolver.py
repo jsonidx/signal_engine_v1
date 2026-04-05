@@ -56,9 +56,16 @@ def _load_module_weights() -> Dict[str, float]:
         if row and row["value"]:
             loaded = json.loads(row["value"])
             if loaded and isinstance(loaded, dict):
-                _weights_cache = loaded
-                logger.debug("module_weights loaded from Supabase strategy_config")
-                return _weights_cache
+                # Filter to only known modules (removes pruned keys like cross_asset_divergence)
+                loaded = {k: v for k, v in loaded.items() if k in _SIGNALS_KEY_MAP}
+                if loaded:
+                    # Normalize so weights always sum to 1.0 after filtering
+                    total = sum(loaded.values())
+                    if total > 0:
+                        loaded = {k: v / total for k, v in loaded.items()}
+                    _weights_cache = loaded
+                    logger.debug("module_weights loaded from Supabase strategy_config")
+                    return _weights_cache
     except Exception as exc:
         logger.debug("Could not load module_weights from Supabase: %s — using defaults", exc)
     _weights_cache = MODULE_WEIGHTS
@@ -72,19 +79,14 @@ def _load_module_weights() -> Dict[str, float]:
 # Weights sum to 1.0. Adjust in config.py as you gather per-module P&L attribution.
 
 MODULE_WEIGHTS: Dict[str, float] = {
-    "signal_engine_composite_z": 0.25,   # Most rigorous multi-factor model
+    "signal_engine_composite_z": 0.35,   # Most rigorous multi-factor model
     "fundamental_analysis":       0.20,   # Point-in-time fundamental quality
     "squeeze_screener":           0.15,   # Mechanical; good when data is clean
     "options_flow":               0.15,   # Real market positioning signal
-    "cross_asset_divergence":     0.10,   # Macro relative context
-    "polymarket":                 0.08,   # Prediction market (some resolution lag)
-    "dark_pool_flow":             0.07,   # FINRA ATS institutional routing signal
+    "dark_pool_flow":             0.08,   # FINRA ATS accumulation flag (zscore < -1.5)
     "red_flag_screener":          0.08,   # Accounting quality — BEAR-only vote
-    "sec_insider":                0.03,   # Directional but very noisy
-    "congress_trades":            0.01,   # 30–45 day disclosure lag (reduced; weight given to dark_pool)
-    # NOTE: weights sum to ~1.12 (intentional — the weighted-vote algorithm compares
-    # bull_weight vs bear_weight with a margin threshold and does not require exact
-    # sum-to-1). Recalibrate after 8-12 weeks using logs/conflict_resolution_*.csv.
+    "sec_insider":                0.04,   # Directional but noisy
+    # NOTE: cross_asset_divergence, congress_trades, polymarket removed (pruning pass 2026-04).
 }
 
 # Maps MODULE_WEIGHTS keys → signals dict keys (as returned by collect_all_signals)
@@ -93,12 +95,9 @@ _SIGNALS_KEY_MAP: Dict[str, str] = {
     "fundamental_analysis":       "fundamentals",
     "squeeze_screener":           "squeeze",
     "options_flow":               "options_flow",
-    "cross_asset_divergence":     "cross_asset",
-    "polymarket":                 "polymarket",
     "dark_pool_flow":             "dark_pool_flow",
     "red_flag_screener":          "red_flags",
     "sec_insider":                "sec",
-    "congress_trades":            "congress",
 }
 
 # Log output directory
@@ -157,11 +156,6 @@ def _is_earnings_catalyst(signals_dict: dict) -> bool:
       - Polymarket market question mentions earnings / EPS / beat
       - Catalyst screener flags mention earnings
     """
-    poly = signals_dict.get("polymarket") or {}
-    question = str(poly.get("polymarket_market", "")).lower()
-    if any(kw in question for kw in ("earnings", "eps", "revenue beat", "beat estimates", "beat consensus")):
-        return True
-
     catalyst = signals_dict.get("catalyst") or {}
     all_flags = (
         catalyst.get("short_squeeze_flags", [])
@@ -187,9 +181,7 @@ def extract_module_direction(module_name: str, module_output: dict) -> Optional[
       fundamental_analysis       : score% > 65 → BULL | < 35 → BEAR
       squeeze_screener           : final_score > 55 → BULL (squeezes are directionally BULL only)
       options_flow               : heat > 65 → then PCR < 0.7 → BULL | PCR > 1.8 → BEAR
-      cross_asset_divergence     : 'BOTTOM' → BULL | 'TOP' → BEAR | else None
-      polymarket                 : score > 0.6 AND prob > 0.65 → BULL | prob < 0.35 → BEAR
-      congress_trades            : direction 'bullish' or score > 0 → BULL | 'bearish' → BEAR
+      dark_pool_flow             : signal == ACCUMULATION → BULL
       sec_insider                : score > 0 with buy/activist flags → BULL
                                    (sell detection not in current sec_module implementation)
     """
@@ -245,64 +237,12 @@ def extract_module_direction(module_name: str, module_output: dict) -> Optional[
             return "BEAR"   # Put-heavy = market expects down move
         return None
 
-    # ── cross_asset_divergence ───────────────────────────────────────────────
-    if module_name == "cross_asset_divergence":
-        signal = str(module_output.get("signal", "")).upper()
-        if "BOTTOM" in signal:
-            return "BULL"
-        if "TOP" in signal:
-            return "BEAR"
-        return None
-
-    # ── polymarket ───────────────────────────────────────────────────────────
-    # signal_score in ai_quant is on a 0–5 scale; > 0.6 means any non-trivial signal.
-    # Directional inference comes primarily from probability.
-    if module_name == "polymarket":
-        score = float(module_output.get("polymarket_score", 0) or 0)
-        prob  = float(module_output.get("polymarket_probability", 0) or 0)
-        if score > 0.6 and prob > 0.65:
-            return "BULL"
-        if prob < 0.35:
-            return "BEAR"
-        return None
-
-    # ── congress_trades ──────────────────────────────────────────────────────
-    # congress_direction comes from score_congress_signal; fall back to
-    # score > 0 (any buys detected) when direction field is absent.
-    if module_name == "congress_trades":
-        direction = str(module_output.get("congress_direction", "neutral")).lower()
-        if "bull" in direction:
-            return "BULL"
-        if "bear" in direction:
-            return "BEAR"
-        # Fallback: positive score means congressional buys were detected
-        score = float(module_output.get("congress_score", 0) or 0)
-        if score > 0:
-            return "BULL"
-        return None
-
     # ── dark_pool_flow ───────────────────────────────────────────────────────
-    # FINRA ATS short volume institutional flow signal.
-    # ACCUMULATION (score >= threshold) → BULL; DISTRIBUTION (score <= threshold) → BEAR.
+    # FINRA ATS accumulation flag: signal == ACCUMULATION → BULL, else no vote.
     if module_name == "dark_pool_flow":
-        dp_score = module_output.get("dark_pool_score")
         dp_signal = str(module_output.get("signal", "")).upper()
-        # Prefer the pre-classified signal label; fall back to raw score thresholds
         if dp_signal == "ACCUMULATION":
             return "BULL"
-        if dp_signal == "DISTRIBUTION":
-            return "BEAR"
-        # Fallback via raw score (uses same thresholds as dark_pool_flow.py)
-        if dp_score is not None:
-            try:
-                from config import DARK_POOL_ACCUMULATION_THRESHOLD, DARK_POOL_DISTRIBUTION_THRESHOLD
-            except ImportError:
-                DARK_POOL_ACCUMULATION_THRESHOLD = 65
-                DARK_POOL_DISTRIBUTION_THRESHOLD = 35
-            if dp_score >= DARK_POOL_ACCUMULATION_THRESHOLD:
-                return "BULL"
-            if dp_score <= DARK_POOL_DISTRIBUTION_THRESHOLD:
-                return "BEAR"
         return None
 
     # ── sec_insider ──────────────────────────────────────────────────────────

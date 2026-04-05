@@ -52,10 +52,7 @@
 |------|-------|-------------|
 | [ai_quant.py](../ai_quant.py) | 1833 | AI QUANT ANALYST v1.0 — Claude-Powered Signal Synthesis |
 | [sec_module.py](../sec_module.py) | 592 | SEC EDGAR MODULE v1.0 |
-| [congress_trades.py](../congress_trades.py) | 605 | CONGRESSIONAL TRADING MODULE v1.0 |
-| [max_pain.py](../max_pain.py) | 264 | MAX PAIN — Options Expiration Price Target |
 | [volume_profile.py](../volume_profile.py) | 354 | VOLUME PROFILE — Support & Resistance via Volume-at-Price |
-| [cross_asset_divergence.py](../cross_asset_divergence.py) | 368 | CROSS-ASSET DIVERGENCE SIGNAL |
 
 ### Paper Trading & Journaling
 
@@ -209,27 +206,8 @@
 - `scan_watchlist_insiders()`
 - `main()`
 
-#### congress_trades.py
-- `fetch_house_trades(days_back)`
-- `fetch_senate_trades(days_back)`
-- `get_all_trades(days_back)`
-- `get_trades_for_ticker(ticker, days_back)`
-- `score_congress_signal(ticker, days_back)`
-- `print_ticker_report(ticker)`
-- `print_watchlist_scan()`
-- `print_top_traders()`
-- `main()`
-
-#### max_pain.py
-- `get_max_pain(ticker, n_expirations)`
-- `main()`
-
 #### volume_profile.py
 - `get_volume_profile(ticker, period, n_bins, n_levels)`
-- `main()`
-
-#### cross_asset_divergence.py
-- `get_cross_asset_signal(ticker, period, ref_symbols, di_length, ma_length, threshold_bot, threshold_top, spike_ratio)`
 - `main()`
 
 #### paper_trader.py
@@ -281,9 +259,8 @@
 | Source | Modules | Auth | Rate Limit | Lag | Cost |
 |--------|---------|------|-----------|-----|------|
 | **yfinance** (Yahoo Finance) | All modules | None | ~100 req/min (soft) | 15 min | Free |
-| **Yahoo Finance options chains** | `options_flow.py`, `max_pain.py` | None | ~50 req/min | Near real-time | Free |
+| **Yahoo Finance options chains** | `options_flow.py` | None | ~50 req/min | Near real-time | Free |
 | **SEC EDGAR** (Form 4, 13F, 13D, 8-K, FTD CSVs) | `sec_module.py`, `squeeze_screener.py` | None (User-Agent required) | 10 req/sec (hard) | 2–7 days (filings), ~2 weeks (FTD) | Free |
-| **House/Senate Stock Watcher** | `congress_trades.py` | None | ~50 req/min | 30–45 days (STOCK Act) | Free |
 | **Polymarket Gamma API** `gamma-api.polymarket.com` | `polymarket_screener.py` | None | ~1,000 req/hr | Real-time | Free |
 | **Finviz** (HTML scraping) | `squeeze_screener.py`, `catalyst_screener.py` | None | Rate-limited (1s delays enforced) | ~2 weeks | Free (scraping) |
 | **ECB / Frankfurter API** | `fx_rates.py` | None | Free | Daily 16:00 CET | Free |
@@ -475,21 +452,7 @@ up-vol > 1.3x down-vol         +1
 
 ---
 
-### 4.7 Max Pain (`max_pain.py`)
-
-```python
-# For each candidate strike S:
-call_pain(S) = Σ (S − K) × OI_calls   for all K < S
-put_pain(S)  = Σ (K − S) × OI_puts    for all K > S
-total_pain(S) = call_pain(S) + put_pain(S)
-max_pain = argmin(total_pain)
-```
-
-Signal strength: HIGH if ≤ 7 DTE and total OI > 10,000. Pin risk zone: ±0.5% around max pain.
-
----
-
-### 4.8 Volume Profile (`volume_profile.py`)
+### 4.7 Volume Profile (`volume_profile.py`)
 
 ```python
 DEFAULT_BINS     = 60
@@ -502,23 +465,7 @@ Output: `poc_price`, `value_area_high/low`, `support_levels`, `resistance_levels
 
 ---
 
-### 4.9 Cross-Asset Divergence (`cross_asset_divergence.py`)
-
-```python
-# References: RSP (equity breadth), HYG (risk appetite), UUP (dollar)
-bot_line = weighted_avg(ref_plusDI  / stock_plusDI)   # refs surge, stock lags → bottom
-top_line = weighted_avg(ref_minusDI / stock_minusDI)  # refs drop, stock doesn't → top
-
-# Signal fires when:
-# 1. line > 0.65
-# 2. line > 1.8 × 20-bar SMA of that line
-```
-
-Output signal: `"BOTTOM"` | `"TOP"` | `"NEUTRAL"`
-
----
-
-### 4.10 Polymarket Signal (`polymarket_screener.py`)
+### 4.8 Polymarket Signal (`polymarket_screener.py`)
 
 | Component | Weight | Logic |
 |-----------|--------|-------|
@@ -536,18 +483,16 @@ Blocks: sports, entertainment, celebrity markets. Political markets require a fi
 ### Module Dependency Graph
 
 ```
-yfinance / SEC EDGAR / Gamma API / House-Senate Watcher
+yfinance / SEC EDGAR / Gamma API / FINRA ATS
         │
         ├─► signal_engine.py ──────────────────────────────────────────┐
         ├─► catalyst_screener.py   ──────────────────────────────────── │
         ├─► options_flow.py   ───────────────────────────────────────── │
         ├─► squeeze_screener.py  ──────────────────────────────────────►│
-        ├─► max_pain.py   ──────────────────────────────────────────────►│
+        ├─► dark_pool_flow.py  ─────────────────────────────────────────►│
         ├─► volume_profile.py  ─────────────────────────────────────────►│
-        ├─► cross_asset_divergence.py  ─────────────────────────────────►│
         ├─► fundamental_analysis.py  ───────────────────────────────────►│
         ├─► sec_module.py  ─────────────────────────────────────────────►│
-        ├─► congress_trades.py  ────────────────────────────────────────►│
         └─► polymarket_screener.py  ─────────────────────────────────────►│
                                                                          │
                                                                    ai_quant.py
@@ -772,7 +717,6 @@ Navigate to `/rankings` (sidebar shortcut `k`). Click any row to open a side pan
 
 **Potentially broken:**
 - `--social` flag in `catalyst_screener.py` — Reddit API changes may have broken this
-- `catalyst_backtest.py` referenced in `run_master.sh` Step 7 — existence unconfirmed
 - Multi-asset crypto signals retired (−0.20 Sharpe); BTC-only 200-MA binary used instead
 
 **Architecture debt:**

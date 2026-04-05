@@ -69,11 +69,6 @@ try:
 except ImportError:
     _POLYMARKET_AVAILABLE = False
 
-try:
-    from congress_trades import score_congress_signal, get_all_trades
-    _CONGRESS_AVAILABLE = True
-except ImportError:
-    _CONGRESS_AVAILABLE = False
 
 try:
     import dark_pool_flow as _dpf
@@ -705,7 +700,6 @@ def screen_universe(
     tickers: List[str],
     include_social: bool = False,
     include_polymarket: bool = False,
-    include_congress: bool = False,
 ) -> pd.DataFrame:
     """Run all screens on a universe of tickers."""
 
@@ -734,19 +728,6 @@ def screen_universe(
                 print(f"  [WARN] Polymarket fetch failed: {e}")
         else:
             print("  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
-
-    # Congress trades — fetch all trades once, reuse per ticker (avoids repeated API calls)
-    congress_all_trades: list = []
-    if include_congress:
-        if _CONGRESS_AVAILABLE:
-            try:
-                print(f"  Fetching congressional trades (House + Senate)...")
-                congress_all_trades = get_all_trades(days_back=90)
-                print(f"  Congress: {len(congress_all_trades)} trades loaded")
-            except Exception as e:
-                print(f"  [WARN] Congress trades fetch failed: {e}")
-        else:
-            print("  [WARN] congress_trades.py not found — skipping congressional signals")
 
     # Dark pool — pre-load FINRA files once; try result cache first (from run_master.sh)
     _dp_result_cache: Dict[str, dict] = {}
@@ -793,17 +774,6 @@ def screen_universe(
         if include_polymarket:
             polymarket = score_polymarket_signal(ticker, poly_data)
 
-        congress = {"score": 0, "max": 5, "flags": []}
-        if include_congress and _CONGRESS_AVAILABLE and congress_all_trades:
-            try:
-                # score_congress_signal fetches internally but we pass pre-fetched trades
-                # via a targeted filter to avoid re-fetching the full dataset
-                ticker_trades = [t for t in congress_all_trades if t["ticker"] == ticker]
-                if ticker_trades:
-                    congress = score_congress_signal(ticker, days_back=90)
-            except Exception:
-                pass
-
         # Dark pool: +2 bonus (ACCUMULATION) or -1 penalty (DISTRIBUTION)
         dark_pool = {"score": 0, "max": 2, "flags": [], "signal": "NEUTRAL", "detail": None}
         if _DARK_POOL_AVAILABLE:
@@ -819,16 +789,16 @@ def screen_universe(
         # Composite score
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
                         options["max"] + technical["max"] + social["max"] +
-                        polymarket["max"] + congress["max"] + dark_pool["max"])
+                        polymarket["max"] + dark_pool["max"])
         raw_total = (squeeze["score"] + volume["score"] + vol_squeeze["score"] +
                      options["score"] + technical["score"] + social["score"] +
-                     polymarket["score"] + congress["score"] + dark_pool["score"])
+                     polymarket["score"] + dark_pool["score"])
 
         composite = raw_total / max_possible * 100 if max_possible > 0 else 0
 
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
                      options["flags"] + technical["flags"] + social["flags"] +
-                     polymarket["flags"] + congress["flags"] + dark_pool["flags"])
+                     polymarket["flags"] + dark_pool["flags"])
 
         # Cross-module post-squeeze guard (mirrors squeeze_screener.py logic).
         # Zeroes the composite score when a squeeze has already fired — the
@@ -860,7 +830,6 @@ def screen_universe(
             "technical_score": technical["score"],
             "social_score": social["score"],
             "polymarket_score": polymarket["score"],
-            "congress_score": congress["score"],
             "dark_pool_score": dark_pool["score"],
             "dark_pool_signal": dark_pool["signal"],
             "post_squeeze_guard": bool(_recent_sq),
@@ -894,17 +863,15 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
     print(f"{'─' * 60}")
 
     has_poly = "polymarket_score" in df.columns and df["polymarket_score"].sum() > 0
-    has_congress = "congress_score" in df.columns and df["congress_score"].sum() > 0
     has_dark_pool = "dark_pool_score" in df.columns and df["dark_pool_score"].abs().sum() > 0
 
     print(f"\n  {'Rank':<5}{'Ticker':<8}{'Price':>10}{'MktCap':>10}"
           f"{'Short%':>8}{'VolRatio':>9}{'Squeeze':>8}{'Volume':>8}"
           f"{'VolComp':>8}{'Options':>8}{'Tech':>7}{'Social':>7}"
           + (f"{'Poly':>6}" if has_poly else "")
-          + (f"{'Cong':>6}" if has_congress else "")
           + (f"{'DkPool':>7}" if has_dark_pool else "")
           + f"{'TOTAL':>8}")
-    print(f"  {'─' * (104 + (6 if has_poly else 0) + (6 if has_congress else 0) + (7 if has_dark_pool else 0))}")
+    print(f"  {'─' * (104 + (6 if has_poly else 0) + (7 if has_dark_pool else 0))}")
 
     for i, (_, row) in enumerate(df.head(top_n).iterrows()):
         if row["composite"] >= 50:
@@ -929,8 +896,6 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
                 f"{row['social_score']:>5}/5")
         if has_poly:
             line += f"{row['polymarket_score']:>4}/5"
-        if has_congress:
-            line += f"{row['congress_score']:>4}/5"
         if has_dark_pool:
             dp_s = row.get("dark_pool_score", 0)
             dp_icon = "↑" if dp_s > 0 else ("↓" if dp_s < 0 else " ")
@@ -949,8 +914,7 @@ def print_results(df: pd.DataFrame, top_n: int = 20):
             print(f"    • {flag}")
 
 
-def deep_dive(ticker: str, include_social: bool = False, include_polymarket: bool = False,
-              include_congress: bool = False):
+def deep_dive(ticker: str, include_social: bool = False, include_polymarket: bool = False):
     """Single-stock deep analysis."""
     print(f"\n{'█' * 60}")
     print(f"  DEEP DIVE: {ticker}")
@@ -1035,19 +999,6 @@ def deep_dive(ticker: str, include_social: bool = False, include_polymarket: boo
         else:
             print("\n  [WARN] polymarket_screener.py not found — skipping Polymarket signals")
 
-    if include_congress:
-        if _CONGRESS_AVAILABLE:
-            try:
-                congress = score_congress_signal(ticker)
-                print(f"\n  CONGRESSIONAL TRADES: {congress['score']}/{congress['max']}")
-                for flag in congress["flags"]:
-                    print(f"    • {flag}")
-                if not congress["flags"]:
-                    print(f"    No congressional trades found for {ticker} in last 90 days.")
-            except Exception as e:
-                print(f"\n  [WARN] Congress trades fetch failed: {e}")
-        else:
-            print("\n  [WARN] congress_trades.py not found — skipping congressional signals")
 
 
 # ==============================================================================
@@ -1303,8 +1254,6 @@ def main():
     parser.add_argument("--ticker", type=str, help="Single stock deep dive")
     parser.add_argument("--social", action="store_true", help="Include Reddit scan")
     parser.add_argument("--polymarket", action="store_true", help="Include Polymarket prediction market signals")
-    parser.add_argument("--congress", action="store_true",
-                        help="Include congressional trading signals (House + Senate STOCK Act)")
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
     parser.add_argument("--update-watchlist", action="store_true",
                         help="After screening, re-rank watchlist.txt and append history")
@@ -1320,7 +1269,7 @@ def main():
 
     if args.ticker:
         deep_dive(args.ticker.upper(), include_social=args.social,
-                  include_polymarket=args.polymarket, include_congress=args.congress)
+                  include_polymarket=args.polymarket)
         return
 
     # ------------------------------------------------------------------
@@ -1395,7 +1344,7 @@ def _main_continue(args, universe):
     """Continuation of main() after universe is built — kept for readability."""
 
     results = screen_universe(universe, include_social=args.social,
-                              include_polymarket=args.polymarket, include_congress=args.congress)
+                              include_polymarket=args.polymarket)
 
     if not results.empty:
         print_results(results, top_n=args.top)

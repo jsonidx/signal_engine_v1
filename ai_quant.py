@@ -3,7 +3,7 @@
 ================================================================================
 AI QUANT ANALYST v1.0 — Claude-Powered Signal Synthesis
 ================================================================================
-Uses claude-sonnet-4-6 with adaptive thinking to analyze aggregated signals for
+Uses grok-4-1 (xAI) to analyze aggregated signals for
 a ticker and produce a structured quant thesis.
 
 WHAT IT DOES:
@@ -33,15 +33,15 @@ USAGE:
     python3 ai_quant.py --ticker COIN --raw    # Show raw Claude response
 
 REQUIREMENTS:
-    pip install anthropic
-    export ANTHROPIC_API_KEY="your-key"
+    pip install openai
+    export XAI_API_KEY="your-key"
 
-COST (claude-sonnet-4-6, $3/M input · $15/M output):
+COST (grok-4-1-fast-reasoning default, $1/M in · $4/M out):
     Prompt size : ~3,558 input tokens (system + user)
-                  └─ 5 upgrade modules add ~461 tokens vs original (~1,800 tok)
-    Per ticker  : ~$0.026 standard  |  ~$0.071 with extended thinking
-    5-ticker run: ~$0.13  standard  |  ~$0.35  with extended thinking
-    Thinking is auto-enabled when signal_agreement_score ≥ 0.70.
+    Per ticker  : ~$0.009 default  |  ~$0.027 premium (grok-4.20-0309-reasoning)
+    5-ticker run: ~$0.045 default  |  ~$0.135 premium
+    Premium auto-enabled when signal_agreement_score ≥ AI_PREMIUM_THRESHOLD (0.85).
+    Fallback: if premium fails → retries with grok-4-1-fast-reasoning.
 
     New section token cost breakdown:
       Earnings & Event Calendar : ~127 tok
@@ -76,19 +76,26 @@ from utils.db import get_connection
 warnings.filterwarnings("ignore")
 
 try:
-    import anthropic
-    _ANTHROPIC_AVAILABLE = True
+    from openai import OpenAI as _OpenAI
+    _OPENAI_AVAILABLE = True
 except ImportError:
-    anthropic = None  # type: ignore[assignment]
-    _ANTHROPIC_AVAILABLE = False
+    _OpenAI = None  # type: ignore[assignment]
+    _OPENAI_AVAILABLE = False
 
 try:
-    from config import OUTPUT_DIR, PORTFOLIO_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION
+    from config import (
+        OUTPUT_DIR, PORTFOLIO_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION,
+        AI_MODEL_DEFAULT, AI_MODEL_PREMIUM, AI_MODEL_FALLBACK, AI_PREMIUM_THRESHOLD,
+    )
 except ImportError:
     OUTPUT_DIR = "./signals_output"
     PORTFOLIO_NAV = 50_000
     CRYPTO_ALLOCATION = 0.25
     EQUITY_ALLOCATION = 0.65
+    AI_MODEL_DEFAULT   = "grok-4-1-fast-reasoning"
+    AI_MODEL_PREMIUM   = "grok-4.20-0309-reasoning"
+    AI_MODEL_FALLBACK  = "grok-4-1-fast-reasoning"
+    AI_PREMIUM_THRESHOLD = 0.85
 
 # ─── Regime filter (optional — degrades gracefully) ───────────────────────────
 try:
@@ -248,8 +255,8 @@ def save_thesis(thesis: dict) -> None:
                  catalysts_json, risks_json, raw_response, signals_json, created_at,
                  bull_probability, bear_probability, neutral_probability,
                  signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
-                 expected_moves_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 expected_moves_json, model_used, cost_usd)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
@@ -275,7 +282,9 @@ def save_thesis(thesis: dict) -> None:
                 key_invalidation=excluded.key_invalidation,
                 primary_scenario=excluded.primary_scenario,
                 bear_scenario=excluded.bear_scenario,
-                expected_moves_json=excluded.expected_moves_json
+                expected_moves_json=excluded.expected_moves_json,
+                model_used=excluded.model_used,
+                cost_usd=excluded.cost_usd
         """, (
             thesis.get("ticker", "").upper(),
             date,
@@ -304,6 +313,8 @@ def save_thesis(thesis: dict) -> None:
             thesis.get("primary_scenario"),
             thesis.get("bear_scenario"),
             json.dumps(thesis.get("expected_moves") or []),
+            thesis.get("model_used"),
+            thesis.get("cost_usd"),
         ))
         conn.commit()
         conn.close()
@@ -510,23 +521,6 @@ def _collect_volume_profile_signals(ticker: str) -> dict:
         return {}
 
 
-def _collect_cross_asset_signals(ticker: str) -> dict:
-    """Cross-asset divergence signal (Bottom/Top Finder logic)."""
-    try:
-        from cross_asset_divergence import get_cross_asset_signal
-        return get_cross_asset_signal(ticker)
-    except Exception:
-        return {}
-
-
-def _collect_max_pain_signals(ticker: str) -> dict:
-    """Max pain — options expiration price gravity target."""
-    try:
-        from max_pain import get_max_pain
-        return get_max_pain(ticker)
-    except Exception:
-        return {}
-
 
 def _collect_options_signals(ticker: str) -> dict:
     """Pull options flow data from options_flow module."""
@@ -536,24 +530,6 @@ def _collect_options_signals(ticker: str) -> dict:
     except Exception:
         return {}
 
-
-def _collect_congress_signals(ticker: str) -> dict:
-    """Pull congressional trade signal."""
-    try:
-        from congress_trades import score_congress_signal, get_all_trades
-        trades = get_all_trades()
-        result = score_congress_signal(ticker, trades)
-        if not result:
-            return {}
-        return {
-            "congress_score": result.get("score", 0),
-            "congress_direction": result.get("direction", "neutral"),
-            "congress_trade_count": result.get("trade_count", 0),
-            "congress_notable_traders": result.get("notable_traders", []),
-            "congress_recent_trades": result.get("recent_trades", [])[:3],
-        }
-    except Exception:
-        return {}
 
 
 def _collect_polymarket_signals(ticker: str) -> dict:
@@ -779,33 +755,6 @@ def _collect_red_flag_signals(ticker: str) -> dict:
         return {"red_flag_available": False}
 
 
-def _collect_transcript_signals(ticker: str) -> dict:
-    """
-    Pull earnings call transcript analysis from earnings_transcript module.
-    Uses cache (7-day TTL) — live Claude call only on cache miss.
-    """
-    try:
-        from earnings_transcript import get_transcript_signals
-        result = get_transcript_signals(ticker, use_cache=True)
-        if not result.get("transcript_available"):
-            return {"transcript_available": False}
-        return {
-            "transcript_available": True,
-            "transcript_filing_date": result.get("filing_date"),
-            "transcript_tone_score": result.get("tone_score"),
-            "transcript_tone_label": result.get("tone_label"),
-            "transcript_guidance_direction": result.get("guidance_direction"),
-            "transcript_guidance_confidence": result.get("guidance_confidence"),
-            "transcript_capex_signal": result.get("capex_signal"),
-            "transcript_buyback_signal": result.get("buyback_signal"),
-            "transcript_management_summary": result.get("management_summary"),
-            "transcript_key_quotes": result.get("key_quotes", []),
-            "transcript_risks": result.get("risks_mentioned", []),
-            "transcript_catalysts": result.get("catalysts_mentioned", []),
-        }
-    except Exception:
-        return {"transcript_available": False}
-
 
 def compute_signal_agreement(signals_dict: dict) -> float:
     """
@@ -855,15 +804,7 @@ def compute_signal_agreement(signals_dict: dict) -> float:
         if heat > 60:
             votes.append("BULL")
 
-    # 4. cross_asset_divergence signal  (BOTTOM → BULL, TOP → BEAR)
-    cadiv_signal = str((signals_dict.get("cross_asset") or {}).get("signal") or "")
-    upper_sig = cadiv_signal.upper()
-    if "BOTTOM" in upper_sig:
-        votes.append("BULL")
-    elif "TOP" in upper_sig:
-        votes.append("BEAR")
-
-    # 5. fundamental_analysis composite score
+    # 4. fundamental_analysis composite score
     fund_score = (signals_dict.get("fundamentals") or {}).get("fundamental_score_pct")
     if fund_score is not None:
         if fund_score > 60:
@@ -1352,30 +1293,9 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
         print("done")
 
     if verbose:
-        print(f"  [{ticker}]   → cross-asset divergence...", end=" ", flush=True)
-    cadiv = _collect_cross_asset_signals(ticker)
-    signals["cross_asset"] = cadiv
-    if verbose:
-        print("done")
-
-    if verbose:
         print(f"  [{ticker}]   → options flow...", end=" ", flush=True)
     opts = _collect_options_signals(ticker)
     signals["options_flow"] = opts
-    if verbose:
-        print("done")
-
-    if verbose:
-        print(f"  [{ticker}]   → max pain...", end=" ", flush=True)
-    mp = _collect_max_pain_signals(ticker)
-    signals["max_pain"] = mp
-    if verbose:
-        print("done")
-
-    if verbose:
-        print(f"  [{ticker}]   → congress...", end=" ", flush=True)
-    cong = _collect_congress_signals(ticker)
-    signals["congress"] = cong
     if verbose:
         print("done")
 
@@ -1437,14 +1357,6 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     if verbose:
         level = red_flags.get("red_flag_risk_level", "N/A") if red_flags.get("red_flag_available") else "N/A"
         print(f"done ({level})")
-
-    if verbose:
-        print(f"  [{ticker}]   → earnings transcript...", end=" ", flush=True)
-    transcript = _collect_transcript_signals(ticker)
-    signals["transcript"] = transcript
-    if verbose:
-        tone = transcript.get("transcript_tone_label", "N/A") if transcript.get("transcript_available") else "N/A"
-        print(f"done (tone={tone})")
 
     if verbose:
         print(f"  [{ticker}]   → earnings event...", end=" ", flush=True)
@@ -1755,12 +1667,12 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
         return
 
     # ── API key required beyond this point ───────────────────────────────────
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("  ERROR: ANTHROPIC_API_KEY not set.")
-        print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+    if not os.environ.get("XAI_API_KEY"):
+        print("  ERROR: XAI_API_KEY not set.")
+        print("  Set it with: export XAI_API_KEY='your-key'")
         sys.exit(1)
 
-    # ── Run Claude on selected tickers ────────────────────────────────────────
+    # ── Run Grok on selected tickers ──────────────────────────────────────────
     results = []
     for i, selection in enumerate(selected, 1):
         ticker = selection["ticker"]
@@ -1974,11 +1886,8 @@ def _build_prompt(signals: dict) -> str:
     wr       = signals.get("weekly_regime", {})
     tech     = signals.get("technical", {})
     vp       = signals.get("volume_profile", {})
-    cadiv    = signals.get("cross_asset", {})
     fund     = signals.get("fundamentals", {})
     opts     = signals.get("options_flow", {})
-    mp       = signals.get("max_pain", {})
-    cong     = signals.get("congress", {})
     poly     = signals.get("polymarket", {})
     sec      = signals.get("sec", {})
     catalyst = signals.get("catalyst", {})
@@ -2144,17 +2053,6 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Liquidity data: unavailable")
 
-    prompt_parts += ["", "## CROSS-ASSET DIVERGENCE (vs RSP / HYG / DXY)"]
-    if cadiv:
-        prompt_parts += [
-            f"Signal:         {cadiv.get('signal', 'N/A')}",
-            f"Bottom line:    {cadiv.get('bot_line', 'N/A')} (MA={cadiv.get('bot_line_ma', 'N/A')}, spike={cadiv.get('bot_diff', 'N/A')}x) | trigger={cadiv.get('bot_trigger', False)}",
-            f"Top line:       {cadiv.get('top_line', 'N/A')} (MA={cadiv.get('top_line_ma', 'N/A')}, spike={cadiv.get('top_diff', 'N/A')}x) | trigger={cadiv.get('top_trigger', False)}",
-            f"Interpretation: {cadiv.get('interpretation', 'N/A')}",
-        ]
-    else:
-        prompt_parts.append("Cross-asset divergence: unavailable")
-
     prompt_parts += ["", "## RELATIVE STRENGTH / SECTOR CONTEXT"]
     if rs.get("rs_available"):
         etf = rs.get("sector_etf", "SPY")
@@ -2272,54 +2170,6 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Fundamental data: unavailable")
 
-    prompt_parts += ["", "## MAX PAIN (Options Expiration Price Target)"]
-    if mp:
-        exps = mp.get("all_expirations", [])
-        prompt_parts += [
-            f"Current price: ${mp.get('current_price', 'N/A')}",
-            f"Nearest expiry ({mp.get('nearest_expiry', 'N/A')}, {mp.get('nearest_days_to_expiry', '?')}d away):",
-            f"  Max pain: ${mp.get('nearest_max_pain', 'N/A')}  |  "
-            f"Distance: {mp.get('nearest_distance_pct', 'N/A'):+.2f}%  |  "
-            f"Direction: {mp.get('nearest_direction', 'N/A')}  |  "
-            f"Strength: {mp.get('nearest_signal_strength', 'N/A')}"
-            if isinstance(mp.get('nearest_distance_pct'), (int, float)) else
-            f"  Max pain: ${mp.get('nearest_max_pain', 'N/A')}",
-            f"  Pin zone: ${mp.get('pin_zone_low', 'N/A')} — ${mp.get('pin_zone_high', 'N/A')}  "
-            f"(OI: {mp.get('nearest_total_oi', 0):,})",
-        ]
-        if len(exps) > 1:
-            prompt_parts.append("Upcoming expirations:")
-            for e in exps[1:]:
-                prompt_parts.append(
-                    f"  {e['expiry']} ({e['days_to_expiry']}d): "
-                    f"max pain ${e['max_pain']}  {e['distance_pct']:+.2f}%  "
-                    f"{e['direction']}  OI:{e['total_oi']:,}"
-                )
-        prompt_parts.append(f"Interpretation: {mp.get('interpretation', '')}")
-    else:
-        prompt_parts.append("Max pain: unavailable (no listed options or data failure)")
-
-    prompt_parts += ["", "## CONGRESSIONAL TRADES"]
-    if cong:
-        traders = cong.get("congress_notable_traders", [])
-        trades = cong.get("congress_recent_trades", [])
-        prompt_parts += [
-            f"Congress signal score: {cong.get('congress_score', 'N/A')}/100",
-            f"Direction: {cong.get('congress_direction', 'N/A')}",
-            f"Trade count (recent): {cong.get('congress_trade_count', 'N/A')}",
-            f"Notable traders: {', '.join(traders) if traders else 'None'}",
-        ]
-        if trades:
-            prompt_parts.append("Recent trades:")
-            for trade in trades[:3]:
-                if isinstance(trade, dict):
-                    prompt_parts.append(
-                        f"  - {trade.get('politician', '?')}: {trade.get('type', '?')} "
-                        f"${trade.get('amount', '?')} on {trade.get('date', '?')}"
-                    )
-    else:
-        prompt_parts.append("Congressional trade data: none / unavailable")
-
     prompt_parts += ["", "## SEC FILINGS (Insider / Activist / Institutional)"]
     if sec:
         prompt_parts += [
@@ -2345,30 +2195,20 @@ def _build_prompt(signals: dict) -> str:
         prompt_parts.append("Polymarket data: no relevant markets found")
 
     dp = signals.get("dark_pool_flow") or {}
-    prompt_parts += ["", "## DARK POOL FLOW (FINRA ATS — Institutional Routing)"]
+    prompt_parts += ["", "## DARK POOL FLOW (FINRA ATS)"]
     if dp and dp.get("signal"):
         prompt_parts += [
-            f"Signal: {dp.get('signal', 'N/A')}  (score {dp.get('dark_pool_score', 'N/A')}/100, 50=neutral)",
-            f"Short ratio today   : {dp.get('short_ratio_today', 0):.3%}"
-            if isinstance(dp.get('short_ratio_today'), float) else
-            f"Short ratio today   : {dp.get('short_ratio_today', 'N/A')}",
-            f"Short ratio mean    : {dp.get('short_ratio_mean', 0):.3%}"
-            if isinstance(dp.get('short_ratio_mean'), float) else
-            f"Short ratio mean    : {dp.get('short_ratio_mean', 'N/A')}",
-            f"Short ratio trend   : {dp.get('short_ratio_trend', 0):+.5f}/day"
-            if isinstance(dp.get('short_ratio_trend'), float) else
-            f"Short ratio trend   : {dp.get('short_ratio_trend', 'N/A')}",
-            f"Short ratio z-score : {dp.get('short_ratio_zscore', 0):+.2f}"
+            f"Signal: {dp.get('signal', 'N/A')}  "
+            f"(short_ratio_zscore={dp.get('short_ratio_zscore', 'N/A'):+.2f})"
             if isinstance(dp.get('short_ratio_zscore'), float) else
-            f"Short ratio z-score : {dp.get('short_ratio_zscore', 'N/A')}",
-            f"Dark pool intensity : {dp.get('dark_pool_intensity', 0):.1%}"
-            if isinstance(dp.get('dark_pool_intensity'), float) else
-            f"Dark pool intensity : {dp.get('dark_pool_intensity', 'N/A')}",
-            f"Days of FINRA data  : {dp.get('days_of_data', 'N/A')}",
-            f"Interpretation      : {dp.get('interpretation', '')}",
+            f"Signal: {dp.get('signal', 'N/A')}",
+            f"Short ratio today: {dp.get('short_ratio_today', 0):.3%}"
+            if isinstance(dp.get('short_ratio_today'), float) else
+            f"Short ratio today: {dp.get('short_ratio_today', 'N/A')}",
+            f"Days of FINRA data: {dp.get('days_of_data', 'N/A')}",
         ]
     else:
-        prompt_parts.append("Dark pool data: unavailable (FINRA file not yet published or ticker not found)")
+        prompt_parts.append("Dark pool data: unavailable")
 
     prompt_parts += ["", "## HISTORICAL ANALOG SCORE"]
     if analog.get("analog_available"):
@@ -2487,90 +2327,94 @@ def _validate_probabilities(thesis: dict) -> None:
         )
 
 
-THINKING_AGREEMENT_THRESHOLD = 0.70  # signal_agreement_score >= this → enable extended thinking
-THINKING_BUDGET_TOKENS = 3000        # token budget for thinking (billed separately)
+# Model routing: premium kicks in when signal_agreement_score ≥ AI_PREMIUM_THRESHOLD (config.py)
+XAI_BASE_URL = "https://api.x.ai/v1"
 
-_last_call_usage: dict = {"input_tokens": 0, "output_tokens": 0, "model": "claude-sonnet-4-6"}
+_last_call_usage: dict = {"input_tokens": 0, "output_tokens": 0, "model": AI_MODEL_DEFAULT}
+
+
+def _grok_stream(client, model: str, prompt: str) -> str:
+    """Inner streaming call — returns full response text. Raises on error."""
+    full_text = ""
+    with client.chat.completions.create(
+        model=model,
+        max_tokens=8192,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ],
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                full_text += delta.content
+    return full_text
 
 
 def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False) -> Optional[str]:
     """
-    Call claude-sonnet-4-6 with streaming.
-    use_thinking=True enables extended thinking (higher quality, ~3x cost).
+    Call xAI Grok with streaming (OpenAI-compatible API).
+
+    Model routing:
+      use_thinking=False → AI_MODEL_DEFAULT  (grok-4-1-fast-reasoning)
+      use_thinking=True  → AI_MODEL_PREMIUM  (grok-4.20-0309-reasoning)
+                           falls back to AI_MODEL_FALLBACK on any error
+
     Returns the response text, or None on failure.
     Token usage is stored in module-level _last_call_usage after each call.
     """
-    if not _ANTHROPIC_AVAILABLE:
-        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+    if not _OPENAI_AVAILABLE:
+        print("ERROR: openai package not installed. Run: pip install openai")
         return None
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
-        print("  ERROR: ANTHROPIC_API_KEY environment variable not set.")
-        print("         export ANTHROPIC_API_KEY='your-key-here'")
+        print("  ERROR: XAI_API_KEY environment variable not set.")
+        print("         export XAI_API_KEY='your-key-here'")
         return None
 
-    client = anthropic.Anthropic(api_key=api_key)
+    primary_model = AI_MODEL_PREMIUM if use_thinking else AI_MODEL_DEFAULT
+    client = _OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
 
     if verbose:
-        mode = "extended thinking" if use_thinking else "standard"
-        print(f"  Calling Claude API (sonnet-4-6, {mode})...", flush=True)
+        label = f"premium ({AI_MODEL_PREMIUM})" if use_thinking else f"default ({AI_MODEL_DEFAULT})"
+        print(f"  Calling xAI Grok API ({label})...", flush=True)
     elif use_thinking:
-        print("  [thinking enabled — high-conviction setup]", flush=True)
-
-    full_text = ""
-    thinking_shown = False
-
-    extra_kwargs: dict = {}
-    if use_thinking:
-        extra_kwargs["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}
-        # thinking requires a higher max_tokens to accommodate budget + response
-        extra_kwargs["max_tokens"] = 8192 + THINKING_BUDGET_TOKENS
-    else:
-        extra_kwargs["max_tokens"] = 8192
+        print(f"  [premium model — agreement ≥ {AI_PREMIUM_THRESHOLD}]", flush=True)
 
     try:
-        # Use streaming to handle long responses and avoid timeouts
-        with client.messages.stream(
-            model="claude-sonnet-4-6",
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-            **extra_kwargs,
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_start":
-                    if hasattr(event, "content_block"):
-                        if event.content_block.type == "thinking" and verbose and not thinking_shown:
-                            print("  [thinking...]", flush=True)
-                            thinking_shown = True
-                elif event.type == "content_block_delta":
-                    if hasattr(event, "delta"):
-                        if event.delta.type == "text_delta":
-                            full_text += event.delta.text
-            # Capture real token counts for usage logging
-            try:
-                final_msg = stream.get_final_message()
-                _last_call_usage["input_tokens"]  = final_msg.usage.input_tokens
-                _last_call_usage["output_tokens"] = final_msg.usage.output_tokens
-                _last_call_usage["model"]         = "claude-sonnet-4-6"
-            except Exception:
-                _last_call_usage["input_tokens"]  = len(prompt) // 4
-                _last_call_usage["output_tokens"] = len(full_text) // 4
-                _last_call_usage["model"]         = "claude-sonnet-4-6"
-
-        return full_text.strip() if full_text else None
-
-    except anthropic.AuthenticationError:
-        print("  ERROR: Invalid ANTHROPIC_API_KEY.")
-        return None
-    except anthropic.RateLimitError:
-        print("  ERROR: Claude API rate limit hit. Wait and retry.")
-        return None
-    except anthropic.APIStatusError as e:
-        print(f"  ERROR: Claude API error {e.status_code}: {e.message}")
-        return None
+        full_text = _grok_stream(client, primary_model, prompt)
     except Exception as e:
-        print(f"  ERROR: Unexpected error calling Claude: {e}")
-        return None
+        if use_thinking:
+            # Fallback: retry with the cheaper model instead of failing
+            print(f"  [premium failed ({e}), retrying with fallback {AI_MODEL_FALLBACK}]", flush=True)
+            try:
+                full_text = _grok_stream(client, AI_MODEL_FALLBACK, prompt)
+                primary_model = AI_MODEL_FALLBACK
+            except Exception as e2:
+                err = str(e2)
+                if "401" in err or "authentication" in err.lower():
+                    print("  ERROR: Invalid XAI_API_KEY.")
+                elif "429" in err or "rate" in err.lower():
+                    print("  ERROR: Grok API rate limit hit. Wait and retry.")
+                else:
+                    print(f"  ERROR: Grok fallback also failed: {e2}")
+                return None
+        else:
+            err = str(e)
+            if "401" in err or "authentication" in err.lower():
+                print("  ERROR: Invalid XAI_API_KEY.")
+            elif "429" in err or "rate" in err.lower():
+                print("  ERROR: Grok API rate limit hit. Wait and retry.")
+            else:
+                print(f"  ERROR: Unexpected error calling Grok: {e}")
+            return None
+
+    _last_call_usage["input_tokens"]  = (len(SYSTEM_PROMPT) + len(prompt)) // 4
+    _last_call_usage["output_tokens"] = len(full_text) // 4
+    _last_call_usage["model"]         = primary_model
+
+    return full_text.strip() if full_text else None
 
 
 def _parse_response(raw: str) -> Optional[dict]:
@@ -2952,7 +2796,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
             print(f"\n  [{ticker}] Using cached result from today — skipping API call.")
             try:
                 from utils.usage import log_api_usage
-                log_api_usage(module="thesis", model="claude-sonnet-4-6",
+                log_api_usage(module="thesis", model=AI_MODEL_DEFAULT,
                               input_tokens=0, output_tokens=0, ticker=ticker, cache_hit=True)
             except Exception:
                 pass
@@ -2997,9 +2841,9 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print(prompt)
         print("--- END PROMPT ---\n")
 
-    # Enable extended thinking for high-conviction setups (strong signal agreement)
+    # Upgrade to premium model for highest-conviction setups
     agreement = signals.get("signal_agreement_score", 0.0) or 0.0
-    use_thinking = agreement >= THINKING_AGREEMENT_THRESHOLD
+    use_thinking = agreement >= AI_PREMIUM_THRESHOLD
 
     # Call Claude
     raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
@@ -3071,6 +2915,17 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     # Validate probability sum; emit warning if not ~1.0
     _validate_probabilities(thesis)
 
+    # --- Stamp model provenance + cost ---
+    try:
+        from utils.usage import compute_cost
+        _model  = _last_call_usage.get("model", AI_MODEL_DEFAULT)
+        _in_tok = _last_call_usage.get("input_tokens", 0)
+        _out_tok= _last_call_usage.get("output_tokens", 0)
+        thesis["model_used"] = _model
+        thesis["cost_usd"]   = round(compute_cost(_model, _in_tok, _out_tok), 4)
+    except Exception:
+        pass
+
     # --- Save to cache ---
     save_thesis(thesis)
 
@@ -3079,7 +2934,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         from utils.usage import log_api_usage
         log_api_usage(
             module="thesis",
-            model=_last_call_usage.get("model", "claude-sonnet-4-6"),
+            model=_last_call_usage.get("model", AI_MODEL_DEFAULT),
             input_tokens=_last_call_usage.get("input_tokens", 0),
             output_tokens=_last_call_usage.get("output_tokens", 0),
             ticker=ticker,
@@ -3317,11 +3172,11 @@ def print_full_report(results: List[dict]) -> None:
 
 def analyze_report_file(report_path: str, verbose: bool = False) -> Optional[str]:
     """
-    Send an existing signal report file to Claude for portfolio-level analysis.
-    Useful for analyzing the output of run_master.sh.
+    Send an existing signal report file to Grok for portfolio-level analysis.
+    Uses grok-4-20 for complex multi-ticker synthesis.
     """
-    if not _ANTHROPIC_AVAILABLE:
-        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+    if not _OPENAI_AVAILABLE:
+        print("ERROR: openai package not installed. Run: pip install openai")
         return None
 
     if not os.path.exists(report_path):
@@ -3336,12 +3191,12 @@ def analyze_report_file(report_path: str, verbose: bool = False) -> Optional[str
     if len(content) > max_chars:
         content = content[:max_chars] + f"\n\n[... report truncated at {max_chars} chars ...]"
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
-        print("  ERROR: ANTHROPIC_API_KEY not set.")
+        print("  ERROR: XAI_API_KEY not set.")
         return None
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
 
     system = """You are a senior portfolio manager and quant analyst at a hedge fund.
 Analyze the provided weekly signal report and give a structured portfolio briefing:
@@ -3356,23 +3211,25 @@ Be direct, specific, and quantitative. Use actual price levels from the data."""
 
     prompt = f"""Analyze this weekly signal report for my portfolio:\n\n{content}"""
 
-    print(f"  Sending report to Claude ({len(content):,} chars)...")
+    print(f"  Sending report to Grok ({len(content):,} chars)...")
 
     full_response = ""
     try:
-        with client.messages.stream(
-            model="claude-opus-4-6",
+        with client.chat.completions.create(
+            model=AI_MODEL_PREMIUM,
             max_tokens=8192,
-            thinking={"type": "adaptive"},
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
+            stream=True,
         ) as stream:
-            for event in stream:
-                if event.type == "content_block_delta":
-                    if hasattr(event, "delta") and event.delta.type == "text_delta":
-                        full_response += event.delta.text
-                        if verbose:
-                            print(event.delta.text, end="", flush=True)
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    full_response += delta.content
+                    if verbose:
+                        print(delta.content, end="", flush=True)
 
         return full_response.strip()
 
@@ -3684,12 +3541,12 @@ def main():
         # Optionally run Claude on the top N
         if args.top and qualified:
             top_candidates = display
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                print("  ERROR: ANTHROPIC_API_KEY not set — cannot run Claude analysis.")
-                print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+            if not os.environ.get("XAI_API_KEY"):
+                print("  ERROR: XAI_API_KEY not set — cannot run Grok analysis.")
+                print("  Set it with: export XAI_API_KEY='your-key'")
                 sys.exit(1)
 
-            print(f"  Running Claude analysis on top {len(top_candidates)}: "
+            print(f"  Running Grok analysis on top {len(top_candidates)}: "
                   f"{', '.join(r['ticker'] for r in top_candidates)}")
             results = []
             for i, r in enumerate(top_candidates, 1):
@@ -3731,9 +3588,9 @@ def main():
         _run_top_n_mode(args, use_cache)
         return
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("  ERROR: ANTHROPIC_API_KEY not set.")
-        print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+    if not os.environ.get("XAI_API_KEY"):
+        print("  ERROR: XAI_API_KEY not set.")
+        print("  Set it with: export XAI_API_KEY='your-key'")
         sys.exit(1)
 
     if args.report:

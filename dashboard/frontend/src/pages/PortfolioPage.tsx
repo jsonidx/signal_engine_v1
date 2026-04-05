@@ -27,6 +27,7 @@ import {
   usePortfolioSummary,
   usePortfolioHistory,
   usePortfolioPositions,
+  usePortfolioSparklines,
   useEquityScreener,
   useCash,
   useCashUpdate,
@@ -239,6 +240,30 @@ function StatusBadge({ status }: { status: SizingStatus }) {
   )
 }
 
+// ─── Position sparkline ───────────────────────────────────────────────────────
+
+function MiniSparkline({ prices }: { prices: number[] }) {
+  if (!prices || prices.length < 2) {
+    return <span className="font-mono text-[10px] text-text-tertiary">—</span>
+  }
+  const w = 56, h = 24, pad = 2
+  const min = Math.min(...prices)
+  const max = Math.max(...prices)
+  const range = max - min || 1
+  const pts = prices.map((p, i) => {
+    const x = pad + (i / (prices.length - 1)) * (w - pad * 2)
+    const y = h - pad - ((p - min) / range) * (h - pad * 2)
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+  const isUp = prices[prices.length - 1] >= prices[0]
+  const color = isUp ? '#4ade80' : '#f87171'  // accent-green / accent-red
+  return (
+    <svg width={w} height={h} className="inline-block">
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 const TAB_STYLE =
   'px-4 py-2.5 font-mono text-xs uppercase tracking-widest border-b-2 transition-colors cursor-pointer ' +
   'data-[state=active]:border-accent-blue data-[state=active]:text-text-primary ' +
@@ -274,6 +299,7 @@ export function PortfolioPage() {
   const closePositionMutation = useClosePosition()
   const { data: tradesData, isLoading: tradesLoading } = useTrades()
   const { data: regimeData } = useRegime()
+  const { data: sparklines } = usePortfolioSparklines()
   const [regimePanelOpen, setRegimePanelOpen] = useState(true)
 
   // Add-position form state
@@ -365,6 +391,10 @@ export function PortfolioPage() {
 
   // Position Sizes section data
   const equityArr = equityScreener?.data ?? []
+  const overweightCount = positionsArr.filter((p: any) => {
+    const eq = equityArr.find((e: any) => e.ticker === p.ticker)
+    return eq && getSizingStatus(p.size_eur, eq.position_eur ?? 0) === 'OVERWEIGHT'
+  }).length
   const positionMap = new Map<string, number>(positionsArr.map((p: any) => [p.ticker, p.size_eur as number]))
 
   const isZeroRow = (r: any) =>
@@ -588,6 +618,11 @@ export function PortfolioPage() {
             <span className="font-mono text-xs text-text-secondary">
               {positionsArr.length} positions
             </span>
+            {overweightCount > 0 && (
+              <span className="inline-block px-2 py-0.5 rounded font-mono text-[10px] uppercase tracking-wide bg-red-500/15 text-red-400 border border-red-500/30">
+                {overweightCount} overweight
+              </span>
+            )}
             <button
               onClick={() => { setShowAddForm(v => !v); setAddFormError(null) }}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded font-mono text-xs bg-accent-blue/15 text-accent-blue border border-accent-blue/30 hover:bg-accent-blue/25 transition-colors"
@@ -735,7 +770,7 @@ export function PortfolioPage() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-border-subtle">
-                  {['Ticker', 'Direction', 'Entry', 'Current', 'P&L (€)', 'P&L (%)', 'Size (€)', 'Days', 'Conviction', ''].map(h => (
+                  {['Ticker', 'Direction', 'Entry', 'Current', 'P&L (€)', 'P&L (%)', 'Size (€)', '5d', 'Days', 'Conviction', ''].map(h => (
                     <th
                       key={h}
                       className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary"
@@ -777,6 +812,9 @@ export function PortfolioPage() {
                       <MonoNumber value={pos.size_eur} prefix="€" />
                     </td>
                     <td className="px-4 py-3">
+                      <MiniSparkline prices={sparklines?.[pos.ticker] ?? []} />
+                    </td>
+                    <td className="px-4 py-3">
                       <span className="font-mono text-sm text-text-secondary">{pos.days_held}d</span>
                     </td>
                     <td className="px-4 py-3">
@@ -800,7 +838,7 @@ export function PortfolioPage() {
                   </tr>
                   {sellingTicker === pos.ticker && (
                     <tr key={`${pos.ticker}-sell`} className="bg-bg-elevated border-b border-border-subtle/50">
-                      <td colSpan={10} className="px-4 py-3">
+                      <td colSpan={11} className="px-4 py-3">
                         <div className="flex flex-wrap items-end gap-3">
                           <span className="font-mono text-xs text-text-tertiary uppercase tracking-wide">
                             Sell {pos.ticker}
@@ -853,7 +891,7 @@ export function PortfolioPage() {
                 ))}
                 {sortedPositions.length === 0 && (
                   <tr>
-                    <td colSpan={10} className="px-4 py-8 text-center font-mono text-sm text-text-tertiary">
+                    <td colSpan={11} className="px-4 py-8 text-center font-mono text-sm text-text-tertiary">
                       No open positions
                     </td>
                   </tr>

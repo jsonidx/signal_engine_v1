@@ -593,7 +593,6 @@ class TestPostSqueezeGuard:
              patch.object(cs, "_SQUEEZE_GUARD_AVAILABLE", True), \
              patch.object(cs, "_DARK_POOL_AVAILABLE", False), \
              patch.object(cs, "_POLYMARKET_AVAILABLE", False), \
-             patch.object(cs, "_CONGRESS_AVAILABLE", False), \
              patch.object(cs, "_SOCIAL_SENTIMENT_AVAILABLE", False):
             df = cs.screen_universe(["SQUZE"], include_social=False)
 

@@ -186,34 +186,6 @@ def test_thesis_cache_miss_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# 5. Global AI cache — transcript_cache
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(autouse=False)
-def cleanup_test_transcript():
-    yield
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM transcript_cache WHERE ticker = %s", (TEST_TICKER,))
-    conn.commit()
-    conn.close()
-
-
-def test_transcript_cache_write_and_read(cleanup_test_transcript):
-    """_save_cache() writes; _get_cached() reads within TTL."""
-    from earnings_transcript import _save_cache, _get_cached
-
-    analysis = {"tone": "positive", "guidance": "raised", "cached": False}
-    filing_date = "2026-01-01"
-    _save_cache(TEST_TICKER, filing_date, analysis, "transcript snippet here")
-
-    result = _get_cached(TEST_TICKER)
-    assert result is not None, "_get_cached returned None after _save_cache"
-    assert result["tone"] == "positive"
-    assert result["cached"] is True
-
-
-# ---------------------------------------------------------------------------
 # 6. Watchlist
 # ---------------------------------------------------------------------------
 
@@ -436,7 +408,7 @@ def test_module_weights_loaded_from_supabase():
     cr._weights_cache = None
     weights = cr._load_module_weights()
     assert isinstance(weights, dict)
-    assert len(weights) >= 8, "Expected at least 8 module weight entries"
+    assert len(weights) >= 7, "Expected at least 7 module weight entries"
     total = sum(weights.values())
     assert abs(total - 1.0) < 0.05, f"module_weights sum {total:.3f} should be near 1.0"
 

@@ -9,13 +9,11 @@ import type { HeatmapRow } from '../lib/api'
 
 const SIGNAL_MODULES = [
   { key: 'signal_engine', label: 'SigEng' },
-  { key: 'squeeze', label: 'Sqz' },
-  { key: 'options', label: 'Opts' },
-  { key: 'dark_pool', label: 'DkPl' },
-  { key: 'fundamentals', label: 'Fund' },
-  { key: 'social', label: 'Socl' },
-  { key: 'polymarket', label: 'Poly' },
-  { key: 'cross_asset', label: 'XAss' },
+  { key: 'squeeze',       label: 'Sqz'    },
+  { key: 'options',       label: 'Opts'   },
+  { key: 'dark_pool',     label: 'DkPl'   },
+  { key: 'fundamentals',  label: 'Fund'   },
+  { key: 'social',        label: 'Socl'   },
 ] as const
 
 function getCellStyle(score: number | undefined | null): string {
@@ -38,11 +36,31 @@ function getCellTitle(score: number | undefined | null): string {
 
 function AgreementCell({ score }: { score: number }) {
   const pct = Math.round(score * 100)
-  const color = pct >= 70 ? 'text-accent-green' : pct >= 40 ? 'text-accent-amber' : 'text-accent-red'
+  const color = pct >= 70 ? 'text-accent-green' : pct >= 50 ? 'text-accent-amber' : 'text-accent-red'
   return (
     <span className={clsx('font-mono text-xs font-semibold', color)}>{pct}%</span>
   )
 }
+
+function DarkPoolCell({ signal, zscore }: { signal?: string; zscore?: number | null }) {
+  const isAccum = signal === 'ACCUMULATION'
+  return (
+    <div className="flex flex-col items-center leading-none gap-0.5">
+      <span className={clsx('font-mono text-[9px] font-semibold uppercase tracking-wide',
+        isAccum ? 'text-accent-green' : 'text-text-tertiary'
+      )}>
+        {isAccum ? 'ACCUM' : 'NEUT'}
+      </span>
+      {zscore != null && (
+        <span className="font-mono text-[9px] text-text-tertiary">
+          {zscore > 0 ? '+' : ''}{zscore.toFixed(1)}σ
+        </span>
+      )}
+    </div>
+  )
+}
+
+type FilterDir = 'all' | 'fifty' | 'bull' | 'bear' | 'high'
 
 const CELL_SIZE = 28
 const ROW_HEIGHT = 36
@@ -51,13 +69,15 @@ const VISIBLE_EXTRA = 10
 export function HeatmapPage() {
   const navigate = useNavigate()
   const { data: rows, isLoading } = useHeatmap()
-  const [filterDir, setFilterDir] = useState<'all' | 'bull' | 'bear' | 'high'>('all')
+  const [filterDir, setFilterDir] = useState<FilterDir>('fifty')
   const [filterSector, setFilterSector] = useState<string>('all')
   const [sortBy, setSortBy] = useState<'agreement' | 'rank' | 'squeeze' | 'darkpool'>('agreement')
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const containerRef = useRef<HTMLDivElement>(null)
   const containerHeight = 560
+
+  const totalRows = rows?.length ?? 0
 
   const sectors = useMemo(() => {
     if (!rows) return []
@@ -67,14 +87,27 @@ export function HeatmapPage() {
   const filtered = useMemo(() => {
     if (!rows) return []
     let result = [...rows]
-    if (filterDir === 'bull') result = result.filter(r => r.pre_resolved_direction === 'BULL')
-    if (filterDir === 'bear') result = result.filter(r => r.pre_resolved_direction === 'BEAR')
-    if (filterDir === 'high') result = result.filter(r => r.signal_agreement_score >= 0.7)
+
+    // Direction / conviction filter
+    if (filterDir === 'fifty') {
+      const highAgree = result.filter(r => r.signal_agreement_score >= 0.5)
+      // fallback: show top 50 by agreement if fewer than 50 qualify
+      result = highAgree.length >= 10 ? highAgree : result.slice(0, 50)
+    } else if (filterDir === 'bull') {
+      result = result.filter(r => r.pre_resolved_direction === 'BULL')
+    } else if (filterDir === 'bear') {
+      result = result.filter(r => r.pre_resolved_direction === 'BEAR')
+    } else if (filterDir === 'high') {
+      result = result.filter(r => r.signal_agreement_score >= 0.7)
+    }
+    // 'all' → no filter
+
     if (filterSector !== 'all') result = result.filter(r => r.sector === filterSector)
+
     result.sort((a, b) => {
       if (sortBy === 'agreement') return b.signal_agreement_score - a.signal_agreement_score
-      if (sortBy === 'squeeze') return (b.squeeze ?? 0) - (a.squeeze ?? 0)
-      if (sortBy === 'darkpool') return (b.dark_pool ?? 0) - (a.dark_pool ?? 0)
+      if (sortBy === 'squeeze')   return (b.squeeze ?? 0) - (a.squeeze ?? 0)
+      if (sortBy === 'darkpool')  return (b.dark_pool ?? 0) - (a.dark_pool ?? 0)
       return b.signal_agreement_score - a.signal_agreement_score
     })
     return result
@@ -93,27 +126,25 @@ export function HeatmapPage() {
   }, [])
 
   const handleRowClick = (row: HeatmapRow) => {
-    if (expandedRow === row.ticker) {
-      setExpandedRow(null)
-    } else {
-      setExpandedRow(row.ticker)
-    }
+    setExpandedRow(expandedRow === row.ticker ? null : row.ticker)
   }
 
   return (
     <Shell title="Signal Heatmap">
       {/* Controls */}
       <div className="flex items-center gap-3 mb-4 flex-wrap">
+        {/* Direction / conviction filters */}
         <div className="flex items-center gap-1">
-          {[
-            { val: 'all', label: 'All' },
-            { val: 'bull', label: 'BULL only' },
-            { val: 'bear', label: 'BEAR only' },
-            { val: 'high', label: 'High Agree (>70%)' },
-          ].map(({ val, label }) => (
+          {([
+            { val: 'all',   label: 'All'                   },
+            { val: 'fifty', label: '≥50% Agree'            },
+            { val: 'bull',  label: 'BULL only'             },
+            { val: 'bear',  label: 'BEAR only'             },
+            { val: 'high',  label: 'High Conviction (≥70%)' },
+          ] as { val: FilterDir; label: string }[]).map(({ val, label }) => (
             <button
               key={val}
-              onClick={() => setFilterDir(val as 'all' | 'bull' | 'bear' | 'high')}
+              onClick={() => setFilterDir(val)}
               className={clsx(
                 'px-3 py-1.5 text-xs font-mono rounded border transition-colors',
                 filterDir === val
@@ -149,7 +180,7 @@ export function HeatmapPage() {
         </select>
 
         <span className="ml-auto font-mono text-xs text-text-tertiary">
-          {filtered.length} tickers
+          Showing {filtered.length} of {totalRows}
         </span>
       </div>
 
@@ -191,6 +222,10 @@ export function HeatmapPage() {
         {isLoading ? (
           <div className="p-6">
             <LoadingSkeleton rows={12} />
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="p-8 text-center font-mono text-xs text-text-tertiary">
+            No tickers match the current filter.
           </div>
         ) : (
           <div
@@ -236,14 +271,18 @@ export function HeatmapPage() {
                             className="flex-1 px-1 flex items-center justify-center"
                             style={{ width: CELL_SIZE + 8 }}
                           >
-                            <div
-                              title={getCellTitle(score)}
-                              className={clsx(
-                                'rounded-sm transition-opacity',
-                                getCellStyle(score)
-                              )}
-                              style={{ width: CELL_SIZE, height: CELL_SIZE - 6 }}
-                            />
+                            {mod.key === 'dark_pool' ? (
+                              <DarkPoolCell signal={row.dark_pool_signal} zscore={row.dark_pool_zscore} />
+                            ) : (
+                              <div
+                                title={getCellTitle(score)}
+                                className={clsx(
+                                  'rounded-sm transition-opacity',
+                                  getCellStyle(score)
+                                )}
+                                style={{ width: CELL_SIZE, height: CELL_SIZE - 6 }}
+                              />
+                            )}
                           </div>
                         )
                       })}
@@ -259,6 +298,19 @@ export function HeatmapPage() {
                       <div className="bg-bg-elevated border-b border-border-active px-3 py-2 flex gap-4 flex-wrap">
                         {SIGNAL_MODULES.map(mod => {
                           const score = row[mod.key as keyof HeatmapRow] as number | undefined
+                          if (mod.key === 'dark_pool') {
+                            return (
+                              <div key={mod.key} className="flex items-center gap-1.5">
+                                <span className="font-mono text-[10px] text-text-tertiary uppercase">{mod.label}:</span>
+                                <span className={clsx('font-mono text-xs font-semibold',
+                                  row.dark_pool_signal === 'ACCUMULATION' ? 'text-accent-green' : 'text-text-tertiary'
+                                )}>
+                                  {row.dark_pool_signal ?? 'NEUTRAL'}
+                                  {row.dark_pool_zscore != null && ` (${row.dark_pool_zscore > 0 ? '+' : ''}${row.dark_pool_zscore.toFixed(2)}σ)`}
+                                </span>
+                              </div>
+                            )
+                          }
                           return (
                             <div key={mod.key} className="flex items-center gap-1.5">
                               <span className="font-mono text-[10px] text-text-tertiary uppercase">

@@ -1,12 +1,15 @@
 """
-utils/usage.py — Anthropic API usage tracker.
+utils/usage.py — API usage tracker.
 
-Logs every Claude API call to the Supabase api_usage table.
+Logs every AI API call to the Supabase api_usage table.
 Used for cost monitoring and per-user billing when the product launches.
 
-Cost reference (as of 2025):
-    claude-sonnet-4-6  input=$3.00/M  output=$15.00/M   (haiku-level speed, sonnet quality)
-    claude-opus-4-6    input=$15.00/M output=$75.00/M
+Cost reference (as of April 2026):
+    grok-4-1-fast-reasoning       input=$1.00/M  output=$4.00/M   ← default
+    grok-4-1-fast-non-reasoning   input=$0.20/M  output=$0.80/M
+    grok-4.20-0309-reasoning      input=$3.00/M  output=$12.00/M  ← premium
+    claude-sonnet-4-6             input=$3.00/M  output=$15.00/M  (legacy)
+    claude-opus-4-6               input=$15.00/M output=$75.00/M  (legacy)
 """
 
 import logging
@@ -17,11 +20,22 @@ logger = logging.getLogger(__name__)
 
 # Cost per 1M tokens (USD)
 _MODEL_COSTS: dict = {
-    "claude-sonnet-4-6":        {"input": 3.00,  "output": 15.00},
-    "claude-haiku-4-5-20251001":{"input": 0.80,  "output": 4.00},
-    "claude-opus-4-6":          {"input": 15.00, "output": 75.00},
+    # xAI Grok (April 2026)
+    "grok-4-1-fast-reasoning":      {"input": 1.00,  "output": 4.00},
+    "grok-4-1-fast-non-reasoning":  {"input": 0.20,  "output": 0.80},
+    "grok-4-fast-reasoning":        {"input": 1.00,  "output": 4.00},
+    "grok-4-fast-non-reasoning":    {"input": 0.20,  "output": 0.80},
+    "grok-4.20-0309-reasoning":     {"input": 3.00,  "output": 12.00},
+    "grok-4.20-0309-non-reasoning": {"input": 3.00,  "output": 12.00},
+    "grok-4-0709":                  {"input": 3.00,  "output": 12.00},
+    "grok-3":                       {"input": 1.00,  "output": 4.00},
+    "grok-3-mini":                  {"input": 0.20,  "output": 0.80},
+    # Anthropic Claude (legacy)
+    "claude-sonnet-4-6":            {"input": 3.00,  "output": 15.00},
+    "claude-haiku-4-5-20251001":    {"input": 0.80,  "output": 4.00},
+    "claude-opus-4-6":              {"input": 15.00, "output": 75.00},
 }
-_DEFAULT_COSTS = {"input": 3.00, "output": 15.00}
+_DEFAULT_COSTS = {"input": 1.00, "output": 4.00}  # grok-4-1-fast-reasoning
 
 
 def compute_cost(model: str, input_tokens: int, output_tokens: int) -> float:

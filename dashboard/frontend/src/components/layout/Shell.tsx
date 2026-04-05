@@ -1,16 +1,14 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
+  Home,
   LayoutDashboard,
   Grid3x3,
   Search,
   Filter,
-  Activity,
   BarChart2,
   FileText,
   RefreshCw,
-  Bitcoin,
-  Target,
   ListOrdered,
 } from 'lucide-react'
 import { clsx } from 'clsx'
@@ -21,16 +19,14 @@ import { format } from 'date-fns'
 import { usePortfolioSummary } from '../../hooks/usePortfolio'
 
 const NAV_ITEMS = [
-  { path: '/', label: 'Portfolio', icon: LayoutDashboard, exact: true, shortcut: 'p' },
-  { path: '/heatmap', label: 'Signal Heatmap', icon: Grid3x3, shortcut: 'h' },
-  { path: '/deepdive', label: 'Deep Dive', icon: Search, shortcut: 't' },
-  { path: '/screeners', label: 'Screeners', icon: Filter, shortcut: 's' },
-  { path: '/darkpool', label: 'Dark Pool', icon: Activity, shortcut: 'd' },
-  { path: '/backtest', label: 'Backtest', icon: BarChart2, shortcut: 'b' },
-  { path: '/resolution', label: 'Resolution Log', icon: FileText, shortcut: 'r' },
-  { path: '/crypto',     label: 'Crypto',         icon: Bitcoin,  shortcut: 'c' },
-  { path: '/accuracy',  label: 'Claude Accuracy', icon: Target,       shortcut: 'a' },
-  { path: '/rankings',  label: 'Daily Top-20',    icon: ListOrdered,  shortcut: 'k' },
+  { path: '/',           label: 'Morning Brief',      icon: Home,            exact: true, shortcut: 'g' },
+  { path: '/portfolio',  label: 'Portfolio',          icon: LayoutDashboard, shortcut: 'p' },
+  { path: '/heatmap',    label: 'Signal Heatmap',     icon: Grid3x3,         shortcut: 'h' },
+  { path: '/deepdive',   label: 'Deep Dive',          icon: Search,          shortcut: 't' },
+  { path: '/screeners',  label: 'Screeners',          icon: Filter,          shortcut: 's' },
+  { path: '/rankings',   label: 'Daily Top-20',       icon: ListOrdered,     shortcut: 'k' },
+  { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText,     shortcut: 'r' },
+  { path: '/backtest',   label: 'Backtest',           icon: BarChart2,       shortcut: 'b' },
 ]
 
 function ETClock() {

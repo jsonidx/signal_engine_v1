@@ -201,19 +201,12 @@ class TestDecliningShortRatio:
         assert result is not None
         assert result["signal"] == "ACCUMULATION"
 
-    def test_score_above_threshold(self):
-        """Score must be >= DARK_POOL_ACCUMULATION_THRESHOLD."""
+    def test_zscore_is_negative(self):
+        """Declining short ratio → short_ratio_zscore must be negative."""
         frames = _declining_sr_frames(n=20)
         result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
         assert result is not None
-        assert result["dark_pool_score"] >= dpf.DARK_POOL_ACCUMULATION_THRESHOLD
-
-    def test_negative_trend(self):
-        """short_ratio_trend must be negative (declining shorts)."""
-        frames = _declining_sr_frames(n=20)
-        result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
-        assert result is not None
-        assert result["short_ratio_trend"] < 0
+        assert result["short_ratio_zscore"] < 0
 
     def test_days_of_data_correct(self):
         """days_of_data reflects actual matched days."""
@@ -228,39 +221,28 @@ class TestDecliningShortRatio:
         frames = _declining_sr_frames(n=20)
         result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
         assert result is not None
-        required_keys = {
-            "ticker", "dark_pool_score", "signal", "short_ratio_today",
-            "short_ratio_mean", "short_ratio_trend", "short_ratio_zscore",
-            "dark_pool_intensity", "days_of_data", "interpretation",
-        }
+        required_keys = {"ticker", "signal", "short_ratio_today", "short_ratio_zscore", "days_of_data"}
         assert required_keys.issubset(set(result.keys()))
 
 
 # ==============================================================================
-# 3. RISING SHORT RATIO → DISTRIBUTION
+# 3. RISING SHORT RATIO → NEUTRAL (no DISTRIBUTION in minimal version)
 # ==============================================================================
 
 class TestRisingShortRatio:
-    def test_returns_distribution_signal(self):
-        """Steadily rising short ratio over 20 days → DISTRIBUTION."""
+    def test_returns_neutral_signal(self):
+        """Steadily rising short ratio over 20 days → NEUTRAL (not DISTRIBUTION)."""
         frames = _rising_sr_frames(n=20)
         result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
         assert result is not None
-        assert result["signal"] == "DISTRIBUTION"
+        assert result["signal"] == "NEUTRAL"
 
-    def test_score_below_threshold(self):
-        """Score must be <= DARK_POOL_DISTRIBUTION_THRESHOLD."""
+    def test_zscore_is_positive(self):
+        """Rising short ratio → short_ratio_zscore must be positive."""
         frames = _rising_sr_frames(n=20)
         result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
         assert result is not None
-        assert result["dark_pool_score"] <= dpf.DARK_POOL_DISTRIBUTION_THRESHOLD
-
-    def test_positive_trend(self):
-        """short_ratio_trend must be positive (rising shorts)."""
-        frames = _rising_sr_frames(n=20)
-        result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
-        assert result is not None
-        assert result["short_ratio_trend"] > 0
+        assert result["short_ratio_zscore"] > 0
 
 
 # ==============================================================================
@@ -275,12 +257,12 @@ class TestNeutral:
         assert result is not None
         assert result["signal"] == "NEUTRAL"
 
-    def test_score_in_neutral_band(self):
-        """Flat data: score should be in (35, 65)."""
+    def test_zscore_near_zero(self):
+        """Flat data: short_ratio_zscore should be near 0."""
         frames = _flat_sr_frames(n=20, sr=0.48)
         result = dpf.compute_dark_pool_signal("TSLA", _preloaded_frames=frames)
         assert result is not None
-        assert dpf.DARK_POOL_DISTRIBUTION_THRESHOLD < result["dark_pool_score"] < dpf.DARK_POOL_ACCUMULATION_THRESHOLD
+        assert abs(result["short_ratio_zscore"]) < 1.5
 
 
 # ==============================================================================
@@ -449,8 +431,8 @@ class TestBatchScan:
         with patch.object(dpf, "_fetch_single_date", side_effect=lambda d: merged.get(d.strftime("%Y%m%d"))):
             results = dpf.batch_scan(["TSLA", "AAPL"], lookback_days=20)
 
-        scores = [r["dark_pool_score"] for r in results]
-        assert scores == sorted(scores, reverse=True)
+        zscores = [r["short_ratio_zscore"] for r in results]
+        assert zscores == sorted(zscores)
 
 
 # ==============================================================================
@@ -461,11 +443,8 @@ class TestScoreDarkPool:
     def test_accumulation_returns_plus2(self):
         """ACCUMULATION signal → score = +2."""
         mock_result = {
-            "ticker": "AAPL", "dark_pool_score": 70, "signal": "ACCUMULATION",
-            "short_ratio_today": 0.35, "short_ratio_mean": 0.45,
-            "short_ratio_trend": -0.008, "short_ratio_zscore": -1.8,
-            "dark_pool_intensity": 0.48, "days_of_data": 18,
-            "interpretation": "Institutional accumulation likely.",
+            "ticker": "AAPL", "signal": "ACCUMULATION",
+            "short_ratio_today": 0.35, "short_ratio_zscore": -1.8, "days_of_data": 18,
         }
         with patch.object(dpf, "compute_dark_pool_signal", return_value=mock_result):
             result = dpf.score_dark_pool("AAPL")
@@ -474,28 +453,11 @@ class TestScoreDarkPool:
         assert result["signal"] == "ACCUMULATION"
         assert len(result["flags"]) == 1
 
-    def test_distribution_returns_minus1(self):
-        """DISTRIBUTION signal → score = -1."""
-        mock_result = {
-            "ticker": "GME", "dark_pool_score": 20, "signal": "DISTRIBUTION",
-            "short_ratio_today": 0.68, "short_ratio_mean": 0.52,
-            "short_ratio_trend": 0.009, "short_ratio_zscore": 1.9,
-            "dark_pool_intensity": 0.30, "days_of_data": 15,
-            "interpretation": "Distribution risk detected.",
-        }
-        with patch.object(dpf, "compute_dark_pool_signal", return_value=mock_result):
-            result = dpf.score_dark_pool("GME")
-        assert result["score"] == -1
-        assert result["signal"] == "DISTRIBUTION"
-
     def test_neutral_returns_zero(self):
         """NEUTRAL signal → score = 0, no flags."""
         mock_result = {
-            "ticker": "MSFT", "dark_pool_score": 50, "signal": "NEUTRAL",
-            "short_ratio_today": 0.48, "short_ratio_mean": 0.48,
-            "short_ratio_trend": 0.0001, "short_ratio_zscore": 0.1,
-            "dark_pool_intensity": 0.40, "days_of_data": 20,
-            "interpretation": "No clear institutional bias.",
+            "ticker": "MSFT", "signal": "NEUTRAL",
+            "short_ratio_today": 0.48, "short_ratio_zscore": 0.1, "days_of_data": 20,
         }
         with patch.object(dpf, "compute_dark_pool_signal", return_value=mock_result):
             result = dpf.score_dark_pool("MSFT")
@@ -621,13 +583,6 @@ class TestConflictResolverIntegration:
         direction = cr.extract_module_direction("dark_pool_flow", dp_output)
         assert direction == "BULL"
 
-    def test_extract_module_direction_distribution(self):
-        """conflict_resolver.extract_module_direction maps DISTRIBUTION → BEAR."""
-        import conflict_resolver as cr
-        dp_output = {"dark_pool_score": 25, "signal": "DISTRIBUTION"}
-        direction = cr.extract_module_direction("dark_pool_flow", dp_output)
-        assert direction == "BEAR"
-
     def test_extract_module_direction_neutral(self):
         """conflict_resolver.extract_module_direction returns None for NEUTRAL."""
         import conflict_resolver as cr
@@ -639,7 +594,7 @@ class TestConflictResolverIntegration:
         """dark_pool_flow must be in MODULE_WEIGHTS."""
         import conflict_resolver as cr
         assert "dark_pool_flow" in cr.MODULE_WEIGHTS
-        assert cr.MODULE_WEIGHTS["dark_pool_flow"] == pytest.approx(0.07)
+        assert cr.MODULE_WEIGHTS["dark_pool_flow"] == pytest.approx(0.08)
 
     def test_dark_pool_in_signals_key_map(self):
         """dark_pool_flow must be in _SIGNALS_KEY_MAP."""
@@ -647,7 +602,3 @@ class TestConflictResolverIntegration:
         assert "dark_pool_flow" in cr._SIGNALS_KEY_MAP
         assert cr._SIGNALS_KEY_MAP["dark_pool_flow"] == "dark_pool_flow"
 
-    def test_congress_weight_reduced(self):
-        """congress_trades weight must be 0.01 (reduced from 0.04)."""
-        import conflict_resolver as cr
-        assert cr.MODULE_WEIGHTS["congress_trades"] == pytest.approx(0.01)

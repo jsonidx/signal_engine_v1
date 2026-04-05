@@ -51,12 +51,11 @@ def test_agreement_all_bear():
 def test_agreement_mixed_majority_bull():
     """4 BULL vs 1 BEAR → score = 4/5 = 0.8."""
     signals = {
-        "signal_engine":  {"composite_z": 0.8},            # BULL
-        "squeeze":        {"squeeze_score_100": 60},        # BULL
-        "options_flow":   {"heat_score": 65},               # BULL
-        "cross_asset":    {"signal": "TOP"},                # BEAR
-        "fundamentals":   {"fundamental_score_pct": 70},   # BULL
-        # polymarket absent → no vote
+        "signal_engine":  {"composite_z": 0.8},             # BULL
+        "squeeze":        {"squeeze_score_100": 60},         # BULL
+        "options_flow":   {"heat_score": 65},                # BULL
+        "polymarket":     {"polymarket_probability": 0.20},  # BEAR (< 0.35)
+        "fundamentals":   {"fundamental_score_pct": 70},    # BULL
     }
     score = compute_signal_agreement(signals)
     assert score == 0.8, f"Expected 0.8, got {score}"
@@ -95,8 +94,8 @@ def test_agreement_tie_breaks_to_plurality_count():
     signals = {
         "signal_engine": {"composite_z": 0.8},             # BULL
         "squeeze":       {"squeeze_score_100": 60},         # BULL
-        "cross_asset":   {"signal": "TOP"},                 # BEAR
-        "polymarket":    {"polymarket_probability": 0.20},  # BEAR
+        "fundamentals":  {"fundamental_score_pct": 30},    # BEAR (< 40)
+        "polymarket":    {"polymarket_probability": 0.20},  # BEAR (< 0.35)
     }
     score = compute_signal_agreement(signals)
     assert score == 0.5, f"Expected 0.5, got {score}"

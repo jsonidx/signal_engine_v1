@@ -98,11 +98,9 @@ def _make_ai_quant_db(path: str):
         "options_flow": {"heat_score": 72.5, "iv_rank": 45.0, "pc_ratio": 0.82,
                          "expected_move_pct": 3.1, "days_to_exp": 7},
         "fundamentals": {"fundamental_score_pct": 66.0},
-        "cross_asset": {"signal": "NEUTRAL"},
         "squeeze": {"short_squeeze_score": 20, "short_squeeze_max": 100},
         "social": {"bull_ratio": 0.62},
         "polymarket": {},
-        "max_pain": {"nearest_max_pain": 175.0, "nearest_days_to_expiry": 7},
         "volume_profile": {"poc": 176.5, "vwap_20d": 174.0},
     })
     conn = sqlite3.connect(path)

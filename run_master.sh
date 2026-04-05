@@ -112,42 +112,7 @@ echo "Step 8b: Running accounting red flag screener..."
 python3 red_flag_screener.py --watchlist --skip-edgar
 echo "Step 8b complete."
 
-# ── Step 8c: Earnings transcript analysis ────────────────
-# Fetches latest 8-K transcript from EDGAR + Claude NLP analysis.
-# Cache TTL = 7 days; only calls Claude API on cache miss.
-# Scoped to top-5 signals + all open positions (same pool as Step 13).
-if [ "$SKIP_AI" = true ]; then
-  echo "Step 8c: SKIPPED — transcript fetch uses cached results (--skip-ai)"
-else
-  echo "Step 8c: Fetching earnings transcripts (top 5 + open positions)..."
-  TOP5=$(python3 -c "
-from utils.ticker_selector import select_top_tickers
-from ai_quant import _get_open_positions
-import config
-open_pos = _get_open_positions()
-selected = select_top_tickers(
-    resolved_signals_path='data/resolved_signals.json',
-    equity_signals_path=None,
-    max_tickers=config.AI_QUANT_MAX_TICKERS,
-    always_include=open_pos,
-)
-tickers = list({s['ticker'] for s in selected} | set(open_pos))
-print(','.join(tickers))
-" 2>/dev/null)
-  if [ -n "$TOP5" ]; then
-    python3 earnings_transcript.py --tickers "$TOP5"
-  else
-    echo "  [warn] Could not resolve top tickers — skipping transcript step"
-  fi
-  echo "Step 8c complete."
-fi
-
-# ── Step 9: Congressional trades ─────────────────────────
-echo "Step 9: Fetching congressional trade disclosures..."
-python3 congress_trades.py --scan
-echo "Step 9 complete."
-
-# ── Step 10: Polymarket ───────────────────────────────────
+# ── Step 9: Polymarket ───────────────────────────────────
 echo "Step 10: Fetching Polymarket prediction market signals..."
 python3 polymarket_screener.py
 echo "Step 10 complete."
@@ -235,12 +200,7 @@ echo "Step 13b: Checking prior Claude thesis outcomes..."
 python3 thesis_checker.py --verbose
 echo "Step 13b complete."
 
-# ── Step 14: Max pain ─────────────────────────────────────
-echo "Step 14: Computing options max pain levels..."
-python3 max_pain.py --watchlist
-echo "Step 14 complete."
-
-# ── Step 15: Volume profile ───────────────────────────────
+# ── Step 14: Volume profile ───────────────────────────────
 echo "Step 15: Computing volume profiles and VWAP levels..."
 python3 volume_profile.py --watchlist
 echo "Step 15 complete."

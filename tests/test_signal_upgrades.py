@@ -57,10 +57,18 @@ from ai_quant import (
 
 # ─── Shared price-history factory ─────────────────────────────────────────────
 
+def _bdate_range(periods: int) -> pd.DatetimeIndex:
+    """Return exactly `periods` business days, safe on weekends/holidays."""
+    end = pd.Timestamp("today").normalize()
+    while end.weekday() >= 5:  # 5=Sat, 6=Sun
+        end -= pd.Timedelta(days=1)
+    return pd.bdate_range(end=end, periods=periods)
+
+
 def _make_price_df(n_days: int = 90, start_price: float = 100.0, vol: float = 0.015, seed: int = 42) -> pd.DataFrame:
     """Synthetic OHLCV DataFrame with known statistical properties."""
     rng   = np.random.default_rng(seed)
-    dates = pd.bdate_range(end=datetime.now(), periods=n_days)
+    dates = _bdate_range(n_days)
     log_r = rng.normal(0.0003, vol, n_days)
     close = start_price * np.exp(np.cumsum(log_r))
     high  = close * (1 + rng.uniform(0.002, 0.012, n_days))
@@ -72,7 +80,7 @@ def _make_price_df(n_days: int = 90, start_price: float = 100.0, vol: float = 0.
 def _make_multi_price_df(tickers, n_days=130, seed=0) -> pd.DataFrame:
     """Multi-ticker Close price DataFrame for relative-strength tests."""
     rng   = np.random.default_rng(seed)
-    dates = pd.bdate_range(end=datetime.now(), periods=n_days)
+    dates = _bdate_range(n_days)
     cols  = {}
     for i, t in enumerate(tickers):
         lr  = rng.normal(0.0002 * (i + 1), 0.015, n_days)
@@ -363,7 +371,7 @@ class TestCollectRelativeStrengthSignals:
     def test_strong_outperform_when_ticker_much_higher(self, mock_dl):
         """Manually craft prices where ticker beats RSP by >>5% over 20d."""
         n_days = 130
-        dates  = pd.bdate_range(end=datetime.now(), periods=n_days)
+        dates  = _bdate_range(n_days)
         aapl_p = np.concatenate([np.full(n_days - 20, 100.0), np.linspace(100.0, 115.0, 20)])
         rsp_p  = np.concatenate([np.full(n_days - 20, 100.0), np.linspace(100.0, 101.0, 20)])
         xlk_p  = np.concatenate([np.full(n_days - 20, 100.0), np.linspace(100.0, 102.0, 20)])
@@ -604,7 +612,7 @@ class TestCollectVolatilityRegimeSignals:
         stock_hist = _make_price_df(n_days=n_days, vol=stock_vol)
         vix_hist   = pd.DataFrame(
             {"Close": [vix_current] * 260},
-            index=pd.bdate_range(end=datetime.now(), periods=260),
+            index=_bdate_range(260),
         )
         def _factory(sym):
             tk = MagicMock()
@@ -641,7 +649,7 @@ class TestCollectVolatilityRegimeSignals:
     def test_vol_regime_expanding(self, mock_ticker_cls):
         """First 65 days: low vol; last 20 days: high vol → 20d rv >> 60d rv → EXPANDING."""
         n_days  = 85
-        dates   = pd.bdate_range(end=datetime.now(), periods=n_days)
+        dates   = _bdate_range(n_days)
         low_lr  = np.random.default_rng(1).normal(0, 0.005, n_days - 20)
         high_lr = np.random.default_rng(1).normal(0, 0.040, 20)
         lr      = np.concatenate([low_lr, high_lr])
@@ -650,7 +658,7 @@ class TestCollectVolatilityRegimeSignals:
             "Open": close, "High": close * 1.01, "Low": close * 0.99,
             "Close": close, "Volume": np.full(n_days, 1_000_000),
         }, index=dates)
-        vix_hist = pd.DataFrame({"Close": [18.0] * 260}, index=pd.bdate_range(end=datetime.now(), periods=260))
+        vix_hist = pd.DataFrame({"Close": [18.0] * 260}, index=_bdate_range(260))
 
         def _factory(sym):
             tk = MagicMock()
@@ -665,7 +673,7 @@ class TestCollectVolatilityRegimeSignals:
     def test_vol_regime_contracting(self, mock_ticker_cls):
         """First 65 days: high vol; last 20 days: low vol → 20d rv << 60d rv → CONTRACTING."""
         n_days  = 85
-        dates   = pd.bdate_range(end=datetime.now(), periods=n_days)
+        dates   = _bdate_range(n_days)
         high_lr = np.random.default_rng(2).normal(0, 0.040, n_days - 20)
         low_lr  = np.random.default_rng(2).normal(0, 0.004, 20)
         lr      = np.concatenate([high_lr, low_lr])
@@ -674,7 +682,7 @@ class TestCollectVolatilityRegimeSignals:
             "Open": close, "High": close * 1.01, "Low": close * 0.99,
             "Close": close, "Volume": np.full(n_days, 1_000_000),
         }, index=dates)
-        vix_hist = pd.DataFrame({"Close": [18.0] * 260}, index=pd.bdate_range(end=datetime.now(), periods=260))
+        vix_hist = pd.DataFrame({"Close": [18.0] * 260}, index=_bdate_range(260))
 
         def _factory(sym):
             tk = MagicMock()
@@ -692,7 +700,7 @@ class TestCollectVolatilityRegimeSignals:
         vix_vals = np.arange(10.0, 30.1, (30 - 10) / 251)[:252]
         vix_hist = pd.DataFrame(
             {"Close": vix_vals},
-            index=pd.bdate_range(end=datetime.now(), periods=252),
+            index=_bdate_range(252),
         )
 
         def _factory(sym):
@@ -733,10 +741,7 @@ def _minimal_signals(ticker: str = "AAPL") -> dict:
         "weekly_regime":    {"regime": "bullish", "price": 180.0, "ma20w": 170.0, "pct_from_ma20w": 5.9, "slope": 0.5},
         "technical":        {"price": 180.0, "rsi_14": 62, "above_ma200": True, "ma200": 160.0, "above_ma50": True, "ma50": 175.0, "momentum_1m_pct": 5.2, "momentum_3m_pct": 12.1, "momentum_6m_pct": 22.0, "volume_ratio_5d_vs_20d": 1.3, "low_52w": 130.0, "high_52w": 195.0, "pct_from_52w_high": -7.7},
         "volume_profile":   {},
-        "cross_asset":      {},
         "options_flow":     {"heat_score": 72, "direction": "BULL", "expected_move_pct": 4.5, "days_to_exp": 21, "implied_vol_pct": 32.0, "iv_rank": 45, "pc_ratio": 0.8, "total_options_vol": 125000, "straddle_cost": 8.10},
-        "max_pain":         {},
-        "congress":         {},
         "polymarket":       {},
         "sec":              {},
         "catalyst":         {},
@@ -900,7 +905,6 @@ class TestBuildPromptNewSections:
             "VOLATILITY REGIME":            p.index("## VOLATILITY REGIME"),
             "VOLUME PROFILE":               p.index("## VOLUME PROFILE"),
             "LIQUIDITY":                    p.index("## LIQUIDITY & TRANSACTION COST"),
-            "CROSS-ASSET":                  p.index("## CROSS-ASSET DIVERGENCE"),
             "RELATIVE STRENGTH":            p.index("## RELATIVE STRENGTH / SECTOR CONTEXT"),
             "OPTIONS FLOW":                 p.index("## OPTIONS FLOW"),
             "EARNINGS":                     p.index("## EARNINGS & EVENT CALENDAR"),
@@ -911,8 +915,7 @@ class TestBuildPromptNewSections:
         order = sorted(positions, key=lambda k: positions[k])
         assert order.index("VOLATILITY REGIME")  < order.index("VOLUME PROFILE")
         assert order.index("VOLUME PROFILE")     < order.index("LIQUIDITY")
-        assert order.index("LIQUIDITY")          < order.index("CROSS-ASSET")
-        assert order.index("CROSS-ASSET")        < order.index("RELATIVE STRENGTH")
+        assert order.index("LIQUIDITY")          < order.index("RELATIVE STRENGTH")
         assert order.index("RELATIVE STRENGTH")  < order.index("OPTIONS FLOW")
         assert order.index("OPTIONS FLOW")       < order.index("EARNINGS")
         assert order.index("EARNINGS")           < order.index("CATALYST SETUP")
