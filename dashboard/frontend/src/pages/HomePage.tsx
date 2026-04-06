@@ -450,10 +450,10 @@ export function HomePage() {
 
   const nav = summary?.nav_eur ?? 50000
 
-  // Top 7: directional signals sorted by agreement desc, exclude NEUTRAL
+  // Top 7: all signals sorted by agreement desc (NEUTRAL included)
   const top7 = (heatmapRows ?? [])
-    .filter(r => r.pre_resolved_direction !== 'NEUTRAL')
-    .sort((a, b) => b.signal_agreement_score - a.signal_agreement_score)
+    .filter(r => (r.signal_agreement_score ?? 0) > 0)
+    .sort((a, b) => (b.signal_agreement_score ?? 0) - (a.signal_agreement_score ?? 0))
     .slice(0, 7)
 
   const alert = regime ? regimeAlert(regime.regime) : null
@@ -498,7 +498,7 @@ export function HomePage() {
               <LoadingSkeleton rows={4} />
             ) : top7.length === 0 ? (
               <div className="bg-bg-surface border border-border-subtle rounded p-6 text-center font-mono text-xs text-text-tertiary">
-                No signals yet — run <code>./run_master.sh</code>
+                No heatmap data — run <code>./run_master.sh</code> to generate signals
               </div>
             ) : (
               <div className="grid grid-cols-2 gap-2">
