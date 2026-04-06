@@ -78,7 +78,6 @@ export interface HeatmapRow {
   dark_pool_signal?: 'ACCUMULATION' | 'NEUTRAL'
   dark_pool_zscore?: number | null
   fundamentals: number
-  social: number
   pre_resolved_direction: string
   signal_agreement_score: number
 }
@@ -161,11 +160,6 @@ export interface TickerDetail extends TickerSignal {
   dark_pool_score?: number
   short_ratio_trend?: string
   dark_pool_intensity?: number
-  // Social
-  trend_score?: number
-  interest_level?: number
-  bull_bear_ratio?: number
-  message_count?: number
   // Expected moves
   expected_moves?: ExpectedMove[]
   // Catalysts / risks
@@ -235,7 +229,6 @@ export interface CatalystScreenerRow {
   total_score: number
   squeeze_setup: number
   volume_breakout: number
-  social: number
   dark_pool: number
   override_applied: boolean
   override_flag?: string

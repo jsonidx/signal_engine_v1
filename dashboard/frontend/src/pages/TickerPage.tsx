@@ -41,7 +41,6 @@ const MODULE_KEYS = [
   { key: 'options', label: 'Opts' },
   { key: 'dark_pool', label: 'DkPl' },
   { key: 'fundamentals', label: 'Fund' },
-  { key: 'social', label: 'Socl' },
   { key: 'polymarket', label: 'Poly' },
   { key: 'cross_asset', label: 'XAss' },
 ]
@@ -231,7 +230,6 @@ const MODULE_DESCRIPTIONS: Record<string, string> = {
   options:       'Options flow heat score. IV rank, put/call ratio, unusual volume spikes, and expected move vs historical.',
   dark_pool:     'Dark pool accumulation/distribution signal. Off-exchange print volume trend and short-ratio direction.',
   fundamentals:  'Fundamental quality score. Revenue growth, EPS surprise history, valuation vs sector, and balance sheet strength.',
-  social:        'Social sentiment composite. Google Trends interest level, StockTwits bull/bear ratio, and message volume trend.',
   polymarket:    'Prediction market signal. Polymarket probability vs current price implied move (where available).',
   cross_asset:   'Cross-asset divergence. Correlation of equity signal vs sector ETF, bond yield, and VIX regime.',
 }
@@ -244,7 +242,6 @@ const DEFAULT_WEIGHTS: Record<string, number> = {
   options:       1.0,
   dark_pool:     1.0,
   fundamentals:  1.0,
-  social:        0.5,
   polymarket:    0.5,
   cross_asset:   0.75,
 }
@@ -2011,13 +2008,6 @@ export function TickerPage() {
               />
             )}
 
-            {/* Social */}
-            <SocialCard
-              trendScore={signal.trend_score}
-              interestLevel={signal.interest_level}
-              bullBearRatio={signal.bull_bear_ratio}
-              messageCount={signal.message_count}
-            />
 
             {/* Dark pool history */}
             {dpHistory && dpHistory.length > 0 && (

@@ -13,7 +13,6 @@ const SIGNAL_MODULES = [
   { key: 'options',       label: 'Opts'   },
   { key: 'dark_pool',     label: 'DkPl'   },
   { key: 'fundamentals',  label: 'Fund'   },
-  { key: 'social',        label: 'Socl'   },
 ] as const
 
 function getCellStyle(score: number | undefined | null): string {

@@ -469,7 +469,6 @@ function CatalystsTab() {
                 <SortHeader label="Total" sortKey="total_score" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Squeeze setup score: combines float short %, borrow cost, and volume buildup." onClick={() => toggle('squeeze_setup' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Squeeze</span></th>
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Volume breakout score: abnormal volume vs 20-day average." onClick={() => toggle('volume_breakout' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Vol Break</span></th>
-                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Social sentiment score from Reddit/StockTwits mention velocity." onClick={() => toggle('social' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Social</span></th>
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Dark pool score: off-exchange block flow signal strength." onClick={() => toggle('dark_pool' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Dark Pool</span></th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Override</th>
               </tr>
@@ -495,9 +494,6 @@ function CatalystsTab() {
                   </td>
                   <td className="px-4 py-2.5">
                     <Badge label={row.volume_breakout?.toFixed(1) ?? '—'} color={row.volume_breakout > 2 ? 'blue' : 'gray'} />
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <Badge label={row.social?.toFixed(1) ?? '—'} color={row.social > 1 ? 'green' : 'gray'} />
                   </td>
                   <td className="px-4 py-2.5">
                     <Badge label={row.dark_pool?.toFixed(1) ?? '—'} color={row.dark_pool > 1 ? 'green' : 'gray'} />
