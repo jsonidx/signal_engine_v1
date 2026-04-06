@@ -37,12 +37,15 @@ IMPORTANT: This is NOT investment advice. High-potential = high-risk.
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import warnings
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -162,17 +165,26 @@ LARGE_CAP_WATCH:    list = []
 # SECTION 1: DATA COLLECTION
 # ==============================================================================
 
-def get_stock_data(ticker: str) -> dict:
+def get_stock_data(ticker: str, prefetched_hist: "pd.DataFrame | None" = None) -> dict:
     """
     Pull comprehensive data for a single ticker from yfinance.
     Returns dict with price data, fundamentals, short interest, etc.
+
+    Args:
+        prefetched_hist: Pre-fetched OHLCV DataFrame from yf_cache.bulk_history().
+            When provided the expensive stock.history() HTTP call is skipped.
+            Pass None (default) to fall back to the normal per-ticker fetch.
     """
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
 
-        # Price history (6 months for technical analysis)
-        hist = stock.history(period="6mo")
+        # Price history — use pre-fetched bulk data when available
+        if prefetched_hist is not None and not prefetched_hist.empty and len(prefetched_hist) >= 20:
+            hist = prefetched_hist
+        else:
+            hist = stock.history(period="6mo")
+
         if hist.empty or len(hist) < 20:
             return None
 
@@ -773,13 +785,24 @@ def screen_universe(
         except Exception as _e:
             print(f"  [WARN] Dark pool pre-load failed: {_e}")
 
+    # ── Blacklist + bulk history pre-fetch ───────────────────────────────────
+    try:
+        from yf_cache import filter_blacklisted, bulk_history as _bulk_history
+        tickers = filter_blacklisted(tickers)
+        print(f"  Pre-fetching {len(tickers)} price histories (bulk)...", end=" ", flush=True)
+        _hist_cache = _bulk_history(tickers, period="6mo")
+        print(f"OK ({len(_hist_cache)} loaded)")
+    except Exception as _yfc_exc:
+        _hist_cache = {}
+        logger.debug("yf_cache unavailable: %s", _yfc_exc)
+
     results = []
     total = len(tickers)
 
     for i, ticker in enumerate(tickers):
         print(f"\r  Scanning: {ticker:<8} ({i+1}/{total})", end="", flush=True)
 
-        data = get_stock_data(ticker)
+        data = get_stock_data(ticker, prefetched_hist=_hist_cache.get(ticker.upper()))
         if data is None:
             continue
 

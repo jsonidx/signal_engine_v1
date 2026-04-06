@@ -1158,6 +1158,15 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
         sources.append(f"open positions: {open_positions}")
     print(f"  Universe: {len(universe)} tickers from {', '.join(sources) or 'no source'}")
 
+    try:
+        from yf_cache import filter_blacklisted
+        before = len(universe)
+        universe = filter_blacklisted(universe)
+        if len(universe) < before:
+            print(f"  Blacklist: skipped {before - len(universe)} tickers")
+    except Exception:
+        pass
+
     # Fetch data
     prices = fetch_price_data(universe, label="equity universe")
     if prices.empty:

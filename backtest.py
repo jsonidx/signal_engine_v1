@@ -40,8 +40,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 import warnings
+
+logger = logging.getLogger(__name__)
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -317,10 +321,36 @@ class WalkForwardBacktest:
 
     # ── Survivorship bias ────────────────────────────────────────────────────
 
+    def _prefetch_ipo_dates(self, tickers: List[str]) -> None:
+        """
+        Load IPO dates from ticker_metadata into self._ipo_cache in one DB query.
+
+        Called once at the start of run_single_window before _filter_universe.
+        Tickers absent from the DB fall through to the per-ticker yfinance path
+        in _get_ipo_date; their results are then saved back to DB for next time.
+        """
+        try:
+            from db_cache import bulk_get_ipo_dates
+            db_dates = bulk_get_ipo_dates(tickers)
+            for ticker, ipo_ts in db_dates.items():
+                if ticker not in self._ipo_cache:
+                    self._ipo_cache[ticker] = ipo_ts
+            if db_dates:
+                print(f"    IPO dates: {len(db_dates)}/{len(tickers)} loaded from DB cache")
+        except Exception as exc:
+            # DB unavailable — fall through to per-ticker yfinance calls
+            logger.debug("_prefetch_ipo_dates DB error (falling back to yfinance): %s", exc)
+
     def _get_ipo_date(self, ticker: str) -> Optional[pd.Timestamp]:
         """
         Return first trading date for ticker (from yfinance firstTradingDay).
-        Cached in self._ipo_cache. Returns None on failure (treated as pre-window).
+
+        Lookup order:
+          1. self._ipo_cache  (populated by _prefetch_ipo_dates for most tickers)
+          2. ticker_metadata table in Supabase
+          3. yf.Ticker(ticker).info  (only for cache misses; result saved to DB)
+
+        Returns None on failure — treated as pre-window IPO by _filter_universe.
         """
         if ticker in self._ipo_cache:
             return self._ipo_cache[ticker]
@@ -331,6 +361,16 @@ class WalkForwardBacktest:
             first = info.get("firstTradingDay")
             if first and isinstance(first, (int, float)) and first > 0:
                 result = pd.Timestamp(int(first), unit="s").normalize()
+        except Exception:
+            pass
+
+        # Persist to DB so the next run skips this yfinance call
+        try:
+            from db_cache import save_ticker_metadata
+            save_ticker_metadata(
+                ticker,
+                {"ipo_date": result.date().isoformat() if result else None},
+            )
         except Exception:
             pass
 
@@ -684,6 +724,8 @@ class WalkForwardBacktest:
         )
 
         # 1. Filter universe for survivorship bias
+        # Prefetch known IPO dates from DB (one query replaces N yfinance calls)
+        self._prefetch_ipo_dates(self.tickers)
         included, excluded = self._filter_universe(self.tickers, train_start)
         print(
             f"    Universe: {len(included)} tickers "
@@ -1018,7 +1060,39 @@ def main():
             from config import EQUITY_WATCHLIST, CUSTOM_WATCHLIST
             tickers = list(dict.fromkeys(EQUITY_WATCHLIST + CUSTOM_WATCHLIST))
         except ImportError:
-            print("ERROR: config.py not found and --tickers not specified.")
+            tickers = []
+
+        # Config lists are empty (tickers now live in watchlist.txt / Supabase).
+        # Fall back to watchlist.txt TIER 1 + TIER 2, matching ai_quant behaviour.
+        if not tickers:
+            wl_paths = [
+                os.path.join(os.path.dirname(__file__), "watchlist.txt"),
+                "./watchlist.txt",
+            ]
+            for wl_path in wl_paths:
+                if os.path.exists(wl_path):
+                    _tiers = {"TIER 1", "TIER 2"}
+                    current_tier = None
+                    with open(wl_path) as _f:
+                        for _line in _f:
+                            _s = _line.strip()
+                            if not _s:
+                                continue
+                            _u = _s.upper()
+                            if "TIER 1" in _u:
+                                current_tier = "TIER 1"
+                            elif "TIER 2" in _u:
+                                current_tier = "TIER 2"
+                            elif _u.startswith("TIER") or "MANUALLY ADDED" in _u:
+                                current_tier = None
+                            elif not _s.startswith("#"):
+                                t = _s.split("#")[0].strip().upper()
+                                if t and current_tier in _tiers:
+                                    tickers.append(t)
+                    break
+
+        if not tickers:
+            print("ERROR: No tickers found. Pass --tickers or populate watchlist.txt.")
             sys.exit(1)
 
     bt = WalkForwardBacktest(tickers=tickers, transaction_cost_bps=args.tc_bps)

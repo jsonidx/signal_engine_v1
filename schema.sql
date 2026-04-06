@@ -2,7 +2,7 @@
 -- Signal Engine v1 — Supabase PostgreSQL Schema
 -- =============================================================================
 -- All persistent data (user trades, AI cache, config) lives here.
--- Local SQLite is only used for fundamentals_cache (ephemeral, per-process).
+-- Local SQLite is no longer used for any cache.
 --
 -- To recreate from scratch in a new Supabase project:
 --   1. Open Supabase SQL Editor
@@ -23,6 +23,9 @@
 --   strategy_config     — key/value strategy parameters (module weights, etc.)
 --   thesis_outcomes     — post-hoc performance of Claude theses
 --   resolution_cache    — daily conflict-resolver output per ticker
+--   blacklist           — ticker exclusions with reason + optional TTL
+--   ticker_metadata     — IPO/delist dates, sector; eliminates per-ticker yf calls
+--   fundamentals        — quarterly fundamental data cache (30-day TTL)
 -- =============================================================================
 
 
@@ -241,6 +244,60 @@ CREATE TABLE IF NOT EXISTS resolution_cache (
 );
 
 
+-- ---------------------------------------------------------------------------
+-- 9. Blacklist — pipeline-wide ticker exclusions (Phase 1 cache layer)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS blacklist (
+    ticker      TEXT        PRIMARY KEY,
+    reason      TEXT        NOT NULL,
+    added_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ             -- NULL = permanent exclusion
+);
+
+CREATE INDEX IF NOT EXISTS idx_blacklist_expires_at
+    ON blacklist (expires_at)
+    WHERE expires_at IS NOT NULL;
+
+
+-- ---------------------------------------------------------------------------
+-- 10. Ticker Metadata — IPO dates, delist status, sector/industry
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ticker_metadata (
+    ticker          TEXT        PRIMARY KEY,
+    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+    ipo_date        DATE,
+    delisted_date   DATE,
+    status          TEXT        NOT NULL DEFAULT 'unknown'
+                                CHECK (status IN ('active','delisted','suspect','unknown')),
+    sector          TEXT,
+    industry        TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticker_metadata_ipo_date
+    ON ticker_metadata (ipo_date)
+    WHERE ipo_date IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_ticker_metadata_status
+    ON ticker_metadata (status);
+
+
+-- ---------------------------------------------------------------------------
+-- 11. Fundamentals Cache — quarterly data, 30-day TTL (was local SQLite)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS fundamentals (
+    ticker      TEXT        PRIMARY KEY,
+    data_json   TEXT        NOT NULL,
+    fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fundamentals_fetched_at
+    ON fundamentals (fetched_at);
+
+
 -- =============================================================================
 -- ROW LEVEL SECURITY (RLS)
 -- =============================================================================
@@ -273,6 +330,9 @@ ALTER TABLE iv_history         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE resolution_cache   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE strategy_config    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE thesis_outcomes    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE blacklist          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ticker_metadata    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fundamentals       ENABLE ROW LEVEL SECURITY;
 
 -- Policies: authenticated users can access all tables
 -- (replace USING (true) with USING (auth.uid() = user_id) in Phase 5 for user tables)
@@ -284,7 +344,8 @@ BEGIN
         'trades','trade_returns','snapshots','equity_positions',
         'weekly_returns','portfolio_settings','user_watchlists',
         'thesis_cache','transcript_cache','iv_history',
-        'resolution_cache','strategy_config','thesis_outcomes'
+        'resolution_cache','strategy_config','thesis_outcomes',
+        'blacklist','ticker_metadata','fundamentals'
     ] LOOP
         EXECUTE format(
             'DROP POLICY IF EXISTS "authenticated_full_access" ON %I;

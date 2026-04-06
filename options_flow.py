@@ -297,15 +297,18 @@ def _get_options_data(ticker: str) -> Optional[dict]:
         return None
 
 
-def _get_volume_ratio(ticker: str) -> Tuple[float, float]:
+def _get_volume_ratio(ticker: str, prefetched_hist=None) -> Tuple[float, float]:
     """
     Return (today_options_volume, 20d_avg_options_volume) using
     stock volume as a proxy when options history isn't available.
     Also returns 5d stock volume ratio vs 20d avg.
     """
     try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="3mo")
+        if prefetched_hist is not None and len(prefetched_hist) >= 21:
+            hist = prefetched_hist
+        else:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="3mo")
         if hist.empty or len(hist) < 21:
             return 0.0, 0.0
 
@@ -453,7 +456,7 @@ def _score_put_call(pc_ratio: float) -> Tuple[float, str]:
 # SECTION 4: MAIN ANALYSIS
 # ==============================================================================
 
-def analyze_ticker(ticker: str, verbose: bool = False) -> Optional[dict]:
+def analyze_ticker(ticker: str, verbose: bool = False, prefetched_hist=None) -> Optional[dict]:
     """
     Full options flow analysis for a single ticker.
     Returns scored result dict or None if data unavailable.
@@ -497,7 +500,7 @@ def analyze_ticker(ticker: str, verbose: bool = False) -> Optional[dict]:
         current_iv, iv_low, iv_high = _get_historical_iv(t)
 
         # Get stock volume for context
-        today_vol, avg_vol = _get_volume_ratio(ticker)
+        today_vol, avg_vol = _get_volume_ratio(ticker, prefetched_hist=prefetched_hist)
 
         # Score each component
         vol_score, vol_label = _score_volume_spike(
@@ -579,6 +582,20 @@ def screen_universe(tickers: List[str], min_heat: float = 0,
     """
     Screen a list of tickers and return results sorted by heat score.
     """
+    try:
+        from yf_cache import filter_blacklisted, bulk_history as _bulk_history
+        before = len(tickers)
+        tickers = filter_blacklisted(tickers)
+        if len(tickers) < before:
+            print(f"  Blacklist: skipped {before - len(tickers)} tickers")
+        # Only equity tickers have options; crypto has no history to bulk-fetch
+        equity_tickers = [t for t in tickers if not t.endswith("-USD")]
+        print(f"  Pre-fetching {len(equity_tickers)} price histories (bulk)...", end=" ", flush=True)
+        _hist_cache = _bulk_history(equity_tickers, period="3mo")
+        print(f"OK ({len(_hist_cache)} loaded)")
+    except Exception:
+        _hist_cache = {}
+
     results = []
     total = len(tickers)
 
@@ -586,7 +603,8 @@ def screen_universe(tickers: List[str], min_heat: float = 0,
         if verbose:
             print(f"  [{i}/{total}] {ticker}...", end=" ", flush=True)
 
-        result = analyze_ticker(ticker, verbose=verbose)
+        result = analyze_ticker(ticker, verbose=verbose,
+                                prefetched_hist=_hist_cache.get(ticker.upper()))
         if result and result["heat_score"] >= min_heat:
             results.append(result)
             if verbose:
@@ -594,7 +612,8 @@ def screen_universe(tickers: List[str], min_heat: float = 0,
         else:
             if verbose:
                 print("skipped" if result is None else f"below threshold (heat={result['heat_score']:.0f})")
-            time.sleep(0.3)
+            if not _hist_cache:
+                time.sleep(0.3)
 
     return sorted(results, key=lambda x: x["heat_score"], reverse=True)
 

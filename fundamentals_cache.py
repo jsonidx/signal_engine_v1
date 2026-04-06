@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-FUNDAMENTALS CACHE  — SQLite-backed cache for quarterly fundamental data
+FUNDAMENTALS CACHE  — Supabase-backed cache for quarterly fundamental data
 ================================================================================
 Fundamental data (PE ratios, revenue growth, margins, analyst ratings) changes
-at most once per quarter. This module caches it in a local SQLite database so
-we skip the yfinance network call on every run.
+at most once per quarter. This module caches it in Supabase so we skip the
+yfinance network call on every run — including GitHub Actions runners that have
+no local state between runs.
 
-CACHE FILE:   ./fundamentals_cache.db   (gitignored)
+CACHE TABLE:  fundamentals  (in the shared Supabase project)
 DEFAULT TTL:  30 days  (refreshes ~monthly, well within one earnings quarter)
+
+The public API is identical to the old SQLite version so no changes are needed
+in fundamental_analysis.py or any other caller.
 
 USAGE:
     from fundamentals_cache import get_cached, save_to_cache, clear_ticker, clear_all
@@ -35,42 +39,37 @@ CLI:
 
 import argparse
 import json
-import os
-import sqlite3
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import datetime, timezone
 from typing import Optional
 
-from utils.db import get_local_connection
+logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CACHE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fundamentals_cache.db")
 DEFAULT_TTL_DAYS = 30   # Refresh at most once per month
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _connect() -> sqlite3.Connection:
-    conn = get_local_connection(CACHE_DB)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS fundamentals (
-            ticker      TEXT PRIMARY KEY,
-            data_json   TEXT NOT NULL,
-            fetched_at  TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _age_days(fetched_at_iso: str) -> float:
-    fetched = datetime.fromisoformat(fetched_at_iso)
+def _age_days(fetched_at_iso) -> float:
+    """Accept a datetime object (psycopg2) or an ISO string."""
+    if isinstance(fetched_at_iso, datetime):
+        fetched = fetched_at_iso
+    else:
+        fetched = datetime.fromisoformat(str(fetched_at_iso))
     if fetched.tzinfo is None:
         fetched = fetched.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - fetched).total_seconds() / 86400
+
+
+def _conn():
+    """Open a Supabase connection. Raises if DATABASE_URL is not set."""
+    from utils.db import get_connection
+    return get_connection()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -81,23 +80,25 @@ def get_cached(ticker: str, ttl_days: int = DEFAULT_TTL_DAYS) -> Optional[dict]:
     Returns None if cache miss or stale (caller should fetch fresh data).
     """
     try:
-        conn = _connect()
-        row = conn.execute(
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
             "SELECT data_json, fetched_at FROM fundamentals WHERE ticker = %s",
-            (ticker.upper(),)
-        ).fetchone()
+            (ticker.upper(),),
+        )
+        row = cur.fetchone()
         conn.close()
 
         if row is None:
             return None
 
-        data_json, fetched_at = row
-        if _age_days(fetched_at) > ttl_days:
+        if _age_days(row["fetched_at"]) > ttl_days:
             return None  # Stale
 
-        return json.loads(data_json)
+        return json.loads(row["data_json"])
 
-    except Exception:
+    except Exception as exc:
+        logger.debug("fundamentals_cache get_cached(%s): %s", ticker, exc)
         return None
 
 
@@ -107,43 +108,47 @@ def save_to_cache(ticker: str, data: dict) -> None:
     Call this after a successful yfinance fetch.
     """
     try:
-        conn = _connect()
-        conn.execute(
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO fundamentals (ticker, data_json, fetched_at)
-            VALUES (%s, %s, %s)
-            ON CONFLICT(ticker) DO UPDATE SET
-                data_json  = excluded.data_json,
-                fetched_at = excluded.fetched_at
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (ticker) DO UPDATE SET
+                data_json  = EXCLUDED.data_json,
+                fetched_at = NOW()
             """,
-            (ticker.upper(), json.dumps(data), _now_iso())
+            (ticker.upper(), json.dumps(data)),
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass  # Cache write failure is non-fatal
+    except Exception as exc:
+        logger.debug("fundamentals_cache save_to_cache(%s): %s", ticker, exc)
+        # Cache write failure is non-fatal
 
 
 def clear_ticker(ticker: str) -> None:
     """Remove one ticker from the cache (forces re-fetch on next run)."""
     try:
-        conn = _connect()
-        conn.execute("DELETE FROM fundamentals WHERE ticker = %s", (ticker.upper(),))
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM fundamentals WHERE ticker = %s", (ticker.upper(),))
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("fundamentals_cache clear_ticker(%s): %s", ticker, exc)
 
 
 def clear_all() -> None:
     """Wipe the entire cache."""
     try:
-        conn = _connect()
-        conn.execute("DELETE FROM fundamentals")
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM fundamentals")
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("fundamentals_cache clear_all: %s", exc)
 
 
 def cache_status() -> list:
@@ -151,22 +156,26 @@ def cache_status() -> list:
     Return list of dicts: [{ticker, fetched_at, age_days, expired}] for all rows.
     """
     try:
-        conn = _connect()
-        rows = conn.execute(
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
             "SELECT ticker, fetched_at FROM fundamentals ORDER BY ticker"
-        ).fetchall()
+        )
+        rows = cur.fetchall()
         conn.close()
+
         result = []
-        for ticker, fetched_at in rows:
-            age = _age_days(fetched_at)
+        for row in rows:
+            age = _age_days(row["fetched_at"])
             result.append({
-                "ticker": ticker,
-                "fetched_at": fetched_at[:19].replace("T", " "),
-                "age_days": round(age, 1),
-                "expired": age > DEFAULT_TTL_DAYS,
+                "ticker":     row["ticker"],
+                "fetched_at": str(row["fetched_at"])[:19].replace("T", " "),
+                "age_days":   round(age, 1),
+                "expired":    age > DEFAULT_TTL_DAYS,
             })
         return result
-    except Exception:
+    except Exception as exc:
+        logger.debug("fundamentals_cache cache_status: %s", exc)
         return []
 
 
@@ -203,7 +212,6 @@ def main():
     elif args.refresh:
         ticker = args.refresh.upper()
         clear_ticker(ticker)
-        # Import here to avoid circular deps at module level
         from fundamental_analysis import fetch_fundamentals
         print(f"  Fetching {ticker} from yfinance...", end=" ", flush=True)
         raw = fetch_fundamentals(ticker, use_cache=False)

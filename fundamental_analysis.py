@@ -885,6 +885,15 @@ def main():
     if use_extended:
         print("  Extended mode: DCF + peer benchmarking + accounting quality checks enabled.\n")
 
+    try:
+        from yf_cache import filter_blacklisted
+        before = len(tickers)
+        tickers = filter_blacklisted(tickers)
+        if len(tickers) < before:
+            print(f"  Blacklist: skipped {before - len(tickers)} tickers")
+    except Exception:
+        pass
+
     results = []
     for i, ticker in enumerate(tickers):
         print(f"\r  Fetching: {ticker:<8} ({i+1}/{len(tickers)})", end="", flush=True)

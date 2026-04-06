@@ -495,17 +495,47 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 250) -> list:
     """
     _MIN_BARS = 20
 
+    # ── Blacklist pre-filter: skip known-bad tickers before any yfinance call ──
+    _blacklisted: set = set()
+    try:
+        from db_cache import get_active_blacklist
+        _blacklisted = set(get_active_blacklist())
+        if _blacklisted:
+            n_before = len(tickers)
+            tickers = [t for t in tickers if t.upper() not in _blacklisted]
+            skipped = n_before - len(tickers)
+            if skipped:
+                print(f"  Blacklist: skipped {skipped} tickers")
+                logger.info("Blacklist: skipped %d tickers", skipped)
+    except Exception as _bl_exc:
+        logger.debug("Blacklist check unavailable: %s", _bl_exc)
+
     ticker_hash = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()
     cached = _load_liquidity_cache(ticker_hash)
     if cached is not None:
         print(f"  Liquidity filter: cache hit — {len(cached)} passed (skipping downloads)")
         return cached
 
+    # ── Supabase warm-start cache (survives GitHub Actions runner restarts) ──
+    # Falls through on: first run, DB unavailable, or snapshot older than 25h.
+    try:
+        from db_cache import get_cached_universe
+        warm = get_cached_universe(max_age_hours=25.0)
+        if warm is not None:
+            # Re-apply blacklist: a ticker may have been added since the snapshot
+            warm = [t for t in warm if t not in _blacklisted]
+            _save_liquidity_cache(ticker_hash, warm)   # prime disk cache too
+            print(f"  Liquidity filter: Supabase warm cache — {len(warm)} passed (skipping downloads)")
+            return warm
+    except Exception as _sc_exc:
+        logger.debug("Supabase universe cache unavailable: %s", _sc_exc)
+
     passed:   list = []
     fail_price: int = 0
     fail_vol:   int = 0
     fail_bars:  int = 0
     failed_tickers: list = []
+    _no_data_tickers: list = []   # tickers where yfinance returned zero data (delist candidates)
 
     _yf_log = logging.getLogger("yfinance")
     _prev_level = _yf_log.level
@@ -551,6 +581,7 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 250) -> list:
                       t.upper() if t.upper() in close_df.columns else None)
                 if col is None:
                     failed_tickers.append(t)
+                    _no_data_tickers.append(t)   # zero yfinance data → delist candidate
                     continue
 
                 c_ser = close_df[col]
@@ -622,7 +653,28 @@ def _apply_liquidity_filter(tickers: list, batch_size: int = 250) -> list:
     except Exception:
         pass
 
+    # Blacklist tickers with zero yfinance data (7-day TTL — re-evaluated next week)
+    if _no_data_tickers:
+        try:
+            from db_cache import add_to_blacklist
+            from datetime import timedelta, timezone as _tz
+            _expires = datetime.now(_tz.utc) + timedelta(days=7)
+            for ft in set(_no_data_tickers):
+                add_to_blacklist(ft, reason="no_yfinance_data", expires_at=_expires)
+            logger.info("Blacklist: auto-added %d no-data tickers (7d TTL)", len(set(_no_data_tickers)))
+        except Exception as _bl_exc:
+            logger.debug("Blacklist write unavailable: %s", _bl_exc)
+
     _save_liquidity_cache(ticker_hash, passed)
+
+    # ── Persist to Supabase so the next GHA run warm-starts (skips this loop) ──
+    # _SECTOR_MAP is populated by fetch_index_constituents() earlier in build_master_universe()
+    try:
+        from db_cache import save_universe_results
+        save_universe_results(passed, sector_map=_SECTOR_MAP)
+    except Exception as _sv_exc:
+        logger.debug("save_universe_results unavailable: %s", _sv_exc)
+
     return passed
 
 

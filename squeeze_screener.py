@@ -52,6 +52,7 @@ import argparse
 import csv
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -60,6 +61,8 @@ import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -167,16 +170,26 @@ class SqueezeScore:
 # SECTION 1: DATA FETCHERS
 # ==============================================================================
 
-def fetch_stock_data(ticker: str) -> Optional[dict]:
+def fetch_stock_data(ticker: str, prefetched_hist: "pd.DataFrame | None" = None) -> Optional[dict]:
     """
     Pull price history, short interest, and volume from yfinance.
     Returns None if data is insufficient.
+
+    Args:
+        prefetched_hist: Pre-fetched OHLCV DataFrame from yf_cache.bulk_history().
+            When provided the expensive stock.history() HTTP call is skipped.
+            Pass None (default) to fall back to the normal per-ticker fetch.
     """
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
 
-        hist = stock.history(period="6mo")
+        # History — use bulk pre-fetched when available
+        if prefetched_hist is not None and not prefetched_hist.empty and len(prefetched_hist) >= 20:
+            hist = prefetched_hist
+        else:
+            hist = stock.history(period="6mo")
+
         if hist.empty or len(hist) < 20:
             return None
 
@@ -815,6 +828,19 @@ def run_screener(
             else:
                 print(f" unavailable (will skip FTD signal)")
 
+    # ── Blacklist + bulk history pre-fetch ───────────────────────────────────
+    _hist_cache: dict = {}
+    try:
+        from yf_cache import filter_blacklisted, bulk_history as _bulk_history
+        tickers = filter_blacklisted(tickers)
+        if verbose:
+            print(f"\n  Pre-fetching {len(tickers)} price histories (bulk)...", end=" ", flush=True)
+        _hist_cache = _bulk_history(tickers, period="6mo")
+        if verbose:
+            print(f"OK ({len(_hist_cache)} loaded)")
+    except Exception as _yfc_exc:
+        logger.debug("yf_cache unavailable: %s", _yfc_exc)
+
     # ── Main scan loop ────────────────────────────────────────────────────────
     results: List[SqueezeScore] = []
     total = len(tickers)
@@ -823,8 +849,8 @@ def run_screener(
         if verbose:
             print(f"\r  Scanning: {ticker:<8} ({i+1}/{total})", end="", flush=True)
 
-        # 1. yfinance data
-        data = fetch_stock_data(ticker)
+        # 1. yfinance data (history from bulk cache when available)
+        data = fetch_stock_data(ticker, prefetched_hist=_hist_cache.get(ticker.upper()))
         if data is None:
             continue
 
@@ -838,8 +864,8 @@ def run_screener(
         sq = compute_squeeze_score(ticker, data, finviz, ftd_df)
         results.append(sq)
 
-        # Brief pause between yfinance calls
-        if not include_finviz:
+        # Brief pause between yfinance .info calls (skipped when bulk history is active)
+        if not include_finviz and not _hist_cache:
             time.sleep(0.3)
 
     if verbose:

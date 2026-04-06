@@ -182,6 +182,203 @@ python3 -m http.server 5173 --directory dashboard/frontend/dist/
 
 ---
 
+## Phase 2 — Centralized yfinance Wrapper (Completed)
+
+`yf_cache.py` provides two optimizations used by the screener scan loops:
+
+### `bulk_history(tickers, period, interval)`
+One `yf.download()` call replaces N individual `stock.history()` calls.
+Returns `{TICKER: DataFrame}` — drop-in compatible with `stock.history()`.
+
+Used by `catalyst_screener.screen_universe()` and `squeeze_screener.run_screener()`
+before their main loops. Each screener pre-fetches all ~185 histories in one
+HTTP roundtrip, then passes the slice in via `prefetched_hist=`.
+
+Savings: ~3–4 min per screener on each run (~6–8 min total).
+
+### `filter_blacklisted(tickers)`
+Removes blacklisted tickers before any download. Thin wrapper around
+`db_cache.get_active_blacklist()`. Fails open (returns full list on DB error).
+
+### What was NOT abstracted (and why)
+
+`yf.Ticker().info` has no bulk API — each call is a separate HTTP request.
+The correct cache for it is `fundamentals_cache` (Supabase, 30-day TTL),
+which `fundamental_analysis.py` already populates at Step 7. On warm runs,
+screeners calling `yf.Ticker(t).info` benefit automatically because
+`fundamentals_cache.get_cached()` short-circuits before yfinance is called.
+
+`options_flow.py` uses `.options` and `.option_chain()` which are inherently
+per-ticker — no bulk optimization is possible there.
+
+### Runtime savings summary (warm run, 185 tickers)
+
+| Optimization | Savings/run |
+|---|---|
+| `fundamentals_cache` → Supabase (Phase 1) | ~5 min |
+| IPO dates → `ticker_metadata` (Phase 1) | ~2 min |
+| Universe snapshot → `ticker_metadata` (Phase 1) | ~3 min |
+| `bulk_history` in catalyst_screener (Phase 2) | ~3–4 min |
+| `bulk_history` in squeeze_screener (Phase 2) | ~3–4 min |
+| `bulk_history` in options_flow screener (Phase 2) | ~1–2 min |
+| `filter_blacklisted` in fundamental_analysis + signal_engine (Phase 2) | negligible |
+| **Total warm-run savings** | **~17–20 min** |
+
+---
+
+## Database Caching & Blacklist System (Phase 1)
+
+Three Supabase tables replace local SQLite/JSON caches that were lost on every
+GitHub Actions run.  All changes are backward-compatible — no callers outside
+the patched modules need to change.
+
+### New Tables
+
+| Table | Purpose | TTL |
+|-------|---------|-----|
+| `blacklist` | Tickers excluded from all pipeline steps | permanent or custom |
+| `ticker_metadata` | IPO/delist dates, sector, status | indefinite (updated on change) |
+| `fundamentals` | Quarterly fundamental data from yfinance | 30 days |
+
+### Apply the Migration
+
+```bash
+# Option A — Supabase SQL Editor (paste and run)
+cat migrations/001_add_blacklist_and_metadata.sql
+
+# Option B — psql
+psql "$DATABASE_URL" -f migrations/001_add_blacklist_and_metadata.sql
+```
+
+### Migrate Existing Data
+
+```bash
+# Import any tickers from liquidity_failed.log into the blacklist (7-day TTL)
+python3 -c "from db_cache import migrate_liquidity_failed_log; migrate_liquidity_failed_log()"
+```
+
+### Managing the Blacklist
+
+```bash
+# Show active entries
+python3 db_cache.py blacklist --list
+
+# Permanently blacklist a confirmed delist
+python3 db_cache.py blacklist --add LILM --reason confirmed_delist
+
+# Temporarily blacklist with 14-day TTL
+python3 db_cache.py blacklist --add XYZ --reason no_yfinance_data --days 14
+
+# Remove an entry
+python3 db_cache.py blacklist --remove XYZ
+```
+
+### Managing the Fundamentals Cache
+
+```bash
+# Show all cached tickers and their age
+python3 fundamentals_cache.py --list
+
+# Force-expire one ticker (re-fetched on next run)
+python3 fundamentals_cache.py --clear GME
+
+# Force re-fetch one ticker now
+python3 fundamentals_cache.py --refresh GME
+```
+
+### What Changed in Each Module
+
+- **`universe_builder.py`** — Checks blacklist before liquidity filter; auto-adds
+  tickers with zero yfinance data (7-day TTL); warm-starts from Supabase snapshot.
+- **`backtest.py`** — Prefetches all IPO dates from `ticker_metadata` in one DB
+  query before `_filter_universe`; saves new results back for subsequent runs.
+- **`fundamentals_cache.py`** — Migrated from local SQLite to Supabase. Public
+  API unchanged (`get_cached`, `save_to_cache`, CLI commands all identical).
+- **`catalyst_screener.py`, `squeeze_screener.py`, `options_flow.py`** — Call
+  `filter_blacklisted()` + `bulk_history()` before their per-ticker loops.
+- **`fundamental_analysis.py`, `signal_engine.py`** — Call `filter_blacklisted()`
+  before their main loops (no bulk history needed — `.info` has no bulk API).
+
+---
+
+## Phase 3 — GitHub Actions Cache + Observability (Completed)
+
+### GitHub Actions Cache for iShares Constituents
+
+The workflow (`.github/workflows/daily_pipeline.yml`) caches `data/universe_cache/`
+between runs using a date-based key:
+
+```yaml
+key: universe-cache-2026-04-06        # new key each calendar day
+restore-keys: universe-cache-         # falls back to any previous day's cache
+```
+
+**Effect on a typical day:**
+
+| Run | GHA cache | `universe_builder` disk cache | iShares HTTP fetches |
+|-----|-----------|-------------------------------|----------------------|
+| First daily run | miss | miss | 7 × iShares CSV requests |
+| Same-day re-run | hit — files restored | fresh (< 24h) | 0 |
+| Next calendar day | new key (miss) | stale (> 24h) | 7 × iShares CSV requests |
+
+The fallback chain in `fetch_index_constituents()` is unchanged: fresh disk cache
+→ iShares HTTP → stale disk cache → hardcoded fallback list.  The GHA cache simply
+pre-populates the disk cache for same-day re-runs.
+
+### Observability Improvements
+
+All INFO-level messages now appear in GitHub Actions logs. Key messages:
+
+```
+# db_cache.py
+get_cached_universe: warm cache HIT — 183 tickers (age < 25h)   ← skip 1000-ticker download
+get_cached_universe: cache miss — 0 tickers in snapshot           ← first/stale run
+get_active_blacklist: 12 tickers on blacklist
+bulk_get_ipo_dates: cache hit — 171/183 tickers have stored IPO dates
+save_universe_results: upserted 183 tickers into ticker_metadata
+
+# yf_cache.py
+filter_blacklisted: removed 12/195 blacklisted tickers
+bulk_history: 179/183 tickers with valid history (period=6mo, 4 skipped)
+```
+
+### Verification Checklist
+
+Run these after any change to the caching stack:
+
+```bash
+# 1. Blacklist round-trip
+python3 db_cache.py blacklist --add TEST --reason smoke_test --days 1
+python3 db_cache.py blacklist --list            # TEST should appear
+python3 -c "from yf_cache import filter_blacklisted; print(filter_blacklisted(['TEST','AAPL']))"  # ['AAPL']
+python3 db_cache.py blacklist --remove TEST
+
+# 2. Universe warm-start
+python3 -c "
+from db_cache import get_cached_universe, save_universe_results
+save_universe_results(['AAPL','MSFT','GOOG'], sector_map={})
+result = get_cached_universe(max_age_hours=1)
+print('warm-start OK:', result)
+"
+
+# 3. bulk_history smoke test (uses real yfinance)
+python3 -c "
+from yf_cache import bulk_history
+m = bulk_history(['AAPL','MSFT'], period='1mo')
+assert 'AAPL' in m and len(m['AAPL']) >= 15, 'bulk_history failed'
+print('bulk_history OK:', {k: len(v) for k, v in m.items()})
+"
+
+# 4. Full pipeline dry-run (no AI cost)
+bash run_master.sh --skip-ai
+# Expected log lines:
+#   get_cached_universe: warm cache HIT (second+ run)
+#   filter_blacklisted: removed N tickers
+#   bulk_history: X/Y tickers with valid history
+```
+
+---
+
 ## License
 
 For personal, non-commercial use only. No warranty expressed or implied.
