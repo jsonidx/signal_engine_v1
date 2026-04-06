@@ -203,15 +203,33 @@ def _print_selection_table(
     total_input: int,
     max_tickers: int,
 ) -> None:
-    """Print the AI QUANT SELECTION summary table to stdout."""
+    """
+    Print the AI QUANT SELECTION summary table to stdout.
+
+    Layout:
+      - Top N dynamic tickers ranked by priority (open positions excluded from rank)
+      - Open positions appended after the dynamic rows, re-sorted by priority
+      - Each open position row gets an inline flag: ← high attention — open position
+    """
     cost_per_call_eur = 0.03
-    n = len(selected)
+    n             = len(selected)
     estimated_cost = n * cost_per_call_eur
     skipped_count  = total_input - n
 
+    # Count dynamic vs open-position rows using the internal bookkeeping key
+    n_open    = sum(1 for s in selected if s.get("_always_include"))
+    n_dynamic = n - n_open
+
+    # Build header text — fits within the 61-char inner box width
+    if n_open:
+        pos_word    = "position" if n_open == 1 else "positions"
+        header_text = f" AI QUANT SELECTION — Top {n_dynamic} dynamic + {n_open} open {pos_word} (high attention)"
+    else:
+        header_text = f" AI QUANT SELECTION — Top {n_dynamic} tickers for Claude synthesis"
+
     print()
     print("┌─────────────────────────────────────────────────────────────┐")
-    print(f"│ AI QUANT SELECTION — Top {max_tickers} tickers for Claude synthesis    │")
+    print(f"│{header_text:<61}│")
     print("├──────┬────────┬──────────┬───────────┬──────────┬──────────┤")
     print("│ Rank │ Ticker │ Priority │ Agreement │ Direction│ Eq.Rank  │")
     print("├──────┼────────┼──────────┼───────────┼──────────┼──────────┤")
@@ -223,11 +241,10 @@ def _print_selection_table(
         direction = (s.get("pre_resolved_direction") or "NEUTRAL")[:8].ljust(8)
         eq_rank   = s.get("equity_rank")
         eq_str    = (f"#{eq_rank}" if eq_rank else "N/A").ljust(8)
-        print(f"│ {i:>4} │ {ticker} │ {priority} │ {agreement} │ {direction} │ {eq_str} │")
-
-        reason = s.get("selection_reason", "")
-        if "always_include" in reason.lower() or "open position" in reason.lower():
-            print("│      │ (always include — open position)                            │")
+        row = f"│ {i:>4} │ {ticker} │ {priority} │ {agreement} │ {direction} │ {eq_str} │"
+        if s.get("_always_include"):
+            row += "  ← high attention — open position"
+        print(row)
 
     print("└──────┴────────┴──────────┴───────────┴──────────┴──────────┘")
     print(f"Skipped: {skipped_count} tickers (skip_claude=True or below agreement threshold)")
