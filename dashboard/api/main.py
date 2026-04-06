@@ -1343,11 +1343,6 @@ async def signals_ticker(ticker: str):
             "dark_pool_score":     _safe_float(dp.get("dark_pool_score") or dp.get("score")),
             "short_ratio_trend":   _normalise_dp_trend(dp.get("short_ratio_trend") or dp.get("trend")),
             "dark_pool_intensity": _normalise_dp_intensity(dp.get("dark_pool_intensity") or dp.get("intensity") or dp.get("off_exchange_pct")),
-            # ── Social ────────────────────────────────────────────────────────
-            "trend_score":   _safe_float(soc.get("trend_score")),
-            "interest_level": _safe_float(soc.get("interest_level")),
-            "bull_bear_ratio": _safe_float(soc.get("bull_bear_ratio")),
-            "message_count": soc.get("message_count"),
             # ── Raw nested (kept for backward compat) ─────────────────────────
             "ai_thesis":     {
                 "direction": data.get("direction"), "conviction": data.get("conviction"),
@@ -1357,7 +1352,6 @@ async def signals_ticker(ticker: str):
             "targets":       [data.get("target_1"), data.get("target_2")],
             "signals":       sigs,
             "dark_pool":     dp,
-            "social":        soc,
             "squeeze":       sq,
             "volume_profile": vp,
             "options_heat":  of,
