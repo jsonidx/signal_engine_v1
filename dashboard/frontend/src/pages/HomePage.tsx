@@ -479,19 +479,17 @@ export function HomePage() {
           </div>
         </div>
 
-        {/* AI Quant Selection + Candidate Pool side by side */}
-        <div className="grid grid-cols-5 gap-4">
-          <div className="col-span-2">
+        {/* Candidate Pool — full width so Reason column has room */}
+        <CandidateSnapshotsTable />
+
+        {/* AI Quant Selection + Top signals + sidebar */}
+        <div className="grid grid-cols-4 gap-4">
+          {/* AI Selection */}
+          <div className="col-span-1">
             <AiSelectionTable />
           </div>
-          <div className="col-span-3">
-            <CandidateSnapshotsTable />
-          </div>
-        </div>
 
-        {/* Top signals + sidebar */}
-        <div className="grid grid-cols-3 gap-4">
-          {/* Top 7 signals — 2/3 width */}
+          {/* Top 7 signals — 2 cols wide so signal cards stay readable */}
           <div className="col-span-2">
             <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
               Top Signals by Agreement

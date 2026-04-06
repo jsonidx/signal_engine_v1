@@ -240,7 +240,7 @@ export function CandidateSnapshotsTable() {
               </th>
               <SortTh label="Eq.Rank"  col="equity_rank"    active={sortKey} dir={sortDir} onSort={handleSort} className="hidden md:table-cell" title="Rank in today's equity screener by composite Z-score." />
               <SortTh label="Z-Score"  col="composite_z"    active={sortKey} dir={sortDir} onSort={handleSort} className="hidden lg:table-cell" title="Multi-factor composite Z-score from the equity screener. Positive = above cross-sectional median." />
-              <th className="px-3 py-2.5 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary hidden xl:table-cell" title="Why this ticker was included: high agreement, open position, squeeze setup, etc.">
+              <th className="px-3 py-2.5 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell" title="Why this ticker was included: high agreement, open position, squeeze setup, etc.">
                 Reason
               </th>
               <th className="px-3 py-2.5 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary" title="Whether this ticker was chosen for final Claude synthesis (top 5 + open positions).">
@@ -311,8 +311,8 @@ export function CandidateSnapshotsTable() {
                 </td>
 
                 {/* Selection reason */}
-                <td className="px-3 py-2.5 hidden xl:table-cell">
-                  <span className="font-mono text-[10px] text-text-tertiary truncate block max-w-[180px]">
+                <td className="px-3 py-2.5 hidden lg:table-cell">
+                  <span className="font-mono text-[10px] text-text-tertiary leading-relaxed">
                     {row.selection_reason || '—'}
                   </span>
                 </td>
