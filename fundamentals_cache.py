@@ -98,7 +98,9 @@ def get_cached(ticker: str, ttl_days: int = DEFAULT_TTL_DAYS) -> Optional[dict]:
         return json.loads(row["data_json"])
 
     except Exception as exc:
-        logger.debug("fundamentals_cache get_cached(%s): %s", ticker, exc)
+        from db_cache import _handle_missing_tables
+        if not _handle_missing_tables(exc):
+            logger.debug("fundamentals_cache get_cached(%s): %s", ticker, exc)
         return None
 
 
@@ -123,7 +125,9 @@ def save_to_cache(ticker: str, data: dict) -> None:
         conn.commit()
         conn.close()
     except Exception as exc:
-        logger.debug("fundamentals_cache save_to_cache(%s): %s", ticker, exc)
+        from db_cache import _handle_missing_tables
+        if not _handle_missing_tables(exc):
+            logger.debug("fundamentals_cache save_to_cache(%s): %s", ticker, exc)
         # Cache write failure is non-fatal
 
 

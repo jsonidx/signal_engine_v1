@@ -70,6 +70,11 @@ logger = logging.getLogger(__name__)
 # Lazy import so modules that don't need DB don't pay the psycopg2 import cost
 _get_conn = None
 
+# Set to True the first time we detect a missing-table error.
+# All subsequent cache calls silently return their safe defaults without
+# hitting the DB again, so the logs stay clean on first-run / pre-migration.
+_TABLES_MISSING: bool = False
+
 
 def _connection():
     global _get_conn
@@ -77,6 +82,40 @@ def _connection():
         from utils.db import managed_connection as _mc
         _get_conn = _mc
     return _get_conn
+
+
+def _is_missing_table(exc: Exception) -> bool:
+    """Return True if *exc* is a PostgreSQL 'relation does not exist' (42P01) error."""
+    return (
+        getattr(exc, "pgcode", None) == "42P01"
+        or "does not exist" in str(exc).lower()
+    )
+
+
+def _handle_missing_tables(exc: Exception) -> bool:
+    """
+    If *exc* is a missing-table error, set _TABLES_MISSING=True and log a
+    clear one-time INFO message with the fix command.  Returns True so callers
+    know they should silently return their safe default.
+
+    If it is NOT a missing-table error, returns False so callers log it normally.
+    """
+    global _TABLES_MISSING
+    if _is_missing_table(exc):
+        if not _TABLES_MISSING:
+            _TABLES_MISSING = True
+            logger.info(
+                "db_cache: Supabase tables not found — migration not yet applied. "
+                "Pipeline running in cold mode (no caching). "
+                "Fix with: psql \"$DATABASE_URL\" -f migrations/001_add_blacklist_and_metadata.sql"
+            )
+            print(
+                "\n  [db_cache] Tables missing — running cold (no Supabase cache).\n"
+                "  Apply migration once and caching activates on next run:\n"
+                "    psql \"$DATABASE_URL\" -f migrations/001_add_blacklist_and_metadata.sql\n"
+            )
+        return True
+    return False
 
 
 # =============================================================================
@@ -89,6 +128,8 @@ def is_blacklisted(ticker: str) -> bool:
 
     Fails open: returns False on any DB error so the pipeline never stalls.
     """
+    if _TABLES_MISSING:
+        return False
     try:
         with _connection()() as conn:
             cur = conn.cursor()
@@ -103,6 +144,8 @@ def is_blacklisted(ticker: str) -> bool:
             )
             return cur.fetchone() is not None
     except Exception as exc:
+        if _handle_missing_tables(exc):
+            return False
         logger.debug("is_blacklisted(%s) DB error (failing open): %s", ticker, exc)
         return False
 
@@ -136,7 +179,8 @@ def add_to_blacklist(
             )
         logger.debug("add_to_blacklist: %s (%s, expires=%s)", ticker, reason, expires_at)
     except Exception as exc:
-        logger.warning("add_to_blacklist(%s) DB error: %s", ticker, exc)
+        if not _handle_missing_tables(exc):
+            logger.warning("add_to_blacklist(%s) DB error: %s", ticker, exc)
 
 
 def remove_from_blacklist(ticker: str) -> None:
@@ -150,7 +194,8 @@ def remove_from_blacklist(ticker: str) -> None:
             )
         logger.debug("remove_from_blacklist: %s", ticker)
     except Exception as exc:
-        logger.warning("remove_from_blacklist(%s) DB error: %s", ticker, exc)
+        if not _handle_missing_tables(exc):
+            logger.warning("remove_from_blacklist(%s) DB error: %s", ticker, exc)
 
 
 def get_active_blacklist() -> list[str]:
@@ -158,6 +203,8 @@ def get_active_blacklist() -> list[str]:
     Return all currently active (non-expired) blacklisted tickers.
     Returns [] on DB error.
     """
+    if _TABLES_MISSING:
+        return []
     try:
         with _connection()() as conn:
             cur = conn.cursor()
@@ -173,6 +220,8 @@ def get_active_blacklist() -> list[str]:
                 logger.info("get_active_blacklist: %d tickers on blacklist", len(result))
             return result
     except Exception as exc:
+        if _handle_missing_tables(exc):
+            return []
         logger.warning("get_active_blacklist DB error: %s", exc)
         return []
 
@@ -198,6 +247,8 @@ def get_ticker_metadata(ticker: str) -> Optional[dict]:
             row = cur.fetchone()
             return dict(row) if row else None
     except Exception as exc:
+        if _handle_missing_tables(exc):
+            return None
         logger.debug("get_ticker_metadata(%s) DB error: %s", ticker, exc)
         return None
 
@@ -240,7 +291,8 @@ def save_ticker_metadata(ticker: str, data: dict) -> None:
                 [ticker.upper()] + vals,
             )
     except Exception as exc:
-        logger.warning("save_ticker_metadata(%s) DB error: %s", ticker, exc)
+        if not _handle_missing_tables(exc):
+            logger.warning("save_ticker_metadata(%s) DB error: %s", ticker, exc)
 
 
 def bulk_get_ipo_dates(tickers: list[str]) -> dict:
@@ -252,7 +304,7 @@ def bulk_get_ipo_dates(tickers: list[str]) -> dict:
     Used by WalkForwardBacktest to preload self._ipo_cache in one query instead
     of 185 individual yf.Ticker().info calls.
     """
-    if not tickers:
+    if not tickers or _TABLES_MISSING:
         return {}
 
     upper = [t.upper() for t in tickers]
@@ -278,6 +330,8 @@ def bulk_get_ipo_dates(tickers: list[str]) -> dict:
             )
             return result
     except Exception as exc:
+        if _handle_missing_tables(exc):
+            return {}
         logger.warning("bulk_get_ipo_dates DB error: %s", exc)
         return {}
 
@@ -305,6 +359,8 @@ def get_cached_universe(max_age_hours: float = 25.0) -> list[str] | None:
     Used by universe_builder._apply_liquidity_filter to skip the 1000-ticker
     yfinance batch download on warm runs (~2-4 min saved per GHA run).
     """
+    if _TABLES_MISSING:
+        return None
     try:
         with _connection()() as conn:
             cur = conn.cursor()
@@ -334,6 +390,8 @@ def get_cached_universe(max_age_hours: float = 25.0) -> list[str] | None:
         return tickers
 
     except Exception as exc:
+        if _handle_missing_tables(exc):
+            return None
         logger.info("get_cached_universe: DB unavailable (cold start) — %s", exc)
         return None
 
@@ -354,7 +412,7 @@ def save_universe_results(
     Called by universe_builder._apply_liquidity_filter after the download loop.
     On DB error the function fails silently — the pipeline continues normally.
     """
-    if not passed:
+    if not passed or _TABLES_MISSING:
         return
 
     _sm = sector_map or {}
@@ -385,7 +443,8 @@ def save_universe_results(
         conn.close()
         logger.info("save_universe_results: upserted %d tickers into ticker_metadata", len(rows))
     except Exception as exc:
-        logger.warning("save_universe_results DB error: %s", exc)
+        if not _handle_missing_tables(exc):
+            logger.warning("save_universe_results DB error: %s", exc)
 
 
 # =============================================================================
