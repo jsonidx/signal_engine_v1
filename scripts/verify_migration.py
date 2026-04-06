@@ -41,11 +41,11 @@ def main() -> int:
         for table in ("blacklist", "ticker_metadata", "fundamentals"):
             cur.execute(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name = %s)",
+                "WHERE table_schema = 'public' AND table_name = %s) AS exists",
                 (table,),
             )
             row = cur.fetchone()
-            exists = row[0] if row else False
+            exists = row["exists"] if row else False
             if not check(f"{table} table exists", exists):
                 errors += 1
                 print(f"    → Run: psql \"$DATABASE_URL\" -f migrations/001_add_blacklist_and_metadata.sql")

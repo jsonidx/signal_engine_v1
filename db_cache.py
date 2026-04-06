@@ -429,7 +429,7 @@ def save_universe_results(
         execute_values(
             cur,
             """
-            INSERT INTO ticker_metadata (ticker, is_active, status, sector, updated_at)
+            INSERT INTO ticker_metadata (ticker, is_active, status, sector)
             VALUES %s
             ON CONFLICT (ticker) DO UPDATE SET
                 is_active  = EXCLUDED.is_active,
