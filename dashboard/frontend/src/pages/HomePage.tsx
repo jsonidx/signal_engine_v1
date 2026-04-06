@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus } from 'lucide-react'
+import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Shell } from '../components/layout/Shell'
+import { AiSelectionTable } from '../components/AiSelectionTable'
+import { CandidateSnapshotsTable } from '../components/CandidateSnapshotsTable'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
@@ -345,18 +347,83 @@ function FavoritesPanel() {
   )
 }
 
+// ─── Pipeline Status card ─────────────────────────────────────────────────────
+
+function PipelineStatusCard() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['status', 'pipeline'],
+    queryFn:  api.pipelineStatus,
+    staleTime:       60 * 1000,
+    refetchInterval: 5 * 60 * 1000,
+    retry: 1,
+  })
+
+  if (isLoading || !data?.pipeline?.last_run) return null
+
+  const p = data.pipeline
+  const lastRun = p.last_run ? new Date(p.last_run) : null
+  const isRecent = lastRun ? (Date.now() - lastRun.getTime()) < 25 * 3600 * 1000 : false
+  const runtimeMins = p.total_runtime_secs != null ? Math.floor(p.total_runtime_secs / 60) : null
+  const runtimeSecs = p.total_runtime_secs != null ? p.total_runtime_secs % 60 : null
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded px-4 py-2.5 flex items-center gap-5 flex-wrap">
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        <Activity size={11} className={isRecent ? 'text-accent-green' : 'text-accent-amber'} />
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Pipeline</span>
+      </div>
+
+      {lastRun && (
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-[10px] text-text-tertiary">Last run</span>
+          <span className="font-mono text-[10px] text-text-secondary">{lastRun.toLocaleString()}</span>
+        </div>
+      )}
+
+      {runtimeMins != null && (
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-[10px] text-text-tertiary">Runtime</span>
+          <span className="font-mono text-[10px] text-text-secondary">
+            {runtimeMins}m {String(runtimeSecs).padStart(2, '0')}s
+          </span>
+        </div>
+      )}
+
+      <div className="flex items-center gap-1.5">
+        <span className="font-mono text-[10px] text-text-tertiary">Mode</span>
+        <span className={clsx('font-mono text-[10px] font-medium', p.skip_ai ? 'text-accent-amber' : 'text-accent-green')}>
+          {p.skip_ai ? 'data-only' : 'full run'}
+        </span>
+      </div>
+
+      {p.cost_estimate && (
+        <div className="flex items-center gap-1.5">
+          <span className="font-mono text-[10px] text-text-tertiary">Cost</span>
+          <span className="font-mono text-[10px] text-text-secondary">{p.cost_estimate}</span>
+        </div>
+      )}
+
+      <div className="flex items-center gap-1.5">
+        <span className="font-mono text-[10px] text-text-tertiary">Cache</span>
+        <span className="font-mono text-[10px] text-text-secondary">{data.cache.warm_keys} warm keys</span>
+      </div>
+    </div>
+  )
+}
+
 // ─── Quick nav cards ──────────────────────────────────────────────────────────
 
 const QUICK_LINKS = [
-  { path: '/heatmap',    label: 'Signal Heatmap',     icon: Grid3x3,    desc: 'Multi-factor score matrix' },
-  { path: '/rankings',   label: 'Daily Top-20',        icon: ListOrdered, desc: 'Ranked by composite score' },
-  { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText, desc: 'Conflict log + Claude accuracy' },
+  { path: '/heatmap',    label: 'Signal Heatmap',       icon: Grid3x3,    desc: 'Multi-factor score matrix' },
+  { path: '/rankings',   label: 'Daily Top-20',          icon: ListOrdered, desc: 'Ranked by composite score' },
+  { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText,   desc: 'Conflict log + Claude accuracy' },
+  { path: '/deep-dive',  label: 'AI Deep Dive',          icon: Brain,      desc: 'Claude thesis + scenarios' },
 ]
 
 function QuickLinks() {
   const navigate = useNavigate()
   return (
-    <div className="grid grid-cols-3 gap-3">
+    <div className="grid grid-cols-4 gap-3">
       {QUICK_LINKS.map(({ path, label, icon: Icon, desc }) => (
         <button
           key={path}
@@ -395,6 +462,9 @@ export function HomePage() {
     <Shell title="Monday Morning Brief">
       <div className="space-y-5">
 
+        {/* Pipeline status */}
+        <PipelineStatusCard />
+
         {/* Regime banner */}
         <div className={clsx('border rounded px-4 py-3 flex items-start gap-3', alert?.cls ?? 'bg-bg-elevated border-border-subtle')}>
           <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
@@ -406,6 +476,16 @@ export function HomePage() {
               </span>
             </div>
             <p className="font-mono text-xs leading-relaxed">{alert?.text}</p>
+          </div>
+        </div>
+
+        {/* AI Quant Selection + Candidate Pool side by side */}
+        <div className="grid grid-cols-5 gap-4">
+          <div className="col-span-2">
+            <AiSelectionTable />
+          </div>
+          <div className="col-span-3">
+            <CandidateSnapshotsTable />
           </div>
         </div>
 

@@ -2,6 +2,44 @@
 
 React + FastAPI dashboard for the signal_engine_v1 quant terminal.
 
+## Current Capabilities & Dashboard Overview
+
+### Active Screeners
+
+| Screener | Tab | Description | Data source |
+|---|---|---|---|
+| **Equity Rankings** | Screeners → Rankings | Multi-factor composite Z-scores (mom 12-1, mom 6-1, mean-rev, vol-qual, risk-mom). Top 20 long + bottom 5 short. | `equity_signals_YYYYMMDD.csv` |
+| **Short Squeeze** | Screeners → Squeeze | Float short %, days-to-cover, volume surge, borrow cost, EV score. Scored 0–100. | `squeeze_signals_*.csv` |
+| **Catalysts** | Screeners → Catalysts | Squeeze setup + volume breakout + dark pool + social sentiment composite. | `catalyst_screen_*.csv` |
+| **Options Heat** | Screeners → Options | IV rank, vol spike, expected move %, put/call ratio. | `ai_quant_cache.db` (options_flow signals) |
+| **Red Flags** | Screeners → Red Flags | Accounting quality: GAAP vs adjusted earnings, accruals, payout sustainability, revenue quality. | `red_flag_*.csv` |
+| **Fundamentals** | Screeners → Fundamentals | PE, growth, margins, ROE, FCF, analyst consensus. Composite 0–100. | `fundamentals_*.csv` |
+
+### Active Dashboard Features
+
+| Feature | Location | Description |
+|---|---|---|
+| **Pipeline Status card** | Home (top) | Last run time, runtime, mode (full/data-only), cost, warm cache keys |
+| **AI Quant Selection** | Home | Top 5 tickers by priority score sent to Claude synthesis + open positions |
+| **Candidate Pool** | Home | Full 50-ticker scored pool before AI selection, sortable, filterable |
+| **Signal Heatmap** | /heatmap | Per-ticker module scores across 6+ dimensions with agreement matrix |
+| **Ticker Deep Dive** | /ticker/:symbol | AI thesis, price chart, action zones, module scores, historical analogs |
+| **Portfolio** | /portfolio | Open positions, P&L chart, NAV, weekly return vs SPY |
+| **Resolution Log** | /resolution | Conflict resolution log, Claude accuracy matrix by regime × conviction |
+| **Backtest** | /backtest | Walk-forward Sharpe, factor IC table, weight recommendations |
+| **Daily Top-20** | /rankings | Ranked by composite Z-score with day-over-day rank changes |
+| **AI Deep Dive** | /deep-dive | Claude thesis synthesis on demand, scenario analysis, accuracy tracking |
+
+### Performance After Caching (Supabase + yfinance bulk)
+
+| Mode | Typical runtime | API cost |
+|---|---|---|
+| Full run (Monday, Claude synthesis) | ~35–50 min | ~€0.03–0.05 (5 × sonnet-4-6) |
+| Data-only (`--skip-ai`) | ~20–30 min | €0.00 |
+| Expected savings vs cold run | ~10–15 min | — |
+
+Warm cache hits (Supabase price cache + bulk yfinance) avoid redundant HTTP calls across screener modules sharing the same universe.
+
 ## Stack
 
 - **Frontend**: React 19, Vite, TypeScript, Tailwind CSS, Recharts, Radix UI, TanStack Query
@@ -42,13 +80,15 @@ npm run build
 
 | Route | Page | Key features |
 |---|---|---|
-| `/` | Portfolio | PnL chart, positions table, weekly stats |
-| `/heatmap` | Signal Heatmap | Virtualised 200×8 matrix, sector/direction filters |
-| `/ticker/:symbol` | Ticker Deep Dive | AI thesis, price ladder, module heatmap, dark pool |
-| `/screeners` | Screeners | Squeeze / Catalysts / Options tabs with sorting |
-| `/darkpool` | Dark Pool | Card grid with donut gauges, short ratio charts |
-| `/backtest` | Backtest | Factor IC table, walk-forward Sharpe timeline |
-| `/resolution` | Resolution Log | Stats row, arbitration log, module accuracy tracker |
+| `/` | Morning Brief | Pipeline status, AI selection, candidate pool, top signals, portfolio mini |
+| `/portfolio` | Portfolio | PnL chart, positions table, weekly stats vs SPY |
+| `/heatmap` | Signal Heatmap | Multi-factor score matrix, sector/direction filters |
+| `/ticker/:symbol` | Ticker Deep Dive | AI thesis, price chart, action zones, module scores, historical analogs |
+| `/screeners` | Screeners | Rankings, Squeeze, Catalysts, Options, Red Flags, Fundamentals tabs |
+| `/deep-dive` | AI Deep Dive | Claude thesis synthesis, scenario analysis, thesis accuracy tracking |
+| `/backtest` | Backtest | Factor IC table, walk-forward Sharpe timeline, weight recommendations |
+| `/resolution` | Resolution Log | Conflict resolver log, Claude accuracy matrix |
+| `/rankings` | Daily Top-20 | Ranked by composite Z-score with day-over-day changes |
 
 ## Screenshots
 
@@ -66,10 +106,12 @@ Resolution Log   — conflict resolver log with override flags
 
 | Key | Page |
 |---|---|
+| `g` | Morning Brief (home) |
 | `p` | Portfolio |
 | `h` | Signal Heatmap |
+| `t` | AI Deep Dive |
 | `s` | Screeners |
-| `d` | Dark Pool |
+| `k` | Daily Top-20 |
 | `b` | Backtest |
 | `r` | Resolution Log |
 

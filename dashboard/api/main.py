@@ -1068,7 +1068,7 @@ async def signals_heatmap():
     Module-level signal matrix — sourced from equity_signals CSV (all watchlist
     tickers), enriched with Claude cache, dark pool, squeeze, and fundamentals.
     Each row: ticker × {signal_engine, squeeze, options_flow, dark_pool,
-                         fundamentals, social, polymarket, cross_asset}
+                         fundamentals, cross_asset}
     All scores normalised to [-1, +1].
     """
     cache_key = "signals_heatmap"
@@ -1190,11 +1190,6 @@ async def signals_heatmap():
                 fu_pct = 50.0 + min(40.0, max(-40.0, (eg or 0) * 100)) if eg is not None else 50.0
             fu_score = _normalize_score(fu_pct, 0.0, 100.0)
 
-            # social: Claude cache only
-            soc = sigs.get("social") or {}
-            bull_ratio = _safe_float(soc.get("bull_ratio"), 0.5)
-            soc_score = _normalize_score(bull_ratio, 0.0, 1.0)
-
             # pre_resolved_direction: Claude DB → else derive from composite_z
             direction = cc.get("direction") or (
                 "BULL" if (cz or 0) > 0.3 else "BEAR" if (cz or 0) < -0.3 else "NEUTRAL"
@@ -1212,7 +1207,6 @@ async def signals_heatmap():
                 "dark_pool_signal":        dp_signal,
                 "dark_pool_zscore":        round(dp_zscore, 3) if dp_zscore is not None else None,
                 "fundamentals":            round(fu_score, 3),
-                "social":                  round(soc_score, 3),
                 "pre_resolved_direction":  direction,
                 "signal_agreement_score":  _safe_float(cc.get("agreement")),
             })
@@ -1268,7 +1262,6 @@ async def signals_ticker(ticker: str):
         sigs = data.get("signals_json") or {}
         of   = sigs.get("options_flow") or {}
         dp   = sigs.get("dark_pool_flow") or sigs.get("dark_pool") or {}
-        soc  = sigs.get("social") or {}
         sq   = sigs.get("squeeze") or sigs.get("catalyst") or {}
         vp   = sigs.get("volume_profile") or {}
 
@@ -1282,18 +1275,12 @@ async def signals_ticker(ticker: str):
         sq_score = _safe_float(sq_raw.get("squeeze_score_100") or sq_raw.get("short_squeeze_score"))
         fu_raw   = sigs.get("fundamentals") or {}
         fu_score = _safe_float(fu_raw.get("fundamental_score_pct") or fu_raw.get("composite_score"))
-        pm_raw   = sigs.get("polymarket")
-        pm_score = _safe_float(
-            (pm_raw.get("signal_score") if isinstance(pm_raw, dict) else None)
-        )
         modules = {
             "signal_engine": _equity_signals_composite_z(ticker),
             "squeeze":        round((sq_score - 50) / 50, 3) if sq_score is not None else None,
             "options":        _normalize_score(_safe_float(of.get("heat_score"), 50), 0, 100),
             "dark_pool":      _normalize_score(_safe_float(dp.get("dark_pool_score") or dp.get("score"), 50), 0, 100),
             "fundamentals":   round((fu_score - 50) / 50, 3) if fu_score is not None else None,
-            "social":         _safe_float(soc.get("bull_bear_ratio")),
-            "polymarket":     pm_score,
         }
         modules = {k: v for k, v in modules.items() if v is not None}
 
@@ -1565,7 +1552,7 @@ async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
                    o.outcome, o.claude_correct, o.was_traded,
                    o.last_checked
             FROM thesis_outcomes o
-            WHERE o.thesis_date >= ?
+            WHERE o.thesis_date >= %s
             ORDER BY o.thesis_date DESC
         """, (cutoff,)).fetchall()
         conn.close()
@@ -1648,24 +1635,24 @@ async def signals_accuracy():
     try:
         rows = conn.execute("""
             SELECT
-                strftime('%Y-%m', thesis_date)            AS month,
-                COUNT(*)                                   AS total,
+                TO_CHAR(thesis_date::date, 'YYYY-MM')      AS month,
+                COUNT(*)                                    AS total,
                 SUM(CASE WHEN outcome != 'OPEN' THEN 1 ELSE 0 END) AS resolved,
                 SUM(CASE WHEN outcome  = 'OPEN' THEN 1 ELSE 0 END) AS open,
-                -- direction accuracy
+                -- direction accuracy (claude_correct is integer 0/1/NULL)
                 SUM(CASE WHEN claude_correct = 1 THEN 1 ELSE 0 END) AS correct,
                 SUM(CASE WHEN claude_correct = 0 THEN 1 ELSE 0 END) AS wrong,
-                -- target / stop hit counts
-                SUM(CASE WHEN hit_target_1 = 1 THEN 1 ELSE 0 END)  AS hit_target_1,
-                SUM(CASE WHEN hit_stop     = 1
-                         AND (hit_target_1 = 0 OR days_to_stop < days_to_target_1)
-                         THEN 1 ELSE 0 END)                          AS hit_stop_first,
+                -- target / stop hit counts (hit_* are boolean)
+                SUM(CASE WHEN hit_target_1 IS TRUE THEN 1 ELSE 0 END)  AS hit_target_1,
+                SUM(CASE WHEN hit_stop IS TRUE
+                         AND (hit_target_1 IS NOT TRUE OR days_to_stop < days_to_target_1)
+                         THEN 1 ELSE 0 END)                              AS hit_stop_first,
                 -- averages
-                ROUND(AVG(return_30d),        2)            AS avg_return_30d,
-                ROUND(AVG(vs_target_1_pct),   2)            AS avg_vs_target_1_pct,
-                ROUND(AVG(days_to_target_1),  1)            AS avg_days_to_target_1,
-                -- traded
-                SUM(CASE WHEN was_traded = 1 THEN 1 ELSE 0 END)     AS traded
+                ROUND(AVG(return_30d)::numeric,       2)   AS avg_return_30d,
+                ROUND(AVG(vs_target_1_pct)::numeric,  2)   AS avg_vs_target_1_pct,
+                ROUND(AVG(days_to_target_1)::numeric, 1)   AS avg_days_to_target_1,
+                -- traded (was_traded is integer 0/1)
+                SUM(CASE WHEN was_traded = 1 THEN 1 ELSE 0 END)         AS traded
             FROM thesis_outcomes
             GROUP BY month
             ORDER BY month DESC
@@ -1807,6 +1794,7 @@ async def screeners_squeeze(min_score: float = Query(40.0, ge=0.0)):
         result = {
             "data_available": True,
             "source_file":   f.name,
+            "as_of":         datetime.utcfromtimestamp(f.stat().st_mtime).isoformat() + "Z",
             "count":         len(records),
             "data":          records,
         }
@@ -1815,6 +1803,186 @@ async def screeners_squeeze(min_score: float = Query(40.0, ge=0.0)):
 
     except Exception as e:
         log.exception("screeners_squeeze error")
+        return _no_data(str(e))
+
+
+@app.get("/api/screeners/redflags")
+async def screeners_redflags(min_score: int = Query(0, ge=0)):
+    """
+    Accounting and behavioral red flags from the most recent red_flag_screener run.
+
+    Returns rows sorted by red_flag_score descending.  Rows with risk_level='CLEAN'
+    are included so the caller can filter; use min_score to restrict to flagged tickers.
+    Cached for 5 minutes (TTL_SHORT).
+    """
+    cache_key = f"screeners_redflags:{min_score}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    f = _latest_screener_file("red_flags")
+    if f is None:
+        result = _no_data("no red_flags CSV found — run Step 8b (red_flag_screener.py)")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    try:
+        df = pd.read_csv(f)
+
+        if "red_flag_score" in df.columns:
+            df = df[df["red_flag_score"].fillna(0) >= min_score]
+            df = df.sort_values("red_flag_score", ascending=False)
+
+        records = []
+        for _, row in df.iterrows():
+            records.append({
+                "ticker":             str(row.get("ticker", "")),
+                "red_flag_score":     _safe_int(row.get("red_flag_score")) or 0,
+                "risk_level":         str(row.get("risk_level") or "CLEAN"),
+                "top_flag":           str(row.get("top_flag") or ""),
+                "data_quality":       str(row.get("data_quality") or ""),
+                "gaap_score":         _safe_int(row.get("gaap_score")) or 0,
+                "accruals_score":     _safe_int(row.get("accruals_score")) or 0,
+                "accruals_ratio":     _safe_float(row.get("accruals_ratio")),
+                "payout_score":       _safe_int(row.get("payout_score")) or 0,
+                "payout_ratio_fcf":   _safe_float(row.get("payout_ratio_fcf")),
+                "rev_quality_score":  _safe_int(row.get("rev_quality_score")) or 0,
+                "restatement_score":  _safe_int(row.get("restatement_score")) or 0,
+            })
+
+        # Extract date from filename (red_flags_YYYYMMDD.csv)
+        stem = f.stem  # e.g. "red_flags_20260405"
+        as_of = stem.split("_")[-1] if "_" in stem else None
+
+        result = {
+            "data_available": True,
+            "source_file":    f.name,
+            "as_of":          as_of,
+            "count":          len(records),
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("screeners_redflags error")
+        return _no_data(str(e))
+
+
+@app.get("/api/screeners/fundamentals")
+async def screeners_fundamentals(
+    min_composite:          float = Query(0.0,  ge=0.0,  le=100.0, description="Min composite score (0–100)"),
+    max_pe_forward:         float = Query(999.0, description="Max forward PE (use 999 to disable)"),
+    min_revenue_growth:     float = Query(-99.0, description="Min revenue growth YoY (0.1 = 10%)"),
+    min_operating_margin:   float = Query(-99.0, description="Min operating margin (0.10 = 10%)"),
+):
+    """
+    Fundamental analysis screener from the most recent fundamental_*.csv.
+
+    Returns up to 500 rows sorted by composite score descending.
+    Supports optional server-side pre-filtering via query params.
+    Client-side filtering for ticker search and preset quick-filters
+    is handled in the frontend.
+    Cached for 5 minutes (TTL_SHORT).
+    """
+    cache_key = f"screeners_fundamentals:{min_composite}:{max_pe_forward}:{min_revenue_growth}:{min_operating_margin}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    f = _latest_screener_file("fundamental_")
+    if f is None:
+        result = _no_data("no fundamental CSV found — run Step 7 (fundamental_analysis.py)")
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    try:
+        df = pd.read_csv(f)
+
+        # Coerce numeric columns (some cells may be empty strings)
+        num_cols = [
+            "price", "mkt_cap", "pe_forward", "pe_trailing",
+            "revenue_growth_yoy", "earnings_growth_yoy",
+            "operating_margin", "roe", "free_cash_flow",
+            "analyst_rating", "analyst_count", "target_mean",
+            "composite", "extended_composite",
+            "score_valuation", "score_growth", "score_quality",
+            "score_balance", "score_earnings", "score_analyst",
+            "score_dcf_valuation", "score_peer_relative", "score_accounting_quality",
+        ]
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Server-side pre-filters
+        if "composite" in df.columns:
+            df = df[df["composite"].fillna(0) >= min_composite]
+        if "pe_forward" in df.columns and max_pe_forward < 900:
+            df = df[(df["pe_forward"].isna()) | (df["pe_forward"] <= max_pe_forward)]
+        if "revenue_growth_yoy" in df.columns and min_revenue_growth > -99:
+            df = df[(df["revenue_growth_yoy"].isna()) | (df["revenue_growth_yoy"] >= min_revenue_growth)]
+        if "operating_margin" in df.columns and min_operating_margin > -99:
+            df = df[(df["operating_margin"].isna()) | (df["operating_margin"] >= min_operating_margin)]
+
+        df = df.sort_values("composite", ascending=False) if "composite" in df.columns else df
+
+        def _mktcap_tier(cap) -> str:
+            if cap is None or (isinstance(cap, float) and cap != cap):
+                return "unknown"
+            cap = float(cap)
+            if cap >= 200e9:  return "mega"
+            if cap >= 10e9:   return "large"
+            if cap >= 2e9:    return "mid"
+            if cap >= 300e6:  return "small"
+            return "micro"
+
+        records = []
+        for _, row in df.iterrows():
+            records.append({
+                "ticker":                  str(row.get("ticker", "")),
+                "name":                    str(row.get("name", "") or ""),
+                "sector":                  str(row.get("sector", "") or ""),
+                "price":                   _safe_float(row.get("price")),
+                "mkt_cap":                 _safe_float(row.get("mkt_cap")),
+                "mkt_cap_tier":            _mktcap_tier(row.get("mkt_cap")),
+                "pe_forward":              _safe_float(row.get("pe_forward")),
+                "pe_trailing":             _safe_float(row.get("pe_trailing")),
+                "revenue_growth_yoy":      _safe_float(row.get("revenue_growth_yoy")),
+                "earnings_growth_yoy":     _safe_float(row.get("earnings_growth_yoy")),
+                "operating_margin":        _safe_float(row.get("operating_margin")),
+                "roe":                     _safe_float(row.get("roe")),
+                "free_cash_flow":          _safe_float(row.get("free_cash_flow")),
+                "analyst_rating":          _safe_float(row.get("analyst_rating")),
+                "analyst_count":           _safe_int(row.get("analyst_count")),
+                "target_mean":             _safe_float(row.get("target_mean")),
+                "composite":               _safe_float(row.get("composite")),
+                "extended_composite":      _safe_float(row.get("extended_composite")),
+                "score_valuation":         _safe_int(row.get("score_valuation")),
+                "score_growth":            _safe_int(row.get("score_growth")),
+                "score_quality":           _safe_int(row.get("score_quality")),
+                "score_balance":           _safe_int(row.get("score_balance")),
+                "score_earnings":          _safe_int(row.get("score_earnings")),
+                "score_analyst":           _safe_int(row.get("score_analyst")),
+                "score_accounting_quality": _safe_int(row.get("score_accounting_quality")),
+            })
+
+        # Extract date from filename (fundamental_YYYYMMDD.csv)
+        as_of = f.stem.split("_")[-1] if "_" in f.stem else None
+
+        result = {
+            "data_available": True,
+            "source_file":    f.name,
+            "as_of":          as_of,
+            "count":          len(records),
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("screeners_fundamentals error")
         return _no_data(str(e))
 
 
@@ -1853,11 +2021,9 @@ async def screeners_catalysts(min_score: float = Query(5.0, ge=0.0)):
                 "total_score":    _safe_float(row.get("composite") or row.get("total_score")),
                 "squeeze_setup":  _safe_float(row.get("squeeze_score")),
                 "volume_breakout": _safe_float(row.get("volume_score")),
-                "social_score":   _safe_float(row.get("social_score")),
                 "dark_pool_signal": _safe_float(row.get("dark_pool_score")),
                 "options_score":  _safe_float(row.get("options_score")),
                 "technical_score": _safe_float(row.get("technical_score")),
-                "polymarket_score": _safe_float(row.get("polymarket_score")),
                 "n_flags":        _safe_int(row.get("n_flags")),
                 "setup_details":  str(row.get("flags", "")),
             })
@@ -1865,6 +2031,7 @@ async def screeners_catalysts(min_score: float = Query(5.0, ge=0.0)):
         result = {
             "data_available": True,
             "source_file":   f.name,
+            "as_of":         datetime.utcfromtimestamp(f.stat().st_mtime).isoformat() + "Z",
             "count":         len(records),
             "data":          records,
         }
@@ -1930,9 +2097,12 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
                 continue
 
         records.sort(key=lambda x: x["heat_score"] or 0, reverse=True)
+        # as_of = most recent data date across all records
+        dates = [r["as_of"] for r in records if r.get("as_of")]
         result = {
             "data_available": True,
             "count":          len(records),
+            "as_of":          max(dates) + "Z" if dates else None,
             "data":           records,
         }
         _cache.set(cache_key, result, TTL_SHORT)
@@ -2070,6 +2240,176 @@ async def rankings_latest():
 
     except Exception as e:
         log.exception("rankings_latest error")
+        return _no_data(str(e))
+
+
+@app.get("/api/signals/selection")
+async def signals_selection():
+    """
+    AI Quant Selection — today's top 5 dynamic tickers + all open positions.
+
+    Reads from candidate_snapshots (Supabase) for the most recent run_date.
+    Open positions (is_open_position=True) are always included and flagged.
+    Dynamic rows are the top 5 by priority_score among non-open-position candidates.
+
+    Returns up to 8 rows: 5 dynamic + however many open positions exist.
+    Cached for 5 minutes (data updates once daily).
+    """
+    cache_key = "signals_selection"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        conn = _db_connect()
+        cur  = conn.execute(
+            """
+            SELECT ticker, priority_score, signal_agreement_score,
+                   pre_resolved_direction, equity_rank, composite_z,
+                   is_open_position, selection_reason, run_date
+            FROM   candidate_snapshots
+            WHERE  run_date = (SELECT MAX(run_date) FROM candidate_snapshots)
+            ORDER  BY is_open_position DESC, priority_score DESC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            result = _no_data("candidate_snapshots table is empty")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        run_date = str(rows[0]["run_date"])
+
+        # Separate open positions from dynamic candidates
+        open_pos  = [r for r in rows if r["is_open_position"]]
+        dynamic   = [r for r in rows if not r["is_open_position"]]
+
+        # Top 5 dynamic by priority_score (already sorted)
+        top_dynamic = dynamic[:5]
+
+        # Merge: dynamic first, then open positions not already in dynamic
+        dynamic_tickers = {r["ticker"] for r in top_dynamic}
+        extra_open      = [r for r in open_pos if r["ticker"] not in dynamic_tickers]
+
+        selection = top_dynamic + extra_open
+
+        records = []
+        for i, r in enumerate(selection, 1):
+            eq_rank = _safe_int(r["equity_rank"])
+            records.append({
+                "rank":             i,
+                "ticker":           str(r["ticker"]),
+                "priority_score":   round(_safe_float(r["priority_score"]) or 0.0, 1),
+                "agreement_pct":    round((_safe_float(r["signal_agreement_score"]) or 0.0) * 100),
+                "direction":        str(r["pre_resolved_direction"] or "NEUTRAL"),
+                "equity_rank":      eq_rank,
+                "is_open_position": bool(r["is_open_position"]),
+                "selection_reason": str(r["selection_reason"] or ""),
+            })
+
+        result = {
+            "data_available": True,
+            "count":          len(records),
+            "as_of":          run_date,
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "n_dynamic":      len(top_dynamic),
+            "n_open":         len(extra_open),
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("signals_selection error")
+        return _no_data(str(e))
+
+
+@app.get("/api/signals/candidates")
+async def signals_candidates():
+    """
+    Full priority-scored candidate pool for the most recent run.
+
+    Returns all rows from candidate_snapshots for the latest run_date, sorted
+    by priority_score descending. Each row includes a `selected` flag marking
+    whether it made it into the final AI Quant Selection (top 5 dynamic +
+    all open positions).
+
+    Cached for 5 minutes (TTL_SHORT).
+    """
+    import json as _json
+
+    cache_key = "signals_candidates"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        conn = _db_connect()
+        cur  = conn.execute(
+            """
+            SELECT ticker, priority_score, signal_agreement_score,
+                   pre_resolved_direction, pre_resolved_confidence,
+                   equity_rank, composite_z,
+                   override_flags, selection_reason,
+                   is_open_position, run_date
+            FROM   candidate_snapshots
+            WHERE  run_date = (SELECT MAX(run_date) FROM candidate_snapshots)
+            ORDER  BY priority_score DESC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            result = _no_data("candidate_snapshots table is empty")
+            _cache.set(cache_key, result, TTL_SHORT)
+            return result
+
+        run_date = str(rows[0]["run_date"])
+
+        # Mirror the selection logic: top 5 dynamic by priority + all open positions
+        open_tickers    = {r["ticker"] for r in rows if r["is_open_position"]}
+        dynamic_ranked  = [r for r in rows if not r["is_open_position"]]
+        top5_tickers    = {r["ticker"] for r in dynamic_ranked[:5]}
+        selected_tickers = top5_tickers | open_tickers
+
+        records = []
+        for rank, r in enumerate(rows, 1):
+            try:
+                flags = _json.loads(r["override_flags"] or "[]")
+            except Exception:
+                flags = []
+
+            records.append({
+                "rank":             rank,
+                "ticker":           str(r["ticker"]),
+                "priority_score":   round(_safe_float(r["priority_score"]) or 0.0, 1),
+                "agreement_pct":    round((_safe_float(r["signal_agreement_score"]) or 0.0) * 100),
+                "direction":        str(r["pre_resolved_direction"] or "NEUTRAL"),
+                "confidence_pct":   round((_safe_float(r["pre_resolved_confidence"]) or 0.0) * 100),
+                "equity_rank":      _safe_int(r["equity_rank"]),
+                "composite_z":      round(_safe_float(r["composite_z"]) or 0.0, 3),
+                "override_flags":   flags,
+                "selection_reason": str(r["selection_reason"] or ""),
+                "is_open_position": bool(r["is_open_position"]),
+                "selected":         r["ticker"] in selected_tickers,
+            })
+
+        result = {
+            "data_available": True,
+            "count":          len(records),
+            "as_of":          run_date,
+            "generated_at":   datetime.utcnow().isoformat() + "Z",
+            "n_selected":     len(selected_tickers),
+            "data":           _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception as e:
+        log.exception("signals_candidates error")
         return _no_data(str(e))
 
 
@@ -2482,12 +2822,32 @@ async def resolution_log(
         df = pd.read_csv(log_file)
         df = df.tail(limit)
         raw_records = df.to_dict(orient="records")
-        records = _json_safe(raw_records)
+
+        # Normalize the overrides column: CSV stores a semicolon-delimited string,
+        # frontend expects a list of individual flag strings.
+        records = []
+        for r in raw_records:
+            overrides_raw = r.get("overrides") or ""
+            if overrides_raw and str(overrides_raw).strip():
+                # Split on "; " — each item looks like "override: flag_name"
+                override_list = [
+                    s.strip()
+                    for s in str(overrides_raw).split(";")
+                    if s.strip()
+                ]
+            else:
+                override_list = []
+
+            records.append({
+                **{k: v for k, v in r.items() if k != "overrides"},
+                "overrides": override_list,
+            })
+
         return {
             "data_available": True,
             "source_file":    log_file.name,
             "count":          len(records),
-            "data":           records,
+            "data":           _json_safe(records),
         }
     except Exception as e:
         log.exception("resolution_log error")
@@ -2874,6 +3234,25 @@ async def cache_invalidate_post():
     return {"invalidated": True, "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 
+@app.get("/api/status/cache")
+async def status_cache():
+    """Pipeline status + live in-memory cache stats for the dashboard status card."""
+    status_file = DATA_DIR / "pipeline_status.json"
+    pipeline: dict = {}
+    if status_file.exists():
+        try:
+            pipeline = json.loads(status_file.read_text())
+        except Exception:
+            pass
+    return {
+        "pipeline": pipeline,
+        "cache": {
+            "warm_keys": len(_cache._store),
+        },
+        "as_of": datetime.utcnow().isoformat() + "Z",
+    }
+
+
 # ==============================================================================
 # SECTION 13: ACTION ZONES + AI ANALYSIS TRIGGER
 # ==============================================================================
@@ -3106,7 +3485,7 @@ async def ticker_analyze_status(symbol: str):
 
 
 # ==============================================================================
-# SECTION 14: TICKER INTELLIGENCE — SEC FILINGS, CONGRESS TRADES, EARNINGS
+# SECTION 14: TICKER INTELLIGENCE — SEC FILINGS, EARNINGS
 # ==============================================================================
 
 _SEC_USER_AGENT = "SignalEngine/2.0 research@localhost"

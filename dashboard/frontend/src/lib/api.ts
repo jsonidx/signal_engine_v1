@@ -186,6 +186,29 @@ export interface ExpectedMove {
   neutral_prob: number
 }
 
+// ─── Pipeline Status ──────────────────────────────────────────────────────────
+
+export interface PipelineStatus {
+  pipeline: {
+    last_run?: string
+    total_runtime_secs?: number
+    skip_ai?: boolean
+    cost_estimate?: string
+    steps_completed?: number
+  }
+  cache: {
+    warm_keys: number
+  }
+  as_of: string
+}
+
+// ─── Screener wrapper (data + timestamp) ─────────────────────────────────────
+
+export interface ScreenerResponse<T> {
+  data: T[]
+  as_of?: string
+}
+
 // ─── Screeners ────────────────────────────────────────────────────────────────
 
 export interface ScreenerResult {
@@ -527,14 +550,6 @@ export interface SecFiling {
   url: string
 }
 
-export interface CongressTrade {
-  chamber: 'House' | 'Senate'
-  member: string
-  date: string
-  type: string
-  amount: string
-  asset: string
-}
 
 export interface EarningsQuarter {
   label: string              // "Q4 '24"
@@ -565,6 +580,120 @@ export interface EarningsData {
   eps_growth_yoy: number | null
   quarterly: EarningsQuarter[]  // oldest → newest
   annual: EarningsAnnual[]      // oldest → newest
+}
+
+// ─── Red Flag Screener ────────────────────────────────────────────────────────
+
+export interface RedFlagRow {
+  ticker:            string
+  red_flag_score:    number
+  risk_level:        'CAUTION' | 'CLEAN' | string
+  top_flag:          string
+  data_quality:      string
+  gaap_score:        number
+  accruals_score:    number
+  accruals_ratio:    number | null
+  payout_score:      number
+  payout_ratio_fcf:  number | null
+  rev_quality_score: number
+  restatement_score: number
+}
+
+export interface RedFlagResponse {
+  data_available: boolean
+  source_file?:   string
+  as_of:          string | null
+  count:          number
+  generated_at:   string
+  data:           RedFlagRow[]
+}
+
+// ─── Fundamental Screener ─────────────────────────────────────────────────────
+
+export interface FundamentalRow {
+  ticker:                  string
+  name:                    string
+  sector:                  string
+  price:                   number | null
+  mkt_cap:                 number | null
+  mkt_cap_tier:            'mega' | 'large' | 'mid' | 'small' | 'micro' | 'unknown'
+  pe_forward:              number | null
+  pe_trailing:             number | null
+  revenue_growth_yoy:      number | null
+  earnings_growth_yoy:     number | null
+  operating_margin:        number | null
+  roe:                     number | null
+  free_cash_flow:          number | null
+  analyst_rating:          number | null
+  analyst_count:           number | null
+  target_mean:             number | null
+  composite:               number | null
+  extended_composite:      number | null
+  score_valuation:         number | null
+  score_growth:            number | null
+  score_quality:           number | null
+  score_balance:           number | null
+  score_earnings:          number | null
+  score_analyst:           number | null
+  score_accounting_quality: number | null
+}
+
+export interface FundamentalsResponse {
+  data_available: boolean
+  source_file?:   string
+  as_of:          string | null
+  count:          number
+  generated_at:   string
+  data:           FundamentalRow[]
+}
+
+// ─── Candidate Snapshots ─────────────────────────────────────────────────────
+
+export interface CandidateRow {
+  rank:             number
+  ticker:           string
+  priority_score:   number
+  agreement_pct:    number
+  direction:        string
+  confidence_pct:   number
+  equity_rank:      number | null
+  composite_z:      number
+  override_flags:   string[]
+  selection_reason: string
+  is_open_position: boolean
+  selected:         boolean       // made it into the final AI Quant Selection
+}
+
+export interface CandidatesResponse {
+  data_available: boolean
+  count:          number
+  as_of:          string | null
+  generated_at:   string
+  n_selected:     number
+  data:           CandidateRow[]
+}
+
+// ─── AI Quant Selection ───────────────────────────────────────────────────────
+
+export interface AiSelectionRow {
+  rank:             number
+  ticker:           string
+  priority_score:   number
+  agreement_pct:    number
+  direction:        string
+  equity_rank:      number | null
+  is_open_position: boolean
+  selection_reason: string
+}
+
+export interface AiSelectionResponse {
+  data_available: boolean
+  count:          number
+  as_of:          string | null
+  generated_at:   string
+  n_dynamic:      number
+  n_open:         number
+  data:           AiSelectionRow[]
 }
 
 // ─── Daily Top-20 Rankings ────────────────────────────────────────────────────
@@ -762,17 +891,48 @@ export const api = {
       as_of:        r.data?.as_of,
     })),
 
-  screenerSqueezeRich: (minScore = 40): Promise<SqueezeScreenerRow[]> =>
-    client.get('/api/screeners/squeeze', { params: { min_score: minScore } }).then(r => r.data?.data ?? []),
+  screenerSqueezeRich: (minScore = 40): Promise<ScreenerResponse<SqueezeScreenerRow>> =>
+    client.get('/api/screeners/squeeze', { params: { min_score: minScore } }).then(r => ({
+      data:  r.data?.data  ?? [],
+      as_of: r.data?.as_of,
+    })),
 
-  screenerCatalystRich: (minScore = 4): Promise<CatalystScreenerRow[]> =>
-    client.get('/api/screeners/catalysts', { params: { min_score: minScore } }).then(r => r.data?.data ?? []),
+  screenerCatalystRich: (minScore = 4): Promise<ScreenerResponse<CatalystScreenerRow>> =>
+    client.get('/api/screeners/catalysts', { params: { min_score: minScore } }).then(r => ({
+      data:  r.data?.data  ?? [],
+      as_of: r.data?.as_of,
+    })),
 
-  screenerOptionsRich: (minHeat = 40): Promise<OptionsScreenerRow[]> =>
-    client.get('/api/screeners/options', { params: { min_heat: minHeat } }).then(r => r.data?.data ?? []),
+  screenerOptionsRich: (minHeat = 40): Promise<ScreenerResponse<OptionsScreenerRow>> =>
+    client.get('/api/screeners/options', { params: { min_heat: minHeat } }).then(r => ({
+      data:  r.data?.data  ?? [],
+      as_of: r.data?.as_of,
+    })),
+
+  screenerRedFlags: (minScore = 0): Promise<RedFlagResponse> =>
+    client.get('/api/screeners/redflags', { params: { min_score: minScore } }).then(r => r.data),
+
+  screenerFundamentals: (params?: {
+    minComposite?: number
+    maxPeForward?: number
+    minRevenueGrowth?: number
+    minOperatingMargin?: number
+  }): Promise<FundamentalsResponse> =>
+    client.get('/api/screeners/fundamentals', {
+      params: {
+        min_composite:        params?.minComposite        ?? 0,
+        max_pe_forward:       params?.maxPeForward        ?? 999,
+        min_revenue_growth:   params?.minRevenueGrowth    ?? -99,
+        min_operating_margin: params?.minOperatingMargin  ?? -99,
+      },
+    }).then(r => r.data),
 
   screenerCrypto: (): Promise<CryptoResponse | null> =>
     client.get('/api/screeners/crypto').then(r => r.data).catch(() => null),
+
+  // Pipeline status
+  pipelineStatus: (): Promise<PipelineStatus> =>
+    client.get('/api/status/cache').then(r => r.data),
 
   // Dark pool
   darkpoolLatest: (): Promise<DarkPoolCard[]> =>
@@ -863,9 +1023,6 @@ export const api = {
   tickerSecFilings: (symbol: string): Promise<SecFiling[]> =>
     client.get(`/api/ticker/${symbol}/sec-filings`).then(r => r.data?.data ?? []),
 
-  tickerCongressTrades: (symbol: string): Promise<CongressTrade[]> =>
-    client.get(`/api/ticker/${symbol}/congress-trades`).then(r => r.data?.data ?? []),
-
   tickerEarnings: (symbol: string): Promise<EarningsData | null> =>
     client.get(`/api/ticker/${symbol}/earnings`).then(r => r.data).catch(() => null),
 
@@ -881,6 +1038,14 @@ export const api = {
     client.get(`/api/ticker/${symbol}/earnings-reactions`)
       .then(r => r.data?.data_available ? r.data : null)
       .catch(() => null),
+
+  // AI Quant Selection
+  signalsSelection: (): Promise<AiSelectionResponse> =>
+    client.get('/api/signals/selection').then(r => r.data),
+
+  // Candidate Snapshots (full scored pool)
+  signalsCandidates: (): Promise<CandidatesResponse> =>
+    client.get('/api/signals/candidates').then(r => r.data),
 
   // Daily Top-20 Rankings
   rankingsLatest: (): Promise<RankingsLatestResponse> =>

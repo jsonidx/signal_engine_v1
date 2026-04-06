@@ -1,11 +1,12 @@
 import { useState, useMemo, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import * as Tabs from '@radix-ui/react-tabs'
-import { ArrowUpDown, Download } from 'lucide-react'
+import { ArrowUpDown, Download, ShieldAlert, BarChart2, RefreshCw } from 'lucide-react'
 import { Shell } from '../components/layout/Shell'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow, type EquityScreenerRow } from '../lib/api'
+import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow, type EquityScreenerRow, type RedFlagRow } from '../lib/api'
+import { FundamentalScreenerTable } from '../components/FundamentalScreenerTable'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
 
@@ -156,9 +157,15 @@ function RankingsTable({
           <tr className={clsx('border-b border-border-subtle', headerClass)}>
             <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Rank</th>
             <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Ticker</th>
-            <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Composite Z</th>
+            <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary" title="Weighted composite of all factor Z-scores. Higher = stronger multi-factor signal.">Composite Z</th>
             {FACTOR_COLS.map(f => (
-              <th key={f.key} className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
+              <th key={f.key} className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell" title={
+                f.key === 'momentum_12_1'     ? '12-month return minus the most recent month (avoids short-term mean-reversion).' :
+                f.key === 'momentum_6_1'      ? '6-month return minus the most recent month.' :
+                f.key === 'mean_reversion_5d' ? 'Inverted 5-day return — high score = recent pullback from an uptrend.' :
+                f.key === 'volatility_quality'? 'Inverted 63-day realized volatility. Low vol = more consistent momentum.' :
+                f.key === 'risk_adj_momentum' ? 'Momentum divided by realized volatility: reward per unit of risk.' : undefined
+              }>
                 {f.label}
               </th>
             ))}
@@ -282,14 +289,15 @@ function SqueezeTab() {
   const navigate = useNavigate()
   const [minScore, setMinScore] = useState(40)
 
-  const { data: raw, isLoading, dataUpdatedAt } = useQuery({
+  const { data: raw, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['screeners', 'squeeze', minScore],
     queryFn: () => api.screenerSqueezeRich(minScore),
     retry: 1,
   })
 
+  const rows = raw?.data ?? []
   const { sorted, sortKey, sortDir, toggle } = useSortedRows<SqueezeScreenerRow>(
-    raw,
+    rows,
     'final_score'
   )
 
@@ -315,16 +323,24 @@ function SqueezeTab() {
         </div>
         <button
           onClick={() => exportCSV(filtered, 'squeeze_screener.csv')}
-          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
         >
           <Download size={11} />
           Export CSV
         </button>
-        {dataUpdatedAt > 0 && (
+        {raw?.as_of && (
           <span className="font-mono text-[10px] text-text-tertiary">
-            Last run: {new Date(dataUpdatedAt).toLocaleTimeString()}
+            Last updated: {new Date(raw.as_of).toLocaleString()}
           </span>
         )}
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="ml-auto p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40"
+          title="Refresh"
+        >
+          <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+        </button>
       </div>
 
       {isLoading ? (
@@ -339,11 +355,11 @@ function SqueezeTab() {
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary w-8">#</th>
                 <SortHeader label="Ticker" sortKey="ticker" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
                 <SortHeader label="Score" sortKey="final_score" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
-                <SortHeader label="Float Short %" sortKey="float_short_pct" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
-                <SortHeader label="Days to Cover" sortKey="days_to_cover" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
-                <SortHeader label="Vol Surge" sortKey="volume_surge" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
-                <SortHeader label="Borrow Cost" sortKey="cost_to_borrow" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
-                <SortHeader label="EV Score" sortKey="ev_score" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof SqueezeScreenerRow)} />
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="% of free-float shares sold short. >20% = elevated squeeze risk." onClick={() => toggle('float_short_pct' as keyof SqueezeScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Float Short %</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Short interest divided by average daily volume. >5 days = hard to cover quickly." onClick={() => toggle('days_to_cover' as keyof SqueezeScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Days to Cover</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Recent volume vs 20-day average. >2× = unusual accumulation or panic." onClick={() => toggle('volume_surge' as keyof SqueezeScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Vol Surge</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Estimated annualized cost to borrow shares (% per year). >5% = hard-to-borrow." onClick={() => toggle('cost_to_borrow' as keyof SqueezeScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Borrow Cost</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Expected value score combining short %, borrow cost, and catalyst setup." onClick={() => toggle('ev_score' as keyof SqueezeScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">EV Score</span></th>
               </tr>
             </thead>
             <tbody>
@@ -403,14 +419,15 @@ function SqueezeTab() {
 function CatalystsTab() {
   const navigate = useNavigate()
 
-  const { data: raw, isLoading, dataUpdatedAt } = useQuery({
+  const { data: raw, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['screeners', 'catalysts'],
     queryFn: () => api.screenerCatalystRich(4),
     retry: 1,
   })
 
+  const rows = raw?.data ?? []
   const { sorted, sortKey, sortDir, toggle } = useSortedRows<CatalystScreenerRow>(
-    raw,
+    rows,
     'total_score'
   )
 
@@ -419,16 +436,24 @@ function CatalystsTab() {
       <div className="flex items-center gap-4">
         <button
           onClick={() => exportCSV(sorted, 'catalyst_screener.csv')}
-          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
         >
           <Download size={11} />
           Export CSV
         </button>
-        {dataUpdatedAt > 0 && (
+        {raw?.as_of && (
           <span className="font-mono text-[10px] text-text-tertiary">
-            Last run: {new Date(dataUpdatedAt).toLocaleTimeString()}
+            Last updated: {new Date(raw.as_of).toLocaleString()}
           </span>
         )}
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="ml-auto p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40"
+          title="Refresh"
+        >
+          <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+        </button>
       </div>
 
       {isLoading ? (
@@ -442,10 +467,10 @@ function CatalystsTab() {
               <tr className="border-b border-border-subtle">
                 <SortHeader label="Ticker" sortKey="ticker" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
                 <SortHeader label="Total" sortKey="total_score" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
-                <SortHeader label="Squeeze" sortKey="squeeze_setup" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
-                <SortHeader label="Vol Break" sortKey="volume_breakout" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
-                <SortHeader label="Social" sortKey="social" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
-                <SortHeader label="Dark Pool" sortKey="dark_pool" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof CatalystScreenerRow)} />
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Squeeze setup score: combines float short %, borrow cost, and volume buildup." onClick={() => toggle('squeeze_setup' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Squeeze</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Volume breakout score: abnormal volume vs 20-day average." onClick={() => toggle('volume_breakout' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Vol Break</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Social sentiment score from Reddit/StockTwits mention velocity." onClick={() => toggle('social' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Social</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Dark pool score: off-exchange block flow signal strength." onClick={() => toggle('dark_pool' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Dark Pool</span></th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Override</th>
               </tr>
             </thead>
@@ -501,20 +526,21 @@ function OptionsTab() {
   const [sortKey, setSortKey] = useState<keyof OptionsScreenerRow>('heat_score')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
 
-  const { data: raw, isLoading, dataUpdatedAt } = useQuery({
+  const { data: raw, isLoading, refetch, isFetching } = useQuery({
     queryKey: ['screeners', 'options'],
     queryFn: () => api.screenerOptionsRich(40),
     retry: 1,
   })
 
+  const rows = raw?.data ?? []
+
   const sorted = useMemo(() => {
-    if (!raw) return []
-    return [...raw].sort((a, b) => {
+    return [...rows].sort((a, b) => {
       const av = a[sortKey] as number
       const bv = b[sortKey] as number
       return sortDir === 'desc' ? bv - av : av - bv
     })
-  }, [raw, sortKey, sortDir])
+  }, [rows, sortKey, sortDir])
 
   const toggle = (k: keyof OptionsScreenerRow) => {
     if (k === sortKey) setSortDir(d => d === 'desc' ? 'asc' : 'desc')
@@ -543,16 +569,24 @@ function OptionsTab() {
         </div>
         <button
           onClick={() => exportCSV(sorted, 'options_screener.csv')}
-          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
         >
           <Download size={11} />
           Export CSV
         </button>
-        {dataUpdatedAt > 0 && (
+        {raw?.as_of && (
           <span className="font-mono text-[10px] text-text-tertiary">
-            Last run: {new Date(dataUpdatedAt).toLocaleTimeString()}
+            Last updated: {new Date(raw.as_of).toLocaleString()}
           </span>
         )}
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="ml-auto p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40"
+          title="Refresh"
+        >
+          <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+        </button>
       </div>
 
       {isLoading ? (
@@ -565,18 +599,19 @@ function OptionsTab() {
             <thead>
               <tr className="border-b border-border-subtle">
                 {[
-                  { label: 'Ticker', key: 'ticker' },
-                  { label: 'Heat', key: 'heat_score' },
-                  { label: 'IV Rank', key: 'iv_rank' },
-                  { label: 'IV Source', key: 'iv_source' },
-                  { label: 'Vol Spike', key: 'vol_spike' },
-                  { label: 'Exp Move', key: 'exp_move_pct' },
-                  { label: 'P/C Ratio', key: 'put_call_ratio' },
-                  { label: 'DTE', key: 'dte' },
-                ].map(({ label, key }) => (
+                  { label: 'Ticker',    key: 'ticker',         tip: undefined },
+                  { label: 'Heat',      key: 'heat_score',     tip: 'Composite options heat: IV rank + volume spike + call/put flow. 0–100.' },
+                  { label: 'IV Rank',   key: 'iv_rank',        tip: 'Implied volatility percentile rank over the past year (0–100). >50 = expensive options.' },
+                  { label: 'IV Source', key: 'iv_source',      tip: '"true" = calculated from live options chain. "estimated" = approximated from HV.' },
+                  { label: 'Vol Spike', key: 'vol_spike',      tip: 'Options volume today vs 20-day average. >2× = unusual activity.' },
+                  { label: 'Exp Move',  key: 'exp_move_pct',   tip: 'Market-implied 1σ expected move to next expiry (±%). Derived from ATM straddle price.' },
+                  { label: 'P/C Ratio', key: 'put_call_ratio', tip: 'Put/call open interest ratio. >1.5 = elevated hedging or bearish positioning.' },
+                  { label: 'DTE',       key: 'dte',            tip: 'Days to the nearest liquid expiry used for calculations.' },
+                ].map(({ label, key, tip }) => (
                   <th
                     key={key}
                     className="px-4 py-2.5 text-left cursor-pointer hover:text-text-primary"
+                    title={tip}
                     onClick={() => toggle(key as keyof OptionsScreenerRow)}
                   >
                     <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
@@ -632,6 +667,215 @@ function OptionsTab() {
   )
 }
 
+// ─── Red Flags Tab ────────────────────────────────────────────────────────────
+
+function SeverityBadge({ level, score }: { level: string; score: number }) {
+  if (level === 'CAUTION' || score >= 25) {
+    return (
+      <span className="inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border bg-accent-red/15 text-accent-red border-accent-red/30 font-semibold">
+        <ShieldAlert size={9} />
+        CAUTION
+      </span>
+    )
+  }
+  if (score >= 10) {
+    return (
+      <span className="inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border bg-accent-amber/15 text-accent-amber border-accent-amber/30">
+        WATCH
+      </span>
+    )
+  }
+  return (
+    <span className="font-mono text-[10px] px-2 py-0.5 rounded border bg-bg-elevated text-text-tertiary border-border-subtle">
+      CLEAN
+    </span>
+  )
+}
+
+function SubScorePip({ label, value, warn }: { label: string; value: number; warn: number }) {
+  const hot = value >= warn
+  return (
+    <div className="flex flex-col items-center gap-0.5">
+      <span className={clsx('font-mono text-xs font-semibold', hot ? 'text-accent-red' : 'text-text-secondary')}>
+        {value}
+      </span>
+      <span className="font-mono text-[9px] text-text-tertiary">{label}</span>
+    </div>
+  )
+}
+
+function RedFlagsTab() {
+  const navigate = useNavigate()
+  const [showClean, setShowClean] = useState(false)
+  const [sortKey, setSortKey] = useState<keyof RedFlagRow>('red_flag_score')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
+
+  const toggle = useCallback(
+    (key: keyof RedFlagRow) => {
+      if (key === sortKey) setSortDir(d => (d === 'desc' ? 'asc' : 'desc'))
+      else { setSortKey(key); setSortDir('desc') }
+    },
+    [sortKey]
+  )
+
+  const { data, isLoading, refetch, isFetching } = useQuery({
+    queryKey: ['screeners', 'redflags'],
+    queryFn:  () => api.screenerRedFlags(0),
+    retry: 1,
+  })
+
+  const rows: RedFlagRow[] = data?.data ?? []
+
+  const displayed = useMemo(() => {
+    const base = showClean ? rows : rows.filter(r => r.red_flag_score > 0 || r.risk_level !== 'CLEAN')
+    return [...base].sort((a, b) =>
+      sortDir === 'desc'
+        ? (b[sortKey] as number) - (a[sortKey] as number)
+        : (a[sortKey] as number) - (b[sortKey] as number)
+    )
+  }, [rows, showClean, sortKey, sortDir])
+
+  const cautionCount = rows.filter(r => r.risk_level === 'CAUTION').length
+
+  return (
+    <div className="space-y-4">
+      {/* Description banner */}
+      <div className="flex items-start gap-3 p-3 rounded border border-accent-red/20 bg-accent-red/5">
+        <ShieldAlert size={14} className="text-accent-red flex-shrink-0 mt-0.5" />
+        <div className="min-w-0">
+          <p className="font-mono text-xs text-text-secondary leading-relaxed">
+            Tickers with accounting or behavioral red flags: GAAP vs adjusted earnings gaps, elevated accruals,
+            unsustainable payouts, and revenue quality issues. Use as a <span className="text-accent-amber">risk filter</span> — avoid or size down flagged names.
+          </p>
+        </div>
+      </div>
+
+      {/* Controls */}
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          {cautionCount > 0 && (
+            <span className="inline-flex items-center gap-1 font-mono text-[10px] px-2 py-1 rounded border bg-accent-red/10 text-accent-red border-accent-red/30">
+              <ShieldAlert size={10} />
+              {cautionCount} flagged
+            </span>
+          )}
+        </div>
+        <label className="flex items-center gap-1.5 cursor-pointer ml-2">
+          <input
+            type="checkbox"
+            checked={showClean}
+            onChange={e => setShowClean(e.target.checked)}
+            className="accent-accent-blue"
+          />
+          <span className="font-mono text-xs text-text-secondary">Show clean tickers</span>
+        </label>
+        <button
+          onClick={() => exportCSV(displayed, 'red_flags.csv')}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active rounded transition-colors"
+        >
+          <Download size={11} />
+          Export CSV
+        </button>
+        {data?.as_of && (
+          <span className="font-mono text-[10px] text-text-tertiary">
+            Last updated: {new Date(data.as_of).toLocaleString()}
+          </span>
+        )}
+        <button
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className="ml-auto p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40"
+          title="Refresh"
+        >
+          <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+        </button>
+      </div>
+
+      {isLoading ? (
+        <LoadingSkeleton rows={8} />
+      ) : displayed.length === 0 ? (
+        <EmptyState message="No red flag data found" command="./run_master.sh" />
+      ) : (
+        <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-border-subtle bg-accent-red/5">
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Ticker</th>
+                <SortHeader label="Score" sortKey="red_flag_score" activeSortKey={String(sortKey)} sortDir={sortDir} onSort={k => toggle(k as keyof RedFlagRow)} />
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary" title="CLEAN = no flags. WATCH = 1–2 minor flags. CAUTION = significant accounting concern.">Severity</th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell" title="GAAP: earnings quality gap. Accrual: cash vs accrual earnings. Payout: dividend sustainability. RevQual: revenue quality vs sector.">Sub-scores</th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary" title="The single highest-severity accounting flag detected.">Top Flag</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayed.map(row => (
+                <tr
+                  key={row.ticker}
+                  onClick={() => navigate(`/ticker/${row.ticker}`)}
+                  className={clsx(
+                    'border-b border-border-subtle/50 cursor-pointer transition-colors hover:bg-bg-elevated',
+                    (row.risk_level === 'CAUTION' || row.red_flag_score >= 25) && 'bg-accent-red/5'
+                  )}
+                >
+                  {/* Ticker */}
+                  <td className="px-4 py-3">
+                    <span className="font-mono text-sm font-semibold text-accent-blue">{row.ticker}</span>
+                  </td>
+
+                  {/* Score bar */}
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <div className="w-16 h-1.5 bg-bg-elevated rounded overflow-hidden flex-shrink-0">
+                        <div
+                          style={{ width: `${Math.min(100, (row.red_flag_score / 50) * 100)}%` }}
+                          className={clsx(
+                            'h-full rounded',
+                            row.red_flag_score >= 30 ? 'bg-accent-red' :
+                            row.red_flag_score >= 15 ? 'bg-accent-amber' : 'bg-text-tertiary'
+                          )}
+                        />
+                      </div>
+                      <span className={clsx(
+                        'font-mono text-xs font-semibold',
+                        row.red_flag_score >= 30 ? 'text-accent-red' :
+                        row.red_flag_score >= 15 ? 'text-accent-amber' : 'text-text-tertiary'
+                      )}>
+                        {row.red_flag_score}
+                      </span>
+                    </div>
+                  </td>
+
+                  {/* Severity badge */}
+                  <td className="px-4 py-3">
+                    <SeverityBadge level={row.risk_level} score={row.red_flag_score} />
+                  </td>
+
+                  {/* Sub-scores (hidden on small screens) */}
+                  <td className="px-4 py-3 hidden lg:table-cell">
+                    <div className="flex items-end gap-3">
+                      <SubScorePip label="GAAP"    value={row.gaap_score}        warn={15} />
+                      <SubScorePip label="Accrual" value={row.accruals_score}    warn={10} />
+                      <SubScorePip label="Payout"  value={row.payout_score}      warn={15} />
+                      <SubScorePip label="RevQual" value={row.rev_quality_score} warn={10} />
+                    </div>
+                  </td>
+
+                  {/* Top flag description */}
+                  <td className="px-4 py-3">
+                    <span className="font-mono text-[11px] text-text-secondary leading-relaxed line-clamp-2 max-w-xs block">
+                      {row.top_flag || '—'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Page ──────────────────────────────────────────────────────────────────────
 
 const TAB_STYLE =
@@ -656,6 +900,18 @@ export function ScreenersPage() {
           <Tabs.Trigger value="rankings" className={TAB_STYLE}>
             Rankings
           </Tabs.Trigger>
+          <Tabs.Trigger value="redflags" className={TAB_STYLE}>
+            <span className="flex items-center gap-1.5">
+              <ShieldAlert size={11} />
+              Red Flags
+            </span>
+          </Tabs.Trigger>
+          <Tabs.Trigger value="fundamentals" className={TAB_STYLE}>
+            <span className="flex items-center gap-1.5">
+              <BarChart2 size={11} />
+              Fundamentals
+            </span>
+          </Tabs.Trigger>
         </Tabs.List>
 
         <Tabs.Content value="squeeze">
@@ -669,6 +925,12 @@ export function ScreenersPage() {
         </Tabs.Content>
         <Tabs.Content value="rankings">
           <RankingsTab />
+        </Tabs.Content>
+        <Tabs.Content value="redflags">
+          <RedFlagsTab />
+        </Tabs.Content>
+        <Tabs.Content value="fundamentals">
+          <FundamentalScreenerTable />
         </Tabs.Content>
       </Tabs.Root>
     </Shell>

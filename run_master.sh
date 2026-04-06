@@ -153,13 +153,6 @@ python3 red_flag_screener.py --watchlist --skip-edgar
 step_end "Step 8b: Red flag screener"
 echo ""
 
-# ── Step 11: Social sentiment ─────────────────────────────
-echo "Step 11: Pre-warming social sentiment cache (Google Trends + StockTwits)..."
-step_start
-python3 social_sentiment.py --batch
-step_end "Step 11: Social sentiment"
-echo ""
-
 # ── Step 12: Conflict resolver ────────────────────────────
 echo "Step 12: Running deterministic conflict resolution layer..."
 step_start
@@ -326,6 +319,19 @@ done
 echo "------------------------------------------------"
 printf "  %-45s %dm %02ds\n" "TOTAL" "$TOTAL_MINS" "$TOTAL_SECS"
 echo "================================================"
+
+# ── Write pipeline status file for dashboard ─────────────
+COST_ESTIMATE=$([ "$SKIP_AI" = true ] && echo "€0.00" || echo "~€0.03–0.05")
+SKIP_AI_JSON=$([ "$SKIP_AI" = true ] && echo "true" || echo "false")
+cat > data/pipeline_status.json <<EOF
+{
+  "last_run": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "total_runtime_secs": ${TOTAL},
+  "skip_ai": ${SKIP_AI_JSON},
+  "cost_estimate": "${COST_ESTIMATE}",
+  "steps_completed": 18
+}
+EOF
 
 echo ""
 echo "================================================"
