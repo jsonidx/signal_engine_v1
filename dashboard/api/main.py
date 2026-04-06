@@ -1212,7 +1212,7 @@ async def signals_heatmap():
             })
 
         # Sort by agreement score descending (most actionable first)
-        heatmap.sort(key=lambda r: r["signal_agreement_score"], reverse=True)
+        heatmap.sort(key=lambda r: r["signal_agreement_score"] or 0.0, reverse=True)
 
         result = {"data_available": True, "count": len(heatmap), "data": heatmap}
         _cache.set(cache_key, result, TTL_SHORT)
