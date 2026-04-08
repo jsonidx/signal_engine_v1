@@ -1,0 +1,54 @@
+name: Manual Signal Pipeline (with AI cost)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_ai:
+        description: 'Run master (with AI cost'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Set cache date key
+        id: date
+        run: echo "today=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Cache iShares constituent files
+        uses: actions/cache@v4
+        with:
+          path: data/universe_cache
+          key: universe-cache-${{ steps.date.outputs.today }}
+          restore-keys: |
+            universe-cache-
+      - name: Run master pipeline
+        run: |
+          SKIP_AI="${{ github.event.inputs.skip_ai || 'true' }}"
+          if [ "$SKIP_AI" = "true" ]; then
+            echo "Running with --skip-ai (€0.00)"
+            bash run_master.sh --skip-ai
+          else
+            echo "Running full pipeline with AI synthesis (~€0.03)"
+            bash run_master.sh
+          fi
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
