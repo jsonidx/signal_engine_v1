@@ -1356,6 +1356,7 @@ async def signals_ticker(ticker: str):
             "volume_profile": vp,
             "options_heat":  of,
         }
+        result = _json_safe(result)
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 

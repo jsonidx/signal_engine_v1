@@ -38,7 +38,8 @@ BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 GH_TOKEN    = os.environ.get("GITHUB_TOKEN", "")
 GH_REPO     = os.environ.get("GITHUB_REPO", "jsonidx/signal_engine_v1")
-WORKFLOW_ID = "daily_pipeline.yml"
+WORKFLOW_ID        = "daily_pipeline.yml"
+WORKFLOW_ID_MANUAL = "manual_pipeline.yml"
 
 POLL_INTERVAL   = 3    # seconds between Telegram polls
 GH_POLL_WAIT    = 20   # seconds between GitHub run status checks
@@ -95,13 +96,14 @@ GH_HEADERS = {
 GH_API = f"https://api.github.com/repos/{GH_REPO}"
 
 
-def gh_trigger(skip_ai: bool = True) -> bool:
-    """Dispatch the daily_pipeline workflow. Returns True on success."""
-    url = f"{GH_API}/actions/workflows/{WORKFLOW_ID}/dispatches"
-    payload = {
-        "ref": "main",
-        "inputs": {"skip_ai": "true" if skip_ai else "false"},
-    }
+def gh_trigger(skip_ai: bool = True, manual_ai: bool = False) -> bool:
+    """Dispatch a workflow. Returns True on success."""
+    if manual_ai:
+        url = f"{GH_API}/actions/workflows/{WORKFLOW_ID_MANUAL}/dispatches"
+        payload = {"ref": "main", "inputs": {"confirm": "true"}}
+    else:
+        url = f"{GH_API}/actions/workflows/{WORKFLOW_ID}/dispatches"
+        payload = {"ref": "main", "inputs": {"skip_ai": "true" if skip_ai else "false"}}
     try:
         r = requests.post(url, json=payload, headers=GH_HEADERS, timeout=15)
         if r.status_code == 204:
@@ -114,9 +116,9 @@ def gh_trigger(skip_ai: bool = True) -> bool:
         return False
 
 
-def gh_latest_run(after_ts: float) -> dict | None:
+def gh_latest_run(after_ts: float, workflow: str = WORKFLOW_ID) -> dict | None:
     """Return the most recent workflow_dispatch run created after after_ts."""
-    url = f"{GH_API}/actions/workflows/{WORKFLOW_ID}/runs"
+    url = f"{GH_API}/actions/workflows/{workflow}/runs"
     try:
         r = requests.get(
             url,
@@ -173,24 +175,30 @@ def gh_run_jobs_summary(run_id: int) -> str:
         return f"Could not fetch step details: {exc}"
 
 
-def wait_for_run(skip_ai: bool) -> None:
+def wait_for_run(skip_ai: bool, manual_ai: bool = False) -> None:
     """
     Trigger, wait for completion, send Telegram updates.
     Runs in the main thread (blocking); call from a thread in production.
     """
-    mode = "data-only (--skip-ai, €0.00)" if skip_ai else "full run with AI (~€0.03)"
+    if manual_ai:
+        mode = "full AI run via xAI/Grok (~€0.03–0.05)"
+    elif skip_ai:
+        mode = "data-only (--skip-ai, €0.00)"
+    else:
+        mode = "full run with AI (~€0.03)"
     tg_send(f"🚀 <b>Pipeline triggered</b> — {mode}\nWaiting for GitHub Actions to start…")
 
     trigger_ts = time.time() - 5  # slight buffer for clock skew
-    if not gh_trigger(skip_ai):
+    if not gh_trigger(skip_ai, manual_ai=manual_ai):
         tg_send("❌ Failed to trigger workflow. Check GITHUB_TOKEN permissions.")
         return
 
     # Wait for the run to appear
+    workflow = WORKFLOW_ID_MANUAL if manual_ai else WORKFLOW_ID
     run = None
     for _ in range(30):
         time.sleep(5)
-        run = gh_latest_run(trigger_ts)
+        run = gh_latest_run(trigger_ts, workflow)
         if run:
             break
 
@@ -229,7 +237,8 @@ def wait_for_run(skip_ai: bool) -> None:
 HELP_TEXT = (
     "📡 <b>Signal Engine Bot</b>\n\n"
     "/run — trigger pipeline (data only, €0.00)\n"
-    "/run full — trigger full pipeline with AI (~€0.03)\n"
+    "/run full — trigger daily pipeline with AI (~€0.03)\n"
+    "/run ai — trigger manual pipeline, full xAI/Grok run (~€0.03–0.05)\n"
     "/status — last pipeline run result\n"
     "/help — show this message"
 )
@@ -243,9 +252,12 @@ def handle_command(text: str, chat_id: str) -> None:
         tg_send(HELP_TEXT, chat_id)
 
     elif lower.startswith("/run"):
-        full = "full" in lower
         import threading
-        t = threading.Thread(target=wait_for_run, args=(not full,), daemon=True)
+        if "ai" in lower.split():
+            t = threading.Thread(target=wait_for_run, args=(False,), kwargs={"manual_ai": True}, daemon=True)
+        else:
+            full = "full" in lower
+            t = threading.Thread(target=wait_for_run, args=(not full,), daemon=True)
         t.start()
 
     elif lower.startswith("/status"):
