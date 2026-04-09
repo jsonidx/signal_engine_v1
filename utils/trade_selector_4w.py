@@ -145,6 +145,38 @@ def _calc_swing_targets(
     }
 
 
+def calc_ev_t1_pct(row) -> float:
+    """
+    Expected Value of the swing trade to T1, expressed as % of price.
+
+    Formula derives from fixed 1.5:1 R:R (T1=1.5×ATR, Stop=1.0×ATR):
+      EV = prob_t1 × 1.5×ATR − (1−prob_t1) × 1.0×ATR
+         = ATR × (2.5 × prob_t1 − 1.0)
+
+    The 2.5 coefficient = R:R + 1 = 1.5 + 1. Breakeven at prob_t1 = 40%.
+
+    NOTE: EV_T1 deliberately gives high-vol stocks a boost (ATR appears in
+    both GBM prob_t1 and the multiplier). This is intentional: we want the
+    biggest profit opportunities, not pure statistical edge.
+    Limitation 1 (vol double-counting): high-ATR names are favoured twice.
+    Limitation 2 (path dependency): this is a binary "at-expiry" EV, not
+    first-passage probability.
+    Future upgrade: replace raw_GBM_prob with first-passage probability
+    (with drift) for more realistic swing-trade P(hit T1 before stop).
+    """
+    direction = row.get("direction", "NEUTRAL")
+    prob_t1   = row.get("prob_t1", 0.0) or 0.0
+    price     = row.get("price", 0.0)   or 0.0
+    atr_14    = row.get("atr_14", 0.0)  or 0.0   # note: column is atr_14 not atr14
+
+    if direction == "NEUTRAL" or prob_t1 <= 0 or price <= 0 or atr_14 <= 0:
+        return -999.0   # force to bottom of ranking
+
+    atr_pct   = atr_14 / price
+    ev_t1_pct = atr_pct * (2.5 * prob_t1 - 1.0)
+    return round(ev_t1_pct * 100, 1)    # return as percent with 1 decimal
+
+
 # ==============================================================================
 # MARKET DATA FETCH
 # ==============================================================================
@@ -669,26 +701,29 @@ def generate_daily_top20_ranking(
     # ── Calculate swing targets & probabilities for all tickers in pool ───────
     target_rows: list[dict] = []
     for _, row in pool.iterrows():
-        ticker    = str(row["ticker"])
-        direction = str(row.get("pre_resolved_direction") or "NEUTRAL").upper()
-        agreement = float(row.get("signal_agreement_score") or 0.0)
+        ticker     = str(row["ticker"])
+        direction  = str(row.get("pre_resolved_direction") or "NEUTRAL").upper()
+        agreement  = float(row.get("signal_agreement_score") or 0.0)
         confidence = float(row.get("pre_resolved_confidence") or 0.0)
         price      = float(row.get("price") or 0.0)
         atr_14     = float(row.get("atr_14") or 0.0)
         hist_vol   = float(row.get("hist_vol_60d") or 0.0)
         targets    = _calc_swing_targets(price, atr_14, hist_vol, direction, agreement, confidence)
-        target_rows.append({"ticker": ticker, **targets})
+        # Compute EV(T1) inline using the same row values
+        ev         = calc_ev_t1_pct({**targets, "price": price, "atr_14": atr_14})
+        target_rows.append({"ticker": ticker, **targets, "ev_t1_pct": ev})
 
     targets_df = pd.DataFrame(target_rows).set_index("ticker")
 
-    # ── Build top-N cluster selection, re-sorted by prob_t1 ──────────────────
+    # ── Build top-N cluster selection, sorted by ev_t1_pct → prob_t1 → priority_score ──
     top_pool = pool[pool["ticker"].isin(selected_tickers)].copy()
     top_pool = top_pool.join(targets_df, on="ticker")
 
-    # Primary sort: prob_t1 descending (BULL/BEAR tickers with high prob first)
-    # Secondary sort: priority_score (for NEUTRAL tickers with prob_t1=0)
+    # ev_t1_pct DESC: surfaces tickers with highest expected profit potential.
+    # prob_t1 DESC: tie-break on raw hit probability.
+    # priority_score DESC: final tie-break on signal quality (active on NEUTRAL days).
     top_pool = top_pool.sort_values(
-        ["prob_t1", "priority_score"], ascending=[False, False]
+        ["ev_t1_pct", "prob_t1", "priority_score"], ascending=[False, False, False]
     ).reset_index(drop=True)
 
     ranked = top_pool.copy()
@@ -710,7 +745,9 @@ def generate_daily_top20_ranking(
     # ── Append tail candidates (passed filters, excluded by clustering) ───────
     tail = pool[~pool["ticker"].isin(selected_tickers)].copy()
     tail = tail.join(targets_df, on="ticker")
-    tail = tail.sort_values(["prob_t1", "priority_score"], ascending=[False, False]).reset_index(drop=True)
+    tail = tail.sort_values(
+        ["ev_t1_pct", "prob_t1", "priority_score"], ascending=[False, False, False]
+    ).reset_index(drop=True)
     if not tail.empty:
         tail["rank"]        = range(len(ranked) + 1, len(ranked) + 1 + len(tail))
         tail["final_score"] = tail["priority_score"]
@@ -765,7 +802,7 @@ def generate_daily_top20_ranking(
         # Swing trade columns
         "direction", "t1_price", "t2_price", "stop_price",
         "prob_t1", "prob_t2", "hold_days",
-        "signal_agreement_score",
+        "signal_agreement_score", "ev_t1_pct",
     ]
     ranked = ranked[[c for c in output_cols if c in ranked.columns]].reset_index(drop=True)
     return ranked
@@ -818,16 +855,10 @@ def run_daily_top20_pipeline(
         logger.warning("run_daily_top20_pipeline: empty candidates — nothing to rank")
         return pd.DataFrame()
 
-    # ── Strip open positions — rankings are for new entry signals only ─────────
-    before = len(candidates)
+    # ── Open positions compete on equal footing — no exclusion ──────────────────
+    # open_positions is used only to set the is_open_position flag on each row.
+    # If an open position genuinely has the highest EV(T1) it deserves rank #1.
     open_set = {t.upper() for t in (open_positions or [])}
-    if open_set:
-        candidates = candidates[~candidates["ticker"].str.upper().isin(open_set)].copy()
-    if len(candidates) < before:
-        logger.info(
-            "Stripped %d open-position ticker(s) from ranking candidates: %s",
-            before - len(candidates), open_set,
-        )
 
     # ── 1. Load yesterday's full list from Supabase ───────────────────────────
     previous_top20: pd.DataFrame | None = None
@@ -894,6 +925,7 @@ def run_daily_top20_pipeline(
             def _safe_price(v):
                 return float(v) if v is not None and not _is_nan(v) else None
 
+            ticker_upper = str(row["ticker"]).upper()
             rows_to_write.append((
                 run_date,
                 int(row["rank"]),
@@ -917,6 +949,8 @@ def run_daily_top20_pipeline(
                 float(row.get("prob_t2") or 0.0),
                 int(row["hold_days"]) if row.get("hold_days") is not None and not _is_nan(row.get("hold_days")) else None,
                 float(row.get("signal_agreement_score") or 0.0),
+                float(row.get("ev_t1_pct") or -999.0),
+                ticker_upper in open_set,   # is_open_position flag
             ))
 
         upsert_sql = """
@@ -926,28 +960,31 @@ def run_daily_top20_pipeline(
                  sector, hist_vol_60d, adv_20d,
                  rank_change, rank_yesterday,
                  direction, t1_price, t2_price, stop_price,
-                 prob_t1, prob_t2, hold_days, agreement_score)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 prob_t1, prob_t2, hold_days, agreement_score,
+                 ev_t1_pct, is_open_position)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (run_date, rank) DO UPDATE SET
-                ticker          = EXCLUDED.ticker,
-                priority_score  = EXCLUDED.priority_score,
-                final_score     = EXCLUDED.final_score,
-                weight          = EXCLUDED.weight,
-                raw_weight      = EXCLUDED.raw_weight,
-                cap_hit         = EXCLUDED.cap_hit,
-                sector          = EXCLUDED.sector,
-                hist_vol_60d    = EXCLUDED.hist_vol_60d,
-                adv_20d         = EXCLUDED.adv_20d,
-                rank_change     = EXCLUDED.rank_change,
-                rank_yesterday  = EXCLUDED.rank_yesterday,
-                direction       = EXCLUDED.direction,
-                t1_price        = EXCLUDED.t1_price,
-                t2_price        = EXCLUDED.t2_price,
-                stop_price      = EXCLUDED.stop_price,
-                prob_t1         = EXCLUDED.prob_t1,
-                prob_t2         = EXCLUDED.prob_t2,
-                hold_days       = EXCLUDED.hold_days,
-                agreement_score = EXCLUDED.agreement_score
+                ticker           = EXCLUDED.ticker,
+                priority_score   = EXCLUDED.priority_score,
+                final_score      = EXCLUDED.final_score,
+                weight           = EXCLUDED.weight,
+                raw_weight       = EXCLUDED.raw_weight,
+                cap_hit          = EXCLUDED.cap_hit,
+                sector           = EXCLUDED.sector,
+                hist_vol_60d     = EXCLUDED.hist_vol_60d,
+                adv_20d          = EXCLUDED.adv_20d,
+                rank_change      = EXCLUDED.rank_change,
+                rank_yesterday   = EXCLUDED.rank_yesterday,
+                direction        = EXCLUDED.direction,
+                t1_price         = EXCLUDED.t1_price,
+                t2_price         = EXCLUDED.t2_price,
+                stop_price       = EXCLUDED.stop_price,
+                prob_t1          = EXCLUDED.prob_t1,
+                prob_t2          = EXCLUDED.prob_t2,
+                hold_days        = EXCLUDED.hold_days,
+                agreement_score  = EXCLUDED.agreement_score,
+                ev_t1_pct        = EXCLUDED.ev_t1_pct,
+                is_open_position = EXCLUDED.is_open_position
         """
 
         with managed_connection() as conn:

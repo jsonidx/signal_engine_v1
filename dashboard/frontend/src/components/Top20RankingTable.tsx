@@ -55,6 +55,12 @@ function fmtProb(v: number | null): string {
   return `${(v * 100).toFixed(0)}%`
 }
 
+function fmtEV(v: number | null): string {
+  if (v == null || v <= -999) return '—'
+  const sign = v >= 0 ? '+' : ''
+  return `${sign}${v.toFixed(1)}%`
+}
+
 function DirectionBadge({ direction }: { direction: string }) {
   if (direction === 'BULL') return (
     <span className="inline-flex items-center font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-green/15 text-accent-green border-accent-green/30">
@@ -92,8 +98,11 @@ function fmtDate(iso: string): string {
 function exportCSV(rows: Top20RankingRow[], asOf: string | null) {
   if (!rows.length) return
   const keys: (keyof Top20RankingRow)[] = [
-    'rank', 'ticker', 'priority_score', 'weight', 'raw_weight', 'cap_hit',
+    'rank', 'ticker', 'direction', 'prob_t1', 'ev_t1_pct', 'prob_t2',
+    't1_price', 't2_price', 'stop_price', 'hold_days', 'agreement_score',
+    'priority_score', 'weight', 'raw_weight', 'cap_hit',
     'sector', 'hist_vol_60d', 'adv_20d', 'rank_change', 'rank_yesterday',
+    'is_open_position',
   ]
   const lines = [
     keys.join(','),
@@ -301,6 +310,12 @@ function TickerPanel({
                 <p className="font-mono text-[9px] uppercase text-accent-green/70">T1</p>
                 <p className="font-mono text-sm font-semibold text-accent-green mt-0.5">{fmtPrice(row.t1_price)}</p>
                 <p className="font-mono text-[10px] text-accent-green/60 mt-0.5">{fmtProb(row.prob_t1)}</p>
+                <p className={clsx(
+                  'font-mono text-[10px] mt-0.5 font-semibold',
+                  row.ev_t1_pct != null && row.ev_t1_pct > 0 ? 'text-accent-green' : 'text-accent-red'
+                )}>
+                  EV {fmtEV(row.ev_t1_pct)}
+                </p>
               </div>
               <div className="bg-accent-blue/10 border border-accent-blue/20 rounded p-2.5">
                 <p className="font-mono text-[9px] uppercase text-accent-blue/70">T2</p>
@@ -497,6 +512,9 @@ export function Top20RankingTable() {
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
                   P(T1)
                 </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                  EV T1 %
+                </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
                   P(T2)
                 </th>
@@ -544,11 +562,18 @@ export function Top20RankingTable() {
                       </span>
                     </td>
 
-                    {/* Ticker */}
+                    {/* Ticker + OPEN badge */}
                     <td className="px-4 py-2.5">
-                      <span className="font-mono text-xs font-semibold text-text-primary">
-                        {row.ticker}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono text-xs font-semibold text-text-primary">
+                          {row.ticker}
+                        </span>
+                        {row.is_open_position && (
+                          <span className="font-mono text-[9px] px-1 py-0.5 rounded border bg-accent-amber/15 text-accent-amber border-accent-amber/30">
+                            OPEN
+                          </span>
+                        )}
+                      </div>
                     </td>
 
                     {/* Direction */}
@@ -559,6 +584,17 @@ export function Top20RankingTable() {
                     {/* P(T1) probability bar */}
                     <td className="px-4 py-2.5">
                       <ProbBar value={row.prob_t1} />
+                    </td>
+
+                    {/* EV T1 % — expected value of swing trade to T1 */}
+                    <td className="px-4 py-2.5 font-mono text-xs font-semibold">
+                      <span className={
+                        row.ev_t1_pct != null && row.ev_t1_pct > 0
+                          ? 'text-accent-green'
+                          : 'text-accent-red'
+                      }>
+                        {fmtEV(row.ev_t1_pct)}
+                      </span>
                     </td>
 
                     {/* P(T2) */}
@@ -603,7 +639,7 @@ export function Top20RankingTable() {
 
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-4 py-8 text-center text-xs text-text-tertiary">
+                  <td colSpan={12} className="px-4 py-8 text-center text-xs text-text-tertiary">
                     No ranking data for today yet.
                   </td>
                 </tr>

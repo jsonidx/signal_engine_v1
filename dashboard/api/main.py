@@ -2223,14 +2223,16 @@ async def rankings_latest():
                 "rank_change":     str(r["rank_change"] or "—"),
                 "rank_yesterday":  _safe_int(r["rank_yesterday"]),
                 # Swing trade fields
-                "direction":       str(r["direction"] or "NEUTRAL"),
-                "t1_price":        _safe_float(r["t1_price"]),
-                "t2_price":        _safe_float(r["t2_price"]),
-                "stop_price":      _safe_float(r["stop_price"]),
-                "prob_t1":         _safe_float(r["prob_t1"]),
-                "prob_t2":         _safe_float(r["prob_t2"]),
-                "hold_days":       _safe_int(r["hold_days"]),
-                "agreement_score": _safe_float(r["agreement_score"]),
+                "direction":        str(r["direction"] or "NEUTRAL"),
+                "t1_price":         _safe_float(r["t1_price"]),
+                "t2_price":         _safe_float(r["t2_price"]),
+                "stop_price":       _safe_float(r["stop_price"]),
+                "prob_t1":          _safe_float(r["prob_t1"]),
+                "prob_t2":          _safe_float(r["prob_t2"]),
+                "hold_days":        _safe_int(r["hold_days"]),
+                "agreement_score":  _safe_float(r["agreement_score"]),
+                "ev_t1_pct":        _safe_float(r["ev_t1_pct"]),
+                "is_open_position": bool(r["is_open_position"]) if r["is_open_position"] is not None else False,
             })
 
         result = {

@@ -706,14 +706,16 @@ export interface Top20RankingRow {
   rank_change:     string
   rank_yesterday:  number | null
   // Swing trade fields
-  direction:       string
-  t1_price:        number | null
-  t2_price:        number | null
-  stop_price:      number | null
-  prob_t1:         number | null
-  prob_t2:         number | null
-  hold_days:       number | null
-  agreement_score: number | null
+  direction:        string
+  t1_price:         number | null
+  t2_price:         number | null
+  stop_price:       number | null
+  prob_t1:          number | null
+  prob_t2:          number | null
+  hold_days:        number | null
+  agreement_score:  number | null
+  ev_t1_pct:        number | null
+  is_open_position: boolean
 }
 
 export interface RankingsLatestResponse {
