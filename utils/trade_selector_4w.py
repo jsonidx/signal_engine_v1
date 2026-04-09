@@ -50,6 +50,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from scipy.stats import norm as _norm
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +72,89 @@ _CORR_HISTORY_DAYS = 100         # calendar days of history for correlation
 
 
 # ==============================================================================
+# SWING TRADE TARGET & PROBABILITY ENGINE
+# ==============================================================================
+
+def _calc_swing_targets(
+    price: float,
+    atr_14: float,
+    hist_vol_60d: float,
+    direction: str,
+    agreement: float,
+    confidence: float,
+) -> dict:
+    """
+    Calculate swing trade T1/T2 targets, stop, hold days, and hit probabilities.
+
+    Targets are ATR-based (1.5× for T1, 3× for T2, 1× for stop).
+    Probability uses a log-normal GBM model blended with signal quality:
+      - Raw vol probability: P(price reaches T1 within hold_days)
+      - Blended with signal agreement × confidence as a quality weight
+
+    Returns dict with keys:
+      direction, t1_price, t2_price, stop_price, prob_t1, prob_t2, hold_days
+    """
+    empty = {
+        "direction": direction, "t1_price": None, "t2_price": None,
+        "stop_price": None, "prob_t1": 0.0, "prob_t2": 0.0, "hold_days": None,
+    }
+    if not direction or direction == "NEUTRAL":
+        return empty
+    if price <= 0 or atr_14 <= 0 or hist_vol_60d <= 0:
+        return empty
+
+    daily_vol = hist_vol_60d / np.sqrt(252)
+    t1_dist   = 1.5 * atr_14
+    t2_dist   = 3.0 * atr_14
+    stop_dist = 1.0 * atr_14
+    sign      = 1 if direction == "BULL" else -1
+
+    t1    = round(price + sign * t1_dist, 2)
+    t2    = round(price + sign * t2_dist, 2)
+    stop  = round(price - sign * stop_dist, 2)
+
+    # Estimated hold days: variance scales linearly → days ≈ (target_pct/daily_vol)²
+    t1_pct    = t1_dist / price
+    hold_days = max(3, min(30, int(round((t1_pct / daily_vol) ** 2))))
+
+    # GBM probability: P(net log-return > log(T1/price) in hold_days days)
+    log_t1 = abs(np.log(t1 / price))
+    log_t2 = abs(np.log(t2 / price))
+    z1 = log_t1 / (daily_vol * np.sqrt(hold_days))
+    z2 = log_t2 / (daily_vol * np.sqrt(hold_days))
+    raw_p1 = float(1 - _norm.cdf(z1))
+    raw_p2 = float(1 - _norm.cdf(z2))
+
+    # Signal quality weight blended in (40% weight to signal, 60% to vol model)
+    sig_quality = min(1.0, agreement * (0.5 + confidence * 0.5))
+    prob_t1 = raw_p1 * 0.6 + sig_quality * 0.4
+    prob_t2 = raw_p2 * 0.6 + sig_quality * 0.25  # T2 is harder to hit
+
+    # Realistic bounds
+    prob_t1 = round(min(0.85, max(0.05, prob_t1)), 3)
+    prob_t2 = round(min(0.65, max(0.02, prob_t2)), 3)
+
+    return {
+        "direction":  direction,
+        "t1_price":   t1,
+        "t2_price":   t2,
+        "stop_price": stop,
+        "prob_t1":    prob_t1,
+        "prob_t2":    prob_t2,
+        "hold_days":  hold_days,
+    }
+
+
+# ==============================================================================
 # MARKET DATA FETCH
 # ==============================================================================
 
 def _fetch_market_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Fetch per-ticker fundamentals and price history via yfinance.
+
+    Uses yf.download() for bulk OHLCV (single HTTP call, rate-limit friendly),
+    then fetches sector/mkt_cap info per-ticker with a best-effort fallback.
 
     Returns
     -------
@@ -87,23 +165,43 @@ def _fetch_market_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     end   = datetime.today()
     start = end - timedelta(days=_CORR_HISTORY_DAYS + 10)
 
+    # ── Bulk OHLCV download (one call for all tickers) ────────────────────────
+    try:
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception as exc:
+        logger.warning("yf.download bulk fetch failed — %s", exc)
+        raw = pd.DataFrame()
+
+    # Normalise to MultiIndex even when only one ticker is requested
+    if not raw.empty and not isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = pd.MultiIndex.from_tuples(
+            [(col, tickers[0]) for col in raw.columns]
+        )
+
     meta_rows: list[dict] = []
     close_series: dict[str, pd.Series] = {}
 
     for ticker in tickers:
         try:
-            t    = yf.Ticker(ticker)
-            info = t.info or {}
-            hist = t.history(start=start, end=end)
-
-            if hist.empty:
-                logger.warning("%s: no price history — will be rejected", ticker)
+            if raw.empty or ticker not in raw.columns.get_level_values(1):
+                logger.warning("%s: no price history in bulk download — will be rejected", ticker)
                 continue
 
-            close  = hist["Close"]
-            volume = hist["Volume"]
-            high   = hist["High"]
-            low    = hist["Low"]
+            close  = raw["Close"][ticker].dropna()
+            volume = raw["Volume"][ticker].dropna()
+            high   = raw["High"][ticker].dropna()
+            low    = raw["Low"][ticker].dropna()
+
+            if len(close) < 15:
+                logger.warning("%s: insufficient history (%d rows) — will be rejected", ticker, len(close))
+                continue
 
             price   = float(close.iloc[-1])
             adv_20d = float((close * volume).tail(20).mean())
@@ -123,8 +221,7 @@ def _fetch_market_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
             ret = close.pct_change().dropna()
             hist_vol_60d = float(ret.tail(60).std() * np.sqrt(252))
 
-            sector  = info.get("sector", "Unknown") or "Unknown"
-            mkt_cap = (info.get("marketCap") or 0) / 1e6
+            close_series[ticker] = close
 
             meta_rows.append(
                 {
@@ -133,16 +230,31 @@ def _fetch_market_data(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "adv_20d":      adv_20d,
                     "atr_14":       atr_14,
                     "hist_vol_60d": hist_vol_60d,
-                    "sector":       sector,
-                    "mkt_cap":      mkt_cap,
+                    "sector":       "Unknown",  # filled below
+                    "mkt_cap":      0.0,         # filled below
                 }
             )
-            close_series[ticker] = close
 
         except Exception as exc:
-            logger.warning("%s: yfinance fetch failed — %s", ticker, exc)
+            logger.warning("%s: market data computation failed — %s", ticker, exc)
 
-    meta_df   = pd.DataFrame(meta_rows).set_index("ticker") if meta_rows else pd.DataFrame()
+    # ── Best-effort per-ticker info for sector / mkt_cap ─────────────────────
+    fetched_tickers = {r["ticker"] for r in meta_rows}
+    for row in meta_rows:
+        ticker = row["ticker"]
+        try:
+            info = yf.Ticker(ticker).info or {}
+            row["sector"]  = info.get("sector", "Unknown") or "Unknown"
+            row["mkt_cap"] = (info.get("marketCap") or 0) / 1e6
+        except Exception:
+            pass  # sector defaults to "Unknown", not a hard-filter column
+
+    logger.info(
+        "_fetch_market_data: %d/%d tickers succeeded via bulk download",
+        len(meta_rows), len(tickers),
+    )
+
+    meta_df    = pd.DataFrame(meta_rows).set_index("ticker") if meta_rows else pd.DataFrame()
     price_hist = pd.DataFrame(close_series) if close_series else pd.DataFrame()
 
     return meta_df, price_hist
@@ -554,18 +666,36 @@ def generate_daily_top20_ranking(
 
     logger.info("After clustering: %d names selected for Top-%d", len(selected_tickers), top_n)
 
-    # ── Build ranked DataFrame ────────────────────────────────────────────────
-    ranked = (
-        pool[pool["ticker"].isin(selected_tickers)]
-        .sort_values("priority_score", ascending=False)
-        .reset_index(drop=True)
-        .copy()
-    )
-    ranked["rank"]           = ranked.index + 1
-    ranked["final_score"]    = ranked["priority_score"]   # alias for dashboard compat
-    ranked["priority_score"] = ranked["priority_score"]   # kept explicit
+    # ── Calculate swing targets & probabilities for all tickers in pool ───────
+    target_rows: list[dict] = []
+    for _, row in pool.iterrows():
+        ticker    = str(row["ticker"])
+        direction = str(row.get("pre_resolved_direction") or "NEUTRAL").upper()
+        agreement = float(row.get("signal_agreement_score") or 0.0)
+        confidence = float(row.get("pre_resolved_confidence") or 0.0)
+        price      = float(row.get("price") or 0.0)
+        atr_14     = float(row.get("atr_14") or 0.0)
+        hist_vol   = float(row.get("hist_vol_60d") or 0.0)
+        targets    = _calc_swing_targets(price, atr_14, hist_vol, direction, agreement, confidence)
+        target_rows.append({"ticker": ticker, **targets})
 
-    # ── Volatility-parity sizing (identical logic to select_4w_trades) ────────
+    targets_df = pd.DataFrame(target_rows).set_index("ticker")
+
+    # ── Build top-N cluster selection, re-sorted by prob_t1 ──────────────────
+    top_pool = pool[pool["ticker"].isin(selected_tickers)].copy()
+    top_pool = top_pool.join(targets_df, on="ticker")
+
+    # Primary sort: prob_t1 descending (BULL/BEAR tickers with high prob first)
+    # Secondary sort: priority_score (for NEUTRAL tickers with prob_t1=0)
+    top_pool = top_pool.sort_values(
+        ["prob_t1", "priority_score"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    ranked = top_pool.copy()
+    ranked["rank"]        = ranked.index + 1
+    ranked["final_score"] = ranked["priority_score"]
+
+    # ── Volatility-parity sizing ──────────────────────────────────────────────
     total_alloc_max = top_n * max_weight
     vol_floored     = ranked["hist_vol_60d"].clip(lower=_VOL_FLOOR)
     raw_weights     = target_port_vol / vol_floored
@@ -577,7 +707,24 @@ def generate_daily_top20_ranking(
     ranked["weight"]  = raw_weights.clip(upper=max_weight).round(4)
     ranked["cap_hit"] = (ranked["raw_weight"] > ranked["weight"])
 
-    # ── Rank-change tracking ──────────────────────────────────────────────────
+    # ── Append tail candidates (passed filters, excluded by clustering) ───────
+    tail = pool[~pool["ticker"].isin(selected_tickers)].copy()
+    tail = tail.join(targets_df, on="ticker")
+    tail = tail.sort_values(["prob_t1", "priority_score"], ascending=[False, False]).reset_index(drop=True)
+    if not tail.empty:
+        tail["rank"]        = range(len(ranked) + 1, len(ranked) + 1 + len(tail))
+        tail["final_score"] = tail["priority_score"]
+        tail["weight"]      = 0.0
+        tail["raw_weight"]  = 0.0
+        tail["cap_hit"]     = False
+        ranked = pd.concat([ranked, tail], ignore_index=True)
+
+    logger.info(
+        "Full ranked universe: %d rows (%d in top-%d + %d tail)",
+        len(ranked), len(selected_tickers), top_n, len(tail) if not tail.empty else 0,
+    )
+
+    # ── Rank-change tracking (across full universe) ───────────────────────────
     if previous_top20 is not None and not previous_top20.empty and "rank" in previous_top20.columns:
         prev_map: dict[str, int] = dict(
             zip(previous_top20["ticker"].astype(str), previous_top20["rank"].astype(int))
@@ -615,6 +762,10 @@ def generate_daily_top20_ranking(
         "weight", "raw_weight", "cap_hit",
         "sector", "hist_vol_60d", "adv_20d",
         "rank_change", "rank_yesterday",
+        # Swing trade columns
+        "direction", "t1_price", "t2_price", "stop_price",
+        "prob_t1", "prob_t2", "hold_days",
+        "signal_agreement_score",
     ]
     ranked = ranked[[c for c in output_cols if c in ranked.columns]].reset_index(drop=True)
     return ranked
@@ -628,6 +779,7 @@ def run_daily_top20_pipeline(
     candidates: "list[dict] | pd.DataFrame",
     next_event_days: dict[str, float] | None = None,
     run_date: "date | None" = None,
+    open_positions: "list[str] | None" = None,
 ) -> pd.DataFrame:
     """
     End-to-end daily Top-20 pipeline: load yesterday → rank → save to Supabase.
@@ -666,7 +818,18 @@ def run_daily_top20_pipeline(
         logger.warning("run_daily_top20_pipeline: empty candidates — nothing to rank")
         return pd.DataFrame()
 
-    # ── 1. Load yesterday's top-20 from Supabase ─────────────────────────────
+    # ── Strip open positions — rankings are for new entry signals only ─────────
+    before = len(candidates)
+    open_set = {t.upper() for t in (open_positions or [])}
+    if open_set:
+        candidates = candidates[~candidates["ticker"].str.upper().isin(open_set)].copy()
+    if len(candidates) < before:
+        logger.info(
+            "Stripped %d open-position ticker(s) from ranking candidates: %s",
+            before - len(candidates), open_set,
+        )
+
+    # ── 1. Load yesterday's full list from Supabase ───────────────────────────
     previous_top20: pd.DataFrame | None = None
     try:
         from utils.db import get_connection
@@ -676,9 +839,10 @@ def run_daily_top20_pipeline(
             """
             SELECT run_date, rank, ticker
             FROM   daily_rankings
-            WHERE  run_date < %s
-            ORDER  BY run_date DESC, rank ASC
-            LIMIT  20
+            WHERE  run_date = (
+                SELECT MAX(run_date) FROM daily_rankings WHERE run_date < %s
+            )
+            ORDER  BY rank ASC
             """,
             (run_date,),
         )
@@ -727,6 +891,9 @@ def run_daily_top20_pipeline(
             else:
                 rank_yesterday_val = None
 
+            def _safe_price(v):
+                return float(v) if v is not None and not _is_nan(v) else None
+
             rows_to_write.append((
                 run_date,
                 int(row["rank"]),
@@ -741,6 +908,15 @@ def run_daily_top20_pipeline(
                 float(row.get("adv_20d") or 0.0),
                 str(row.get("rank_change") or "—"),
                 rank_yesterday_val,
+                # Swing trade columns
+                str(row.get("direction") or "NEUTRAL"),
+                _safe_price(row.get("t1_price")),
+                _safe_price(row.get("t2_price")),
+                _safe_price(row.get("stop_price")),
+                float(row.get("prob_t1") or 0.0),
+                float(row.get("prob_t2") or 0.0),
+                int(row["hold_days"]) if row.get("hold_days") is not None and not _is_nan(row.get("hold_days")) else None,
+                float(row.get("signal_agreement_score") or 0.0),
             ))
 
         upsert_sql = """
@@ -748,20 +924,30 @@ def run_daily_top20_pipeline(
                 (run_date, rank, ticker, priority_score, final_score,
                  weight, raw_weight, cap_hit,
                  sector, hist_vol_60d, adv_20d,
-                 rank_change, rank_yesterday)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 rank_change, rank_yesterday,
+                 direction, t1_price, t2_price, stop_price,
+                 prob_t1, prob_t2, hold_days, agreement_score)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (run_date, rank) DO UPDATE SET
-                ticker         = EXCLUDED.ticker,
-                priority_score = EXCLUDED.priority_score,
-                final_score    = EXCLUDED.final_score,
-                weight         = EXCLUDED.weight,
-                raw_weight     = EXCLUDED.raw_weight,
-                cap_hit        = EXCLUDED.cap_hit,
-                sector         = EXCLUDED.sector,
-                hist_vol_60d   = EXCLUDED.hist_vol_60d,
-                adv_20d        = EXCLUDED.adv_20d,
-                rank_change    = EXCLUDED.rank_change,
-                rank_yesterday = EXCLUDED.rank_yesterday
+                ticker          = EXCLUDED.ticker,
+                priority_score  = EXCLUDED.priority_score,
+                final_score     = EXCLUDED.final_score,
+                weight          = EXCLUDED.weight,
+                raw_weight      = EXCLUDED.raw_weight,
+                cap_hit         = EXCLUDED.cap_hit,
+                sector          = EXCLUDED.sector,
+                hist_vol_60d    = EXCLUDED.hist_vol_60d,
+                adv_20d         = EXCLUDED.adv_20d,
+                rank_change     = EXCLUDED.rank_change,
+                rank_yesterday  = EXCLUDED.rank_yesterday,
+                direction       = EXCLUDED.direction,
+                t1_price        = EXCLUDED.t1_price,
+                t2_price        = EXCLUDED.t2_price,
+                stop_price      = EXCLUDED.stop_price,
+                prob_t1         = EXCLUDED.prob_t1,
+                prob_t2         = EXCLUDED.prob_t2,
+                hold_days       = EXCLUDED.hold_days,
+                agreement_score = EXCLUDED.agreement_score
         """
 
         with managed_connection() as conn:

@@ -692,19 +692,28 @@ export interface AiSelectionResponse {
 // ─── Daily Top-20 Rankings ────────────────────────────────────────────────────
 
 export interface Top20RankingRow {
-  run_date:       string
-  rank:           number
-  ticker:         string
-  priority_score: number | null
-  final_score:    number | null
-  weight:         number | null
-  raw_weight:     number | null
-  cap_hit:        boolean
-  sector:         string
-  hist_vol_60d:   number | null
-  adv_20d:        number | null
-  rank_change:    string
-  rank_yesterday: number | null
+  run_date:        string
+  rank:            number
+  ticker:          string
+  priority_score:  number | null
+  final_score:     number | null
+  weight:          number | null
+  raw_weight:      number | null
+  cap_hit:         boolean
+  sector:          string
+  hist_vol_60d:    number | null
+  adv_20d:         number | null
+  rank_change:     string
+  rank_yesterday:  number | null
+  // Swing trade fields
+  direction:       string
+  t1_price:        number | null
+  t2_price:        number | null
+  stop_price:      number | null
+  prob_t1:         number | null
+  prob_t2:         number | null
+  hold_days:       number | null
+  agreement_score: number | null
 }
 
 export interface RankingsLatestResponse {

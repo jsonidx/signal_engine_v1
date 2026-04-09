@@ -2194,6 +2194,7 @@ async def rankings_latest():
             SELECT *
             FROM   daily_rankings
             WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
+              AND  rank <= 20
             ORDER  BY rank ASC
             """
         )
@@ -2208,19 +2209,28 @@ async def rankings_latest():
         records = []
         for r in rows:
             records.append({
-                "run_date":       str(r["run_date"]),
-                "rank":           _safe_int(r["rank"]),
-                "ticker":         str(r["ticker"]),
-                "priority_score": _safe_float(r["priority_score"]),
-                "final_score":    _safe_float(r["final_score"]),
-                "weight":         _safe_float(r["weight"]),
-                "raw_weight":     _safe_float(r["raw_weight"]),
-                "cap_hit":        bool(r["cap_hit"]) if r["cap_hit"] is not None else False,
-                "sector":         str(r["sector"] or "Unknown"),
-                "hist_vol_60d":   _safe_float(r["hist_vol_60d"]),
-                "adv_20d":        _safe_float(r["adv_20d"]),
-                "rank_change":    str(r["rank_change"] or "—"),
-                "rank_yesterday": _safe_int(r["rank_yesterday"]),
+                "run_date":        str(r["run_date"]),
+                "rank":            _safe_int(r["rank"]),
+                "ticker":          str(r["ticker"]),
+                "priority_score":  _safe_float(r["priority_score"]),
+                "final_score":     _safe_float(r["final_score"]),
+                "weight":          _safe_float(r["weight"]),
+                "raw_weight":      _safe_float(r["raw_weight"]),
+                "cap_hit":         bool(r["cap_hit"]) if r["cap_hit"] is not None else False,
+                "sector":          str(r["sector"] or "Unknown"),
+                "hist_vol_60d":    _safe_float(r["hist_vol_60d"]),
+                "adv_20d":         _safe_float(r["adv_20d"]),
+                "rank_change":     str(r["rank_change"] or "—"),
+                "rank_yesterday":  _safe_int(r["rank_yesterday"]),
+                # Swing trade fields
+                "direction":       str(r["direction"] or "NEUTRAL"),
+                "t1_price":        _safe_float(r["t1_price"]),
+                "t2_price":        _safe_float(r["t2_price"]),
+                "stop_price":      _safe_float(r["stop_price"]),
+                "prob_t1":         _safe_float(r["prob_t1"]),
+                "prob_t2":         _safe_float(r["prob_t2"]),
+                "hold_days":       _safe_int(r["hold_days"]),
+                "agreement_score": _safe_float(r["agreement_score"]),
             })
 
         result = {

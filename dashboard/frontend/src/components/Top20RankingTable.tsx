@@ -45,6 +45,44 @@ function fmtScore(v: number | null): string {
   return v.toFixed(2)
 }
 
+function fmtPrice(v: number | null): string {
+  if (v == null) return '—'
+  return `$${v.toFixed(2)}`
+}
+
+function fmtProb(v: number | null): string {
+  if (v == null || v === 0) return '—'
+  return `${(v * 100).toFixed(0)}%`
+}
+
+function DirectionBadge({ direction }: { direction: string }) {
+  if (direction === 'BULL') return (
+    <span className="inline-flex items-center font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-green/15 text-accent-green border-accent-green/30">
+      ▲ BULL
+    </span>
+  )
+  if (direction === 'BEAR') return (
+    <span className="inline-flex items-center font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-red/15 text-accent-red border-accent-red/30">
+      ▼ BEAR
+    </span>
+  )
+  return <span className="font-mono text-[10px] text-text-tertiary">—</span>
+}
+
+function ProbBar({ value }: { value: number | null }) {
+  if (!value) return <span className="font-mono text-xs text-text-tertiary">—</span>
+  const pct = Math.round(value * 100)
+  const color = pct >= 60 ? '#22c55e' : pct >= 40 ? '#f59e0b' : '#ef4444'
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="w-12 h-1.5 bg-bg-elevated rounded-full overflow-hidden">
+        <div className="h-full rounded-full" style={{ width: `${pct}%`, backgroundColor: color }} />
+      </div>
+      <span className="font-mono text-xs text-text-secondary">{pct}%</span>
+    </div>
+  )
+}
+
 function fmtDate(iso: string): string {
   // "2026-04-03" → "Apr 3"
   const d = new Date(iso + 'T00:00:00')
@@ -252,15 +290,43 @@ function TickerPanel({
           </button>
         </div>
 
+        {/* Swing trade targets */}
+        {row.direction !== 'NEUTRAL' && row.t1_price != null && (
+          <div className="p-5 border-b border-border-subtle">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
+              Swing Targets · <DirectionBadge direction={row.direction} />
+            </p>
+            <div className="grid grid-cols-3 gap-2 mb-3">
+              <div className="bg-accent-green/10 border border-accent-green/20 rounded p-2.5">
+                <p className="font-mono text-[9px] uppercase text-accent-green/70">T1</p>
+                <p className="font-mono text-sm font-semibold text-accent-green mt-0.5">{fmtPrice(row.t1_price)}</p>
+                <p className="font-mono text-[10px] text-accent-green/60 mt-0.5">{fmtProb(row.prob_t1)}</p>
+              </div>
+              <div className="bg-accent-blue/10 border border-accent-blue/20 rounded p-2.5">
+                <p className="font-mono text-[9px] uppercase text-accent-blue/70">T2</p>
+                <p className="font-mono text-sm font-semibold text-accent-blue mt-0.5">{fmtPrice(row.t2_price)}</p>
+                <p className="font-mono text-[10px] text-accent-blue/60 mt-0.5">{fmtProb(row.prob_t2)}</p>
+              </div>
+              <div className="bg-accent-red/10 border border-accent-red/20 rounded p-2.5">
+                <p className="font-mono text-[9px] uppercase text-accent-red/70">Stop</p>
+                <p className="font-mono text-sm font-semibold text-accent-red mt-0.5">{fmtPrice(row.stop_price)}</p>
+                <p className="font-mono text-[10px] text-accent-red/60 mt-0.5">
+                  {row.hold_days != null ? `~${row.hold_days}d hold` : ''}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Metric summary */}
         <div className="grid grid-cols-2 gap-3 p-5 border-b border-border-subtle">
           {[
             { label: 'Priority Score',  value: fmtScore(row.priority_score) },
-            { label: 'Final Score',     value: fmtScore(row.final_score)    },
+            { label: 'Agreement',       value: row.agreement_score != null ? `${(row.agreement_score * 100).toFixed(0)}%` : '—' },
             { label: 'Weight',          value: row.weight != null ? `${(row.weight * 100).toFixed(2)}%` : '—' },
-            { label: 'Raw Weight',      value: row.raw_weight != null ? `${(row.raw_weight * 100).toFixed(2)}%` : '—' },
             { label: 'Hist Vol 60d',    value: fmtPct(row.hist_vol_60d)     },
             { label: 'ADV 20d',         value: fmtAdv(row.adv_20d)          },
+            { label: 'Sector',          value: row.sector                   },
           ].map(({ label, value }) => (
             <div key={label} className="bg-bg-elevated rounded p-3">
               <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">{label}</p>
@@ -426,19 +492,28 @@ export function Top20RankingTable() {
                   Ticker
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-                  Score
+                  Dir
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-                  Weight
+                  P(T1)
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
+                  P(T2)
+                </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
+                  T1
+                </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden md:table-cell">
+                  T2
+                </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell">
+                  Stop
+                </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell">
+                  Hold
+                </th>
+                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell">
                   Sector
-                </th>
-                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell">
-                  Vol 60d
-                </th>
-                <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary hidden lg:table-cell">
-                  ADV 20d
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
                   Change
@@ -476,31 +551,46 @@ export function Top20RankingTable() {
                       </span>
                     </td>
 
-                    {/* Priority score */}
-                    <td className="px-4 py-2.5 font-mono text-xs text-text-secondary">
-                      {fmtScore(row.priority_score)}
-                    </td>
-
-                    {/* Weight + CAP badge */}
+                    {/* Direction */}
                     <td className="px-4 py-2.5">
-                      <WeightCell row={row} />
+                      <DirectionBadge direction={row.direction} />
                     </td>
 
-                    {/* Sector — needs inner span for truncate to work in table layout */}
-                    <td className="px-4 py-2.5 hidden md:table-cell">
-                      <span className="block font-mono text-xs text-text-tertiary truncate max-w-[120px]">
+                    {/* P(T1) probability bar */}
+                    <td className="px-4 py-2.5">
+                      <ProbBar value={row.prob_t1} />
+                    </td>
+
+                    {/* P(T2) */}
+                    <td className="px-4 py-2.5 font-mono text-xs text-text-secondary hidden md:table-cell">
+                      {fmtProb(row.prob_t2)}
+                    </td>
+
+                    {/* T1 price */}
+                    <td className="px-4 py-2.5 font-mono text-xs text-accent-green hidden md:table-cell">
+                      {fmtPrice(row.t1_price)}
+                    </td>
+
+                    {/* T2 price */}
+                    <td className="px-4 py-2.5 font-mono text-xs text-accent-blue hidden md:table-cell">
+                      {fmtPrice(row.t2_price)}
+                    </td>
+
+                    {/* Stop price */}
+                    <td className="px-4 py-2.5 font-mono text-xs text-accent-red hidden lg:table-cell">
+                      {fmtPrice(row.stop_price)}
+                    </td>
+
+                    {/* Hold days */}
+                    <td className="px-4 py-2.5 font-mono text-xs text-text-secondary hidden lg:table-cell">
+                      {row.hold_days != null ? `${row.hold_days}d` : '—'}
+                    </td>
+
+                    {/* Sector */}
+                    <td className="px-4 py-2.5 hidden lg:table-cell">
+                      <span className="block font-mono text-xs text-text-tertiary truncate max-w-[100px]">
                         {row.sector}
                       </span>
-                    </td>
-
-                    {/* Hist vol */}
-                    <td className="px-4 py-2.5 font-mono text-xs text-text-secondary hidden lg:table-cell">
-                      {fmtPct(row.hist_vol_60d)}
-                    </td>
-
-                    {/* ADV */}
-                    <td className="px-4 py-2.5 font-mono text-xs text-text-secondary hidden lg:table-cell">
-                      {fmtAdv(row.adv_20d)}
                     </td>
 
                     {/* Rank change pill */}
@@ -513,7 +603,7 @@ export function Top20RankingTable() {
 
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-xs text-text-tertiary">
+                  <td colSpan={11} className="px-4 py-8 text-center text-xs text-text-tertiary">
                     No ranking data for today yet.
                   </td>
                 </tr>

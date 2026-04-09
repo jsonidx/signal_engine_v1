@@ -225,7 +225,7 @@ try:
         min_agreement=0.0,
         always_include=open_pos,
     )
-    top20 = run_daily_top20_pipeline(candidates)
+    top20 = run_daily_top20_pipeline(candidates, open_positions=open_pos)
     print(f'  Top-20 ranking complete ({len(top20)} names)')
 except Exception as e:
     print(f'  Top-20 ranking skipped: {e}', file=sys.stderr)
