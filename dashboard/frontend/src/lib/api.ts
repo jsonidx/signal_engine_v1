@@ -182,6 +182,28 @@ export interface ExpectedMove {
 
 // ─── Pipeline Status ──────────────────────────────────────────────────────────
 
+export interface WorkflowRun {
+  id: number
+  run_number: number | null
+  workflow_file: string
+  label: string
+  has_ai: boolean | null
+  cost: string | null
+  status: 'queued' | 'in_progress' | 'completed' | string
+  conclusion: 'success' | 'failure' | 'cancelled' | 'skipped' | null
+  event: 'schedule' | 'workflow_dispatch' | string
+  created_at: string
+  updated_at: string
+  duration_secs: number | null
+  html_url: string
+  head_branch: string | null
+}
+
+export interface WorkflowRunsResponse {
+  runs: WorkflowRun[]
+  error?: string
+}
+
 export interface PipelineStatus {
   pipeline: {
     last_run?: string
@@ -937,6 +959,12 @@ export const api = {
   // Pipeline status
   pipelineStatus: (): Promise<PipelineStatus> =>
     client.get('/api/status/cache').then(r => r.data),
+
+  // GitHub Actions workflow runs
+  workflowRuns: (): Promise<WorkflowRunsResponse> =>
+    client.get('/api/workflows/runs', { params: { per_page: 15 } }).then(r => r.data).catch(() => ({ runs: [] })),
+
+  workflowReportUrl: () => '/api/workflows/report',
 
   // Dark pool
   darkpoolLatest: (): Promise<DarkPoolCard[]> =>

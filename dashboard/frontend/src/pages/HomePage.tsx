@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity } from 'lucide-react'
+import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity, ChevronDown, ChevronRight, Download, Circle, CheckCircle2, XCircle, Clock, Cpu } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Shell } from '../components/layout/Shell'
@@ -411,6 +411,181 @@ function PipelineStatusCard() {
   )
 }
 
+// ─── Workflows panel ──────────────────────────────────────────────────────────
+
+function workflowStatusIcon(status: string, conclusion: string | null) {
+  if (status === 'in_progress') return <Loader2 size={12} className="text-accent-amber animate-spin" />
+  if (status === 'queued')      return <Clock size={12} className="text-text-tertiary" />
+  if (conclusion === 'success') return <CheckCircle2 size={12} className="text-accent-green" />
+  if (conclusion === 'failure') return <XCircle size={12} className="text-accent-red" />
+  return <Circle size={12} className="text-text-tertiary" />
+}
+
+function workflowStatusLabel(status: string, conclusion: string | null): string {
+  if (status === 'in_progress') return 'running'
+  if (status === 'queued')      return 'queued'
+  if (conclusion === 'success') return 'success'
+  if (conclusion === 'failure') return 'failed'
+  if (conclusion === 'cancelled') return 'cancelled'
+  return conclusion ?? status
+}
+
+function formatDuration(secs: number | null): string {
+  if (secs == null) return '—'
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return m > 0 ? `${m}m ${String(s).padStart(2, '0')}s` : `${s}s`
+}
+
+function WorkflowRunRow({ run }: { run: import('../lib/api').WorkflowRun }) {
+  const [open, setOpen] = useState(false)
+  const createdAt = new Date(run.created_at)
+
+  return (
+    <div className="border-b border-border-subtle last:border-0">
+      {/* Row header — clickable */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-3 px-3 py-2 hover:bg-bg-elevated transition-colors text-left"
+      >
+        {open ? <ChevronDown size={11} className="text-text-tertiary flex-shrink-0" /> : <ChevronRight size={11} className="text-text-tertiary flex-shrink-0" />}
+        {workflowStatusIcon(run.status, run.conclusion)}
+        <span className="font-mono text-[11px] text-text-primary font-medium flex-1 truncate">{run.label}</span>
+        <span className={clsx('font-mono text-[10px] px-1.5 py-0.5 rounded flex-shrink-0',
+          run.conclusion === 'success' ? 'bg-accent-green/10 text-accent-green' :
+          run.conclusion === 'failure' ? 'bg-accent-red/10 text-accent-red' :
+          run.status === 'in_progress' ? 'bg-accent-amber/10 text-accent-amber' :
+          'bg-bg-elevated text-text-tertiary'
+        )}>
+          {workflowStatusLabel(run.status, run.conclusion)}
+        </span>
+        <span className="font-mono text-[10px] text-text-tertiary flex-shrink-0 w-28 text-right">
+          {createdAt.toLocaleDateString()} {createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        </span>
+      </button>
+
+      {/* Expanded detail */}
+      {open && (
+        <div className="px-6 pb-3 pt-1 space-y-2">
+          <div className="flex flex-wrap gap-x-5 gap-y-1">
+            {run.event && (
+              <span className="font-mono text-[10px] text-text-tertiary">
+                Trigger: <span className="text-text-secondary">{run.event === 'schedule' ? 'Scheduled' : 'Manual'}</span>
+              </span>
+            )}
+            {run.duration_secs != null && (
+              <span className="font-mono text-[10px] text-text-tertiary">
+                Duration: <span className="text-text-secondary">{formatDuration(run.duration_secs)}</span>
+              </span>
+            )}
+            {run.run_number != null && (
+              <span className="font-mono text-[10px] text-text-tertiary">
+                Run: <span className="text-text-secondary">#{run.run_number}</span>
+              </span>
+            )}
+          </div>
+
+          {/* AI cost row */}
+          <div className="flex items-center gap-2">
+            <Cpu size={10} className="text-text-tertiary flex-shrink-0" />
+            {run.has_ai === true && (
+              <span className="font-mono text-[10px]">
+                <span className="text-text-tertiary">AI synthesis: </span>
+                <span className="text-accent-amber font-medium">included</span>
+                {run.cost && <span className="text-text-tertiary ml-1">({run.cost})</span>}
+              </span>
+            )}
+            {run.has_ai === false && (
+              <span className="font-mono text-[10px]">
+                <span className="text-text-tertiary">AI synthesis: </span>
+                <span className="text-accent-green font-medium">skipped</span>
+                <span className="text-text-tertiary ml-1">(€0.00)</span>
+              </span>
+            )}
+            {run.has_ai === null && (
+              <span className="font-mono text-[10px] text-text-tertiary">AI cost unknown</span>
+            )}
+          </div>
+
+          {/* Actions */}
+          <div className="flex items-center gap-2 pt-0.5">
+            {run.html_url && (
+              <a
+                href={run.html_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-[10px] text-text-tertiary hover:text-text-primary underline underline-offset-2"
+              >
+                View on GitHub
+              </a>
+            )}
+            <a
+              href="/api/workflows/report"
+              download="0_run-pipeline.txt"
+              className="flex items-center gap-1 font-mono text-[10px] bg-bg-elevated border border-border-subtle hover:border-border-active rounded px-2 py-1 text-text-secondary hover:text-text-primary transition-colors"
+            >
+              <Download size={10} />
+              Download report
+            </a>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function WorkflowsPanel() {
+  const [collapsed, setCollapsed] = useState(true)
+  const { data, isLoading } = useQuery({
+    queryKey: ['workflows', 'runs'],
+    queryFn: api.workflowRuns,
+    staleTime: 2 * 60 * 1000,
+    refetchInterval: 5 * 60 * 1000,
+    enabled: !collapsed,
+  })
+
+  const runs = data?.runs ?? []
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      {/* Panel header */}
+      <button
+        onClick={() => setCollapsed(c => !c)}
+        className="w-full flex items-center gap-2 px-4 py-2.5 hover:bg-bg-elevated transition-colors text-left"
+      >
+        {collapsed ? <ChevronRight size={12} className="text-text-tertiary" /> : <ChevronDown size={12} className="text-text-tertiary" />}
+        <Activity size={11} className="text-text-tertiary" />
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary flex-1">Workflows Overview</span>
+        {!collapsed && runs.length > 0 && (
+          <span className="font-mono text-[10px] text-text-tertiary">{runs.length} runs</span>
+        )}
+      </button>
+
+      {/* Panel body */}
+      {!collapsed && (
+        <div className="border-t border-border-subtle">
+          {isLoading ? (
+            <div className="px-4 py-3 flex items-center gap-2">
+              <Loader2 size={12} className="animate-spin text-text-tertiary" />
+              <span className="font-mono text-[10px] text-text-tertiary">Fetching workflow runs…</span>
+            </div>
+          ) : data?.error ? (
+            <div className="px-4 py-3 font-mono text-[10px] text-accent-amber">{data.error}</div>
+          ) : runs.length === 0 ? (
+            <div className="px-4 py-3 font-mono text-[10px] text-text-tertiary">No workflow runs found</div>
+          ) : (
+            <div>
+              {runs.map(run => (
+                <WorkflowRunRow key={run.id} run={run} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Quick nav cards ──────────────────────────────────────────────────────────
 
 const QUICK_LINKS = [
@@ -464,6 +639,9 @@ export function HomePage() {
 
         {/* Pipeline status */}
         <PipelineStatusCard />
+
+        {/* Workflows overview — collapsible */}
+        <WorkflowsPanel />
 
         {/* Regime banner */}
         <div className={clsx('border rounded px-4 py-3 flex items-start gap-3', alert?.cls ?? 'bg-bg-elevated border-border-subtle')}>

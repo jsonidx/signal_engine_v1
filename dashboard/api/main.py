@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 
 from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 try:
     from dashboard.api.auth import (
@@ -4406,3 +4406,92 @@ async def remove_favorite(symbol: str, user: AuthUser = Depends(get_current_user
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==============================================================================
+# SECTION 20: GITHUB ACTIONS WORKFLOWS
+# ==============================================================================
+
+_GH_TOKEN = os.getenv("GITHUB_TOKEN", "")
+_GH_REPO  = os.getenv("GITHUB_REPO", "jsonidx/signal_engine_v1")
+
+_WORKFLOW_META = {
+    "daily_pipeline.yml":  {"label": "Daily Pipeline",  "has_ai": False, "cost": "€0.00"},
+    "manual_pipeline.yml": {"label": "Manual Pipeline", "has_ai": True,  "cost": "~€0.03–0.05"},
+}
+
+
+@app.get("/api/workflows/runs")
+async def get_workflow_runs(per_page: int = 15):
+    """Fetch recent GitHub Actions workflow runs for all pipelines."""
+    if not _GH_TOKEN:
+        return {"runs": [], "error": "GITHUB_TOKEN not configured"}
+
+    headers = {
+        "Authorization": f"Bearer {_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{_GH_REPO}/actions/runs"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers=headers, params={"per_page": per_page})
+        if r.status_code != 200:
+            return {"runs": [], "error": f"GitHub API returned {r.status_code}"}
+
+        raw_runs = r.json().get("workflow_runs", [])
+        runs = []
+        for run in raw_runs:
+            path = run.get("path", "")                     # ".github/workflows/daily_pipeline.yml"
+            filename = path.split("/")[-1] if path else ""
+            meta = _WORKFLOW_META.get(filename, {"label": run.get("name", filename), "has_ai": None, "cost": None})
+
+            # duration in seconds
+            started  = run.get("run_started_at") or run.get("created_at")
+            updated  = run.get("updated_at")
+            duration = None
+            if started and updated and run.get("status") == "completed":
+                try:
+                    from datetime import timezone
+                    s = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                    u = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    duration = int((u - s).total_seconds())
+                except Exception:
+                    pass
+
+            runs.append({
+                "id":           run["id"],
+                "run_number":   run.get("run_number"),
+                "workflow_file": filename,
+                "label":        meta["label"],
+                "has_ai":       meta["has_ai"],
+                "cost":         meta["cost"],
+                "status":       run.get("status"),          # queued | in_progress | completed
+                "conclusion":   run.get("conclusion"),      # success | failure | cancelled | null
+                "event":        run.get("event"),           # schedule | workflow_dispatch
+                "created_at":   run.get("created_at"),
+                "updated_at":   run.get("updated_at"),
+                "duration_secs": duration,
+                "html_url":     run.get("html_url"),
+                "head_branch":  run.get("head_branch"),
+            })
+
+        return {"runs": runs}
+
+    except Exception as exc:
+        return {"runs": [], "error": str(exc)}
+
+
+@app.get("/api/workflows/report")
+async def download_workflow_report():
+    """Download the latest pipeline run report (quant_reports/0_run-pipeline.txt)."""
+    report_path = BASE_DIR / "quant_reports" / "0_run-pipeline.txt"
+    if not report_path.exists():
+        raise HTTPException(status_code=404, detail="Report file not found")
+    return FileResponse(
+        path=str(report_path),
+        media_type="text/plain",
+        filename="0_run-pipeline.txt",
+        headers={"Content-Disposition": "attachment; filename=0_run-pipeline.txt"},
+    )

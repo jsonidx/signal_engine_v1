@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ChevronRight, TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import * as Accordion from '@radix-ui/react-accordion'
@@ -690,10 +690,31 @@ function LevelBar({ zones }: { zones: ActionZones }) {
   )
 }
 
-function ActionZonesCard({ zones }: { zones: ActionZones }) {
+function useRefreshCountdown(updatedAt: number, intervalMs: number) {
+  const [secsLeft, setSecsLeft] = useState<number>(0)
+  useEffect(() => {
+    const tick = () => {
+      const elapsed = Date.now() - updatedAt
+      const remaining = Math.max(0, Math.ceil((intervalMs - elapsed) / 1000))
+      setSecsLeft(remaining)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [updatedAt, intervalMs])
+  return secsLeft
+}
+
+function ActionZonesCard({ zones, updatedAt }: { zones: ActionZones; updatedAt?: number }) {
   const { eur, pct, rr_t1, rr_t2, atr_pct, rsi, timing, suggested_size_eur, action, action_color, currency, fx_rate } = zones
   const fmtE = (v: number) => `€${v.toFixed(2)}`
   const fmtP = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`
+
+  const REFRESH_MS = 15 * 60 * 1000
+  const secsLeft = useRefreshCountdown(updatedAt ?? Date.now(), REFRESH_MS)
+  const minsLeft = Math.floor(secsLeft / 60)
+  const sLeft    = secsLeft % 60
+  const lastRefresh = updatedAt ? new Date(updatedAt) : null
 
   return (
     <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-3">
@@ -703,6 +724,19 @@ function ActionZonesCard({ zones }: { zones: ActionZones }) {
         <div className="font-mono text-[9px] text-text-tertiary">
           ATR {fmtE(eur.atr)} ({atr_pct}%) · RSI {rsi != null ? rsi.toFixed(0) : '—'}
           {currency !== 'EUR' && <span className="ml-1 opacity-60">{currency}/{fx_rate}</span>}
+        </div>
+      </div>
+
+      {/* Refresh status */}
+      <div className="flex items-center justify-between border-b border-border-subtle pb-2">
+        <div className="font-mono text-[9px] text-text-tertiary">
+          {lastRefresh && <>Last refresh: <span className="text-text-secondary">{lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span></>}
+        </div>
+        <div className="font-mono text-[9px] text-text-tertiary">
+          Next in{' '}
+          <span className={clsx('tabular-nums', secsLeft < 60 ? 'text-accent-amber' : 'text-text-secondary')}>
+            {minsLeft > 0 ? `${minsLeft}m ` : ''}{String(sLeft).padStart(2, '0')}s
+          </span>
         </div>
       </div>
 
@@ -1570,10 +1604,11 @@ export function TickerPage() {
     staleTime: 4 * 60 * 60 * 1000,
     enabled: !!symbol,
   })
-  const { data: actionZones } = useQuery<ActionZones | null>({
+  const { data: actionZones, dataUpdatedAt: actionZonesUpdatedAt } = useQuery<ActionZones | null>({
     queryKey: ['action_zones', symbol],
     queryFn: () => api.tickerActionZones(symbol),
-    staleTime: 15 * 60 * 1000,
+    staleTime:       15 * 60 * 1000,
+    refetchInterval: 15 * 60 * 1000,
     enabled: !!symbol,
   })
 
@@ -1935,7 +1970,7 @@ export function TickerPage() {
             })()}
 
             {/* Action Zones */}
-            {actionZones && <ActionZonesCard zones={actionZones} />}
+            {actionZones && <ActionZonesCard zones={actionZones} updatedAt={actionZonesUpdatedAt} />}
 
             {/* Override flags */}
             {!!signal.override_flags?.length && (
