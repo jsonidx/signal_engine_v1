@@ -100,7 +100,7 @@ echo ""
 # ── Step 2: Regime filter ─────────────────────────────────
 echo "Step 2: Computing market and sector regime..."
 step_start
-python3 regime_filter.py --compute --output data/regime_latest.json
+python3 regime_filter.py --compute --refresh --output data/regime_latest.json
 step_end "Step 2: Regime filter"
 echo ""
 
