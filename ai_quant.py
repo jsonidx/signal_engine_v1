@@ -241,12 +241,38 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
         return None
 
 
+def _migrate_prob_columns(cur, conn) -> None:
+    """Add prob_* columns to thesis_cache if not already present (idempotent)."""
+    try:
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'thesis_cache'
+        """)
+        existing = {row["column_name"] for row in cur.fetchall()}
+        new_cols = {
+            "prob_combined":  "FLOAT",
+            "prob_technical": "FLOAT",
+            "prob_options":   "FLOAT",
+            "prob_catalyst":  "FLOAT",
+            "prob_news":      "FLOAT",
+        }
+        for col, col_type in new_cols.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE thesis_cache ADD COLUMN {col} {col_type}")
+        conn.commit()
+    except Exception as exc:
+        logger.warning("_migrate_prob_columns: %s", exc)
+
+
 def save_thesis(thesis: dict) -> None:
     """Upsert a thesis result into the cache for today."""
     try:
         date = datetime.now().strftime("%Y-%m-%d")
         conn = _init_db()
         cur = conn.cursor()
+        # Ensure prob_combined columns exist (added in Step 5 of prob_engine build)
+        _migrate_prob_columns(cur, conn)
+
         cur.execute("""
             INSERT INTO thesis_cache
                 (ticker, date, direction, conviction, time_horizon,
@@ -255,8 +281,9 @@ def save_thesis(thesis: dict) -> None:
                  catalysts_json, risks_json, raw_response, signals_json, created_at,
                  bull_probability, bear_probability, neutral_probability,
                  signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
-                 expected_moves_json, model_used, cost_usd)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 expected_moves_json, model_used, cost_usd,
+                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(ticker, date) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
@@ -284,7 +311,12 @@ def save_thesis(thesis: dict) -> None:
                 bear_scenario=excluded.bear_scenario,
                 expected_moves_json=excluded.expected_moves_json,
                 model_used=excluded.model_used,
-                cost_usd=excluded.cost_usd
+                cost_usd=excluded.cost_usd,
+                prob_combined=excluded.prob_combined,
+                prob_technical=excluded.prob_technical,
+                prob_options=excluded.prob_options,
+                prob_catalyst=excluded.prob_catalyst,
+                prob_news=excluded.prob_news
         """, (
             thesis.get("ticker", "").upper(),
             date,
@@ -315,6 +347,11 @@ def save_thesis(thesis: dict) -> None:
             json.dumps(thesis.get("expected_moves") or []),
             thesis.get("model_used"),
             thesis.get("cost_usd"),
+            thesis.get("prob_combined"),
+            thesis.get("prob_technical"),
+            thesis.get("prob_options"),
+            thesis.get("prob_catalyst"),
+            thesis.get("prob_news"),
         ))
         conn.commit()
         conn.close()
@@ -530,6 +567,30 @@ def _collect_options_signals(ticker: str) -> dict:
     except Exception:
         return {}
 
+
+def _collect_max_pain(ticker: str) -> Optional[dict]:
+    """Compute max pain strike from the nearest options expiry via yfinance."""
+    try:
+        from options_flow import compute_max_pain
+        return compute_max_pain(ticker)
+    except Exception:
+        return None
+
+
+def _collect_news_sentiment(ticker: str) -> dict:
+    """Fetch entity-linked news sentiment via Marketaux (falls back to neutral)."""
+    try:
+        from quant_report import fetch_news_sentiment
+        return fetch_news_sentiment(ticker)
+    except Exception:
+        return {
+            "ticker": ticker,
+            "articles_found": 0,
+            "avg_sentiment": 0.0,
+            "sentiment_label": "Neutral",
+            "period_days": 7,
+            "source": "fallback_neutral",
+        }
 
 
 def _collect_polymarket_signals(ticker: str) -> dict:
@@ -1219,7 +1280,9 @@ def _collect_volatility_regime_signals(ticker: str) -> dict:
             try:
                 current_iv = compute_atm_iv(ticker)
                 if current_iv is not None:
-                    iv_rank, iv_percentile = get_iv_rank_and_percentile(ticker, current_iv)
+                    iv_rank, iv_percentile = get_iv_rank_and_percentile(
+                        ticker, current_iv, lookback_days=30, min_history=5
+                    )
             except Exception:
                 pass
 
@@ -1298,6 +1361,14 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     signals["options_flow"] = opts
     if verbose:
         print("done")
+
+    if verbose:
+        print(f"  [{ticker}]   → max pain...", end=" ", flush=True)
+    mp = _collect_max_pain(ticker)
+    signals["max_pain"] = mp
+    if verbose:
+        strike = f"${mp['max_pain_strike']}" if mp else "unavailable"
+        print(f"done ({strike})")
 
     if verbose:
         print(f"  [{ticker}]   → polymarket...", end=" ", flush=True)
@@ -1382,6 +1453,16 @@ def collect_all_signals(ticker: str, verbose: bool = False) -> dict:
     if verbose:
         regime_v = vr.get("vol_regime", "N/A") if vr.get("vol_regime_available") else "N/A"
         print(f"done ({regime_v})")
+
+    if verbose:
+        print(f"  [{ticker}]   → news sentiment...", end=" ", flush=True)
+    news_sent = _collect_news_sentiment(ticker)
+    signals["news_sentiment"] = news_sent
+    if verbose:
+        src   = news_sent.get("source", "?")
+        label = news_sent.get("sentiment_label", "?")
+        n_art = news_sent.get("articles_found", 0)
+        print(f"done ({label}, {n_art} articles, src={src})")
 
     # ── Macro + sector regime ─────────────────────────────────────────────────
     if _REGIME_AVAILABLE:
@@ -1502,12 +1583,22 @@ def _generate_resolved_signals_file(
                     "position_size_override":  None,
                 }
 
+            # Inject prob_combined into resolved so ticker_selector can gate on it
+            try:
+                from utils.prob_engine import compute_prob_combined as _cpc
+                signals["signal_agreement_score"] = resolved.get("signal_agreement_score", 0.0)
+                _pr = _cpc(signals)
+                resolved["prob_combined"] = _pr["prob_combined"]
+            except Exception:
+                resolved["prob_combined"] = resolved.get("signal_agreement_score", 0.50)
+
             resolved_all[ticker] = resolved
             direction = resolved.get("pre_resolved_direction", "NEUTRAL")
             skip      = resolved.get("skip_claude", False)
             agreement = resolved.get("signal_agreement_score", 0.0)
+            pc        = resolved.get("prob_combined", agreement)
             print(
-                f"{direction:<8} agreement={agreement:.0%}"
+                f"{direction:<8} agreement={agreement:.0%}  prob={pc:.2f}"
                 + ("  [skip_claude]" if skip else "")
             )
         except Exception as exc:
@@ -1778,7 +1869,6 @@ Signal weighting priority (highest → lowest)
 4. Relative strength vs RSP/sector  +  Insider + SEC + earnings transcript tone
 5. Fundamentals / DCF / peer benchmarking
 6. Historical analog score (weak prior — calibrate confidence only, never override hard rules)
-7. Congress / Polymarket (lowest weight)
 
 Earnings & Event risk rules
 If earnings_risk = HIGH (≤14d): cap conviction at 3/5 unless implied straddle move ≤ 0.7× avg historical surprise
@@ -1807,13 +1897,30 @@ Volatility regime rules
 EXPANDING vol + RISK_ON macro: widen stop_loss by 1 ATR; reduce position_size_pct by 25%.
 EXPANDING vol + RISK_OFF macro: maximum conviction = 2; maximum position_size_pct = 2.
 CONTRACTING vol: note potential compression breakout; straddle cost context is especially relevant.
-IV rank > 80: options are expensive — prefer stock/delta position over option purchase.
-IV rank < 20: options are cheap — note straddle as an attractive hedge if directional uncertainty exists.
+IV Rank (30-day) rules
+If IV Rank < 25 (cheap options): apply +0.05 qualitative boost to options-based conviction.
+  Note "cheap vol — asymmetric upside from options vs stock" in catalysts.
+  Straddle / long call is attractive relative to expected move.
+If IV Rank > 75 (expensive options): apply -0.05 qualitative discount to options-based conviction.
+  Note "elevated IV crush risk — favour stock/delta position over buying premium" in risks.
+  Straddle is expensive; prefer defined-risk directional spread or stock position.
+If IV Rank 25–75 (normal): no adjustment; options fairly priced.
+If IV Rank source = "estimated" or "Building history": treat as weak signal only.
+  Do not cite IV rank in catalysts or risks — insufficient history.
+  Rely on straddle cost and expected move instead for options pricing context.
 
 Tone & style
 Clinical, no hype. Always give a clear Primary vs Counter thesis.
 Thesis should be 3-4 sentences explaining why the final conviction and sizing were chosen.
 Be brutally honest when signals conflict.
+
+prob_combined anchor rule
+prob_combined is a pre-computed weighted probability (0.30–0.90) from 7 signal scalars.
+It represents the quantitative prior for directional success.
+Your bull_probability MUST be within ±0.10 of prob_combined.
+If you believe the correct bull_probability lies outside that range, you MUST state why
+in the thesis field (e.g. "overriding prob_combined — earnings catalyst not captured by base rate").
+Never silently deviate from prob_combined without narrative justification.
 
 ═══════════════════════════════════════════
 OUTPUT FORMAT (JSON — exact structure below)
@@ -1882,7 +1989,7 @@ def _build_prompt(signals: dict) -> str:
     vp       = signals.get("volume_profile", {})
     fund     = signals.get("fundamentals", {})
     opts     = signals.get("options_flow", {})
-    poly     = signals.get("polymarket", {})
+    mp       = signals.get("max_pain") or {}
     sec      = signals.get("sec", {})
     catalyst = signals.get("catalyst", {})
     mr       = signals.get("market_regime", {})
@@ -1893,6 +2000,7 @@ def _build_prompt(signals: dict) -> str:
     liq      = signals.get("liquidity")        or {}
     analog   = signals.get("historical_analog") or {}
     vr       = signals.get("volatility_regime") or {}
+    news_sent = signals.get("news_sentiment")  or {}
 
     prompt_parts = [
         f"Analyze {ticker} using the following signal data collected on {datetime.now().strftime('%Y-%m-%d')}.",
@@ -2078,18 +2186,64 @@ def _build_prompt(signals: dict) -> str:
 
     prompt_parts += ["", "## OPTIONS FLOW"]
     if opts:
+        # ── IV Rank display ──────────────────────────────────────────────────
+        iv_rank_val  = opts.get("iv_rank")       # float 0–100 or 0.0 fallback
+        iv_src       = opts.get("iv_source", "estimated")
+        iv_hist_days = opts.get("iv_history_days", 0)
+        iv_true_pct  = opts.get("true_iv_pct")
+
+        if iv_src == "true" and isinstance(iv_rank_val, float) and iv_rank_val > 0:
+            # Real Supabase-backed 30-day rank
+            if iv_rank_val < 25:
+                iv_label = "Low IV — options cheap, asymmetric upside if direction is right"
+            elif iv_rank_val > 75:
+                iv_label = "High IV — options expensive, favour delta/stock over buying premium"
+            else:
+                iv_label = "Normal IV — options fairly priced"
+            iv_rank_str = (
+                f"{iv_rank_val:.1f}%  [{iv_label}]"
+                f"  (30-day window, {iv_hist_days} snapshots, source: Black-Scholes)"
+            )
+        elif iv_hist_days > 0:
+            # Snapshots exist but fewer than 5 — show progress
+            iv_rank_str = (
+                f"Building history ({iv_hist_days} of 5 snapshots — "
+                f"recheck in {max(0, 5 - iv_hist_days)} days)"
+            )
+        elif isinstance(iv_rank_val, float) and iv_rank_val > 0:
+            # Fallback realized-vol estimate — label it clearly
+            iv_rank_str = f"{iv_rank_val:.1f}%  [estimated from realized vol — true rank pending]"
+        else:
+            iv_rank_str = "Building history (no snapshots yet — recheck after first daily run)"
+
         prompt_parts += [
             f"Heat score: {opts.get('heat_score', 'N/A')}/100",
             f"Options direction: {opts.get('direction', 'N/A')}",
             f"Expected move ({opts.get('days_to_exp', '?')}d): {opts.get('expected_move_pct', 'N/A')}%",
+            f"Implied vol (ATM): {iv_true_pct}%  |  Chain IV: {opts.get('implied_vol_pct', 'N/A')}%"
+            if iv_true_pct is not None else
             f"Implied vol: {opts.get('implied_vol_pct', 'N/A')}%",
-            f"IV rank: {opts.get('iv_rank', 'N/A')}%",
+            f"IV Rank (30-day): {iv_rank_str}",
             f"Put/call ratio: {opts.get('pc_ratio', 'N/A')}",
             f"Total options volume: {opts.get('total_options_vol', 'N/A'):,}" if isinstance(opts.get('total_options_vol'), int) else f"Total options volume: {opts.get('total_options_vol', 'N/A')}",
             f"Straddle cost: ${opts.get('straddle_cost', 'N/A')}",
         ]
     else:
         prompt_parts.append("Options data: unavailable (possibly crypto or thin options)")
+
+    # Max pain — always rendered regardless of opts availability (uses own yfinance fetch)
+    if mp and mp.get("max_pain_strike"):
+        dist_str = f"{mp['distance_pct']:+.1f}%" if isinstance(mp.get("distance_pct"), float) else "N/A"
+        prompt_parts += [
+            f"Max pain strike: ${mp['max_pain_strike']}  (expiry: {mp.get('expiry', 'N/A')}"
+            f", {mp.get('days_to_expiry', '?')}d)",
+            f"Price vs max pain: current ${mp.get('current_price', 'N/A')} is "
+            f"{mp.get('direction', '?')} max pain by {dist_str}",
+            "Note: price tends to gravitate toward max pain into OpEx — "
+            "use as entry zone anchor and T1 confirmation near expiry.",
+        ]
+    else:
+        prompt_parts.append("Max pain: unavailable (no options chain or thin market)")
 
     prompt_parts += ["", "## EARNINGS & EVENT CALENDAR"]
     if evnt.get("earnings_available"):
@@ -2176,18 +2330,6 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("SEC data: unavailable")
 
-    prompt_parts += ["", "## POLYMARKET PREDICTION MARKETS"]
-    if poly:
-        prompt_parts += [
-            f"Polymarket score: {poly.get('polymarket_score', 'N/A')}/5",
-            f"Direction: {poly.get('polymarket_direction', 'N/A')}",
-            f"Market: \"{poly.get('polymarket_market', 'N/A')}\"",
-            f"Probability: {poly.get('polymarket_probability', 'N/A')}",
-            f"24h volume: ${poly.get('polymarket_volume_24h', 'N/A'):,}" if isinstance(poly.get('polymarket_volume_24h'), (int, float)) else f"24h volume: {poly.get('polymarket_volume_24h', 'N/A')}",
-        ]
-    else:
-        prompt_parts.append("Polymarket data: no relevant markets found")
-
     dp = signals.get("dark_pool_flow") or {}
     prompt_parts += ["", "## DARK POOL FLOW (FINRA ATS)"]
     if dp and dp.get("signal"):
@@ -2203,6 +2345,32 @@ def _build_prompt(signals: dict) -> str:
         ]
     else:
         prompt_parts.append("Dark pool data: unavailable")
+
+    prompt_parts += ["", "## NEWS SENTIMENT (7-day)"]
+    ns_src   = news_sent.get("source", "fallback_neutral")
+    ns_label = news_sent.get("sentiment_label", "Neutral")
+    ns_avg   = news_sent.get("avg_sentiment", 0.0)
+    ns_n     = news_sent.get("articles_found", 0)
+    if ns_src == "marketaux" and ns_n > 0:
+        avg_str = f"{ns_avg:+.3f}" if isinstance(ns_avg, float) else "N/A"
+        prompt_parts += [
+            f"Source: Marketaux (entity-linked NLP sentiment)",
+            f"Articles analysed: {ns_n}  |  Avg entity sentiment: {avg_str}  |  Label: {ns_label}",
+        ]
+        if ns_label == "Bullish":
+            prompt_parts.append(
+                "Note: Positive news flow confirms catalyst thesis — "
+                "add +0.05 qualitative weight to BULL conviction."
+            )
+        elif ns_label == "Bearish":
+            prompt_parts.append(
+                "Note: Negative news flow is a headwind — "
+                "apply -0.05 qualitative discount to BULL conviction; flag in risks."
+            )
+    else:
+        prompt_parts.append(
+            "News sentiment: unavailable (no Marketaux key or no entity-matched articles — neutral assumed)"
+        )
 
     prompt_parts += ["", "## HISTORICAL ANALOG SCORE"]
     if analog.get("analog_available"):
@@ -2234,6 +2402,24 @@ def _build_prompt(signals: dict) -> str:
         f"Portfolio NAV: ${PORTFOLIO_NAV:,}",
         f"Equity allocation: {EQUITY_ALLOCATION*100:.0f}% | Crypto allocation: {CRYPTO_ALLOCATION*100:.0f}%",
     ]
+
+    # Probability assessment block
+    _pr = signals.get("prob_combined_result") or {}
+    _pc = signals.get("prob_combined")
+    if _pc is not None and _pr:
+        _dq    = _pr.get("data_quality", "LOW")
+        _ninputs = sum(1 for v in (_pr.get("inputs_used") or {}).values() if v is not None)
+        prompt_parts += [
+            "",
+            "## PROBABILITY ASSESSMENT (pre-computed, calibrated)",
+            f"prob_combined:  {_pc:.3f}  ({_dq} confidence — {_ninputs}/7 inputs real)",
+            f"  ├─ Technical:   {_pr.get('prob_technical', 0):.3f}  (RSI normalized)",
+            f"  ├─ Options:     {_pr.get('prob_options', 0):.3f}  (heat_score/100)",
+            f"  ├─ Catalyst:    {_pr.get('prob_catalyst', 0):.3f}  (earnings beat rate 4Q)",
+            f"  └─ News:        {_pr.get('prob_news', 0):.3f}  (7-day Marketaux sentiment)",
+            "IMPORTANT: Your bull_probability output must stay within ±0.10 of prob_combined "
+            "unless you explicitly justify the deviation in your thesis text.",
+        ]
 
     # Pre-computed signal agreement + conflict resolution context
     cr_data = signals.get("conflict_resolution") or {}
@@ -2807,6 +2993,17 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     # Pre-compute agreement score (kept for backward compat; may be overridden by resolver)
     signals["signal_agreement_score"] = compute_signal_agreement(signals)
 
+    # ── Calibrated probability (single source of truth across both pipelines) ─
+    try:
+        from utils.prob_engine import compute_prob_combined as _compute_prob_combined
+        _prob_result = _compute_prob_combined(signals)
+        signals["prob_combined_result"] = _prob_result
+        signals["prob_combined"] = _prob_result["prob_combined"]
+    except Exception as _prob_exc:
+        logger.warning("compute_prob_combined failed for %s: %s", ticker, _prob_exc)
+        signals["prob_combined"] = signals.get("signal_agreement_score", 0.50) or 0.50
+        signals["prob_combined_result"] = {}
+
     # ── Conflict resolution — pre-resolve before Claude ──────────────────────
     if _RESOLVER_AVAILABLE:
         try:
@@ -2836,8 +3033,9 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print("--- END PROMPT ---\n")
 
     # Upgrade to premium model for highest-conviction setups
-    agreement = signals.get("signal_agreement_score", 0.0) or 0.0
-    use_thinking = agreement >= AI_PREMIUM_THRESHOLD
+    # Use prob_combined as primary signal; fall back to agreement score
+    _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
+    use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
 
     # Call Claude
     raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
@@ -2861,6 +3059,13 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     thesis["raw_response"] = raw
     # Always use the pre-computed agreement score — don't rely on Claude to echo it back
     thesis["signal_agreement_score"] = signals.get("signal_agreement_score", 0.0)
+    # Persist prob_combined components for calibration tracking
+    _pr = signals.get("prob_combined_result") or {}
+    thesis["prob_combined"]  = signals.get("prob_combined") or _pr.get("prob_combined")
+    thesis["prob_technical"] = _pr.get("prob_technical")
+    thesis["prob_options"]   = _pr.get("prob_options")
+    thesis["prob_catalyst"]  = _pr.get("prob_catalyst")
+    thesis["prob_news"]      = _pr.get("prob_news")
 
     # ── Apply conflict resolver hard constraints (Override 2: bear market cap) ─
     if _RESOLVER_AVAILABLE:

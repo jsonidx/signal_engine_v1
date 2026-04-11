@@ -401,6 +401,7 @@ def _get_iv_metrics(
     current_iv: float,
     lookback_days: int = 252,
     db_path: str = None,
+    min_history: Optional[int] = None,
 ) -> Tuple[Optional[float], Optional[float]]:
     """
     Core computation: store current_iv then query history for rank + percentile.
@@ -409,12 +410,22 @@ def _get_iv_metrics(
         1. _ensure_db — create table if missing
         2. _store_iv  — persist today's IV (INSERT OR REPLACE)
         3. Query last `lookback_days` rows for this ticker (newest first)
-        4. If fewer than IV_MIN_HISTORY_DAYS rows exist → return (None, None)
+        4. If fewer than threshold rows exist → return (None, None)
+           threshold = min_history if provided, else IV_MIN_HISTORY_DAYS
         5. Compute iv_rank = (current − min) / (max − min)
         6. Compute iv_percentile = count(iv < current) / total
 
+    Parameters
+    ----------
+    min_history : int | None
+        Override the global IV_MIN_HISTORY_DAYS threshold.
+        Pass 5 for 30-day rolling mode so rank activates after just 5 daily runs.
+        Pass None (default) to use the global IV_MIN_HISTORY_DAYS = 60 threshold.
+
     Returns (iv_rank, iv_percentile) each in [0.0, 1.0], or (None, None).
     """
+    threshold = min_history if min_history is not None else IV_MIN_HISTORY_DAYS
+
     _ensure_db()
     _store_iv(ticker, current_iv)
 
@@ -431,7 +442,7 @@ def _get_iv_metrics(
         )
         rows = cur.fetchall()
 
-    if len(rows) < IV_MIN_HISTORY_DAYS:
+    if len(rows) < threshold:
         return None, None
 
     values = [r['iv30'] for r in rows]
@@ -462,16 +473,23 @@ def get_iv_rank(
     current_iv: float,
     lookback_days: int = 252,
     db_path: str = None,
+    min_history: Optional[int] = None,
 ) -> Optional[float]:
     """
-    IV Rank = (current_iv − min_iv_52wk) / (max_iv_52wk − min_iv_52wk).
+    IV Rank = (current_iv − min_iv) / (max_iv − min_iv) over lookback window.
 
-    Stores current_iv in iv_history.db before computing.
-    Returns float in [0, 1] or None if fewer than IV_MIN_HISTORY_DAYS rows exist.
+    Stores current_iv in iv_history before computing.
+    Returns float in [0, 1] or None if fewer than threshold rows exist.
+
+    Parameters
+    ----------
+    min_history : int | None
+        Override minimum rows required. Pass 5 for 30-day rolling mode.
+        Defaults to IV_MIN_HISTORY_DAYS (60) when None.
     """
     if db_path is None:
         db_path = IV_HISTORY_DB
-    rank, _ = _get_iv_metrics(ticker, current_iv, lookback_days)
+    rank, _ = _get_iv_metrics(ticker, current_iv, lookback_days, min_history=min_history)
     return rank
 
 
@@ -480,6 +498,7 @@ def get_iv_percentile(
     current_iv: float,
     lookback_days: int = 252,
     db_path: str = None,
+    min_history: Optional[int] = None,
 ) -> Optional[float]:
     """
     IV Percentile = fraction of historical days where IV was below current_iv.
@@ -487,12 +506,18 @@ def get_iv_percentile(
     Unlike IV rank, a single extreme outlier cannot anchor the max and compress
     all other readings — the percentile distribution remains stable.
 
-    Stores current_iv in iv_history.db before computing.
-    Returns float in [0, 1] or None if fewer than IV_MIN_HISTORY_DAYS rows exist.
+    Stores current_iv in iv_history before computing.
+    Returns float in [0, 1] or None if fewer than threshold rows exist.
+
+    Parameters
+    ----------
+    min_history : int | None
+        Override minimum rows required. Pass 5 for 30-day rolling mode.
+        Defaults to IV_MIN_HISTORY_DAYS (60) when None.
     """
     if db_path is None:
         db_path = IV_HISTORY_DB
-    _, percentile = _get_iv_metrics(ticker, current_iv, lookback_days, db_path)
+    _, percentile = _get_iv_metrics(ticker, current_iv, lookback_days, min_history=min_history)
     return percentile
 
 
@@ -501,6 +526,7 @@ def get_iv_rank_and_percentile(
     current_iv: float,
     lookback_days: int = 252,
     db_path: str = None,
+    min_history: Optional[int] = None,
 ) -> Tuple[Optional[float], Optional[float]]:
     """
     Combined getter — compute both IV rank and IV percentile in a single DB
@@ -509,10 +535,17 @@ def get_iv_rank_and_percentile(
 
     Returns (iv_rank, iv_percentile) or (None, None) if insufficient history.
     Both values are floats in [0, 1] when available.
+
+    Parameters
+    ----------
+    min_history : int | None
+        Override minimum rows required. Pass 5 for 30-day rolling mode so
+        that IV rank activates after just 5 daily runs instead of 60.
+        Defaults to IV_MIN_HISTORY_DAYS (60) when None.
     """
     if db_path is None:
         db_path = IV_HISTORY_DB
-    return _get_iv_metrics(ticker, current_iv, lookback_days)
+    return _get_iv_metrics(ticker, current_iv, lookback_days, min_history=min_history)
 
 
 # ===========================================================================

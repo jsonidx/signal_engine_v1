@@ -51,7 +51,8 @@ def compute_priority_score(
     Computes a single priority score (higher = more deserving of Claude synthesis).
 
     Inputs from resolved_signals (output of conflict_resolver.py):
-      - signal_agreement_score: float 0-1 (fraction of modules agreeing)
+      - prob_combined: float 0-1 (calibrated weighted probability — primary signal)
+      - signal_agreement_score: float 0-1 (vote fraction — fallback when prob_combined absent)
       - pre_resolved_confidence: float 0-1
       - bull_weight / bear_weight: whichever is higher (directional strength)
       - override_flags: list (penalize if dominated by a single override)
@@ -62,8 +63,9 @@ def compute_priority_score(
       - equity_rank: int (1 = best, lower is better)
 
     Formula:
-      base  = signal_agreement_score  * 40    # max 40 pts — breadth of signal
-      base += pre_resolved_confidence  * 25    # max 25 pts — conviction strength
+      base  = prob_combined * 40           # max 40 pts — calibrated probability
+              (falls back to signal_agreement_score × 40 if prob_combined is None)
+      base += pre_resolved_confidence * 25 # max 25 pts — conviction strength
       base += max(bull_weight, bear_weight)*20 # max 20 pts — directional weight
       + equity rank bonus (max 15 pts if rank <= 30)
       + composite_z bonus  (max 10 pts)
@@ -76,13 +78,17 @@ def compute_priority_score(
         return -1.0
 
     agreement   = float(resolved_signal.get("signal_agreement_score", 0) or 0)
+    prob_comb   = resolved_signal.get("prob_combined")
+    # Use prob_combined when available; fall back to signal_agreement_score
+    # for older resolved_signals.json entries that predate the prob_engine build.
+    breadth     = float(prob_comb) if prob_comb is not None else agreement
     confidence  = float(resolved_signal.get("pre_resolved_confidence", 0) or 0)
     bull_weight = float(resolved_signal.get("bull_weight", 0) or 0)
     bear_weight = float(resolved_signal.get("bear_weight", 0) or 0)
     override_flags = resolved_signal.get("override_flags", []) or []
 
-    base  = agreement   * 40
-    base += confidence  * 25
+    base  = breadth    * 40
+    base += confidence * 25
     base += max(bull_weight, bear_weight) * 20
 
     # Equity rank bonus (only if in signal_engine top 30)
@@ -345,17 +351,24 @@ def select_top_tickers(
     total_loaded = len(resolved_all)
     resolved_all = {t: r for t, r in resolved_all.items() if not r.get("skip_claude")}
 
-    # ── Step 3: Filter by min_agreement ───────────────────────────────────────
-    # Always-include tickers bypass the agreement filter
+    # ── Step 3: Filter by min_agreement or prob_combined ─────────────────────
+    # Always-include tickers bypass the agreement filter.
+    # A ticker qualifies if:
+    #   agreement >= min_agreement  (legacy path — backwards compatible)
+    #   OR prob_combined >= 0.55    (new calibrated gate — slightly lower threshold
+    #                                because prob_combined is a more accurate signal)
+    PROB_COMBINED_MIN = 0.55
     pre_agreement_count = len(resolved_all)
     resolved_eligible = {}
     for t, r in resolved_all.items():
-        agreement = float(r.get("signal_agreement_score", 0) or 0)
-        if t in always_set or agreement >= min_agreement:
+        agreement    = float(r.get("signal_agreement_score", 0) or 0)
+        prob_combined = float(r.get("prob_combined", 0) or 0)
+        if t in always_set or agreement >= min_agreement or prob_combined >= PROB_COMBINED_MIN:
             resolved_eligible[t] = r
     filtered_count = pre_agreement_count - len(resolved_eligible)
     if filtered_count > 0:
-        print(f"Filtered {filtered_count} tickers below {min_agreement:.0%} agreement")
+        print(f"Filtered {filtered_count} tickers below {min_agreement:.0%} agreement "
+              f"and below {PROB_COMBINED_MIN:.0%} prob_combined")
 
     # ── Step 4: Load equity signals ───────────────────────────────────────────
     eq_path  = equity_signals_path or _find_latest_equity_signals()
@@ -376,6 +389,7 @@ def select_top_tickers(
             "ticker":                  ticker,
             "priority_score":          score,
             "signal_agreement_score":  float(resolved.get("signal_agreement_score", 0) or 0),
+            "prob_combined":           resolved.get("prob_combined"),
             "pre_resolved_direction":  resolved.get("pre_resolved_direction", "NEUTRAL"),
             "pre_resolved_confidence": float(resolved.get("pre_resolved_confidence", 0) or 0),
             "equity_rank":             eq_rank,
@@ -413,6 +427,7 @@ def select_top_tickers(
                                                composite_z=cz,
                                            ),
                 "signal_agreement_score":  float(resolved.get("signal_agreement_score", 0) or 0),
+                "prob_combined":           resolved.get("prob_combined"),
                 "pre_resolved_direction":  resolved.get("pre_resolved_direction", "NEUTRAL"),
                 "pre_resolved_confidence": float(resolved.get("pre_resolved_confidence", 0) or 0),
                 "equity_rank":             eq_rank,

@@ -299,6 +299,10 @@ echo ""
 echo ""
 python3 thesis_checker.py --report --days 60
 
+# ── Post-run: prob_combined calibration check ─────────────
+echo "── prob_combined calibration check ──"
+python3 -c "from utils.prob_engine import compute_empirical_win_rate; compute_empirical_win_rate()" || true
+
 # ── Post-run: invalidate dashboard cache ─────────────────
 echo "Invalidating dashboard cache (if running)..."
 curl -s -X POST http://localhost:8000/api/cache/invalidate || true

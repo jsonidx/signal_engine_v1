@@ -510,7 +510,7 @@ export function Top20RankingTable() {
                   Dir
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-                  P(T1)
+                  P(combined)
                 </th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
                   EV T1 %
@@ -581,9 +581,22 @@ export function Top20RankingTable() {
                       <DirectionBadge direction={row.direction} />
                     </td>
 
-                    {/* P(T1) probability bar */}
+                    {/* P(combined) — calibrated multi-factor probability; falls back to P(T1) est */}
                     <td className="px-4 py-2.5">
-                      <ProbBar value={row.prob_t1} />
+                      <span className={clsx(
+                        'font-mono text-xs font-semibold',
+                        row.prob_combined != null && row.prob_combined > 0.65
+                          ? 'text-accent-green'
+                          : row.prob_combined != null && row.prob_combined >= 0.55
+                          ? 'text-accent-amber'
+                          : 'text-text-tertiary'
+                      )}>
+                        {row.prob_combined != null
+                          ? `${(row.prob_combined * 100).toFixed(0)}%`
+                          : row.prob_t1 != null
+                          ? `${(row.prob_t1 * 100).toFixed(0)}% (est)`
+                          : '—'}
+                      </span>
                     </td>
 
                     {/* EV T1 % — expected value of swing trade to T1 */}

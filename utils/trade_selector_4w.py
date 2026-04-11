@@ -715,15 +715,15 @@ def generate_daily_top20_ranking(
 
     targets_df = pd.DataFrame(target_rows).set_index("ticker")
 
-    # ── Build top-N cluster selection, sorted by ev_t1_pct → prob_t1 → priority_score ──
+    # ── Build top-N cluster selection, sorted by ev_t1_pct → prob_combined → priority_score ──
     top_pool = pool[pool["ticker"].isin(selected_tickers)].copy()
     top_pool = top_pool.join(targets_df, on="ticker")
 
     # ev_t1_pct DESC: surfaces tickers with highest expected profit potential.
-    # prob_t1 DESC: tie-break on raw hit probability.
+    # prob_combined DESC: tie-break on calibrated multi-factor probability.
     # priority_score DESC: final tie-break on signal quality (active on NEUTRAL days).
     top_pool = top_pool.sort_values(
-        ["ev_t1_pct", "prob_t1", "priority_score"], ascending=[False, False, False]
+        ["ev_t1_pct", "prob_combined", "priority_score"], ascending=[False, False, False]
     ).reset_index(drop=True)
 
     ranked = top_pool.copy()
@@ -746,7 +746,7 @@ def generate_daily_top20_ranking(
     tail = pool[~pool["ticker"].isin(selected_tickers)].copy()
     tail = tail.join(targets_df, on="ticker")
     tail = tail.sort_values(
-        ["ev_t1_pct", "prob_t1", "priority_score"], ascending=[False, False, False]
+        ["ev_t1_pct", "prob_combined", "priority_score"], ascending=[False, False, False]
     ).reset_index(drop=True)
     if not tail.empty:
         tail["rank"]        = range(len(ranked) + 1, len(ranked) + 1 + len(tail))
@@ -803,9 +803,34 @@ def generate_daily_top20_ranking(
         "direction", "t1_price", "t2_price", "stop_price",
         "prob_t1", "prob_t2", "hold_days",
         "signal_agreement_score", "ev_t1_pct",
+        "prob_combined",
     ]
     ranked = ranked[[c for c in output_cols if c in ranked.columns]].reset_index(drop=True)
     return ranked
+
+
+# ==============================================================================
+# DB MIGRATION
+# ==============================================================================
+
+def _migrate_daily_rankings_prob_column() -> None:
+    """Add prob_combined column to daily_rankings if not already present (idempotent)."""
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'daily_rankings'
+        """)
+        existing = {row["column_name"] for row in cur.fetchall()}
+        if "prob_combined" not in existing:
+            cur.execute("ALTER TABLE daily_rankings ADD COLUMN prob_combined FLOAT")
+            conn.commit()
+            logger.info("_migrate_daily_rankings_prob_column: added prob_combined column")
+        conn.close()
+    except Exception as exc:
+        logger.warning("_migrate_daily_rankings_prob_column: %s", exc)
 
 
 # ==============================================================================
@@ -846,6 +871,9 @@ def run_daily_top20_pipeline(
     """
     from datetime import date as _date
     run_date = run_date or _date.today()
+
+    # Ensure prob_combined column exists (idempotent — safe to call every run)
+    _migrate_daily_rankings_prob_column()
 
     # Convert list[dict] → DataFrame so generate_daily_top20_ranking can work
     if not isinstance(candidates, pd.DataFrame):
@@ -951,6 +979,7 @@ def run_daily_top20_pipeline(
                 float(row.get("signal_agreement_score") or 0.0),
                 float(row.get("ev_t1_pct") or -999.0),
                 ticker_upper in open_set,   # is_open_position flag
+                float(row["prob_combined"]) if row.get("prob_combined") is not None and not _is_nan(row.get("prob_combined")) else None,
             ))
 
         upsert_sql = """
@@ -961,8 +990,8 @@ def run_daily_top20_pipeline(
                  rank_change, rank_yesterday,
                  direction, t1_price, t2_price, stop_price,
                  prob_t1, prob_t2, hold_days, agreement_score,
-                 ev_t1_pct, is_open_position)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 ev_t1_pct, is_open_position, prob_combined)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (run_date, rank) DO UPDATE SET
                 ticker           = EXCLUDED.ticker,
                 priority_score   = EXCLUDED.priority_score,
@@ -984,7 +1013,8 @@ def run_daily_top20_pipeline(
                 hold_days        = EXCLUDED.hold_days,
                 agreement_score  = EXCLUDED.agreement_score,
                 ev_t1_pct        = EXCLUDED.ev_t1_pct,
-                is_open_position = EXCLUDED.is_open_position
+                is_open_position = EXCLUDED.is_open_position,
+                prob_combined    = EXCLUDED.prob_combined
         """
 
         with managed_connection() as conn:

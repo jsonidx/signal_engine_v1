@@ -297,6 +297,134 @@ def _get_options_data(ticker: str) -> Optional[dict]:
         return None
 
 
+def compute_max_pain(
+    ticker: str,
+    calls: "pd.DataFrame | None" = None,
+    puts: "pd.DataFrame | None" = None,
+    expiry: "str | None" = None,
+    price: "float | None" = None,
+) -> Optional[dict]:
+    """
+    Compute the max pain strike for the nearest options expiry.
+
+    Max pain = the strike where total open-interest writer loss is minimised.
+    Formula: for each candidate strike S, sum across all strikes K:
+        call_loss(K) = max(0, S - K) * call_OI(K)
+        put_loss(K)  = max(0, K - S) * put_OI(K)
+    The strike S that minimises total_loss = min_sum(call_loss + put_loss).
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol.
+    calls, puts : pd.DataFrame | None
+        Pre-fetched option chain DataFrames (columns: strike, openInterest).
+        If both are None, the function fetches the chain from yfinance using
+        the same nearest-expiry logic as _get_options_data().
+    expiry : str | None
+        Expiry date string "YYYY-MM-DD"; required when calls/puts are provided.
+    price : float | None
+        Current stock price; required when calls/puts are provided.
+
+    Returns
+    -------
+    dict with keys:
+        max_pain_strike   : float  — strike where writer loss is minimised
+        expiry            : str    — expiry date used
+        days_to_expiry    : int    — calendar days until expiry
+        current_price     : float  — price at time of calculation
+        distance_pct      : float  — (current_price - max_pain) / max_pain * 100
+        direction         : str    — "ABOVE" if price > max_pain, else "BELOW"
+    Returns None on failure.
+    """
+    try:
+        fetch_needed = calls is None or puts is None
+
+        if fetch_needed:
+            t = yf.Ticker(ticker)
+
+            hist = t.history(period="5d")
+            if hist.empty:
+                return None
+            price = float(hist["Close"].iloc[-1])
+            if price <= 0:
+                return None
+
+            expirations = t.options
+            if not expirations:
+                return None
+
+            today = datetime.now().date()
+            expiry = None
+            for exp in expirations:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                days_out = (exp_date - today).days
+                if 3 <= days_out <= 45:
+                    expiry = exp
+                    break
+            if expiry is None and expirations:
+                expiry = expirations[0]
+            if expiry is None:
+                return None
+
+            chain = t.option_chain(expiry)
+            calls = chain.calls
+            puts = chain.puts
+        else:
+            today = datetime.now().date()
+
+        if calls is None or puts is None or expiry is None or price is None:
+            return None
+        if calls.empty and puts.empty:
+            return None
+
+        # Gather all strikes from both sides
+        all_strikes = sorted(set(
+            calls["strike"].dropna().tolist() + puts["strike"].dropna().tolist()
+        ))
+        if not all_strikes:
+            return None
+
+        call_oi = calls.set_index("strike")["openInterest"].fillna(0)
+        put_oi  = puts.set_index("strike")["openInterest"].fillna(0)
+
+        min_loss   = float("inf")
+        pain_strike = all_strikes[0]
+
+        for s in all_strikes:
+            # Call writer loses when price settles above their short call strike
+            c_loss = sum(
+                max(0.0, s - k) * float(call_oi.get(k, 0))
+                for k in all_strikes
+            )
+            # Put writer loses when price settles below their short put strike
+            p_loss = sum(
+                max(0.0, k - s) * float(put_oi.get(k, 0))
+                for k in all_strikes
+            )
+            total = c_loss + p_loss
+            if total < min_loss:
+                min_loss    = total
+                pain_strike = s
+
+        exp_date      = datetime.strptime(expiry, "%Y-%m-%d").date()
+        days_to_exp   = (exp_date - today).days
+        distance_pct  = round((price - pain_strike) / pain_strike * 100, 2) if pain_strike else 0.0
+        direction     = "ABOVE" if price >= pain_strike else "BELOW"
+
+        return {
+            "max_pain_strike": round(float(pain_strike), 2),
+            "expiry":          expiry,
+            "days_to_expiry":  days_to_exp,
+            "current_price":   round(float(price), 2),
+            "distance_pct":    distance_pct,
+            "direction":       direction,
+        }
+
+    except Exception:
+        return None
+
+
 def _get_volume_ratio(ticker: str, prefetched_hist=None) -> Tuple[float, float]:
     """
     Return (today_options_volume, 20d_avg_options_volume) using
@@ -483,15 +611,30 @@ def analyze_ticker(ticker: str, verbose: bool = False, prefetched_hist=None) -> 
         iv_percentile_true = None
         iv_source = "estimated"
 
+        iv_history_days: int = 0  # snapshots available for this ticker
         if _IV_CALCULATOR_AVAILABLE:
             try:
                 true_iv = compute_atm_iv(ticker)
                 if true_iv is not None:
                     iv_rank_true, iv_percentile_true = get_iv_rank_and_percentile(
-                        ticker, true_iv
+                        ticker, true_iv, lookback_days=30, min_history=5
                     )
                     if iv_rank_true is not None:
                         iv_source = "true"
+                    # Count how many snapshots exist (for "Building history" display)
+                    try:
+                        from utils.db import managed_connection
+                        with managed_connection() as _conn:
+                            _cur = _conn.cursor()
+                            _cur.execute(
+                                "SELECT COUNT(*) AS n FROM iv_history "
+                                "WHERE ticker = %s AND date >= CURRENT_DATE - INTERVAL '30 days'",
+                                (ticker,),
+                            )
+                            _row = _cur.fetchone()
+                            iv_history_days = int(_row["n"]) if _row else 0
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -545,6 +688,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, prefetched_hist=None) -> 
             "implied_vol_pct": opts.get("implied_vol"),
             "true_iv_pct": round(true_iv * 100, 1) if true_iv is not None else None,
             "iv_source": iv_source,
+            "iv_history_days": iv_history_days,
             "iv_percentile": (
                 round(iv_percentile_true * 100, 1)
                 if iv_percentile_true is not None
@@ -750,6 +894,7 @@ def get_options_heat(ticker: str) -> dict:
         "true_iv_pct": result.get("true_iv_pct"),
         "iv_rank": result["iv_rank"],
         "iv_source": result.get("iv_source", "estimated"),
+        "iv_history_days": result.get("iv_history_days", 0),
         "iv_percentile": result.get("iv_percentile"),
         "pc_ratio": result["pc_ratio"],
         "total_options_vol": result["total_options_vol"],

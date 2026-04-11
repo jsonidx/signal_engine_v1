@@ -78,6 +78,11 @@ log = logging.getLogger("signal_api")
 sys.path.insert(0, str(BASE_DIR))
 
 try:
+    from options_flow import compute_max_pain as _compute_max_pain
+except ImportError:
+    _compute_max_pain = None  # type: ignore[assignment]
+
+try:
     from config import (
         PORTFOLIO_NAV,
         EQUITY_ALLOCATION,
@@ -328,6 +333,28 @@ def _equity_signals_composite_z(ticker: str) -> Optional[float]:
         return _safe_float(row.iloc[0].get("composite_z"))
     except Exception:
         return None
+
+
+def _fundamentals_lookup(ticker: str) -> dict:
+    """Return target_mean, analyst_count, analyst_rating from latest fundamental CSV."""
+    try:
+        f = _latest_screener_file("fundamental_")
+        if f is None:
+            return {}
+        df = pd.read_csv(f)
+        if "ticker" not in df.columns:
+            return {}
+        row = df[df["ticker"].str.upper() == ticker.upper()]
+        if row.empty:
+            return {}
+        r = row.iloc[0]
+        return {
+            "target_mean":    _safe_float(r.get("target_mean")),
+            "analyst_count":  _safe_int(r.get("analyst_count")),
+            "analyst_rating": _safe_float(r.get("analyst_rating")),
+        }
+    except Exception:
+        return {}
 
 
 def _normalise_dp_trend(raw) -> Optional[str]:
@@ -1310,6 +1337,11 @@ async def signals_ticker(ticker: str):
             "bull_probability":   data.get("bull_probability"),
             "bear_probability":   data.get("bear_probability"),
             "neutral_probability": data.get("neutral_probability"),
+            "prob_combined":      data.get("prob_combined"),
+            "prob_technical":     data.get("prob_technical"),
+            "prob_options":       data.get("prob_options"),
+            "prob_catalyst":      data.get("prob_catalyst"),
+            "prob_news":          data.get("prob_news"),
             "time_horizon":       data.get("time_horizon"),
             "data_quality":       data.get("data_quality"),
             "model_used":         data.get("model_used"),
@@ -1337,6 +1369,7 @@ async def signals_ticker(ticker: str):
             "heat_score":        _safe_float(of.get("heat_score")),
             "iv_rank":           _safe_float(of.get("iv_rank")),
             "iv_source":         of.get("iv_source"),
+            "iv_history_days":   _safe_int(of.get("iv_history_days")),
             "expected_move_pct": _safe_float(of.get("expected_move_pct")),
             "put_call_ratio":    _safe_float(of.get("pc_ratio") or of.get("put_call_ratio")),
             # ── Dark pool ─────────────────────────────────────────────────────
@@ -1356,6 +1389,47 @@ async def signals_ticker(ticker: str):
             "volume_profile": vp,
             "options_heat":  of,
         }
+
+        # ── Max pain (live yfinance call, cached per ticker separately) ───────
+        mp_cache_key = f"max_pain:{ticker}"
+        mp = _cache.get(mp_cache_key)
+        if mp is None:
+            try:
+                mp = _compute_max_pain(ticker) if _compute_max_pain is not None else None
+            except Exception:
+                mp = None
+            _cache.set(mp_cache_key, mp or {}, TTL_SHORT)
+        if mp:
+            result["max_pain_strike"]      = _safe_float(mp.get("max_pain_strike"))
+            result["max_pain_distance_pct"]= _safe_float(mp.get("distance_pct"))
+            result["max_pain_expiry"]      = mp.get("expiry")
+            result["max_pain_days_to_expiry"] = _safe_int(mp.get("days_to_expiry"))
+        else:
+            result["max_pain_strike"]         = None
+            result["max_pain_distance_pct"]   = None
+            result["max_pain_expiry"]         = None
+            result["max_pain_days_to_expiry"] = None
+
+        # ── Analyst target from fundamentals CSV ──────────────────────────────
+        fund = _fundamentals_lookup(ticker)
+        result["target_mean"]    = fund.get("target_mean")
+        result["analyst_count"]  = fund.get("analyst_count")
+        result["analyst_rating"] = fund.get("analyst_rating")
+
+        # ── ADV 20d (average daily volume, 20-day) — live yfinance, cached ────
+        adv_cache_key = f"adv_20d:{ticker}"
+        adv_cached = _cache.get(adv_cache_key)
+        if adv_cached is not None:
+            result["adv_20d"] = adv_cached.get("adv_20d")
+        else:
+            try:
+                hist = yf.Ticker(ticker).history(period="1mo")
+                adv_20d = int(hist["Volume"].tail(20).mean()) if len(hist) >= 20 else None
+            except Exception:
+                adv_20d = None
+            _cache.set(adv_cache_key, {"adv_20d": adv_20d}, TTL_SHORT)
+            result["adv_20d"] = adv_20d
+
         result = _json_safe(result)
         _cache.set(cache_key, result, TTL_SHORT)
         return result
@@ -2233,6 +2307,7 @@ async def rankings_latest():
                 "agreement_score":  _safe_float(r["agreement_score"]),
                 "ev_t1_pct":        _safe_float(r["ev_t1_pct"]),
                 "is_open_position": bool(r["is_open_position"]) if r["is_open_position"] is not None else False,
+                "prob_combined":    _safe_float(r.get("prob_combined")),
             })
 
         result = {

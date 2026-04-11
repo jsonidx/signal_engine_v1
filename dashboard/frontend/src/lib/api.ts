@@ -129,6 +129,11 @@ export interface TickerDetail extends TickerSignal {
   bull_probability?: number
   bear_probability?: number
   neutral_probability?: number
+  prob_combined?: number
+  prob_technical?: number
+  prob_options?: number
+  prob_catalyst?: number
+  prob_news?: number
   // Price levels
   target_1?: number
   target_2?: number
@@ -154,8 +159,14 @@ export interface TickerDetail extends TickerSignal {
   heat_score?: number
   iv_rank?: number
   iv_source?: string
+  iv_history_days?: number | null
   expected_move_pct?: number
   put_call_ratio?: number
+  // Max pain
+  max_pain_strike?: number | null
+  max_pain_distance_pct?: number | null
+  max_pain_expiry?: string | null
+  max_pain_days_to_expiry?: number | null
   // Dark pool
   dark_pool_score?: number
   short_ratio_trend?: string
@@ -165,6 +176,12 @@ export interface TickerDetail extends TickerSignal {
   // Catalysts / risks
   catalysts?: string[]
   risks?: string[]
+  // Analyst consensus
+  target_mean?: number | null
+  analyst_count?: number | null
+  analyst_rating?: number | null
+  // Volume
+  adv_20d?: number | null
 }
 
 export interface ExpectedMove {
@@ -738,6 +755,7 @@ export interface Top20RankingRow {
   agreement_score:  number | null
   ev_t1_pct:        number | null
   is_open_position: boolean
+  prob_combined:    number | null
 }
 
 export interface RankingsLatestResponse {

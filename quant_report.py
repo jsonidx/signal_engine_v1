@@ -44,6 +44,8 @@ CACHE_TTL_HOURS = 4
 PASS_THRESHOLD = {'min_prob': 0.60, 'min_rr': 2.0}
 REGIME_VIX_MULT = {'VIX<15': 1.0, 'VIX15-25': 0.75, 'VIX25-35': 0.50, 'VIX>35': 0.25}
 
+MARKETAUX_API_KEY: Optional[str] = os.getenv("MARKETAUX_API_KEY")
+
 BULLISH_KW = ['beat', 'raised guidance', 'upgrade', 'acquisition', 'buyback',
               'record revenue', 'partnership', 'approval', 'accelerat']
 BEARISH_KW = ['miss', 'lowered guidance', 'downgrade', 'lawsuit', 'investigation',
@@ -829,6 +831,136 @@ class NewsScraper:
 
 
 # ==============================================================================
+# 3b. MARKETAUX ENTITY-LINKED NEWS SENTIMENT
+# ==============================================================================
+
+# Simple in-memory cache: {ticker: {"expires": datetime, "result": dict}}
+_MARKETAUX_CACHE: dict = {}
+_MARKETAUX_CACHE_TTL_HOURS = 6
+
+
+def fetch_news_sentiment(ticker: str, days_back: int = 7) -> dict:
+    """
+    Fetch entity-linked news sentiment for a ticker via Marketaux.
+
+    Marketaux returns per-article entity sentiment scores linked to the specific
+    symbol — far more precise than keyword matching on headlines.
+
+    Falls back to neutral (avg_sentiment=0.0) when:
+      - MARKETAUX_API_KEY is not set
+      - The API call fails (network, rate-limit, non-200)
+      - No articles with entity scores are found for the ticker
+
+    Parameters
+    ----------
+    ticker    : str  — equity symbol (e.g. "AAPL")
+    days_back : int  — look-back window in calendar days (default 7)
+
+    Returns
+    -------
+    dict with keys:
+        ticker          : str
+        articles_found  : int   — number of articles with entity sentiment
+        avg_sentiment   : float — mean entity sentiment, -1.0 … +1.0
+        sentiment_label : str   — "Bullish" | "Neutral" | "Bearish"
+        period_days     : int   — look-back window used
+        source          : str   — "marketaux" | "fallback_neutral"
+    """
+    import time as _time
+    import urllib.request as _urllib_request
+
+    # ── In-memory cache check ────────────────────────────────────────────────
+    cached = _MARKETAUX_CACHE.get(ticker)
+    if cached and cached["expires"] > datetime.now():
+        return cached["result"]
+
+    _default = {
+        "ticker":          ticker,
+        "articles_found":  0,
+        "avg_sentiment":   0.0,
+        "sentiment_label": "Neutral",
+        "period_days":     days_back,
+        "source":          "fallback_neutral",
+    }
+
+    if not MARKETAUX_API_KEY:
+        logging.getLogger(__name__).warning(
+            "MARKETAUX_API_KEY not set — news sentiment unavailable. "
+            "Add MARKETAUX_API_KEY=your_key to .env (free at marketaux.com)."
+        )
+        return _default
+
+    # ── Build request ────────────────────────────────────────────────────────
+    published_after = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M")
+    params = urllib.parse.urlencode({
+        "api_token":       MARKETAUX_API_KEY,
+        "symbols":         ticker,
+        "filter_entities": "true",
+        "language":        "en",
+        "published_after": published_after,
+        "limit":           50,
+    })
+    url = f"https://api.marketaux.com/v1/news/all?{params}"
+
+    try:
+        req = _urllib_request.Request(url, headers={"Accept": "application/json"})
+        with _urllib_request.urlopen(req, timeout=8) as resp:
+            if resp.status != 200:
+                logging.getLogger(__name__).warning(
+                    "[%s] Marketaux returned HTTP %s", ticker, resp.status
+                )
+                return _default
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "[%s] Marketaux request failed: %s", ticker, exc
+        )
+        return _default
+
+    # ── Extract entity-linked sentiment scores ───────────────────────────────
+    scores = []
+    ticker_upper = ticker.upper()
+    for article in payload.get("data", []):
+        for entity in article.get("entities", []):
+            if entity.get("symbol", "").upper() == ticker_upper:
+                score = entity.get("sentiment_score")
+                if score is not None:
+                    try:
+                        scores.append(float(score))
+                    except (TypeError, ValueError):
+                        pass
+                break  # one entity match per article is enough
+
+    if not scores:
+        result = {**_default, "source": "marketaux"}
+        result["articles_found"] = len(payload.get("data", []))
+    else:
+        avg = round(sum(scores) / len(scores), 4)
+        if avg > 0.20:
+            label = "Bullish"
+        elif avg < -0.20:
+            label = "Bearish"
+        else:
+            label = "Neutral"
+
+        result = {
+            "ticker":          ticker,
+            "articles_found":  len(scores),
+            "avg_sentiment":   avg,
+            "sentiment_label": label,
+            "period_days":     days_back,
+            "source":          "marketaux",
+        }
+
+    # ── Cache and return ─────────────────────────────────────────────────────
+    _MARKETAUX_CACHE[ticker] = {
+        "expires": datetime.now() + timedelta(hours=_MARKETAUX_CACHE_TTL_HOURS),
+        "result":  result,
+    }
+    return result
+
+
+# ==============================================================================
 # 4. QUANT ANALYSIS PIPELINE
 # ==============================================================================
 
@@ -1046,8 +1178,24 @@ class QuantAnalysisPipeline:
         target_mean_usd = info.get('targetMeanPrice') or price * 1.10
         target_high_usd = info.get('targetHighPrice') or price * 1.20
         rec_mean = info.get('recommendationMean') or 3.0  # 1=strong buy, 5=sell
-        # Derive probability from analyst consensus (1=best → high prob)
-        prob = max(0.30, min(0.85, (5 - rec_mean) / 4))
+        # Derive probability: blend prob_combined (signal-based) with analyst consensus.
+        # quant_report collects fewer signals than ai_quant, so analyst consensus
+        # carries 60% weight here while prob_combined contributes 40%.
+        analyst_prob = max(0.30, min(0.85, (5 - rec_mean) / 4))
+        try:
+            from utils.prob_engine import compute_prob_combined as _compute_pcomb
+            _qr_signals = {
+                "fundamentals": result.get("quality") and {
+                    "fundamental_score_pct": result.get("quality", {}).get("score_pct")
+                } or {},
+                "signal_agreement_score": None,
+            }
+            _qr_pr   = _compute_pcomb(_qr_signals)
+            _base_pc = _qr_pr["prob_combined"]
+            prob = round(_base_pc * 0.40 + analyst_prob * 0.60, 3)
+        except Exception:
+            prob = analyst_prob
+        prob = max(0.30, min(0.85, prob))
         # Convert analyst targets to EUR for consistent display
         try:
             from fx_rates import convert_to_eur, get_ticker_currency

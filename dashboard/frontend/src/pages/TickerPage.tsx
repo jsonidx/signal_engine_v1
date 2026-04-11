@@ -22,7 +22,10 @@ import {
   ResponsiveContainer, Cell, ReferenceLine, Legend,
 } from 'recharts'
 import { api } from '../lib/api'
-import type { ExpectedMove, TickerDetail, SecFiling, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus } from '../lib/api'
+import type { ExpectedMove, TickerDetail, SecFiling, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus, RegimeCurrent } from '../lib/api'
+
+// Cache TTL for regime data (1 hour, same as backend TTL_LONG)
+const TTL_LONG_MS = 60 * 60 * 1000
 import { clsx } from 'clsx'
 
 // ─── Module score color encoding (same as heatmap) ────────────────────────────
@@ -818,6 +821,16 @@ function buildPrompt(
   lines.push(`Direction:         ${signal.direction ?? '—'}`)
   lines.push(`Conviction:        ${signal.conviction ?? '—'}/5`)
   lines.push(`Signal Agreement:  ${signal.signal_agreement_score != null ? `${(signal.signal_agreement_score * 100).toFixed(0)}%` : '—'}`)
+  if (signal.prob_combined != null) {
+    lines.push(``)
+    lines.push(`## PROBABILITY ASSESSMENT (pre-computed)`)
+    lines.push(`prob_combined:   ${signal.prob_combined.toFixed(3)}  (${signal.data_quality ?? '—'})`)
+    lines.push(`  ├─ Technical:  ${signal.prob_technical != null ? signal.prob_technical.toFixed(3) : 'N/A'}`)
+    lines.push(`  ├─ Options:    ${signal.prob_options   != null ? signal.prob_options.toFixed(3)   : 'N/A'}`)
+    lines.push(`  ├─ Catalyst:   ${signal.prob_catalyst  != null ? signal.prob_catalyst.toFixed(3)  : 'N/A'}`)
+    lines.push(`  └─ News:       ${signal.prob_news      != null ? signal.prob_news.toFixed(3)      : 'N/A'}`)
+  }
+  lines.push(``)
   lines.push(`Time Horizon:      ${signal.time_horizon ?? '—'}`)
   lines.push(`Data Quality:      ${signal.data_quality ?? '—'}`)
   lines.push(`Bull Probability:  ${signal.bull_probability != null ? `${signal.bull_probability}%` : '—'}`)
@@ -965,12 +978,13 @@ function buildPrompt(
 }
 
 function CopyPromptButton({
-  signal, actionZones, earningsData, dpLatest,
+  signal, actionZones, earningsData, dpLatest, compact = false,
 }: {
   signal: TickerDetail
   actionZones: ActionZones | null | undefined
   earningsData: EarningsData | null | undefined
   dpLatest: any
+  compact?: boolean
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -979,6 +993,24 @@ function CopyPromptButton({
     await navigator.clipboard.writeText(prompt)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
+  }
+
+  // Compact mode: inline button only (used inside AI Thesis card)
+  if (compact) {
+    return (
+      <button
+        onClick={handleCopy}
+        title="Copy full deep-dive prompt for ChatGPT / Grok / Claude"
+        className={clsx(
+          'flex items-center gap-1.5 font-mono text-[10px] px-2.5 py-1 rounded border transition-all',
+          copied
+            ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+            : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+        )}
+      >
+        {copied ? '✓ Copied' : '⎘ Copy Prompt'}
+      </button>
+    )
   }
 
   return (
@@ -1145,12 +1177,14 @@ function loadRiskPct(): number {
 }
 
 interface PositionSizerProps {
-  entry:       number        // midpoint of entry zone
-  stopLoss:    number | null | undefined
-  portfolioNav?: number      // optional total portfolio size (EUR)
+  entry:              number        // midpoint of entry zone
+  stopLoss:           number | null | undefined
+  portfolioNav?:      number        // optional total portfolio size (EUR)
+  regimeMultiplier?:  number | null // e.g. 0.4 for RISK_OFF, 1.0 for RISK_ON
+  regimeLabel?:       string | null // e.g. "RISK_OFF"
 }
 
-function PositionSizer({ entry, stopLoss, portfolioNav }: PositionSizerProps) {
+function PositionSizer({ entry, stopLoss, portfolioNav, regimeMultiplier, regimeLabel }: PositionSizerProps) {
   const [riskPct, setRiskPct] = useState<number>(loadRiskPct)
 
   if (stopLoss == null || Math.abs(entry - stopLoss) < 0.001) return null
@@ -1158,12 +1192,16 @@ function PositionSizer({ entry, stopLoss, portfolioNav }: PositionSizerProps) {
   const stopDist    = Math.abs(entry - stopLoss)
   const stopDistPct = (stopDist / entry) * 100
 
+  // Apply regime multiplier to effective risk %
+  const multiplier      = regimeMultiplier != null ? regimeMultiplier : 1.0
+  const effectiveRiskPct = riskPct * multiplier
+
   // With a given portfolio risk %:
-  //   dollar_risk = nav * (risk_pct / 100)
+  //   dollar_risk = nav * (effective_risk_pct / 100)
   //   shares      = dollar_risk / stop_distance_per_share
   //   notional    = shares * entry
   const dollarRisk = portfolioNav != null
-    ? portfolioNav * (riskPct / 100)
+    ? portfolioNav * (effectiveRiskPct / 100)
     : null   // can't compute without NAV
 
   const shares   = dollarRisk != null ? Math.floor(dollarRisk / stopDist) : null
@@ -1219,6 +1257,14 @@ function PositionSizer({ entry, stopLoss, portfolioNav }: PositionSizerProps) {
           </button>
         ))}
       </div>
+
+      {/* Regime multiplier line */}
+      {regimeMultiplier != null && regimeMultiplier !== 1.0 && (
+        <div className="font-mono text-[9px] text-text-tertiary">
+          {riskPct.toFixed(1)}% × {regimeMultiplier} {regimeLabel ?? ''} ={' '}
+          <span className="text-accent-amber">{effectiveRiskPct.toFixed(2)}% effective</span>
+        </div>
+      )}
 
       {/* Output grid */}
       {portfolioNav != null ? (
@@ -1320,6 +1366,13 @@ function fmtRevenue(v: number | null): string {
   if (Math.abs(v) >= 1e9)  return `$${(v / 1e9).toFixed(1)}B`
   if (Math.abs(v) >= 1e6)  return `$${(v / 1e6).toFixed(0)}M`
   return `$${v.toLocaleString()}`
+}
+
+function fmtVol(v: number | null): string {
+  if (v == null) return '—'
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`
+  if (v >= 1_000)     return `${(v / 1_000).toFixed(0)}K`
+  return v.toString()
 }
 
 function EpsTooltip({ active, payload, label }: any) {
@@ -1435,11 +1488,30 @@ function EarningsCard({ data }: { data: EarningsData }) {
       </div>
 
       {/* Next earnings banner */}
-      {next_earnings && (
+      {next_earnings && (() => {
+        const daysToEarnings = (() => {
+          try {
+            const earningsDate = new Date(next_earnings + 'T00:00:00')
+            const today = new Date()
+            today.setHours(0, 0, 0, 0)
+            return Math.round((earningsDate.getTime() - today.getTime()) / 86400000)
+          } catch { return null }
+        })()
+        const daysColor = daysToEarnings != null
+          ? daysToEarnings <= 7  ? 'text-accent-red'
+          : daysToEarnings <= 21 ? 'text-accent-amber'
+          : 'text-text-tertiary'
+          : 'text-text-tertiary'
+        return (
         <div className="bg-accent-amber/10 border border-accent-amber/30 rounded px-3 py-2 space-y-1">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="font-mono text-[9px] uppercase text-accent-amber tracking-wide">Next</span>
             <span className="font-mono text-sm font-semibold text-accent-amber">{next_earnings}</span>
+            {daysToEarnings != null && (
+              <span className={clsx('font-mono text-xs font-semibold', daysColor)}>
+                · {daysToEarnings > 0 ? `${daysToEarnings}d` : daysToEarnings === 0 ? 'today' : `${Math.abs(daysToEarnings)}d ago`}
+              </span>
+            )}
             {next_earnings_quarter && (
               <span className="font-mono text-xs text-accent-amber/70 border border-accent-amber/30 rounded px-1.5 py-0.5">
                 {next_earnings_quarter}
@@ -1471,7 +1543,8 @@ function EarningsCard({ data }: { data: EarningsData }) {
             )}
           </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* ── Quarterly charts ── */}
       {!isAnnual && quarterlySlice.length > 0 && (
@@ -1611,6 +1684,11 @@ export function TickerPage() {
     refetchInterval: 15 * 60 * 1000,
     enabled: !!symbol,
   })
+  const { data: regimeData } = useQuery<RegimeCurrent | null>({
+    queryKey: ['regime_current'],
+    queryFn: () => api.regimeCurrent(),
+    staleTime: TTL_LONG_MS,
+  })
 
   const allTickers = useMemo(() => heatmapRows?.map(r => r.ticker).sort() ?? [], [heatmapRows])
 
@@ -1625,7 +1703,11 @@ export function TickerPage() {
           <div className="flex items-center gap-3">
             <DirectionBadge direction={signal.direction} />
             <ConvictionDots conviction={signal.conviction} />
-            {signal.regime && <RegimeBadge regime={signal.regime} size="sm" />}
+            {signal.regime && (
+              <span title={regimeData?.vix != null ? `${signal.regime} · VIX ${regimeData.vix.toFixed(1)}` : signal.regime}>
+                <RegimeBadge regime={signal.regime} size="sm" />
+              </span>
+            )}
           </div>
         )}
         <div className="ml-auto">
@@ -1697,6 +1779,8 @@ export function TickerPage() {
                     stopLoss={signal.stop_loss}
                     // TODO: wire portfolioNav from /api/portfolio/summary when needed
                     portfolioNav={undefined}
+                    regimeMultiplier={regimeData?.size_multiplier}
+                    regimeLabel={regimeData?.regime}
                   />
                 ) : null
               })()}
@@ -1784,6 +1868,50 @@ export function TickerPage() {
                     />
                   )}
 
+                  {/* prob_combined card — calibrated multi-factor probability */}
+                  {signal.prob_combined != null && (
+                    <div className="bg-bg-elevated rounded p-3 space-y-2 border border-border-subtle/50">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                          P(combined)
+                        </span>
+                        <span className={clsx(
+                          'font-mono text-sm font-semibold',
+                          signal.prob_combined >= 0.65 ? 'text-accent-green'
+                            : signal.prob_combined >= 0.55 ? 'text-accent-amber'
+                            : 'text-text-tertiary'
+                        )}>
+                          {(signal.prob_combined * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 bg-bg-surface rounded-full overflow-hidden">
+                        <div
+                          className={clsx(
+                            'h-full rounded-full transition-all',
+                            signal.prob_combined >= 0.65 ? 'bg-accent-green'
+                              : signal.prob_combined >= 0.55 ? 'bg-accent-amber'
+                              : 'bg-text-tertiary/50'
+                          )}
+                          style={{ width: `${(signal.prob_combined * 100).toFixed(1)}%` }}
+                        />
+                      </div>
+                      <div className="flex gap-2 font-mono text-[10px] text-text-tertiary flex-wrap">
+                        {signal.prob_technical != null && (
+                          <span>Tech {(signal.prob_technical * 100).toFixed(0)}%</span>
+                        )}
+                        {signal.prob_options != null && (
+                          <span>· Opts {(signal.prob_options * 100).toFixed(0)}%</span>
+                        )}
+                        {signal.prob_catalyst != null && (
+                          <span>· Cat {(signal.prob_catalyst * 100).toFixed(0)}%</span>
+                        )}
+                        {signal.prob_news != null && (
+                          <span>· News {(signal.prob_news * 100).toFixed(0)}%</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Full thesis — collapsed by default */}
                   {thesis && (
                     <Accordion.Root type="single" collapsible>
@@ -1798,6 +1926,17 @@ export function TickerPage() {
                       </Accordion.Item>
                     </Accordion.Root>
                   )}
+
+                  {/* Copy Prompt — inline at bottom of AI Thesis card */}
+                  <div className="border-t border-border-subtle pt-2 flex justify-end">
+                    <CopyPromptButton
+                      signal={signal}
+                      actionZones={actionZones}
+                      earningsData={earningsData}
+                      dpLatest={dpLatest}
+                      compact
+                    />
+                  </div>
                 </div>
               )
             })()}
@@ -1890,14 +2029,6 @@ export function TickerPage() {
             {/* Historical Analogs — similar past setups with win rate / expectancy stats */}
             <HistoricalAnalogs symbol={symbol} />
 
-            {/* LLM Prompt copy */}
-            <CopyPromptButton
-              signal={signal}
-              actionZones={actionZones}
-              earningsData={earningsData}
-              dpLatest={dpLatest}
-            />
-
             {/* Expected Moves */}
             {signal.current_price != null && (() => {
               const moves: ExpectedMove[] = (signal.expected_moves?.length ?? 0) > 0
@@ -1921,9 +2052,24 @@ export function TickerPage() {
               ) : null
             })()}
 
-            {/* Module mini-heatmap */}
+            {/* Module mini-heatmap — collapsed by default */}
             {signal.modules && Object.keys(signal.modules).length > 0 && (
-              <ModuleMiniHeatmap modules={signal.modules} />
+              <Accordion.Root type="single" collapsible>
+                <Accordion.Item value="modules" className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+                  <Accordion.Trigger className="group w-full flex items-center justify-between px-3 py-2.5 font-mono text-xs text-text-secondary hover:text-text-primary transition-colors">
+                    <span className="uppercase tracking-widest text-[10px] text-text-tertiary">
+                      Module Scores
+                    </span>
+                    <ChevronRight
+                      size={12}
+                      className="transition-transform group-data-[state=open]:rotate-90 text-text-tertiary"
+                    />
+                  </Accordion.Trigger>
+                  <Accordion.Content className="px-3 pb-3 data-[state=open]:animate-none">
+                    <ModuleMiniHeatmap modules={signal.modules} />
+                  </Accordion.Content>
+                </Accordion.Item>
+              </Accordion.Root>
             )}
           </div>
 
@@ -1980,8 +2126,24 @@ export function TickerPage() {
             {/* Squeeze details */}
             {(signal.squeeze_score ?? 0) > 30 && (
               <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-3">
-                <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-                  Squeeze Setup
+                <div className="flex items-center justify-between">
+                  <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                    Short Squeeze
+                  </div>
+                  {signal.squeeze_score != null && (
+                    <div className="flex items-center gap-1">
+                      <span className="font-mono text-[9px] text-text-tertiary">Score</span>
+                      <span className={clsx(
+                        'font-mono text-xs font-semibold',
+                        signal.squeeze_score > 60 ? 'text-accent-green'
+                          : signal.squeeze_score >= 40 ? 'text-accent-amber'
+                          : 'text-text-tertiary'
+                      )}>
+                        {signal.squeeze_score.toFixed(0)}
+                      </span>
+                      <span className="font-mono text-[9px] text-text-tertiary">/ 100</span>
+                    </div>
+                  )}
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   {[
@@ -1997,6 +2159,12 @@ export function TickerPage() {
                     </div>
                   ))}
                 </div>
+                {signal.adv_20d != null && (
+                  <div className="flex items-center justify-between font-mono text-xs text-text-tertiary">
+                    <span>ADV 20d</span>
+                    <span className="text-text-secondary">{fmtVol(signal.adv_20d)}</span>
+                  </div>
+                )}
                 {signal.ftd_shares !== undefined && signal.ftd_shares > 0 && (
                   <div className="font-mono text-xs text-text-tertiary">
                     FTD shares: {signal.ftd_shares.toLocaleString()}
@@ -2011,25 +2179,90 @@ export function TickerPage() {
             )}
 
             {/* Options flow */}
-            {(signal.iv_rank != null || signal.expected_move_pct != null || signal.put_call_ratio != null) && (
+            {(signal.heat_score != null || signal.iv_rank != null || signal.expected_move_pct != null || signal.put_call_ratio != null) && (
               <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
                 <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
                   Options Flow
                 </div>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-                  {[
-                    { label: 'IV Rank', value: signal.iv_rank != null ? `${signal.iv_rank.toFixed(0)}%` : '—' },
-                    { label: 'Exp Move', value: signal.expected_move_pct != null ? `±${signal.expected_move_pct.toFixed(1)}%` : '—' },
-                    { label: 'P/C Ratio', value: signal.put_call_ratio != null ? signal.put_call_ratio.toFixed(2) : '—' },
-                  ].map(({ label, value }) => (
-                    <div key={label} className="flex justify-between">
-                      <span className="font-mono text-[10px] text-text-tertiary uppercase">{label}</span>
-                      <span className="font-mono text-xs text-text-primary">{value}</span>
+                {/* Heat score — lead metric */}
+                {signal.heat_score != null && (
+                  <div className="flex items-center justify-between pb-2 border-b border-border-subtle">
+                    <span className="font-mono text-[10px] text-text-tertiary uppercase">Heat</span>
+                    <div className="flex items-center gap-2">
+                      <span className={clsx(
+                        'font-mono text-sm font-semibold',
+                        signal.heat_score > 60 ? 'text-accent-green'
+                          : signal.heat_score >= 40 ? 'text-text-secondary'
+                          : 'text-accent-red'
+                      )}>
+                        {signal.heat_score.toFixed(0)}
+                      </span>
+                      <span className="font-mono text-[10px] text-text-tertiary">/ 100</span>
                     </div>
-                  ))}
+                  </div>
+                )}
+                <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                  {/* IV Rank with Low/Normal/High label */}
+                  {signal.iv_rank != null && (
+                    <div className="flex justify-between">
+                      <span className="font-mono text-[10px] text-text-tertiary uppercase">IV Rank</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono text-xs text-text-primary">{signal.iv_rank.toFixed(0)}%</span>
+                        <span className={clsx(
+                          'font-mono text-[9px]',
+                          signal.iv_rank > 75 ? 'text-accent-amber'
+                            : signal.iv_rank >= 25 ? 'text-text-tertiary'
+                            : 'text-accent-green'
+                        )}>
+                          {signal.iv_rank > 75 ? 'High' : signal.iv_rank >= 25 ? 'Normal' : 'Low'}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                  {signal.expected_move_pct != null && (
+                    <div className="flex justify-between">
+                      <span className="font-mono text-[10px] text-text-tertiary uppercase">Exp Move</span>
+                      <span className="font-mono text-xs text-text-primary">±{signal.expected_move_pct.toFixed(1)}%</span>
+                    </div>
+                  )}
+                  {signal.put_call_ratio != null && (
+                    <div className="flex justify-between">
+                      <span className="font-mono text-[10px] text-text-tertiary uppercase">P/C Ratio</span>
+                      <span className="font-mono text-xs text-text-primary">{signal.put_call_ratio.toFixed(2)}</span>
+                    </div>
+                  )}
                 </div>
+                {/* Max pain */}
+                {signal.max_pain_strike != null && (
+                  <div className="pt-2 border-t border-border-subtle space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="font-mono text-[10px] text-text-tertiary uppercase">Max Pain</span>
+                      <div className="flex items-center gap-1.5 font-mono text-xs">
+                        <span className="text-text-primary font-semibold">${signal.max_pain_strike.toFixed(2)}</span>
+                        {signal.max_pain_distance_pct != null && (
+                          <span className={clsx(
+                            signal.max_pain_distance_pct > 0 ? 'text-accent-green' : 'text-accent-red'
+                          )}>
+                            ({signal.max_pain_distance_pct > 0 ? '+' : ''}{signal.max_pain_distance_pct.toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {signal.max_pain_expiry != null && (
+                      <div className="flex justify-between font-mono text-[9px] text-text-tertiary">
+                        <span>OpEx {signal.max_pain_expiry}</span>
+                        {signal.max_pain_days_to_expiry != null && (
+                          <span>{signal.max_pain_days_to_expiry}d</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="font-mono text-[9px] text-text-tertiary">
                   iv_source: {signal.iv_source ?? 'unknown'}
+                  {signal.iv_history_days != null && signal.iv_history_days > 0 && (
+                    <span className="ml-2">· {signal.iv_history_days} snapshots</span>
+                  )}
                 </div>
               </div>
             )}
@@ -2083,6 +2316,40 @@ export function TickerPage() {
               earningsData={earningsData}
               impliedMove={signal.expected_move_pct}
             />
+
+            {/* Analyst consensus */}
+            {signal.target_mean != null && (
+              <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-2">
+                <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                  Analyst View
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-[10px] text-text-tertiary uppercase">Street Target</span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-sm font-semibold text-text-primary">
+                      ${signal.target_mean.toFixed(2)}
+                    </span>
+                    {signal.current_price != null && (
+                      <span className={clsx(
+                        'font-mono text-xs',
+                        signal.target_mean > signal.current_price ? 'text-accent-green' : 'text-accent-red'
+                      )}>
+                        ({signal.target_mean > signal.current_price ? '+' : ''}
+                        {(((signal.target_mean - signal.current_price) / signal.current_price) * 100).toFixed(1)}%)
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {signal.analyst_count != null && (
+                  <div className="font-mono text-[9px] text-text-tertiary">
+                    {signal.analyst_count} analyst{signal.analyst_count !== 1 ? 's' : ''}
+                    {signal.analyst_rating != null && (
+                      <span className="ml-2">· rating {signal.analyst_rating.toFixed(1)}/5</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* SEC Filings */}
             <SecFilingsCard filings={secFilings} />

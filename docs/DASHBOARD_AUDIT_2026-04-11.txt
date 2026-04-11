@@ -1,0 +1,574 @@
+DASHBOARD RELEVANCE AUDIT — SIGNAL ENGINE v1
+Generated: 2026-04-11
+Author: Claude Code (claude-sonnet-4-6)
+Scope: All frontend pages and components read from source
+Framework: Every field evaluated against 4 swing-trader variables
+
+════════════════════════════════════════════════════════════════
+THE DECISION FRAMEWORK
+════════════════════════════════════════════════════════════════
+
+A swing trader needs exactly 4 things to make an entry/exit decision:
+
+  [1] ENTRY   — Where do I buy? (entry zone, support, ATR, max pain)
+  [2] TARGET  — Where do I sell? (T1, T2, R:R ratio, stop loss)
+  [3] PROB    — How likely does this work? (prob_combined, IV rank, beat rate)
+  [4] TIME    — How long do I hold? (days to earnings, OpEx, hold estimate)
+
+Every field on the dashboard should serve one of these 4 variables.
+A field that serves none of them is noise.
+
+════════════════════════════════════════════════════════════════
+FILE MAP — WHERE THINGS LIVE
+════════════════════════════════════════════════════════════════
+
+Frontend pages:
+  dashboard/frontend/src/pages/TickerPage.tsx         — deep dive (primary trading page)
+  dashboard/frontend/src/pages/HomePage.tsx           — morning brief + signal cards
+  dashboard/frontend/src/pages/RankingsPage.tsx       — daily Top-20 wrapper
+  dashboard/frontend/src/pages/ScreenersPage.tsx      — Squeeze/Options/Fundamentals tabs
+  dashboard/frontend/src/pages/DeepDivePage.tsx       — all tickers with theses table
+  dashboard/frontend/src/pages/PortfolioPage.tsx      — open positions + P&L
+  dashboard/frontend/src/pages/ResolutionPage.tsx     — conflict log + Claude accuracy
+
+Key components:
+  dashboard/frontend/src/components/Top20RankingTable.tsx   — main ranking table
+  dashboard/frontend/src/components/AiSelectionTable.tsx    — AI top-5 selection
+  dashboard/frontend/src/components/CandidateSnapshotsTable.tsx — full candidate pool
+  dashboard/frontend/src/components/RiskRewardBar.tsx       — payoff diagram + EV
+  dashboard/frontend/src/components/charts/PriceLadder.tsx  — price levels visual
+  dashboard/frontend/src/components/charts/PriceChart.tsx   — candlestick chart
+
+API types:
+  dashboard/frontend/src/lib/api.ts                   — TickerDetail interface + all types
+
+Backend:
+  dashboard/api/main.py                               — FastAPI endpoints
+  utils/prob_engine.py                                — prob_combined computation
+  utils/ticker_selector.py                            — priority scoring + candidate pool
+  utils/trade_selector_4w.py                          — Top-20 ranking pipeline
+
+════════════════════════════════════════════════════════════════
+CRITICAL GAP: prob_combined IS INVISIBLE IN THE UI
+════════════════════════════════════════════════════════════════
+
+prob_combined is the most important probability metric. It is:
+  - Computed in:    utils/prob_engine.py → compute_prob_combined()
+  - Stored in:      ai_quant_cache.db → thesis_cache columns
+  - Returned by:    GET /api/signals/ticker/{symbol}
+  - In TypeScript:  TickerDetail.prob_combined (dashboard/frontend/src/lib/api.ts)
+  - In copy-paste:  buildPrompt() in TickerPage.tsx (lines ~821-829)
+  - Drives ranking: compute_priority_score() in ticker_selector.py
+  - Sort key:       trade_selector_4w.py sort: ev_t1_pct → prob_combined → priority_score
+
+BUT: prob_combined is NOT rendered anywhere in the TickerPage UI.
+The trader sees "78% agree" (signal_agreement_score) as the only probability number.
+
+Formula (PATH B fixed weights, clipped to [0.30, 0.90]):
+  prob_combined = tech(0.30) + options(0.25) + fund(0.15) + catalyst(0.15) + news(0.10) + agree(0.05)
+
+Components (also in API, also not shown in UI):
+  prob_technical  — from rsi_14 normalised to [0,1]
+  prob_options    — from heat_score / 100 with iv_rank inversion
+  prob_catalyst   — from earnings beat rate (last 4 quarters)
+  prob_news       — from Marketaux 7-day sentiment
+
+data_quality badge: SHOWN in AI Thesis card header (HIGH/MEDIUM/LOW)
+prob_combined number: NOT SHOWN — critical gap
+
+════════════════════════════════════════════════════════════════
+COMPLETE FIELD VERDICTS — TICKERPAGE (PRIMARY TRADING PAGE)
+════════════════════════════════════════════════════════════════
+
+FORMAT: Field | Location | Verdict | Reason
+
+── PRICE & TECHNICALS ──
+
+Current price           | Header (large)           | KEEP (ENTRY)   | Where you are vs buy zone
+Price change 1d $       | Header                   | KEEP           | Daily momentum context
+Price change 1d %       | Header (next to $)       | MOVE           | Redundant with $; tooltip only
+RSI value               | ActionZones card header  | KEEP (ENTRY)   | OB/OS entry timing
+RSI label (OB/OS)       | Not shown                | MOVE           | Add as color tooltip on RSI number
+ATR value               | ActionZones card header  | KEEP (ENTRY)   | Defines buy zone width
+ATR %                   | ActionZones card header  | KEEP (ENTRY)   | Normalised for sizing
+EMA 21                  | Copy-paste only          | MOVE           | Render as tooltip on ActionZones bar
+EMA 50                  | Copy-paste only          | MOVE           | Same
+52-week high            | Not shown                | GAP-LOW        | T2 resistance ceiling context
+52-week low             | Not shown                | REMOVE         | Not needed for swing entry
+200-DMA                 | Not shown                | REMOVE         | Long-term only; regime covers this
+Beta                    | Not shown                | REMOVE         | ATR is better for swing sizing
+Relative strength       | Not shown                | REMOVE         | Screener decision, not entry
+Volume (raw)            | Not shown                | REMOVE         | Vol surge ratio is sufficient
+Volume surge            | Squeeze card (gated >30) | MOVE           | Always show; not just for squeeze setups
+Candlestick chart       | Left column              | KEEP           | Visual entry confirmation
+
+── OPTIONS & VOLATILITY ──
+
+IV Rank (0-100)         | Options Flow card        | KEEP (PROB)    | Low IV = cheap premium entry
+IV Rank label           | Not shown                | MOVE           | Add Low/Normal/High colour label
+IV snapshot count       | Not shown                | GAP-LOW        | Data confidence ("14 snapshots")
+Put/call ratio          | Options Flow card        | KEEP (PROB)    | Hedging/sentiment indicator
+Heat score              | Not shown (copy-paste)   | GAP-MEDIUM     | Should lead the Options Flow card
+Expected move ±%        | Options Flow card        | KEEP (TARGET)  | Implied price range
+Max pain strike         | Not shown anywhere       | GAP-HIGH       | Strongest options-magnet entry anchor
+Max pain distance %     | Not shown                | GAP-HIGH       | How far price must move to reach it
+Days to OpEx            | Screener only            | GAP-MEDIUM     | When max pain magnetism is strongest
+Vol spike (options)     | Screener only            | MOVE           | Unusual options volume = PROB signal
+
+── SHORT INTEREST & SQUEEZE ──
+
+Float short %           | Squeeze card (gated)     | KEEP (PROB)    | Squeeze probability driver
+Days to cover           | Squeeze card (gated)     | KEEP (TIME)    | Forced-covering time estimate
+Squeeze score value     | HIDDEN — gates section   | MOVE           | Show value in section header; not just gate
+Borrow rate             | Screener only            | MOVE           | Belongs in squeeze section on TickerPage
+Recent squeeze flag     | Squeeze card (if fired)  | KEEP (PROB)    | Reduces probability; important warning
+FTD shares              | Squeeze card (if >0)     | MOVE           | SECONDARY; tooltip on float short %
+
+── PROBABILITY ──
+
+prob_combined           | Copy-paste ONLY          | GAP-CRITICAL   | SEE ABOVE; not rendered in UI
+prob_technical          | Copy-paste only          | GAP-HIGH       | Component breakdown
+prob_options            | Copy-paste only          | GAP-HIGH       | Component breakdown
+prob_catalyst           | Copy-paste only          | GAP-HIGH       | Component breakdown
+prob_news               | Copy-paste only          | GAP-MEDIUM     | Lower fidelity component
+signal_agreement_score  | AI Thesis header "X% agree" | KEEP (PROB) | Breadth; secondary to prob_combined
+data_quality badge      | AI Thesis header         | KEEP (PROB)    | Confidence in probability estimates
+bull_probability (LLM)  | ProbBar + RiskRewardBar  | KEEP (PROB)    | Feeds EV calculation
+bear_probability (LLM)  | ProbBar + RiskRewardBar  | KEEP (PROB)    | Same
+neutral_probability     | ProbBar + RiskRewardBar  | KEEP (PROB)    | Same
+Conviction dots         | Header + AI Thesis card  | KEEP (PROB)    | LLM confidence summary
+
+── AI THESIS ──
+
+Action signal (derived) | AI Thesis card (top)     | KEEP (ENTRY)   | Most actionable single line on page
+Entry zone low/high     | TradeSetupStrip          | KEEP (ENTRY)   | Core trade setup
+T1 target               | TradeSetupStrip          | KEEP (TARGET)  | Core trade setup
+T2 target               | TradeSetupStrip          | KEEP (TARGET)  | Core trade setup
+Stop loss               | TradeSetupStrip          | KEEP (TARGET)  | Core trade setup
+R:R ratio               | RiskRewardBar labels     | KEEP (TARGET)  | Trade quality metric
+EV in R-multiples       | RiskRewardBar            | KEEP (PROB)    | Expected value calculation
+Time horizon label      | AI Thesis card badge     | KEEP (TIME)    | Hold period definition
+Key invalidation        | AI Thesis card (⚡ INVAL) | KEEP (PROB)    | Exit condition before stop
+Primary scenario        | AI Thesis card           | KEEP (PROB)    | Conviction context
+Bear scenario           | AI Thesis card           | KEEP (PROB)    | Risk context
+Full thesis text        | Accordion (collapsed)    | KEEP           | Rich conviction text
+Copy-paste button       | Separate card            | KEEP+MOVE      | Keep but move into AI Thesis card
+Model badge + cost      | AI Thesis card header    | MOVE           | Tooltip on date; operational metadata
+Catalysts list          | Collapsible accordion    | KEEP           | Drives prob_catalyst
+Risks list              | Collapsible accordion    | KEEP           | Invalidation context
+
+── EXPECTED MOVES TABLE ──
+
+Bear/Base/Bull % + prices    | Left column below copy  | KEEP (TARGET)  | All scenarios with prob distribution
+Prob distribution bar        | ExpectedMovesTable      | KEEP (PROB)    | Visual scenario weighting
+
+── POSITION SIZING ──
+
+Portfolio risk % (slider)    | PositionSizer           | KEEP           | User-adjustable sizing input
+Dollar risk                  | PositionSizer           | KEEP           | Maximum loss exposure
+Shares                       | PositionSizer           | KEEP           | Actionable trade size
+Notional $                   | PositionSizer           | KEEP           | Concentration check
+% of NAV                     | PositionSizer           | KEEP           | Concentration risk
+Regime multiplier            | NOT IN PositionSizer    | GAP-MEDIUM     | 1% risk in RISK_OFF should auto-scale
+
+── ACTION ZONES (right column, live ATR-based) ──
+
+Stop (EUR + %)               | ActionZones card        | KEEP (TARGET)  | Live stop level
+Buy zone (low/high/mid)      | ActionZones card        | KEEP (ENTRY)   | Live entry zone
+T1 price + R:R               | ActionZones card        | KEEP (TARGET)  | Live T1 target
+T2 price + R:R               | ActionZones card        | KEEP (TARGET)  | Live T2 target
+Current vs entry             | ActionZones card        | KEEP (ENTRY)   | Position in range
+Suggested size EUR           | ActionZones card        | KEEP           | 2% NAV sizing reference
+Timing text                  | ActionZones card        | KEEP (TIME)    | Action recommendation text
+Refresh countdown            | ActionZones card        | KEEP           | Data freshness indicator
+Conflict flags (thesis vs live)  | Right column top    | KEEP (ENTRY)   | Critical alert system
+
+── CATALYST & TIMING ──
+
+Next earnings date           | EarningsCard amber banner | KEEP (TIME)  | Hard catalyst anchor
+Days to earnings             | NOT SHOWN (date only)   | GAP-HIGH       | "12 days" more useful than "2026-04-23"
+EPS beat/miss chart          | EarningsCard            | KEEP (PROB)    | Beat rate = prob_catalyst input
+Revenue beat/miss chart      | EarningsCard            | KEEP (PROB)    | Revenue quality signal
+EPS surprise %               | EarningsCard tooltip    | KEEP (PROB)    | Magnitude of beat/miss
+Next EPS estimate            | EarningsCard banner     | KEEP (TARGET)  | Expectation level = implicit target
+Next revenue estimate        | EarningsCard banner     | KEEP (TARGET)  | Same
+Historical avg earnings move | EarningsReactionModel   | KEEP (TARGET)  | Sets sizing range for earnings play
+Implied vs historical move   | EarningsReactionModel   | KEEP (PROB)    | Over/underpriced options
+Analyst price target         | SCREENER ONLY           | GAP-MEDIUM     | Street T2 context level missing
+Polymarket probability       | Module heatmap (tiny)   | MOVE           | Too small; collapse into PROB section
+Dark pool score + gauge      | Right column            | KEEP (PROB)    | Accumulation/distribution signal
+Dark pool history (6 rows)   | Right column            | KEEP           | Trend context
+SEC Filings                  | Right column bottom     | KEEP           | Catalyst identification tool
+
+── MACRO & REGIME ──
+
+Regime badge (RISK_ON/OFF)   | Header + HomePage       | KEEP (PROB)    | Global sizing decision
+Regime size multiplier       | HomePage ONLY           | GAP-MEDIUM     | Missing from TickerPage PositionSizer
+VIX level                    | NOT SHOWN               | MOVE           | Tooltip on regime badge ("VIX 18.4")
+Regime components detail     | PortfolioPage only      | SECONDARY      | Collapsed section is fine
+
+── MODULE MINI-HEATMAP ──
+
+7 module tiles (SigEng/Sqz/Opts/DkPl/Fund/Poly/XAss)
+  | Left column (always visible) | MOVE    | SECONDARY — collapse by default
+Weight sliders                  | Edit mode | MOVE    | Advanced feature; hidden unless editing
+
+════════════════════════════════════════════════════════════════
+COMPLETE FIELD VERDICTS — OTHER PAGES
+════════════════════════════════════════════════════════════════
+
+── TOP-20 RANKINGS TABLE ──
+
+Rank #                  | Table                    | KEEP
+Ticker + OPEN badge     | Table                    | KEEP
+Direction badge         | Table                    | KEEP (PROB)
+P(T1) column           | Table — shows prob_t1    | MOVE    ← shows ATR-based prob_t1 but sort is now prob_combined; column should show prob_combined
+EV T1%                  | Table (primary metric)   | KEEP (TARGET+PROB)
+P(T2)                   | Table (hidden MD)        | KEEP
+T1 price               | Table (hidden MD)        | KEEP (TARGET)
+T2 price               | Table (hidden MD)        | KEEP (TARGET)
+Stop price             | Table (hidden LG)        | KEEP (TARGET)
+Hold days              | Table (hidden LG)        | KEEP (TIME)
+Sector                 | Table (hidden LG)        | MOVE — side panel only
+Rank change pill       | Table                    | KEEP
+Priority score         | Side panel               | MOVE — internal score; not primary
+Agreement %            | Side panel               | KEEP
+Weight %               | Side panel               | KEEP
+Hist Vol 60d           | Side panel               | KEEP (sizing)
+ADV 20d                | Side panel               | KEEP (liquidity)
+Rank history chart     | Side panel               | KEEP
+
+── HOME PAGE ──
+
+Regime banner (label + size multiplier + text) | KEEP (PROB)
+Pipeline last run                              | KEEP (data freshness)
+Pipeline mode (skip-ai flag)                   | KEEP (thesis freshness)
+Pipeline runtime                               | REMOVE (operational noise)
+Pipeline cost                                  | REMOVE (operational noise)
+Cache warm keys                                | REMOVE (system metadata)
+Workflow runs panel (collapsible)              | KEEP (correctly hidden by default)
+AI Quant selection table (top 5)               | KEEP
+Signal cards (top 7 by agreement)             | KEEP
+  signal_agreement_score ("X% agree")         | KEEP (PROB)
+  Estimated size EUR                           | REMOVE (misleading heuristic)
+  Sector on signal card                        | REMOVE (available on ticker page)
+Portfolio mini (NAV, weekly, open P&L)         | KEEP
+Position sparklines                            | KEEP
+Overweight count badge                         | KEEP (risk alert)
+CandidateSnapshotsTable                        | KEEP (operational)
+
+── SCREENERS PAGE ──
+
+Equity Rankings tab:
+  Composite Z, Mom 12-1, Mom 6-1, Mean Rev 5d, Vol Qual, Risk Mom | KEEP — valid screener
+  Weight%, Position EUR                                             | KEEP — sizing reference
+
+Squeeze tab:
+  Score, Float Short%, DTC, Vol Surge, Borrow Cost, EV Score | KEEP — all directly relevant
+
+Catalysts tab:
+  Total score, Squeeze, Vol Breakout, Dark Pool, Override    | KEEP — compact and relevant
+
+Options tab:
+  Heat, IV Rank, IV Source, Vol Spike, Exp Move, P/C, DTE   | KEEP — all useful
+  IV Source ("true" vs "estimated")                          | KEEP — excellent data confidence flag
+
+Fundamentals tab:
+  Composite score, sub-scores, PE fwd/trailing, Rev growth,
+  EPS growth, Op margin, ROE, Analyst rating, Target         | KEEP (screener context)
+  EV/EBITDA, FCF, Net debt/EBITDA, Dividend yield            | REMOVE if added — not swing decision
+
+════════════════════════════════════════════════════════════════
+MISSING FIELDS — PRIORITY RANKED
+════════════════════════════════════════════════════════════════
+
+CRITICAL (blocks trading decision quality):
+
+1. prob_combined NOT SHOWN IN UI
+   Variable: PROBABILITY
+   Data: In API response (TickerDetail.prob_combined), in thesis_cache Supabase table
+   File to change: TickerPage.tsx — add prob_combined display in AI Thesis card
+   Effort: Low (data is already there; frontend-only change, ~20 lines)
+
+HIGH (significant improvement to decision quality):
+
+2. prob_technical / prob_options / prob_catalyst / prob_news NOT SHOWN
+   Variable: PROBABILITY
+   Data: In API response
+   Location: Add as sub-row under prob_combined in AI Thesis card
+   Effort: Low
+
+3. Days to earnings (countdown)
+   Variable: TIME
+   Data: next_earnings date exists in EarningsData; compute delta from today
+   Currently: Date "2026-04-23" shown; not "12 days"
+   Location: EarningsCard amber banner, next to the date
+   Effort: Trivial (1 line of JS date math)
+
+4. max_pain_strike + max_pain distance %
+   Variable: ENTRY + TARGET
+   Data: Computed in options_flow.py; stored in Supabase; NOT in TickerDetail API shape
+   Currently: Not surfaced to frontend at all
+   Location: Timing Card (new) or ActionZones card
+   Effort: Medium (backend: add to TickerDetail response; frontend: render)
+
+5. prob_combined in Top20 P(T1) column
+   Variable: PROBABILITY
+   Data: In daily_rankings Supabase table (prob_combined flows through candidates)
+   Currently: Column shows prob_t1 (ATR-based); sort key is prob_combined — inconsistent
+   Location: Top20RankingTable.tsx — rename column + swap data key
+   Effort: Low
+
+MEDIUM (useful, worth doing):
+
+6. Regime multiplier in PositionSizer
+   Variable: PROBABILITY (risk sizing)
+   Data: /api/regime/current → size_multiplier field
+   Currently: Shown on HomePage only; PositionSizer ignores it
+   Location: PositionSizer component; apply multiplier to default risk %
+   Effort: Low-Medium
+
+7. Heat score on TickerPage Options Flow card
+   Variable: PROBABILITY
+   Data: TickerDetail.heat_score (in API, in copy-paste, not rendered)
+   Currently: Only in screener and copy-paste
+   Location: Lead field in Options Flow card on TickerPage
+   Effort: Trivial (field exists; just add to render)
+
+8. Analyst price target on TickerPage
+   Variable: TARGET
+   Data: FundamentalRow.target_mean in screener; not in TickerDetail
+   Currently: Screener only
+   Location: Collapsed "Analyst View" card below EarningsCard
+   Effort: Medium (backend: add to TickerDetail; frontend: render)
+
+9. Days to OpEx
+   Variable: TIME
+   Data: OptionsScreenerRow.dte (screener only)
+   Location: Options Flow card on TickerPage (or Timing card)
+   Effort: Medium (backend: add to TickerDetail)
+
+10. ADV 20d on TickerPage
+    Variable: ENTRY (liquidity)
+    Data: In Top20 side panel; not in TickerDetail
+    Location: Action Zones card or Position Sizer
+    Effort: Medium (backend: add to TickerDetail)
+
+LOW (polish):
+
+11. Squeeze score value in section header
+    Data: TickerDetail.squeeze_score — exists; just not displayed
+    Effort: Trivial
+
+12. IV rank snapshot count
+    Data: Not currently passed to API; needs count from iv_history table
+    Effort: Low-Medium
+
+13. IV rank label (Low/Normal/High)
+    Data: Derivable from value (0-33/33-66/66-100)
+    Effort: Trivial
+
+14. VIX on regime badge tooltip
+    Data: RegimeCurrent.vix — in API, not rendered
+    Effort: Trivial
+
+════════════════════════════════════════════════════════════════
+FIELDS TO REMOVE
+════════════════════════════════════════════════════════════════
+
+These do not change a trading decision. Remove or collapse:
+
+  Price change 1d %          — redundant with $ change (TickerPage header)
+  Pipeline runtime           — operational noise (HomePage PipelineStatusCard)
+  Pipeline cost              — operational noise (HomePage PipelineStatusCard)
+  Cache warm keys            — system metadata (HomePage PipelineStatusCard)
+  Estimated size EUR (cards) — misleading heuristic (HomePage signal cards)
+  Sector on signal cards     — noise (HomePage signal cards; available on ticker page)
+  EV/EBITDA, FCF, Net debt, Dividend yield — not swing variables (if ever added)
+  200-DMA                    — long-term; regime badge covers this
+  Beta                       — ATR is better for swing sizing
+  Relative strength          — screener decision, not entry timing
+  Volume (raw)               — vol surge ratio is what matters
+
+════════════════════════════════════════════════════════════════
+FIELDS TO MOVE TO SECONDARY / COLLAPSED
+════════════════════════════════════════════════════════════════
+
+  Module mini-heatmap (7 tiles + weight sliders)
+    → Collapse by default. Label: "Signal Details". Open on click.
+    → Currently: always visible in primary left column (clutters primary view)
+
+  Model badge + cost
+    → Move to tooltip on thesis date
+    → Currently: In AI Thesis card header competing with direction/conviction
+
+  Full copy-paste button
+    → Move into AI Thesis card (adjacent to thesis text)
+    → Currently: Separate card below the module heatmap
+
+  Polymarket probability
+    → Collapse into PROB section with prob_combined components
+    → Currently: Too small in module heatmap tile
+
+════════════════════════════════════════════════════════════════
+IDEAL TICKERPAGE INFORMATION HIERARCHY
+════════════════════════════════════════════════════════════════
+
+HERO ROW (above fold, always visible):
+  Symbol | Company | $148.32 ↑+$1.40 | BULL ●●●●○ | RISK_ON
+  ➡  IN BUY ZONE — valid entry, confirm catalyst
+
+TRADE SETUP CARD (primary):
+  Entry: $142.50–$146.00
+  T1: +8.2% ($158.40)  R:R 2.0:1
+  T2: +14.5% ($168.00) R:R 3.5:1
+  Stop: −4.1% ($139.20)
+  [Visual R:R bar with EV: +1.4R]
+  Position Sizer: 1.0% × 0.5 RISK_OFF = 0.5% → 68 shares | $10,200 | 6.8% NAV
+
+PROBABILITY CARD (primary — THE MISSING PIECE):
+  prob_combined: 0.71  ████████░░  HIGH (6/7 inputs)
+  Tech 0.66 · Opts 0.79 · Cat 0.62 · News 0.55
+  Signal agreement: 78%
+  Bull 62% / Neutral 22% / Bear 16%  [bar]
+
+TIMING CARD (primary):
+  Time horizon: 2–4 weeks    Hold: ~18 days
+  Next earnings: Apr 23  (12 days)  ⚠ WITHIN HOLD WINDOW
+  Max pain: $147.00 (−0.9%)   OpEx: Apr 17 (6 days)
+
+AI THESIS (primary, partially collapsed):
+  ▲ BULL: [primary scenario]
+  ▼ BEAR: [bear scenario]
+  ⚡ INVAL: [key invalidation]
+  [Full thesis — accordion]
+  [⎘ Copy Prompt]         ← move button here, adjacent to thesis
+
+PRICE LEVELS + CHART (primary, visual):
+  PriceLadder with AI + live action zones overlaid
+  Candlestick chart with level overlays
+
+ACTION ZONES (right column — live, ATR-based):
+  Stop | Buy Zone | T1 R:R | T2 R:R | Current | Size | ATR | RSI | Timing
+
+SIGNAL DETAIL (secondary, collapsed by default):
+  Module heatmap | Squeeze detail | Options flow | Dark pool
+  IV Rank + snapshot count | Heat score | Vol spike
+
+EARNINGS (secondary, visible but lower):
+  Next date + day countdown | EPS/Revenue charts | EarningsReactionModel
+
+ANALYST VIEW (tertiary, collapsed):
+  Rating | Count | Street target | Forward PE
+
+SEC FILINGS (tertiary):
+  Recent form links
+
+════════════════════════════════════════════════════════════════
+SINGLE HIGHEST-IMPACT CHANGE
+════════════════════════════════════════════════════════════════
+
+Add prob_combined as a visible number in the AI Thesis card.
+
+Currently:   Trader sees "78% agree" as the only probability number
+After:       Trader sees:
+               prob  0.71  ████████░░  HIGH
+               Tech 0.66 · Opts 0.79 · Cat 0.62 · News 0.55
+               Agreement: 78%
+
+Why it matters:
+  prob_combined is the calibrated answer to "how likely does this trade work?"
+  It is already computed, already in the API, already in the TypeScript type,
+  already in the copy-paste prompt — it just is not rendered on screen.
+  The change is ~20 lines of TSX in TickerPage.tsx, no backend work required.
+
+  A trader seeing prob_combined = 0.71 with prob_options = 0.79 knows options
+  flow is the conviction driver. One seeing prob_combined = 0.64 with
+  prob_catalyst = 0.40 knows earnings risk is the weak link. None of this is
+  visible today.
+
+════════════════════════════════════════════════════════════════
+IMPLEMENTATION PRIORITY ORDER
+════════════════════════════════════════════════════════════════
+
+WEEK 1 — High-value, frontend-only, low effort:
+
+  1. Show prob_combined + 4 components in AI Thesis card (TickerPage.tsx)
+     Fields: signal.prob_combined, .prob_technical, .prob_options, .prob_catalyst, .prob_news
+     Already in: TickerDetail interface (api.ts), useSignalsTicker hook, API response
+
+  2. Replace P(T1) column with prob_combined in Top20 table (Top20RankingTable.tsx)
+     Field: row.prob_combined (need to verify it flows through to ranking API)
+     Note: Sort key already changed to prob_combined in trade_selector_4w.py
+
+  3. Add days-to-earnings countdown next to date in EarningsCard (TickerPage.tsx)
+     Logic: const daysToEarnings = Math.ceil((new Date(next_earnings) - new Date()) / 86400000)
+
+  4. Show heat score as lead field in Options Flow card (TickerPage.tsx)
+     Field: signal.heat_score — already in TickerDetail, just not rendered
+
+  5. Show squeeze_score value in section header (TickerPage.tsx)
+     Field: signal.squeeze_score — already used to gate section, not displayed
+
+  6. Move copy-paste button into AI Thesis card (layout change)
+
+  7. Collapse module heatmap into secondary accordion (layout change)
+
+WEEK 2 — Medium effort, requires backend + frontend:
+
+  8. Add max_pain_strike + distance_pct to TickerDetail API response
+     Source: options_flow.py already computes this
+     Steps: Add to /api/signals/ticker/{symbol} endpoint, add to TickerDetail type, render
+
+  9. Add regime multiplier to PositionSizer
+     Source: /api/regime/current (already fetched elsewhere)
+     Steps: Pass regime data to PositionSizer, scale default risk%
+
+  10. Add analyst price target to TickerPage
+      Source: fundamentals screener data (target_mean in FundamentalRow)
+      Steps: Add to TickerDetail or separate /api/ticker/{sym}/fundamentals endpoint
+
+LATER — Low effort polish:
+
+  11. VIX on regime badge tooltip (RegimeCurrent.vix exists in API)
+  12. IV rank label (Low/Normal/High from value)
+  13. IV snapshot count (needs count from iv_history)
+  14. ADV 20d on TickerPage (needs adding to TickerDetail)
+
+════════════════════════════════════════════════════════════════
+KEY ARCHITECTURAL NOTES
+════════════════════════════════════════════════════════════════
+
+DATA FLOW for prob_combined:
+  utils/prob_engine.py → compute_prob_combined(signals)
+  → ai_quant.py → save_thesis() → thesis_cache table (Supabase)
+  → dashboard/api/main.py → signals_ticker endpoint → TickerDetail
+  → useSignalsTicker hook → TickerPage.tsx → buildPrompt() [copy-paste only]
+  MISSING: TickerPage.tsx render — the data arrives but is not displayed
+
+DATA FLOW for max_pain:
+  options_flow.py → computes max_pain_strike, distance_pct
+  → stored in Supabase (options signals table)
+  → NOT ADDED to TickerDetail API shape
+  → NOT in frontend at all
+  ACTION: Add to /api/signals/ticker/{symbol} in main.py
+
+RANKING PIPELINE:
+  conflict_resolver.py → data/resolved_signals.json
+  → ai_quant.py → _generate_resolved_signals_file() → injects prob_combined
+  → ticker_selector.py → select_top_tickers() → compute_priority_score()
+    uses: prob_combined × 40 (falls back to signal_agreement_score × 40 if None)
+  → trade_selector_4w.py → run_daily_top20_pipeline()
+    sort: ev_t1_pct DESC → prob_combined DESC → priority_score DESC
+  → Supabase daily_rankings table → /api/rankings/latest → Top20RankingTable.tsx
+
+PROB_COMBINED CALIBRATION STATUS (as of 2026-04-11):
+  - PATH B (fixed weights) in use — need ≥30 closed theses for PATH A logistic regression
+  - Currently ~4 closed theses (all HIT_STOP)
+  - Calibration check runs post-pipeline in run_master.sh via:
+    python3 -c "from utils.prob_engine import compute_empirical_win_rate; compute_empirical_win_rate()"
+  - When 30+ closed theses exist: upgrade to PATH A via logistic regression in prob_engine.py
+  - Tests: tests/test_prob_engine.py (26 tests, all passing)
+
+END OF AUDIT
+════════════════════════════════════════════════════════════════
