@@ -18,6 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Record start time
+        run: echo "PIPELINE_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -45,6 +48,19 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          python3 scripts/notify_pipeline_result.py \
+            --status "${{ job.status }}" \
+            --workflow "Manual Signal Pipeline (AI)" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "$(echo "scale=1; ($(date +%s) - ${PIPELINE_START:-$(date +%s)}) / 60" | bc)"
+        env:
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Upload logs
         if: always()
