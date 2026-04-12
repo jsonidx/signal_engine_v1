@@ -255,6 +255,8 @@ def _migrate_prob_columns(cur, conn) -> None:
             "prob_options":   "FLOAT",
             "prob_catalyst":  "FLOAT",
             "prob_news":      "FLOAT",
+            "model_used":     "TEXT",
+            "cost_usd":       "FLOAT",
         }
         for col, col_type in new_cols.items():
             if col not in existing:

@@ -38,8 +38,11 @@ import secrets
 from datetime import datetime
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
