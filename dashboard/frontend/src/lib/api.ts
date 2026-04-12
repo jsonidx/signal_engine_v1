@@ -734,6 +734,7 @@ export interface Top20RankingRow {
   run_date:        string
   rank:            number
   ticker:          string
+  current_price:   number | null
   priority_score:  number | null
   final_score:     number | null
   weight:          number | null
@@ -759,11 +760,12 @@ export interface Top20RankingRow {
 }
 
 export interface RankingsLatestResponse {
-  data_available: boolean
-  count:          number
-  as_of:          string | null
-  generated_at:   string
-  data:           Top20RankingRow[]
+  data_available:  boolean
+  count:           number
+  as_of:           string | null
+  pipeline_run_at: string | null
+  generated_at:    string
+  data:            Top20RankingRow[]
 }
 
 export interface RankingsHistoryResponse {
@@ -983,6 +985,9 @@ export const api = {
     client.get('/api/workflows/runs', { params: { per_page: 15 } }).then(r => r.data).catch(() => ({ runs: [] })),
 
   workflowReportUrl: () => '/api/workflows/report',
+
+  workflowReportText: (): Promise<{ content: string; filename?: string; label?: string; run_id?: number; source: string }> =>
+    client.get('/api/workflows/report/text').then(r => r.data),
 
   // Dark pool
   darkpoolLatest: (): Promise<DarkPoolCard[]> =>

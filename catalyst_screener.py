@@ -60,6 +60,12 @@ except ImportError:
     _UNIVERSE_TTL = 24
 
 try:
+    from utils.db import get_connection as _get_db_connection
+    _DB_AVAILABLE = True
+except ImportError:
+    _DB_AVAILABLE = False
+
+try:
     import universe_builder as _ub
     _UNIVERSE_BUILDER_AVAILABLE = True
 except ImportError:
@@ -1294,11 +1300,39 @@ def update_watchlist(
 # SECTION 6: MAIN
 # ==============================================================================
 
+def _fetch_top_rankings_tickers(n: int = 20) -> list[str]:
+    """Return the top-N tickers from the most recent daily_rankings run."""
+    if not _DB_AVAILABLE:
+        print("  [ERROR] utils/db not available — cannot read daily_rankings.")
+        return []
+    try:
+        conn = _get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticker
+            FROM   daily_rankings
+            WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
+              AND  rank <= %s
+            ORDER  BY rank ASC
+            """,
+            (n,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [r["ticker"] for r in rows]
+    except Exception as exc:
+        print(f"  [ERROR] Could not fetch daily_rankings: {exc}")
+        return []
+
+
 def main():
     parser = argparse.ArgumentParser(description="Catalyst Screener v1.0")
     parser.add_argument("--universe", choices=["small", "meme", "large", "all"],
                         default="all", help="Which universe to scan")
     parser.add_argument("--ticker", type=str, help="Single stock deep dive")
+    parser.add_argument("--top-rankings", action="store_true",
+                        help="Run deep dive on every ticker in the current Top-20 daily ranking")
     parser.add_argument("--social", action="store_true", help="Include Reddit scan")
     parser.add_argument("--polymarket", action="store_true", help="Include Polymarket prediction market signals")
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
@@ -1313,6 +1347,24 @@ def main():
              "Pass --no-use-dynamic-universe to force hardcoded lists.",
     )
     args = parser.parse_args()
+
+    if args.top_rankings:
+        tickers = _fetch_top_rankings_tickers(args.top)
+        if not tickers:
+            print("  [ERROR] No tickers found in daily_rankings. Run the pipeline first.")
+            return
+        print(f"\n{'═' * 60}")
+        print(f"  TOP-{len(tickers)} RANKINGS DEEP DIVE")
+        print(f"  {', '.join(tickers)}")
+        print(f"{'═' * 60}")
+        for i, ticker in enumerate(tickers, start=1):
+            print(f"\n[{i}/{len(tickers)}] {ticker}")
+            deep_dive(ticker, include_social=args.social,
+                      include_polymarket=args.polymarket)
+        print(f"\n{'═' * 60}")
+        print(f"  Done — {len(tickers)} deep dives complete.")
+        print(f"{'═' * 60}\n")
+        return
 
     if args.ticker:
         deep_dive(args.ticker.upper(), include_social=args.social,

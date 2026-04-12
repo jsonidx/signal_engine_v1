@@ -72,7 +72,11 @@ function DirectionBadge({ direction }: { direction: string }) {
       ▼ BEAR
     </span>
   )
-  return <span className="font-mono text-[10px] text-text-tertiary">—</span>
+  return (
+    <span className="inline-flex items-center font-mono text-[10px] px-1.5 py-0.5 rounded border bg-text-tertiary/10 text-text-tertiary border-text-tertiary/20">
+      ● NEUTRAL
+    </span>
+  )
 }
 
 function ProbBar({ value }: { value: number | null }) {
@@ -336,6 +340,7 @@ function TickerPanel({
         {/* Metric summary */}
         <div className="grid grid-cols-2 gap-3 p-5 border-b border-border-subtle">
           {[
+            { label: 'Current Price',   value: fmtPrice(row.current_price)  },
             { label: 'Priority Score',  value: fmtScore(row.priority_score) },
             { label: 'Agreement',       value: row.agreement_score != null ? `${(row.agreement_score * 100).toFixed(0)}%` : '—' },
             { label: 'Weight',          value: row.weight != null ? `${(row.weight * 100).toFixed(2)}%` : '—' },
@@ -466,14 +471,27 @@ export function Top20RankingTable() {
             </h2>
             {data.as_of && (
               <p className="font-mono text-[10px] text-text-tertiary mt-0.5">
-                as of {data.as_of}
+                {(() => {
+                  const runAt = data.pipeline_run_at ? new Date(data.pipeline_run_at) : null
+                  const sameDay = runAt && runAt.toISOString().startsWith(data.as_of!)
+                  return (
+                    <>
+                      run {data.as_of}
+                      {sameDay && runAt && (
+                        <span className="text-text-tertiary/60 ml-1">
+                          · {runAt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      )}
+                    </>
+                  )
+                })()}
               </p>
             )}
           </div>
           <div className="flex items-center gap-3">
             {lastUpdated && (
               <span className="font-mono text-[10px] text-text-tertiary hidden sm:block">
-                updated {lastUpdated}
+                fetched {lastUpdated}
               </span>
             )}
             <button
@@ -562,7 +580,7 @@ export function Top20RankingTable() {
                       </span>
                     </td>
 
-                    {/* Ticker + OPEN badge */}
+                    {/* Ticker + OPEN badge + price */}
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-1.5">
                         <span className="font-mono text-xs font-semibold text-text-primary">
@@ -574,6 +592,11 @@ export function Top20RankingTable() {
                           </span>
                         )}
                       </div>
+                      {row.current_price != null && (
+                        <div className="font-mono text-[10px] text-text-tertiary mt-0.5">
+                          {fmtPrice(row.current_price)}
+                        </div>
+                      )}
                     </td>
 
                     {/* Direction */}

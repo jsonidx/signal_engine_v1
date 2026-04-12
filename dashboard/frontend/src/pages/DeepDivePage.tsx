@@ -14,7 +14,9 @@ interface DeepDiveTicker {
   has_thesis: boolean
   name: string
   sector: string
+  current_price: number | null
   date: string | null
+  created_at: string | null
   direction: string | null
   conviction: number | null
   signal_agreement_score: number | null
@@ -31,6 +33,16 @@ interface DeepDiveTicker {
 }
 
 type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED'
+
+function fmtDateTime(iso: string | null): { date: string; time: string } | null {
+  if (!iso) return null
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return null
+  return {
+    date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+    time: d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+  }
+}
 
 function useDeepDiveTickers() {
   return useQuery({
@@ -173,6 +185,11 @@ function TickerRow({ t, isOpen }: { t: DeepDiveTicker; isOpen: boolean }) {
               <span className="font-mono text-[10px] text-text-tertiary/60 truncate hidden sm:block">{t.sector}</span>
             )}
           </div>
+          {t.current_price != null && (
+            <span className="font-mono text-xs text-text-secondary flex-shrink-0">
+              ${t.current_price.toFixed(2)}
+            </span>
+          )}
           <div className="font-mono text-[10px] text-text-tertiary/60 flex-shrink-0 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-text-tertiary/40 inline-block" />
             no analysis — click to run
@@ -221,8 +238,23 @@ function TickerRow({ t, isOpen }: { t: DeepDiveTicker; isOpen: boolean }) {
         </div>
 
         {/* Meta */}
-        <div className="text-right flex-shrink-0 space-y-1 w-20">
-          <div className="font-mono text-[10px] text-text-tertiary">{t.date}</div>
+        <div className="text-right flex-shrink-0 space-y-1 w-28">
+          {t.current_price != null && (
+            <div className="font-mono text-xs font-semibold text-text-primary">
+              ${t.current_price.toFixed(2)}
+            </div>
+          )}
+          {(() => {
+            const dt = fmtDateTime(t.created_at)
+            return dt ? (
+              <div>
+                <div className="font-mono text-[10px] text-text-tertiary">{dt.date}</div>
+                <div className="font-mono text-[10px] text-text-tertiary/60">{dt.time}</div>
+              </div>
+            ) : (
+              <div className="font-mono text-[10px] text-text-tertiary">{t.date}</div>
+            )
+          })()}
           {t.time_horizon && (
             <div className="font-mono text-[10px] text-text-tertiary">{t.time_horizon}</div>
           )}

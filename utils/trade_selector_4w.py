@@ -990,8 +990,9 @@ def run_daily_top20_pipeline(
                  rank_change, rank_yesterday,
                  direction, t1_price, t2_price, stop_price,
                  prob_t1, prob_t2, hold_days, agreement_score,
-                 ev_t1_pct, is_open_position, prob_combined)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 ev_t1_pct, is_open_position, prob_combined,
+                 created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
             ON CONFLICT (run_date, rank) DO UPDATE SET
                 ticker           = EXCLUDED.ticker,
                 priority_score   = EXCLUDED.priority_score,
@@ -1014,7 +1015,8 @@ def run_daily_top20_pipeline(
                 agreement_score  = EXCLUDED.agreement_score,
                 ev_t1_pct        = EXCLUDED.ev_t1_pct,
                 is_open_position = EXCLUDED.is_open_position,
-                prob_combined    = EXCLUDED.prob_combined
+                prob_combined    = EXCLUDED.prob_combined,
+                created_at       = NOW()
         """
 
         with managed_connection() as conn:

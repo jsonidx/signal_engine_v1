@@ -89,7 +89,7 @@ try:
         CRYPTO_ALLOCATION,
     )
 except ImportError:
-    PORTFOLIO_NAV = 50_000
+    PORTFOLIO_NAV = 0
     EQUITY_ALLOCATION = 0.65
     CRYPTO_ALLOCATION = 0.25
 
@@ -446,21 +446,28 @@ async def portfolio_summary():
             regime = rc.get("market_regime", {}).get("regime", "UNKNOWN")
             regime_score = rc.get("market_regime", {}).get("score", 0)
 
-        # Open positions count
+        # Open positions count + deployed capital
         open_pos = 0
+        deployed_eur = 0.0
         tj_conn = _db_connect()
         if tj_conn:
             row = tj_conn.execute(
-                "SELECT COUNT(*) as cnt FROM trades WHERE action='BUY' AND status='open'"
+                "SELECT COUNT(*) as cnt, COALESCE(SUM(size_eur), 0) as total"
+                " FROM trades WHERE action='BUY' AND status='open'"
             ).fetchone()
             open_pos = row["cnt"] if row else 0
+            deployed_eur = float(row["total"]) if row else 0.0
             tj_conn.close()
+
+        # Real NAV = cash on hand + deployed capital (entry values of open positions)
+        cash_eur, _ = _get_cash_eur(conn)
+        real_nav = cash_eur + deployed_eur if (cash_eur + deployed_eur) > 0 else PORTFOLIO_NAV
 
         if df.empty or len(df) < 2:
             conn.close()
             return {
                 "data_available": True,
-                "total_value_eur": PORTFOLIO_NAV,
+                "total_value_eur": real_nav,
                 "weekly_return_pct": 0.0,
                 "benchmark_return_pct": 0.0,
                 "sharpe_ratio": 0.0,
@@ -480,7 +487,7 @@ async def portfolio_summary():
         # Cumulative
         cum_port = (1 + df["portfolio_return"]).cumprod()
         total_ret = float(cum_port.iloc[-1] - 1)
-        total_value = PORTFOLIO_NAV * (1 + total_ret)
+        total_value = real_nav
 
         # Annualised Sharpe
         n_weeks = len(df)
@@ -1496,7 +1503,9 @@ async def deepdive_tickers():
                     "has_thesis":             True,
                     "name":                   fd.get("name", ""),
                     "sector":                 fd.get("sector", ""),
+                    "current_price":          fd.get("price"),
                     "date":                   r["date"],
+                    "created_at":             r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else r["created_at"],
                     "direction":              r["direction"],
                     "conviction":             r["conviction"],
                     "signal_agreement_score": r["signal_agreement_score"],
@@ -1533,6 +1542,7 @@ async def deepdive_tickers():
                         "has_thesis":             False,
                         "name":                   fd.get("name", ""),
                         "sector":                 fd.get("sector", ""),
+                        "current_price":          fd.get("price"),
                         "date":                   None,
                         "direction":              None,
                         "conviction":             None,
@@ -1561,6 +1571,7 @@ async def deepdive_tickers():
                 "has_thesis":             False,
                 "name":                   fd.get("name", ""),
                 "sector":                 fd.get("sector", ""),
+                "current_price":          fd.get("price"),
                 "date":                   None,
                 "direction":              None,
                 "conviction":             None,
@@ -2265,7 +2276,7 @@ async def rankings_latest():
         cur  = conn.cursor()
         cur.execute(
             """
-            SELECT *
+            SELECT *, MAX(created_at) OVER () AS pipeline_run_at
             FROM   daily_rankings
             WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
               AND  rank <= 20
@@ -2280,12 +2291,22 @@ async def rankings_latest():
             _cache.set(cache_key, result, TTL_SHORT)
             return result
 
+        # Fetch live prices for all ranked tickers (run in thread so it doesn't block the event loop)
+        ranked_tickers = [str(r["ticker"]) for r in rows]
+        live_prices = await asyncio.to_thread(_fetch_current_prices, ranked_tickers)
+
+        # pipeline_run_at: when the pipeline last wrote this ranking to the DB
+        pipeline_run_at = rows[0].get("pipeline_run_at")
+        pipeline_run_at_str = pipeline_run_at.strftime("%Y-%m-%dT%H:%M:%SZ") if pipeline_run_at else None
+
         records = []
         for r in rows:
+            ticker = str(r["ticker"])
             records.append({
                 "run_date":        str(r["run_date"]),
                 "rank":            _safe_int(r["rank"]),
-                "ticker":          str(r["ticker"]),
+                "ticker":          ticker,
+                "current_price":   live_prices.get(ticker),
                 "priority_score":  _safe_float(r["priority_score"]),
                 "final_score":     _safe_float(r["final_score"]),
                 "weight":          _safe_float(r["weight"]),
@@ -2311,13 +2332,14 @@ async def rankings_latest():
             })
 
         result = {
-            "data_available": True,
-            "count":          len(records),
-            "as_of":          records[0]["run_date"] if records else None,
-            "generated_at":   datetime.utcnow().isoformat() + "Z",
-            "data":           _json_safe(records),
+            "data_available":  True,
+            "count":           len(records),
+            "as_of":           records[0]["run_date"] if records else None,
+            "pipeline_run_at": pipeline_run_at_str,
+            "generated_at":    datetime.utcnow().isoformat() + "Z",
+            "data":            _json_safe(records),
         }
-        _cache.set(cache_key, result, TTL_SHORT)
+        _cache.set(cache_key, result, TTL_MEDIUM)  # rankings data is daily; 15-min cache is plenty
         return result
 
     except Exception as e:
@@ -4426,7 +4448,7 @@ async def get_favorites():
 
 
 @app.post("/api/favorites/{symbol}")
-async def add_favorite(symbol: str, user: AuthUser = Depends(get_current_user)):
+async def add_favorite(symbol: str):
     """Add a ticker to favorites."""
     symbol = symbol.upper().strip()
     if not symbol or len(symbol) > 10:
@@ -4458,7 +4480,7 @@ async def add_favorite(symbol: str, user: AuthUser = Depends(get_current_user)):
 
 
 @app.delete("/api/favorites/{symbol}")
-async def remove_favorite(symbol: str, user: AuthUser = Depends(get_current_user)):
+async def remove_favorite(symbol: str):
     """Remove a ticker from favorites."""
     symbol = symbol.upper().strip()
     try:
@@ -4570,3 +4592,45 @@ async def download_workflow_report():
         filename="0_run-pipeline.txt",
         headers={"Content-Disposition": "attachment; filename=0_run-pipeline.txt"},
     )
+
+
+@app.get("/api/workflows/report/text")
+async def get_workflow_report_text():
+    """
+    Return the latest clean pipeline report for LLM prompt building.
+    Reads from the Supabase pipeline_reports table, written by
+    scripts/upload_pipeline_report.py at the end of every workflow run.
+    The content is pure pipeline stdout — no CI runner noise.
+    """
+    try:
+        conn = _db_connect()
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, run_id, workflow_name, conclusion, content,
+                       run_at AT TIME ZONE 'UTC' AS run_at
+                FROM pipeline_reports
+                ORDER BY id DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="No pipeline report found — run the pipeline once to generate one")
+        label = f"{row['workflow_name']} ({row['conclusion']}) — {str(row['run_at'])[:19]} UTC"
+        return {
+            "content":    row["content"],
+            "run_id":     row["run_id"],
+            "label":      label,
+            "conclusion": row["conclusion"],
+            "run_at":     str(row["run_at"]),
+            "source":     "supabase",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        msg = str(exc)
+        if "pipeline_reports" in msg and "does not exist" in msg:
+            raise HTTPException(status_code=404, detail="No pipeline report yet — will be available after the next workflow run completes")
+        raise HTTPException(status_code=500, detail=msg)

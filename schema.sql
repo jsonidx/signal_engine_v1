@@ -139,6 +139,13 @@ CREATE TABLE IF NOT EXISTS thesis_cache (
     primary_scenario        TEXT,
     bear_scenario           TEXT,
     expected_moves_json     JSONB,
+    model_used              TEXT,
+    cost_usd                FLOAT,
+    prob_combined           FLOAT,
+    prob_technical          FLOAT,
+    prob_options            FLOAT,
+    prob_catalyst           FLOAT,
+    prob_news               FLOAT,
     PRIMARY KEY (ticker, date)
 );
 

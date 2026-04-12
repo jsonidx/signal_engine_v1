@@ -4,14 +4,13 @@
 #   Daily  06:00 Berlin — com.signalengine.skipai.daily    (--skip-ai, €0.00)
 #   Monday 14:45 Berlin — com.signalengine.master.monday   (full run, ~€0.03–0.05)
 #
-# COST ESTIMATE (ai_quant.py --top-n 5):
-#   ~5 Claude API calls × ~€0.005–0.01 = ~€0.03–0.05 per run (sonnet-4-6 + thinking)
-#   2 runs/week = ~€0.24–0.40/month
-#   To process more tickers: change --top-n 5 to --top-n 10
+# COST ESTIMATE (ai_quant.py --top-n 20):
+#   ~20 Grok API calls × ~$0.009–0.027 = ~$0.18–0.54 per run (grok-4-1-fast-reasoning)
+#   2 runs/week = ~$1.44–4.32/month
 #   Full universe (no cap): python3 ai_quant.py --no-limit  ← WARNING: high cost
 #
 # USAGE:
-#   bash run_master.sh             → full run including Claude API (~€0.03–0.05)
+#   bash run_master.sh             → full run including Grok API (~$0.18–0.54)
 #   bash run_master.sh --skip-ai   → data refresh only, no API cost (€0.00)
 #
 # USE --skip-ai WHEN:
@@ -171,8 +170,8 @@ if [ "$SKIP_AI" = true ]; then
   step_end "Step 13: AI Quant (skipped, backfill only)"
   echo "Step 13 skipped — theses unchanged in ai_quant_cache.db"
 else
-  echo "Step 13: AI Quant synthesis (top 5 tickers — sonnet-4-6 + thinking)..."
-  python3 ai_quant.py --top-n 5
+  echo "Step 13: AI Quant synthesis (top 20 tickers — sonnet-4-6 + thinking)..."
+  python3 ai_quant.py --top-n 20
   step_end "Step 13: AI Quant synthesis"
   echo "Step 13 complete — theses saved to ai_quant_cache.db"
 fi
@@ -325,7 +324,7 @@ printf "  %-45s %dm %02ds\n" "TOTAL" "$TOTAL_MINS" "$TOTAL_SECS"
 echo "================================================"
 
 # ── Write pipeline status file for dashboard ─────────────
-COST_ESTIMATE=$([ "$SKIP_AI" = true ] && echo "€0.00" || echo "~€0.03–0.05")
+COST_ESTIMATE=$([ "$SKIP_AI" = true ] && echo "$0.00" || echo "~$0.18–0.54")
 SKIP_AI_JSON=$([ "$SKIP_AI" = true ] && echo "true" || echo "false")
 cat > data/pipeline_status.json <<EOF
 {
@@ -343,7 +342,7 @@ echo " Pipeline complete — $(date '+%Y-%m-%d %H:%M')"
 if [ "$SKIP_AI" = true ]; then
   echo " Cost this run:  €0.00 (--skip-ai — Claude API skipped)"
 else
-  echo " Cost this run:  ~€0.03–0.05 (5 × sonnet-4-6 + thinking)"
+  echo " Cost this run:  ~$0.18–0.54 (20 × grok-4-1-fast-reasoning)"
 fi
 echo " Dashboard:      http://localhost:3000"
 echo "================================================"
