@@ -45,17 +45,25 @@ jobs:
 
       - name: Run master pipeline
         run: |
+          set -o pipefail
+          mkdir -p logs
           SKIP_AI="${{ github.event.inputs.skip_ai || 'true' }}"
           if [ "$SKIP_AI" = "true" ]; then
             echo "Running with --skip-ai (€0.00)"
-            bash run_master.sh --skip-ai
+            bash run_master.sh --skip-ai 2>&1 | tee logs/pipeline_report.txt
           else
             echo "Running full pipeline with AI synthesis (~€0.03)"
-            bash run_master.sh
+            bash run_master.sh 2>&1 | tee logs/pipeline_report.txt
           fi
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+
+      - name: Upload report to Supabase
+        if: always()
+        run: python3 scripts/upload_pipeline_report.py --run-id "${{ github.run_id }}" --conclusion "${{ job.status }}" --workflow "Daily Signal Pipeline"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Notify Telegram
         if: always()

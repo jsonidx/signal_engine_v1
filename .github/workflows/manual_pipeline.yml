@@ -42,12 +42,20 @@ jobs:
 
       - name: Run master pipeline
         run: |
+          set -o pipefail
+          mkdir -p logs
           echo "Running full pipeline with AI synthesis (~€0.03)"
-          bash run_master.sh
+          bash run_master.sh 2>&1 | tee logs/pipeline_report.txt
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Upload report to Supabase
+        if: always()
+        run: python3 scripts/upload_pipeline_report.py --run-id "${{ github.run_id }}" --conclusion "${{ job.status }}" --workflow "Manual Signal Pipeline (AI)"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Notify Telegram
         if: always()
