@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity, ChevronDown, ChevronRight, Download, Circle, CheckCircle2, XCircle, Clock, Cpu } from 'lucide-react'
+import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity, ChevronDown, ChevronRight, Download, Circle, CheckCircle2, XCircle, Clock, Cpu, Copy } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Shell } from '../components/layout/Shell'
@@ -411,6 +411,78 @@ function PipelineStatusCard() {
   )
 }
 
+// ─── Copy report prompt button ────────────────────────────────────────────────
+
+function buildReportPrompt(reportContent: string, runLabel?: string): string {
+  const today = new Date().toISOString().split('T')[0]
+  const lines: string[] = []
+  lines.push(`You are an expert swing trader and quantitative analyst.`)
+  lines.push(`Below is the full output from my signal engine pipeline run as of ${today}${runLabel ? ` (${runLabel})` : ''}.`)
+  lines.push(``)
+  lines.push(`TASK: Analyze this report and identify the TOP 3–5 candidates for swing trading THIS WEEK (holding period: 2–7 days).`)
+  lines.push(``)
+  lines.push(`For each candidate provide:`)
+  lines.push(`1. Ticker & direction (LONG / SHORT)`)
+  lines.push(`2. Why it stands out this week (catalyst, signal strength, regime alignment)`)
+  lines.push(`3. Ideal entry zone / trigger condition`)
+  lines.push(`4. Price target and stop-loss level`)
+  lines.push(`5. Estimated risk/reward ratio`)
+  lines.push(`6. Conviction rating (1–5) with brief justification`)
+  lines.push(``)
+  lines.push(`Also flag any RISK-OFF or regime warnings from the report that should affect position sizing.`)
+  lines.push(``)
+  lines.push(`--- PIPELINE REPORT START ---`)
+  lines.push(reportContent.trim())
+  lines.push(`--- PIPELINE REPORT END ---`)
+  return lines.join('\n')
+}
+
+function CopyReportPromptButton() {
+  const [state, setState] = useState<'idle' | 'loading' | 'copied' | 'error'>('idle')
+
+  const handleCopy = async () => {
+    setState('loading')
+    try {
+      const res = await api.workflowReportText()
+      const prompt = buildReportPrompt(res.content, res.label)
+      await navigator.clipboard.writeText(prompt)
+      setState('copied')
+      setTimeout(() => setState('idle'), 2500)
+    } catch {
+      setState('error')
+      setTimeout(() => setState('idle'), 2500)
+    }
+  }
+
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); handleCopy() }}
+      title="Copy LLM prompt: paste into ChatGPT / Claude / Grok to get top swing trade candidates"
+      className={clsx(
+        'flex items-center gap-1.5 font-mono text-[10px] px-2 py-1 rounded border transition-all flex-shrink-0',
+        state === 'copied'
+          ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+          : state === 'error'
+            ? 'bg-accent-red/10 text-accent-red border-accent-red/30'
+            : state === 'loading'
+              ? 'opacity-60 cursor-not-allowed border-border-subtle text-text-tertiary'
+              : 'bg-bg-elevated border-border-subtle text-text-secondary hover:text-text-primary hover:border-border-active'
+      )}
+      disabled={state === 'loading'}
+    >
+      {state === 'loading' ? (
+        <><Loader2 size={10} className="animate-spin" /> Building…</>
+      ) : state === 'copied' ? (
+        <>✓ Copied</>
+      ) : state === 'error' ? (
+        <>✗ Failed</>
+      ) : (
+        <><Copy size={10} /> Copy Prompt</>
+      )}
+    </button>
+  )
+}
+
 // ─── Workflows panel ──────────────────────────────────────────────────────────
 
 function workflowStatusIcon(status: string, conclusion: string | null) {
@@ -557,8 +629,9 @@ function WorkflowsPanel() {
         <Activity size={11} className="text-text-tertiary" />
         <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary flex-1">Workflows Overview</span>
         {!collapsed && runs.length > 0 && (
-          <span className="font-mono text-[10px] text-text-tertiary">{runs.length} runs</span>
+          <span className="font-mono text-[10px] text-text-tertiary mr-2">{runs.length} runs</span>
         )}
+        <CopyReportPromptButton />
       </button>
 
       {/* Panel body */}
@@ -592,7 +665,7 @@ const QUICK_LINKS = [
   { path: '/heatmap',    label: 'Signal Heatmap',       icon: Grid3x3,    desc: 'Multi-factor score matrix' },
   { path: '/rankings',   label: 'Daily Top-20',          icon: ListOrdered, desc: 'Ranked by composite score' },
   { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText,   desc: 'Conflict log + Claude accuracy' },
-  { path: '/deep-dive',  label: 'AI Deep Dive',          icon: Brain,      desc: 'Claude thesis + scenarios' },
+  { path: '/deepdive',   label: 'AI Deep Dive',          icon: Brain,      desc: 'Claude thesis + scenarios' },
 ]
 
 function QuickLinks() {
@@ -623,7 +696,7 @@ export function HomePage() {
   const { data: heatmapRows, isLoading: heatmapLoading } = useHeatmap()
   const { data: summary } = usePortfolioSummary()
 
-  const nav = summary?.nav_eur ?? 50000
+  const nav = summary?.nav_eur ?? 0
 
   // Top 7: all signals sorted by agreement desc (NEUTRAL included)
   const top7 = (heatmapRows ?? [])

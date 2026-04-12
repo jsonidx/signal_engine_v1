@@ -419,9 +419,9 @@ export function PortfolioPage() {
 
   const totalRecommendedEur = sortedEquity.reduce((s, r) => s + (r.position_eur ?? 0), 0)
   const totalCurrentEur = positionsArr.reduce((s: number, p: any) => s + (p.size_eur ?? 0), 0)
-  const remainingCash = savedCash !== null ? savedCash : (summary?.nav_eur ?? 50000) - totalCurrentEur
+  const remainingCash = savedCash !== null ? savedCash : (summary?.nav_eur ?? 0) - totalCurrentEur
   // NAV = cash on hand + deployed positions (dynamic when cash is set manually)
-  const nav = savedCash !== null ? savedCash + totalCurrentEur : (summary?.nav_eur ?? 50000)
+  const nav = savedCash !== null ? savedCash + totalCurrentEur : (summary?.nav_eur ?? 0)
 
   const overConcentrated = sortedEquity.filter(r => (r.weight_pct ?? 0) > 8)
 
