@@ -306,13 +306,30 @@ export function PortfolioPage() {
   const [showAddForm, setShowAddForm] = useState(false)
   const [addForm, setAddForm] = useState({
     ticker: '', direction: 'LONG' as 'LONG' | 'SHORT', currency: 'USD' as 'EUR' | 'USD',
-    entry_price: '', size_eur: '', conviction: '', stop_loss: '', target_1: '',
+    entry_price: '', shares: '', size_eur: '', conviction: '', stop_loss: '', target_1: '',
   })
   const [addFormError, setAddFormError] = useState<string | null>(null)
 
+  // FX preview rate for shares↔size auto-calc (backend recalculates with live rate on save)
+  const FX_EUR_USD = 1.08
+
+  function calcSizeFromShares(shares: string, entry_price: string, currency: string): string {
+    const s = parseFloat(shares), p = parseFloat(entry_price)
+    if (!isFinite(s) || !isFinite(p) || p <= 0 || s <= 0) return ''
+    const eur = currency === 'EUR' ? s * p : (s * p) / FX_EUR_USD
+    return String(Math.round(eur * 100) / 100)
+  }
+
+  function calcSharesFromSize(size_eur: string, entry_price: string, currency: string): string {
+    const z = parseFloat(size_eur), p = parseFloat(entry_price)
+    if (!isFinite(z) || !isFinite(p) || p <= 0 || z <= 0) return ''
+    const shares = currency === 'EUR' ? z / p : (z * FX_EUR_USD) / p
+    return String(Math.round(shares * 10000) / 10000)
+  }
+
   // Sell form state
   const [sellingTicker, setSellingTicker] = useState<string | null>(null)
-  const [sellForm, setSellForm] = useState({ price: '', currency: 'USD' as 'EUR' | 'USD' })
+  const [sellForm, setSellForm] = useState({ price: '', currency: 'USD' as 'EUR' | 'USD', shares: '' })
   const [sellError, setSellError] = useState<string | null>(null)
   const [lastPnl, setLastPnl] = useState<{ ticker: string; pnl: number } | null>(null)
 
@@ -333,7 +350,7 @@ export function PortfolioPage() {
       },
       {
         onSuccess: () => {
-          setAddForm({ ticker: '', direction: 'LONG', currency: 'USD', entry_price: '', size_eur: '', conviction: '', stop_loss: '', target_1: '' })
+          setAddForm({ ticker: '', direction: 'LONG', currency: 'USD', entry_price: '', shares: '', size_eur: '', conviction: '', stop_loss: '', target_1: '' })
           setShowAddForm(false)
         },
         onError: () => setAddFormError('Failed to save — check API connection'),
@@ -344,14 +361,17 @@ export function PortfolioPage() {
   function handleSell(ticker: string) {
     const price = parseFloat(sellForm.price)
     if (isNaN(price) || price <= 0) return setSellError('Sell price must be > 0')
+    const shares_to_sell = sellForm.shares ? parseFloat(sellForm.shares) : undefined
+    if (shares_to_sell !== undefined && (isNaN(shares_to_sell) || shares_to_sell <= 0))
+      return setSellError('Shares to sell must be > 0')
     setSellError(null)
     sellPositionMutation.mutate(
-      { ticker, payload: { sell_price: price, currency: sellForm.currency } },
+      { ticker, payload: { sell_price: price, currency: sellForm.currency, shares_to_sell } },
       {
         onSuccess: (res) => {
           setLastPnl({ ticker, pnl: res.pnl_eur })
-          setSellingTicker(null)
-          setSellForm({ price: '', currency: 'USD' })
+          if (!res.partial) setSellingTicker(null)
+          setSellForm({ price: '', currency: 'USD', shares: '' })
         },
         onError: () => setSellError('Failed to sell — check API connection'),
       }
@@ -669,7 +689,17 @@ export function PortfolioPage() {
                 <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Currency</label>
                 <select
                   value={addForm.currency}
-                  onChange={e => setAddForm(f => ({ ...f, currency: e.target.value as 'EUR' | 'USD' }))}
+                  onChange={e => {
+                    const currency = e.target.value as 'EUR' | 'USD'
+                    setAddForm(f => ({
+                      ...f,
+                      currency,
+                      // re-derive size from shares with new currency
+                      ...(f.shares && f.entry_price
+                        ? { size_eur: calcSizeFromShares(f.shares, f.entry_price, currency) }
+                        : {}),
+                    }))
+                  }}
                   className="w-20 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue"
                 >
                   <option value="USD">USD $</option>
@@ -684,19 +714,59 @@ export function PortfolioPage() {
                 <input
                   type="number" min="0" step="0.01"
                   value={addForm.entry_price}
-                  onChange={e => setAddForm(f => ({ ...f, entry_price: e.target.value }))}
+                  onChange={e => {
+                    const entry_price = e.target.value
+                    setAddForm(f => ({
+                      ...f,
+                      entry_price,
+                      // re-derive size from shares if shares is set, else re-derive shares from size
+                      ...(f.shares
+                        ? { size_eur: calcSizeFromShares(f.shares, entry_price, f.currency) }
+                        : f.size_eur
+                          ? { shares: calcSharesFromSize(f.size_eur, entry_price, f.currency) }
+                          : {}),
+                    }))
+                  }}
                   onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
                   placeholder="0.00"
                   className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
                 />
               </div>
+              {/* Shares */}
+              <div className="flex flex-col gap-1">
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Shares</label>
+                <input
+                  type="number" min="0" step="1"
+                  value={addForm.shares}
+                  onChange={e => {
+                    const shares = e.target.value
+                    setAddForm(f => ({
+                      ...f,
+                      shares,
+                      size_eur: calcSizeFromShares(shares, f.entry_price, f.currency),
+                    }))
+                  }}
+                  onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
+                  placeholder="qty"
+                  className="w-24 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                />
+              </div>
               {/* Size EUR */}
               <div className="flex flex-col gap-1">
-                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">Size (€)</label>
+                <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">
+                  Size (€){addForm.currency === 'USD' && addForm.shares && addForm.entry_price ? <span className="text-text-tertiary/60 ml-1">≈</span> : null}
+                </label>
                 <input
                   type="number" min="0" step="100"
                   value={addForm.size_eur}
-                  onChange={e => setAddForm(f => ({ ...f, size_eur: e.target.value }))}
+                  onChange={e => {
+                    const size_eur = e.target.value
+                    setAddForm(f => ({
+                      ...f,
+                      size_eur,
+                      shares: calcSharesFromSize(size_eur, f.entry_price, f.currency),
+                    }))
+                  }}
                   onKeyDown={e => e.key === 'Enter' && handleAddPosition()}
                   placeholder="0"
                   className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-blue placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
@@ -824,7 +894,7 @@ export function PortfolioPage() {
                       <button
                         onClick={() => {
                           if (sellingTicker === pos.ticker) { setSellingTicker(null); setSellError(null) }
-                          else { setSellingTicker(pos.ticker); setSellForm({ price: '', currency: 'USD' }); setSellError(null) }
+                          else { setSellingTicker(pos.ticker); setSellForm({ price: '', currency: 'USD', shares: '' }); setSellError(null) }
                         }}
                         className={`px-2.5 py-1 rounded font-mono text-[10px] border transition-colors ${
                           sellingTicker === pos.ticker
@@ -867,6 +937,20 @@ export function PortfolioPage() {
                               onKeyDown={e => e.key === 'Enter' && handleSell(pos.ticker)}
                               placeholder="0.00"
                               className="w-32 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-red placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+                            />
+                          </div>
+                          {/* Shares to sell (partial) */}
+                          <div className="flex flex-col gap-1">
+                            <label className="font-mono text-[10px] text-text-tertiary uppercase tracking-wide">
+                              Shares{pos.shares ? <span className="text-text-tertiary/60 ml-1">/ {pos.shares}</span> : null}
+                            </label>
+                            <input
+                              type="number" min="0" step="1"
+                              value={sellForm.shares}
+                              onChange={e => setSellForm(f => ({ ...f, shares: e.target.value }))}
+                              onKeyDown={e => e.key === 'Enter' && handleSell(pos.ticker)}
+                              placeholder="all"
+                              className="w-28 bg-bg-surface border border-border-subtle rounded px-2 h-8 font-mono text-sm text-text-primary outline-none focus:border-accent-red placeholder:text-text-tertiary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
                             />
                           </div>
                           <button

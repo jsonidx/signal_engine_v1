@@ -83,6 +83,13 @@ except ImportError:
     _OPENAI_AVAILABLE = False
 
 try:
+    import anthropic as _anthropic_module
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _anthropic_module = None  # type: ignore[assignment]
+    _ANTHROPIC_AVAILABLE = False
+
+try:
     from config import (
         OUTPUT_DIR, PORTFOLIO_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION,
         AI_MODEL_DEFAULT, AI_MODEL_PREMIUM, AI_MODEL_FALLBACK, AI_PREMIUM_THRESHOLD,
@@ -2599,6 +2606,49 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
     return full_text.strip() if full_text else None
 
 
+def _call_anthropic(prompt: str, verbose: bool = False,
+                    model: str = "claude-sonnet-4-6") -> Optional[str]:
+    """
+    Call Anthropic Claude API (non-streaming).
+
+    model: claude-sonnet-4-6 (default) or claude-opus-4-6
+    Token usage is stored in module-level _last_call_usage after each call.
+    """
+    if not _ANTHROPIC_AVAILABLE:
+        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  ERROR: ANTHROPIC_API_KEY environment variable not set.")
+        return None
+
+    if verbose:
+        print(f"  Calling Anthropic Claude API ({model})...", flush=True)
+
+    try:
+        client = _anthropic_module.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text if response.content else ""
+        _last_call_usage["input_tokens"]  = response.usage.input_tokens
+        _last_call_usage["output_tokens"] = response.usage.output_tokens
+        _last_call_usage["model"]         = model
+        return text.strip() if text else None
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "authentication" in err.lower():
+            print("  ERROR: Invalid ANTHROPIC_API_KEY.")
+        elif "429" in err or "rate" in err.lower():
+            print("  ERROR: Anthropic API rate limit hit. Wait and retry.")
+        else:
+            print(f"  ERROR: Anthropic API call failed: {e}")
+        return None
+
+
 def _parse_response(raw: str) -> Optional[dict]:
     """Extract JSON from Claude's response, with truncation recovery."""
     if not raw:
@@ -2962,7 +3012,7 @@ def update_watchlist_from_screen(
 # ==============================================================================
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
-                   use_cache: bool = True) -> Optional[dict]:
+                   use_cache: bool = True, llm: str = "grok") -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
     Returns parsed thesis dict, or None on failure.
@@ -3034,13 +3084,19 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print(prompt)
         print("--- END PROMPT ---\n")
 
-    # Upgrade to premium model for highest-conviction setups
-    # Use prob_combined as primary signal; fall back to agreement score
-    _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
-    use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
-
-    # Call Claude
-    raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
+    # Route to the selected LLM backend
+    if llm == "claude":
+        # Anthropic Claude (claude-sonnet-4-6)
+        raw = _call_anthropic(prompt, verbose=verbose)
+    elif llm == "grok-premium":
+        # Force xAI Grok premium model regardless of agreement score
+        raw = _call_claude(prompt, verbose=verbose, use_thinking=True)
+    else:
+        # Default: xAI Grok — upgrade to premium for highest-conviction setups
+        # Use prob_combined as primary signal; fall back to agreement score
+        _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
+        use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
+        raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
     if raw is None:
         return None
 
@@ -3497,6 +3553,11 @@ def main():
         help="Run on ALL non-skipped tickers (WARNING: high API cost)",
     )
     parser.add_argument(
+        "--llm", type=str, default="grok",
+        choices=["grok", "grok-premium", "claude"],
+        help="LLM backend: grok (default xAI fast), grok-premium (forced premium Grok), claude (Anthropic Claude Sonnet)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print selection table and cost estimate without calling Claude",
     )
@@ -3809,7 +3870,7 @@ def main():
     elif args.ticker:
         result = analyze_ticker(
             args.ticker.upper(), verbose=args.verbose, raw_output=args.raw,
-            use_cache=use_cache,
+            use_cache=use_cache, llm=args.llm,
         )
         if result:
             print_thesis(result)

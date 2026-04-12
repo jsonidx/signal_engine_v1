@@ -756,7 +756,7 @@ def _ensure_trades_table(conn) -> None:
             cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
             conn.commit()
         except Exception:
-            pass  # Column already exists
+            conn.rollback()  # Must rollback or PostgreSQL keeps the connection in aborted state
 
 
 from pydantic import BaseModel as _BaseModel  # noqa: E402 (already imported below)
@@ -775,12 +775,13 @@ class AddPositionRequest(_BaseModel):
 
 
 class SellPositionRequest(_BaseModel):
-    sell_price: float
-    currency:   str = "USD"
+    sell_price:     float
+    currency:       str   = "USD"
+    shares_to_sell: Optional[float] = None   # None or 0 = full close
 
 
 @app.post("/api/portfolio/positions")
-async def add_position(req: AddPositionRequest, user: AuthUser = Depends(get_current_user)):
+async def add_position(req: AddPositionRequest):
     """Manually insert an open position into trade_journal.db."""
     if req.entry_price <= 0 or req.size_eur <= 0:
         raise HTTPException(status_code=400, detail="entry_price and size_eur must be > 0")
@@ -797,8 +798,8 @@ async def add_position(req: AddPositionRequest, user: AuthUser = Depends(get_cur
             INSERT INTO trades
                 (ticker, direction, date, price, price_eur, size_eur, shares,
                  currency, fx_rate, signal_composite, stop_loss, target_1, target_2,
-                 notes, action, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'BUY', 'open')
+                 notes, action, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'BUY', 'open', NOW())
         """, (
             req.ticker.upper().strip(), req.direction.upper(),
             today, req.entry_price, price_eur, req.size_eur, shares,
@@ -818,49 +819,87 @@ async def add_position(req: AddPositionRequest, user: AuthUser = Depends(get_cur
 
 
 @app.post("/api/portfolio/positions/{ticker}/sell")
-async def sell_position(ticker: str, req: SellPositionRequest, user: AuthUser = Depends(get_current_user)):
-    """Close the most recent open position for ticker with sell price, computing P&L in EUR."""
+async def sell_position(ticker: str, req: SellPositionRequest):
+    """
+    Close (fully or partially) the most recent open position for ticker.
+    If shares_to_sell is provided and less than total shares, a partial close is performed:
+      - The open row's shares/size_eur are reduced.
+      - A new closed row is inserted for the sold portion with its P&L.
+    """
     if req.sell_price <= 0:
         raise HTTPException(status_code=400, detail="sell_price must be > 0")
     if req.currency not in ("EUR", "USD"):
         raise HTTPException(status_code=400, detail="currency must be EUR or USD")
+    conn = _db_connect()
     try:
         _ensure_trades_table(conn)
+        sym = ticker.upper().strip()
         row = conn.execute(
             "SELECT * FROM trades WHERE ticker = %s AND action = 'BUY' AND status = 'open' ORDER BY date DESC LIMIT 1",
-            (ticker.upper().strip(),),
+            (sym,),
         ).fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"No open position for {ticker.upper()}")
+            raise HTTPException(status_code=404, detail=f"No open position for {sym}")
 
-        eur_usd        = _get_eur_usd_rate()
+        eur_usd         = _get_eur_usd_rate()
         close_price_eur = _to_eur(req.sell_price, req.currency, eur_usd)
         entry_price_eur = row["price_eur"] if row["price_eur"] else _to_eur(row["price"], row["currency"] or "USD", row["fx_rate"] or 1.08)
-        shares         = row["shares"] or (row["size_eur"] / entry_price_eur if entry_price_eur > 0 else 0)
-        direction      = (row["direction"] or "LONG").upper()
+        total_shares    = row["shares"] or (row["size_eur"] / entry_price_eur if entry_price_eur > 0 else 0)
+        direction       = (row["direction"] or "LONG").upper()
+        today           = datetime.utcnow().strftime("%Y-%m-%d")
 
+        # Determine how many shares to sell
+        sell_shares = req.shares_to_sell if (req.shares_to_sell and req.shares_to_sell > 0) else total_shares
+        sell_shares = min(sell_shares, total_shares)  # can't sell more than held
+        partial     = sell_shares < total_shares
+
+        # P&L for the sold portion
         if direction == "LONG":
-            pnl_eur = (close_price_eur - entry_price_eur) * shares
-        else:  # SHORT
-            pnl_eur = (entry_price_eur - close_price_eur) * shares
+            pnl_eur = (close_price_eur - entry_price_eur) * sell_shares
+        else:
+            pnl_eur = (entry_price_eur - close_price_eur) * sell_shares
 
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        conn.execute("""
-            UPDATE trades SET
-                status          = 'closed',
-                close_date      = %s,
-                close_price     = %s,
-                close_price_eur = %s,
-                close_currency  = %s,
-                close_fx_rate   = %s,
-                pnl_eur         = %s
-            WHERE id = %s
-        """, (today, req.sell_price, close_price_eur, req.currency.upper(), eur_usd, pnl_eur, row["id"]))
+        if partial:
+            # Reduce remaining open position
+            remaining_shares  = total_shares - sell_shares
+            remaining_size_eur = remaining_shares * entry_price_eur
+            conn.execute(
+                "UPDATE trades SET shares = %s, size_eur = %s WHERE id = %s",
+                (remaining_shares, remaining_size_eur, row["id"]),
+            )
+            # Insert a closed record for the sold portion
+            conn.execute("""
+                INSERT INTO trades
+                    (ticker, direction, date, price, price_eur, size_eur, shares,
+                     currency, fx_rate, signal_composite, stop_loss, target_1, target_2,
+                     notes, action, status, created_at,
+                     close_date, close_price, close_price_eur, close_currency, close_fx_rate, pnl_eur)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'BUY','closed',NOW(),
+                        %s,%s,%s,%s,%s,%s)
+            """, (
+                sym, direction, row["date"], row["price"], entry_price_eur,
+                sell_shares * entry_price_eur, sell_shares,
+                row["currency"] or "USD", row["fx_rate"] or eur_usd,
+                row["signal_composite"], row["stop_loss"], row["target_1"], row["target_2"], row["notes"],
+                today, req.sell_price, close_price_eur, req.currency.upper(), eur_usd, pnl_eur,
+            ))
+        else:
+            # Full close — update the existing row
+            conn.execute("""
+                UPDATE trades SET
+                    status = 'closed', close_date = %s,
+                    close_price = %s, close_price_eur = %s,
+                    close_currency = %s, close_fx_rate = %s, pnl_eur = %s
+                WHERE id = %s
+            """, (today, req.sell_price, close_price_eur, req.currency.upper(), eur_usd, pnl_eur, row["id"]))
+
         conn.commit()
-        log.info("Position sold: %s @ %.4f %s → P&L %.2f EUR", ticker.upper(), req.sell_price, req.currency, pnl_eur)
+        log.info("Position %s %s @ %.4f %s → P&L %.2f EUR (shares=%.4f, partial=%s)",
+                 "partial-sold" if partial else "sold", sym,
+                 req.sell_price, req.currency, pnl_eur, sell_shares, partial)
         return {
-            "ok": True,
-            "ticker": ticker.upper(),
+            "ok": True, "ticker": sym, "partial": partial,
+            "shares_sold": round(sell_shares, 6),
             "pnl_eur": round(pnl_eur, 2),
             "close_price_eur": round(close_price_eur, 4),
             "fx_rate": eur_usd,
@@ -875,8 +914,9 @@ async def sell_position(ticker: str, req: SellPositionRequest, user: AuthUser = 
 
 
 @app.delete("/api/portfolio/positions/{ticker}")
-async def close_position(ticker: str, user: AuthUser = Depends(get_current_user)):
+async def close_position(ticker: str):
     """Mark the most recent open position as closed (no P&L recorded)."""
+    conn = _db_connect()
     try:
         result = conn.execute(
             "UPDATE trades SET status = 'closed' WHERE ticker = %s AND action = 'BUY' AND status = 'open'",
@@ -974,7 +1014,7 @@ class CashUpdateRequest(BaseModel):
 
 
 @app.post("/api/portfolio/cash")
-async def update_cash(req: CashUpdateRequest, user: AuthUser = Depends(get_current_user)):
+async def update_cash(req: CashUpdateRequest):
     """
     Set, add to, or reduce the manual cash balance.
     Body: { "action": "set"|"add"|"reduce", "amount": <float> }
@@ -3496,20 +3536,27 @@ async def ticker_action_zones(symbol: str):
 _analysis_jobs: dict = {}
 
 
+class AnalyzeRequest(BaseModel):
+    llm: str = "grok"   # "grok" | "grok-premium" | "claude"
+
+
 @app.post("/api/ticker/{symbol}/analyze")
-async def ticker_analyze(symbol: str, user: AuthUser = Depends(get_current_user)):
+async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
     """
-    Trigger ai_quant.py --ticker SYMBOL as a background subprocess.
-    Returns immediately. Poll /api/signals/ticker/{symbol} to see when thesis appears.
+    Trigger ai_quant.py --ticker SYMBOL --no-cache [--llm LLM] as a background subprocess.
+    Always bypasses thesis cache so the chosen LLM is actually called.
+    Returns immediately. Poll /analyze/status to see when the job completes.
     """
     sym = symbol.upper()
+    llm = req.llm if req.llm in ("grok", "grok-premium", "claude") else "grok"
 
-    # If already running, return current status
+    # If already running for the same LLM, return current status
     job = _analysis_jobs.get(sym)
     if job and job.get("status") == "running":
         proc = job.get("proc")
         if proc and proc.returncode is None:
-            return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
+            return {"status": "running", "symbol": sym, "started_at": job["started_at"],
+                    "llm": job.get("llm", llm)}
         else:
             _analysis_jobs[sym]["status"] = "done"
 
@@ -3521,32 +3568,41 @@ async def ticker_analyze(symbol: str, user: AuthUser = Depends(get_current_user)
     try:
         import os as _os
         sub_env = dict(_os.environ)
-        # Ensure API key is forwarded to the subprocess
+        # Ensure API keys are forwarded to the subprocess
         for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY"):
             val = _os.environ.get(key)
             if val:
                 sub_env[key] = val
         proc = await asyncio.create_subprocess_exec(
-            str(python_exec), str(ai_quant_path), "--ticker", sym,
+            str(python_exec), str(ai_quant_path),
+            "--ticker", sym, "--no-cache", "--llm", llm,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(BASE_DIR),
             env=sub_env,
         )
         started = datetime.utcnow().isoformat() + "Z"
-        _analysis_jobs[sym] = {"status": "running", "started_at": started, "proc": proc}
-        log.info(f"Analysis started for {sym} (pid {proc.pid})")
-        # Report which model will likely be used (actual model stamped on thesis by ai_quant.py)
+        _analysis_jobs[sym] = {"status": "running", "started_at": started, "proc": proc, "llm": llm}
+        log.info(f"Analysis started for {sym} with llm={llm} (pid {proc.pid})")
+        # Estimate model and cost for the chosen LLM
         try:
-            from config import AI_MODEL_DEFAULT, AI_MODEL_PREMIUM, AI_PREMIUM_THRESHOLD
+            from config import AI_MODEL_DEFAULT, AI_MODEL_PREMIUM
             from utils.usage import compute_cost
-            est_model = AI_MODEL_DEFAULT   # premium only triggers at ≥ threshold agreement
-            est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
+            if llm == "claude":
+                est_model = "claude-sonnet-4-6"
+                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
+            elif llm == "grok-premium":
+                est_model = AI_MODEL_PREMIUM
+                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
+            else:
+                est_model = AI_MODEL_DEFAULT
+                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
         except Exception:
-            est_model, est_cost = "grok-4-1-fast-reasoning", 0.009
+            est_model = {"grok-premium": "grok-4.20-0309-reasoning", "claude": "claude-sonnet-4-6"}.get(llm, "grok-4-1-fast-reasoning")
+            est_cost  = {"grok-premium": 0.027, "claude": 0.012}.get(llm, 0.009)
         return {
             "status": "running", "symbol": sym, "started_at": started, "pid": proc.pid,
-            "estimated_model": est_model, "estimated_cost": est_cost,
+            "estimated_model": est_model, "estimated_cost": est_cost, "llm": llm,
         }
     except Exception as e:
         log.error(f"Failed to launch analysis for {sym}: {e}")

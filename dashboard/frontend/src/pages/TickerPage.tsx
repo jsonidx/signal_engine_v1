@@ -1052,6 +1052,9 @@ const PREMIUM_MODELS = ['grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasonin
 function ModelBadge({ model, cost }: { model: string; cost?: number }) {
   const isPremium = PREMIUM_MODELS.some(m => model.includes('4.20') || model.includes('4-0709'))
   const shortName = model
+    .replace('claude-sonnet-', 'Sonnet-')
+    .replace('claude-opus-', 'Opus-')
+    .replace('claude-haiku-', 'Haiku-')
     .replace('grok-', 'G-')
     .replace('-reasoning', ' ✦')
     .replace('-non-reasoning', '')
@@ -1077,8 +1080,18 @@ function ModelBadge({ model, cost }: { model: string; cost?: number }) {
 
 // ─── Analyze button ────────────────────────────────────────────────────────────
 
+const LLM_OPTIONS = [
+  { value: 'grok',         label: 'Grok (fast)',    desc: 'xAI Grok — daily driver' },
+  { value: 'grok-premium', label: 'Grok Premium',   desc: 'xAI Grok premium — 3× cost' },
+  { value: 'claude',       label: 'Claude Sonnet',  desc: 'Anthropic Claude Sonnet' },
+] as const
+
+type LLMChoice = typeof LLM_OPTIONS[number]['value']
+
 function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boolean }) {
   const [job, setJob] = useState<AnalyzeStatus | null>(null)
+  const [llm, setLlm] = useState<LLMChoice>('grok')
+  const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
 
   // Poll for completion when running — auto-refresh ticker data when done
@@ -1098,18 +1111,23 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
   } as any)
 
   const handleRun = async () => {
+    setError(null)
     try {
-      const res = await api.tickerAnalyze(symbol)
+      const res = await api.tickerAnalyze(symbol, llm)
       setJob(res)
-    } catch (e) {
+    } catch (e: any) {
+      const msg = e?.response?.data?.detail ?? e?.message ?? 'Failed to start analysis'
+      setError(msg)
       console.error(e)
     }
   }
 
+  const llmLabel = LLM_OPTIONS.find(o => o.value === llm)?.label ?? llm
+
   if (job?.status === 'running') {
     return (
       <div className="flex items-center gap-2 font-mono text-xs text-accent-amber">
-        <span className="animate-pulse">⬤</span> Running Grok analysis for {symbol}…
+        <span className="animate-pulse">⬤</span> Running AI analysis ({llmLabel}) for {symbol}…
         <span className="text-text-tertiary text-[10px]">auto-refreshes when done (~60s)</span>
       </div>
     )
@@ -1119,24 +1137,41 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
     const doneCost  = job.cost_usd ?? job.estimated_cost
     return (
       <div className="flex items-center gap-2 font-mono text-xs text-accent-green">
-        ✓ Analysis complete
+        ✓ AI analysis complete
         {doneModel && <ModelBadge model={doneModel} cost={doneCost} />}
       </div>
     )
   }
 
   return (
-    <button
-      onClick={handleRun}
-      className={clsx(
-        'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
-        hasThesis
-          ? 'border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active'
-          : 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple hover:bg-accent-purple/30'
-      )}
-    >
-      {hasThesis ? '↻ Re-run Grok analysis' : '▶ Run Grok analysis'}
-    </button>
+    <div className="flex items-center gap-2">
+      {/* LLM picker */}
+      <select
+        value={llm}
+        onChange={e => setLlm(e.target.value as LLMChoice)}
+        className="font-mono text-xs px-2 py-1.5 rounded border border-border-subtle bg-bg-surface text-text-secondary hover:border-border-active focus:outline-none cursor-pointer"
+        title={LLM_OPTIONS.find(o => o.value === llm)?.desc}
+      >
+        {LLM_OPTIONS.map(o => (
+          <option key={o.value} value={o.value} title={o.desc}>{o.label}</option>
+        ))}
+      </select>
+
+      {/* Run button */}
+      <button
+        onClick={handleRun}
+        className={clsx(
+          'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+          hasThesis
+            ? 'border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active'
+            : 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple hover:bg-accent-purple/30'
+        )}
+      >
+        {hasThesis ? '↻ Re-run AI analysis' : '▶ Run AI analysis'}
+      </button>
+
+      {error && <span className="font-mono text-[10px] text-accent-red">{error}</span>}
+    </div>
   )
 }
 

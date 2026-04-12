@@ -504,8 +504,9 @@ export interface AddPositionPayload {
 }
 
 export interface SellPositionPayload {
-  sell_price: number
-  currency: 'EUR' | 'USD'
+  sell_price:     number
+  currency:       'EUR' | 'USD'
+  shares_to_sell?: number   // omit or 0 for full close
 }
 
 export interface TradeRecord {
@@ -1048,7 +1049,7 @@ export const api = {
   positionAdd: (payload: AddPositionPayload): Promise<{ ok: boolean; ticker: string; price_eur?: number; fx_rate?: number }> =>
     client.post('/api/portfolio/positions', payload).then(r => r.data),
 
-  positionSell: (ticker: string, payload: SellPositionPayload): Promise<{ ok: boolean; ticker: string; pnl_eur: number; fx_rate: number }> =>
+  positionSell: (ticker: string, payload: SellPositionPayload): Promise<{ ok: boolean; ticker: string; pnl_eur: number; fx_rate: number; partial?: boolean; shares_sold?: number }> =>
     client.post(`/api/portfolio/positions/${ticker}/sell`, payload).then(r => r.data),
 
   positionClose: (ticker: string): Promise<{ ok: boolean; ticker: string }> =>
@@ -1068,8 +1069,8 @@ export const api = {
   tickerActionZones: (symbol: string): Promise<ActionZones | null> =>
     client.get(`/api/ticker/${symbol}/action-zones`).then(r => r.data?.data_available ? r.data : null).catch(() => null),
 
-  tickerAnalyze: (symbol: string): Promise<AnalyzeStatus> =>
-    client.post(`/api/ticker/${symbol}/analyze`).then(r => r.data),
+  tickerAnalyze: (symbol: string, llm: string = 'grok'): Promise<AnalyzeStatus> =>
+    client.post(`/api/ticker/${symbol}/analyze`, { llm }).then(r => r.data),
 
   tickerAnalyzeStatus: (symbol: string): Promise<AnalyzeStatus> =>
     client.get(`/api/ticker/${symbol}/analyze/status`).then(r => r.data),
