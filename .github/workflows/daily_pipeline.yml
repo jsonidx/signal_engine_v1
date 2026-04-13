@@ -2,7 +2,7 @@ name: Daily Signal Pipeline (no AI cost)
 
 on:
   schedule:
-    - cron: '0 2 * * 1-5'   # 04:00 Berlin (CEST, UTC+2) = 02:00 UTC — before Xetra open
+    - cron: '17 1 * * 1-6'   # 03:17 Berlin (CEST, UTC+2) = 02:00 UTC
   workflow_dispatch:
     inputs:
       skip_ai:
