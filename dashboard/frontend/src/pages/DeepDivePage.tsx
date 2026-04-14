@@ -32,7 +32,8 @@ interface DeepDiveTicker {
   stop_loss: number | null
 }
 
-type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED'
+type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR'
+type SortMode = 'direction' | 'rr'
 
 function fmtDateTime(iso: string | null): { date: string; time: string } | null {
   if (!iso) return null
@@ -42,6 +43,18 @@ function fmtDateTime(iso: string | null): { date: string; time: string } | null 
     date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
     time: d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
   }
+}
+
+function computeRR(t: DeepDiveTicker): number | null {
+  const entry =
+    t.entry_low != null && t.entry_high != null
+      ? (t.entry_low + t.entry_high) / 2
+      : t.entry_low ?? t.entry_high
+  if (entry == null || t.target_1 == null || t.stop_loss == null) return null
+  const t1p = ((t.target_1 - entry) / entry) * 100
+  const sp  = ((t.stop_loss - entry) / entry) * 100
+  if (Math.abs(sp) === 0) return null
+  return Math.abs(t1p / sp)
 }
 
 function useDeepDiveTickers() {
@@ -70,6 +83,17 @@ function sortByBullFirst(a: DeepDiveTicker, b: DeepDiveTicker) {
   const da = DIRECTION_ORDER[a.direction ?? 'NEUTRAL'] ?? 1
   const db = DIRECTION_ORDER[b.direction ?? 'NEUTRAL'] ?? 1
   if (da !== db) return da - db
+  return (b.conviction ?? 0) - (a.conviction ?? 0)
+}
+
+// Sort by R:R descending — null R:R goes to bottom, then tiebreak by conviction
+function sortByRR(a: DeepDiveTicker, b: DeepDiveTicker) {
+  const ra = computeRR(a)
+  const rb = computeRR(b)
+  if (ra === null && rb === null) return (b.conviction ?? 0) - (a.conviction ?? 0)
+  if (ra === null) return 1
+  if (rb === null) return -1
+  if (rb !== ra) return rb - ra
   return (b.conviction ?? 0) - (a.conviction ?? 0)
 }
 
@@ -316,11 +340,13 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
   { value: 'BULL',    label: 'Bull' },
   { value: 'BEAR',    label: 'Bear' },
   { value: 'NEUTRAL', label: 'Neutral' },
+  { value: 'HIGH_RR', label: 'R:R ≥2' },
 ]
 
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
-  const { data: tickers, isLoading: loadingTickers } = useDeepDiveTickers()
+  const [sortMode, setSortMode] = useState<SortMode>('direction')
+  const { data: tickers, isLoading: loadingTickers, isError, error, refetch } = useDeepDiveTickers()
   const { data: openTickers = [] } = useOpenPositionTickers()
 
   const openSet = useMemo(() => new Set(openTickers), [openTickers])
@@ -332,18 +358,20 @@ export function DeepDivePage() {
     const analyzed = all.filter(t => t.has_thesis)
     const universe = all.filter(t => !t.has_thesis)
 
-    // Apply direction filter only to analyzed tickers
+    // Apply direction/quality filter to analyzed tickers
     const filteredAnalyzed =
       filter === 'ALL' || filter === 'ANALYZED'
         ? analyzed
-        : analyzed.filter(t => t.direction === filter)
+        : filter === 'HIGH_RR'
+          ? analyzed.filter(t => (computeRR(t) ?? 0) >= 2)
+          : analyzed.filter(t => t.direction === filter)
 
-    // Universe tickers: show when filter is ALL or ANALYZED (hide for direction filters)
-    const filteredUniverse =
-      filter === 'ALL' ? universe : []
+    // Universe tickers: show when filter is ALL only (hide for direction/RR filters)
+    const filteredUniverse = filter === 'ALL' ? universe : []
 
     // Sort analyzed section
-    const sortedAnalyzed = [...filteredAnalyzed].sort(sortByBullFirst)
+    const sorter = sortMode === 'rr' ? sortByRR : sortByBullFirst
+    const sortedAnalyzed = [...filteredAnalyzed].sort(sorter)
 
     // Sort universe: open positions first, then alphabetical
     const sortedUniverse = [...filteredUniverse].sort((a, b) => {
@@ -354,14 +382,14 @@ export function DeepDivePage() {
     })
 
     return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse }
-  }, [tickers, filter, openSet])
+  }, [tickers, filter, sortMode, openSet])
 
   const totalShown = analyzedRows.length + universeRows.length
 
   return (
     <Shell title="Deep Dive">
-      {/* Filter bar */}
-      <div className="flex items-center gap-2 mb-5">
+      {/* Filter + sort bar */}
+      <div className="flex items-center gap-2 mb-5 flex-wrap">
         {FILTER_OPTIONS.map(({ value, label }) => (
           <button
             key={value}
@@ -375,20 +403,56 @@ export function DeepDivePage() {
                     ? 'bg-accent-red/20 text-accent-red border-accent-red/40'
                     : value === 'NEUTRAL'
                       ? 'bg-text-tertiary/20 text-text-secondary border-text-tertiary/30'
-                      : 'bg-bg-elevated text-text-primary border-border-active'
+                      : value === 'HIGH_RR'
+                        ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+                        : 'bg-bg-elevated text-text-primary border-border-active'
                 : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
             )}
           >
             {label}
           </button>
         ))}
-        <span className="font-mono text-[10px] text-text-tertiary ml-2">
+
+        {/* Divider */}
+        <div className="w-px h-4 bg-border-subtle mx-1" />
+
+        {/* Sort toggle */}
+        <div className="flex items-center gap-1">
+          <span className="font-mono text-[10px] text-text-tertiary mr-1">sort:</span>
+          {([['direction', 'Direction'], ['rr', 'R:R ↓']] as const).map(([mode, label]) => (
+            <button
+              key={mode}
+              onClick={() => setSortMode(mode)}
+              className={clsx(
+                'font-mono text-xs px-2.5 py-1.5 rounded border transition-colors',
+                sortMode === mode
+                  ? 'bg-bg-elevated text-text-primary border-border-active'
+                  : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <span className="font-mono text-[10px] text-text-tertiary ml-1">
           {totalShown} ticker{totalShown !== 1 ? 's' : ''}
         </span>
       </div>
 
       {loadingTickers ? (
         <LoadingSkeleton rows={8} />
+      ) : isError ? (
+        <div className="font-mono text-sm py-12 text-center space-y-3">
+          <div className="text-accent-red">Failed to load tickers.</div>
+          <div className="text-text-tertiary text-xs">{String(error)}</div>
+          <button
+            onClick={() => refetch()}
+            className="mt-2 px-4 py-1.5 text-xs border border-border-subtle hover:border-border-active text-text-secondary hover:text-text-primary rounded transition-colors"
+          >
+            Retry
+          </button>
+        </div>
       ) : totalShown === 0 ? (
         <div className="font-mono text-sm text-text-tertiary py-12 text-center">
           {(tickers?.length ?? 0) === 0
