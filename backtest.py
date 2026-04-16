@@ -1105,6 +1105,13 @@ def main():
         if args.output_csv:
             results.to_csv(args.output_csv, index=False)
             print(f"\n  Results saved to: {args.output_csv}")
+        # Persist to Supabase
+        try:
+            from utils.supabase_persist import save_backtest_runs
+            save_backtest_runs(results, factor_ic=getattr(bt, "_aggregated_ic", {}))
+            print("  Backtest results saved to Supabase.")
+        except Exception as _exc:
+            pass  # non-fatal
 
     elif args.run_latest:
         windows = bt._generate_windows()
@@ -1141,6 +1148,13 @@ def main():
             "tickers_excluded": r.get("tickers_excluded", 0),
         }])
         bt.generate_report(df)
+        # Persist to Supabase
+        try:
+            from utils.supabase_persist import save_backtest_runs
+            save_backtest_runs(df, factor_ic=getattr(bt, "_aggregated_ic", {}))
+            print("  Backtest results saved to Supabase.")
+        except Exception as _exc:
+            pass  # non-fatal
 
     elif args.factor_ic or args.suggest_weights:
         print("  --factor-ic / --suggest-weights must be combined with --run-full.")

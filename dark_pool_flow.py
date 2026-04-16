@@ -402,6 +402,12 @@ def save_result_cache(results: List[dict]) -> None:
         logger.info("dark_pool_flow: result cache saved to %s", _RESULT_CACHE_PATH)
     except OSError as exc:
         logger.warning("dark_pool_flow: could not write result cache: %s", exc)
+    # Persist to Supabase for historical record
+    try:
+        from utils.supabase_persist import save_dark_pool_snapshot
+        save_dark_pool_snapshot(results)
+    except Exception as exc:
+        logger.warning("dark_pool_flow: Supabase persist failed (non-fatal): %s", exc)
 
 
 def load_result_cache() -> Dict[str, dict]:

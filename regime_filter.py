@@ -118,12 +118,19 @@ def _load_json_cache(path: Path) -> dict:
 
 
 def _save_json_cache(path: Path, data: dict) -> None:
-    """Write JSON cache to disk; silently suppress errors."""
+    """Write JSON cache to disk and sync to Supabase if both regime keys present."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, default=str))
     except Exception as exc:
         logger.warning("Could not write cache %s: %s", path, exc)
+    # Persist to Supabase whenever the full regime snapshot is available
+    if path == _REGIME_CACHE_PATH and "market_regime" in data and "sector_regimes" in data:
+        try:
+            from utils.supabase_persist import save_regime_snapshot
+            save_regime_snapshot(data)
+        except Exception as exc:
+            logger.warning("Supabase regime persist failed (non-fatal): %s", exc)
 
 
 def _cache_is_fresh(timestamp_iso: Optional[str], ttl_hours: float) -> bool:

@@ -1060,6 +1060,12 @@ def export_to_csv(
         path = os.path.join(OUTPUT_DIR, f"equity_signals_{date_str}.csv")
         equity_signals.to_csv(path)
         files_written.append(path)
+        # Persist to Supabase for historical record + LLM context
+        try:
+            from utils.supabase_persist import save_screener_signals
+            save_screener_signals(equity_signals.reset_index(), TODAY.strftime("%Y-%m-%d"))
+        except Exception as _exc:
+            pass  # non-fatal
 
     if not crypto_signals.empty:
         path = os.path.join(OUTPUT_DIR, f"crypto_signals_{date_str}.csv")
