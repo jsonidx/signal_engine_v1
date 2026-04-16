@@ -1063,7 +1063,9 @@ def main():
             tickers = []
 
         # Config lists are empty (tickers now live in watchlist.txt / Supabase).
-        # Fall back to watchlist.txt TIER 1 + TIER 2, matching ai_quant behaviour.
+        # Fall back to watchlist.txt — collect ALL non-comment tickers regardless of
+        # section header (handles both manual TIER 1/2 and auto-generated sections
+        # like UNIVERSE (auto) / PERSISTENT_AUTO_FAVORITES written by universe_builder).
         if not tickers:
             wl_paths = [
                 os.path.join(os.path.dirname(__file__), "watchlist.txt"),
@@ -1071,25 +1073,35 @@ def main():
             ]
             for wl_path in wl_paths:
                 if os.path.exists(wl_path):
-                    _tiers = {"TIER 1", "TIER 2"}
-                    current_tier = None
                     with open(wl_path) as _f:
                         for _line in _f:
                             _s = _line.strip()
-                            if not _s:
+                            if not _s or _s.startswith("#"):
                                 continue
-                            _u = _s.upper()
-                            if "TIER 1" in _u:
-                                current_tier = "TIER 1"
-                            elif "TIER 2" in _u:
-                                current_tier = "TIER 2"
-                            elif _u.startswith("TIER") or "MANUALLY ADDED" in _u:
-                                current_tier = None
-                            elif not _s.startswith("#"):
-                                t = _s.split("#")[0].strip().upper()
-                                if t and current_tier in _tiers:
-                                    tickers.append(t)
+                            t = _s.split("#")[0].strip().upper()
+                            if t:
+                                tickers.append(t)
+                    tickers = list(dict.fromkeys(tickers))  # deduplicate, preserve order
                     break
+
+        # Last resort: pull TIER1 + PERSISTENT from Supabase user_watchlists
+        # (populated by universe_builder.py step 0 — always available on GHA).
+        if not tickers:
+            try:
+                from utils.db import get_connection
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT ticker FROM user_watchlists "
+                    "WHERE source = 'universe_builder' ORDER BY tier, ticker"
+                )
+                rows = cur.fetchall()
+                conn.close()
+                tickers = [r["ticker"] for r in rows if r.get("ticker")]
+                if tickers:
+                    print(f"INFO: Loaded {len(tickers)} tickers from Supabase user_watchlists")
+            except Exception as _exc:
+                print(f"WARN: Supabase ticker fallback failed: {_exc}")
 
         if not tickers:
             print("ERROR: No tickers found. Pass --tickers or populate watchlist.txt.")
