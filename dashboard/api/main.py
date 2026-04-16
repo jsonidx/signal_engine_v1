@@ -105,6 +105,9 @@ DATA_DIR         = BASE_DIR / "data"
 LOGS_DIR         = BASE_DIR / "logs"
 REGIME_CACHE     = DATA_DIR / "regime_cache.json"
 SECTOR_CACHE     = DATA_DIR / "sector_cache.json"
+PAPER_TRADES_DB  = BASE_DIR / "paper_trades.db"
+TRADE_JOURNAL_DB = BASE_DIR / "trade_journal.db"
+AI_QUANT_DB      = BASE_DIR / "ai_quant_cache.db"
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
