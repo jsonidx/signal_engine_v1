@@ -598,6 +598,179 @@ def score_technical_setup(data: dict) -> dict:
 
 
 # ==============================================================================
+# SECTION 2B: EARNINGS PROXIMITY + ANALYST UPGRADE CLUSTERING
+# ==============================================================================
+
+def score_earnings_catalyst(data: dict) -> dict:
+    """
+    Earnings proximity score.
+
+    Pre-earnings runs are one of the most reliable short-term setups:
+    analyst upgrades cluster, options premiums inflate, and momentum
+    traders front-run the report. The closer earnings are, the higher
+    the urgency.
+
+    Data source: yfinance info["earningsTimestamp"] + stock.calendar
+
+    Scoring (max=5):
+      ≤ 7 days  → 5  (earnings imminent — maximum urgency)
+      8–14 days → 4  (high urgency window)
+      15–21 days → 3  (pre-earnings accumulation window)
+      22–30 days → 2  (early setup phase)
+      31–45 days → 1  (on radar)
+      > 45 days  → 0
+    """
+    score = 0
+    flags = []
+    days_to_earnings = None
+
+    try:
+        info = data.get("info") or {}
+        stock_obj = data.get("stock_obj")
+
+        # Try earningsTimestamp from info first
+        ts = info.get("earningsTimestamp")
+        if ts and ts > 0:
+            from datetime import timezone
+            earnings_dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+            days_to_earnings = (earnings_dt - datetime.utcnow()).days
+
+        # Fallback: stock.calendar DataFrame
+        if days_to_earnings is None and stock_obj is not None:
+            try:
+                cal = stock_obj.calendar
+                if cal is not None and not (hasattr(cal, "empty") and cal.empty):
+                    # calendar is a dict or DataFrame depending on yfinance version
+                    if isinstance(cal, dict):
+                        ed = cal.get("Earnings Date")
+                        if ed:
+                            ed = ed[0] if isinstance(ed, list) else ed
+                            if hasattr(ed, "to_pydatetime"):
+                                ed = ed.to_pydatetime().replace(tzinfo=None)
+                            days_to_earnings = (ed - datetime.utcnow()).days
+                    elif hasattr(cal, "loc"):
+                        ed = cal.loc["Earnings Date"].iloc[0] if "Earnings Date" in cal.index else None
+                        if ed is not None:
+                            if hasattr(ed, "to_pydatetime"):
+                                ed = ed.to_pydatetime().replace(tzinfo=None)
+                            days_to_earnings = (ed - datetime.utcnow()).days
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    if days_to_earnings is not None and days_to_earnings >= 0:
+        if days_to_earnings <= 7:
+            score = 5
+            flags.append(f"EARNINGS IN {days_to_earnings}d — imminent catalyst")
+        elif days_to_earnings <= 14:
+            score = 4
+            flags.append(f"Earnings in {days_to_earnings}d — high-urgency window")
+        elif days_to_earnings <= 21:
+            score = 3
+            flags.append(f"Earnings in {days_to_earnings}d — pre-earnings setup")
+        elif days_to_earnings <= 30:
+            score = 2
+            flags.append(f"Earnings in {days_to_earnings}d — early accumulation window")
+        elif days_to_earnings <= 45:
+            score = 1
+            flags.append(f"Earnings in {days_to_earnings}d — on radar")
+    elif days_to_earnings is not None and days_to_earnings < 0:
+        flags.append(f"Earnings passed {abs(days_to_earnings)}d ago")
+
+    return {"score": score, "max": 5, "flags": flags, "days_to_earnings": days_to_earnings}
+
+
+def score_analyst_momentum(data: dict) -> dict:
+    """
+    Analyst upgrade clustering score.
+
+    Multiple upgrades or price-target raises in the same week signal
+    institutional consensus forming — often a precursor to a gap-up.
+    The AMD pattern (Apr 2026): 3 upgrades + PT raises in 7 days → +5%.
+
+    Data source: yfinance stock.upgrades_downgrades (free, no API key)
+
+    Scoring (max=6):
+      3+ upgrades in 7 days          → +3  (strong clustering)
+      2 upgrades in 7 days           → +2  (clustering detected)
+      1 upgrade in 7 days            → +1  (single upgrade)
+      Bonus: upgrade within earnings → +2  (upgrade × earnings proximity)
+      Downgrade in 7 days penalty    → -1 per downgrade (floor 0)
+    """
+    score = 0
+    flags = []
+    upgrades_7d = 0
+    downgrades_7d = 0
+
+    try:
+        stock_obj = data.get("stock_obj")
+        if stock_obj is None:
+            return {"score": 0, "max": 6, "flags": [], "upgrades_7d": 0}
+
+        upg_df = stock_obj.upgrades_downgrades
+        if upg_df is None or (hasattr(upg_df, "empty") and upg_df.empty):
+            return {"score": 0, "max": 6, "flags": [], "upgrades_7d": 0}
+
+        # Normalise index to datetime
+        if not isinstance(upg_df.index, pd.DatetimeIndex):
+            upg_df.index = pd.to_datetime(upg_df.index, utc=True)
+
+        cutoff_7d  = pd.Timestamp.utcnow() - pd.Timedelta(days=7)
+        cutoff_30d = pd.Timestamp.utcnow() - pd.Timedelta(days=30)
+
+        recent_7d  = upg_df[upg_df.index >= cutoff_7d]
+        recent_30d = upg_df[upg_df.index >= cutoff_30d]
+
+        upgrade_actions   = {"upgrade", "init", "reiterated", "raised"}
+        downgrade_actions = {"downgrade", "lowered"}
+
+        def is_upgrade(row):
+            action = str(row.get("Action", "")).lower()
+            grade  = str(row.get("ToGrade", "")).lower()
+            return (action in upgrade_actions or
+                    any(k in grade for k in ("buy", "outperform", "overweight", "strong buy")))
+
+        def is_downgrade(row):
+            action = str(row.get("Action", "")).lower()
+            grade  = str(row.get("ToGrade", "")).lower()
+            return (action in downgrade_actions or
+                    any(k in grade for k in ("sell", "underperform", "underweight")))
+
+        upgrades_7d   = sum(1 for _, r in recent_7d.iterrows()  if is_upgrade(r))
+        downgrades_7d = sum(1 for _, r in recent_7d.iterrows()  if is_downgrade(r))
+        upgrades_30d  = sum(1 for _, r in recent_30d.iterrows() if is_upgrade(r))
+
+        # Base clustering score
+        if upgrades_7d >= 3:
+            score += 3
+            flags.append(f"ANALYST CLUSTER: {upgrades_7d} upgrades/raises in 7 days")
+        elif upgrades_7d == 2:
+            score += 2
+            flags.append(f"Analyst clustering: {upgrades_7d} upgrades in 7 days")
+        elif upgrades_7d == 1:
+            score += 1
+            flags.append(f"Analyst upgrade in last 7 days")
+
+        # 30-day momentum context
+        if upgrades_30d >= 4 and upgrades_7d == 0:
+            score += 1
+            flags.append(f"Strong analyst momentum: {upgrades_30d} upgrades in 30 days")
+
+        # Downgrade penalty
+        if downgrades_7d > 0:
+            penalty = min(downgrades_7d, score)  # don't go below 0 from here
+            score = max(0, score - penalty)
+            flags.append(f"⚠️  {downgrades_7d} downgrade(s) in 7 days")
+
+    except Exception as exc:
+        flags.append(f"[analyst data unavailable: {exc}]")
+
+    return {"score": min(score, 6), "max": 6, "flags": flags, "upgrades_7d": upgrades_7d}
+
+
+# ==============================================================================
 # SECTION 3: POLYMARKET SIGNAL
 # ==============================================================================
 
@@ -818,6 +991,8 @@ def screen_universe(
         vol_squeeze = score_volatility_squeeze(data)
         options = score_options_activity(data)
         technical = score_technical_setup(data)
+        earnings = score_earnings_catalyst(data)
+        analyst = score_analyst_momentum(data)
 
         social = {"score": 0, "max": 5, "flags": []}
         if include_social:
@@ -842,16 +1017,36 @@ def screen_universe(
         # Composite score
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
                         options["max"] + technical["max"] + social["max"] +
-                        polymarket["max"] + dark_pool["max"])
+                        polymarket["max"] + dark_pool["max"] +
+                        earnings["max"] + analyst["max"])
         raw_total = (squeeze["score"] + volume["score"] + vol_squeeze["score"] +
                      options["score"] + technical["score"] + social["score"] +
-                     polymarket["score"] + dark_pool["score"])
+                     polymarket["score"] + dark_pool["score"] +
+                     earnings["score"] + analyst["score"])
 
         composite = raw_total / max_possible * 100 if max_possible > 0 else 0
 
+        # Earnings × analyst clustering multiplier:
+        # When upgrades cluster AND earnings are near, the signal is
+        # disproportionately strong — apply a 1.5x boost (AMD pattern).
+        days_to_e = earnings.get("days_to_earnings")
+        upgrades_7d = analyst.get("upgrades_7d", 0)
+        if (days_to_e is not None and 0 <= days_to_e <= 30
+                and upgrades_7d >= 2 and not composite == 0):
+            composite = min(composite * 1.5, 100)
+            all_boost_flag = (
+                f"EARNINGS×ANALYST BOOST ×1.5 — {upgrades_7d} upgrades "
+                f"+ earnings in {days_to_e}d"
+            )
+        else:
+            all_boost_flag = None
+
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
                      options["flags"] + technical["flags"] + social["flags"] +
-                     polymarket["flags"] + dark_pool["flags"])
+                     polymarket["flags"] + dark_pool["flags"] +
+                     earnings["flags"] + analyst["flags"])
+        if all_boost_flag:
+            all_flags.insert(0, all_boost_flag)
 
         # Cross-module post-squeeze guard (mirrors squeeze_screener.py logic).
         # Zeroes the composite score when a squeeze has already fired — the
@@ -885,6 +1080,10 @@ def screen_universe(
             "polymarket_score": polymarket["score"],
             "dark_pool_score": dark_pool["score"],
             "dark_pool_signal": dark_pool["signal"],
+            "earnings_score": earnings["score"],
+            "analyst_score": analyst["score"],
+            "days_to_earnings": earnings.get("days_to_earnings"),
+            "upgrades_7d": analyst.get("upgrades_7d", 0),
             "post_squeeze_guard": bool(_recent_sq),
             "composite": round(composite, 1),
             "flags": all_flags,
@@ -994,6 +1193,8 @@ def deep_dive(ticker: str, include_social: bool = False, include_polymarket: boo
         ("VOLATILITY COMPRESSION", score_volatility_squeeze),
         ("OPTIONS ACTIVITY", score_options_activity),
         ("TECHNICAL SETUP", score_technical_setup),
+        ("EARNINGS PROXIMITY", score_earnings_catalyst),
+        ("ANALYST MOMENTUM", score_analyst_momentum),
     ]:
         result = func(data)
         print(f"\n  {name}: {result['score']}/{result['max']}")
