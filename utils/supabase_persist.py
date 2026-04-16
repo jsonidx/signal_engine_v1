@@ -360,3 +360,399 @@ def save_backtest_runs(results_df: Any, factor_ic: dict | None = None,
         logger.info("backtest_runs: inserted %d windows for %s", len(rows), run_date)
     except Exception as exc:
         logger.warning("save_backtest_runs failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 5. CATALYST SCREENER SCORES
+# ==============================================================================
+
+_CATALYST_DDL = """
+CREATE TABLE IF NOT EXISTS catalyst_scores (
+    date              TEXT    NOT NULL,
+    ticker            TEXT    NOT NULL,
+    composite         REAL,
+    squeeze_score     REAL,
+    volume_score      REAL,
+    vol_compress      REAL,
+    options_score     REAL,
+    technical_score   REAL,
+    social_score      REAL,
+    polymarket_score  REAL,
+    dark_pool_score   REAL,
+    dark_pool_signal  TEXT,
+    n_flags           INTEGER,
+    price             REAL,
+    short_pct         REAL,
+    PRIMARY KEY (date, ticker)
+);
+"""
+
+def save_catalyst_scores(df: Any, run_date: str | None = None) -> None:
+    """Upsert catalyst screener per-ticker scores into catalyst_scores."""
+    try:
+        import pandas as pd
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return
+        run_date = run_date or _today()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_CATALYST_DDL)
+
+        def _f(row, col):
+            v = row.get(col)
+            return float(v) if v is not None and pd.notna(v) else None
+
+        rows = []
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                run_date, ticker,
+                _f(row, "composite"), _f(row, "squeeze_score"), _f(row, "volume_score"),
+                _f(row, "vol_compress"), _f(row, "options_score"), _f(row, "technical_score"),
+                _f(row, "social_score"), _f(row, "polymarket_score"), _f(row, "dark_pool_score"),
+                str(row.get("dark_pool_signal") or ""),
+                int(row["n_flags"]) if "n_flags" in row and pd.notna(row["n_flags"]) else None,
+                _f(row, "price"), _f(row, "short_pct"),
+            ))
+        cur.executemany(
+            """
+            INSERT INTO catalyst_scores
+                (date, ticker, composite, squeeze_score, volume_score, vol_compress,
+                 options_score, technical_score, social_score, polymarket_score,
+                 dark_pool_score, dark_pool_signal, n_flags, price, short_pct)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, ticker) DO UPDATE SET
+                composite=EXCLUDED.composite, squeeze_score=EXCLUDED.squeeze_score,
+                volume_score=EXCLUDED.volume_score, vol_compress=EXCLUDED.vol_compress,
+                options_score=EXCLUDED.options_score, technical_score=EXCLUDED.technical_score,
+                social_score=EXCLUDED.social_score, polymarket_score=EXCLUDED.polymarket_score,
+                dark_pool_score=EXCLUDED.dark_pool_score, dark_pool_signal=EXCLUDED.dark_pool_signal,
+                n_flags=EXCLUDED.n_flags, price=EXCLUDED.price, short_pct=EXCLUDED.short_pct
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("catalyst_scores: upserted %d rows for %s", len(rows), run_date)
+    except Exception as exc:
+        logger.warning("save_catalyst_scores failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 6. SQUEEZE SCREENER SCORES
+# ==============================================================================
+
+_SQUEEZE_DDL = """
+CREATE TABLE IF NOT EXISTS squeeze_scores (
+    date                   TEXT    NOT NULL,
+    ticker                 TEXT    NOT NULL,
+    final_score            REAL,
+    juice_target           REAL,
+    recent_squeeze         BOOLEAN,
+    price                  REAL,
+    short_pct_float        REAL,
+    days_to_cover          REAL,
+    market_cap_m           REAL,
+    ev_score               REAL,
+    pct_float_short_score  REAL,
+    short_pnl_score        REAL,
+    days_to_cover_score    REAL,
+    volume_surge_score     REAL,
+    ftd_score              REAL,
+    market_cap_score       REAL,
+    float_score            REAL,
+    price_divergence_score REAL,
+    PRIMARY KEY (date, ticker)
+);
+"""
+
+def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
+    """Upsert squeeze screener per-ticker scores into squeeze_scores."""
+    try:
+        import pandas as pd
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return
+        run_date = run_date or _today()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SQUEEZE_DDL)
+
+        def _f(row, col):
+            v = row.get(col)
+            return float(v) if v is not None and pd.notna(v) else None
+
+        rows = []
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                run_date, ticker,
+                _f(row, "final_score"), _f(row, "juice_target"),
+                bool(row["recent_squeeze"]) if "recent_squeeze" in row else None,
+                _f(row, "price"), _f(row, "short_pct_float"), _f(row, "days_to_cover"),
+                _f(row, "market_cap_m"), _f(row, "ev_score"),
+                _f(row, "pct_float_short_score"), _f(row, "short_pnl_score"),
+                _f(row, "days_to_cover_score"), _f(row, "volume_surge_score"),
+                _f(row, "ftd_score"), _f(row, "market_cap_score"),
+                _f(row, "float_score"), _f(row, "price_divergence_score"),
+            ))
+        cur.executemany(
+            """
+            INSERT INTO squeeze_scores
+                (date, ticker, final_score, juice_target, recent_squeeze, price,
+                 short_pct_float, days_to_cover, market_cap_m, ev_score,
+                 pct_float_short_score, short_pnl_score, days_to_cover_score,
+                 volume_surge_score, ftd_score, market_cap_score,
+                 float_score, price_divergence_score)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, ticker) DO UPDATE SET
+                final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
+                recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
+                short_pct_float=EXCLUDED.short_pct_float,
+                days_to_cover=EXCLUDED.days_to_cover, market_cap_m=EXCLUDED.market_cap_m,
+                ev_score=EXCLUDED.ev_score, pct_float_short_score=EXCLUDED.pct_float_short_score,
+                short_pnl_score=EXCLUDED.short_pnl_score,
+                days_to_cover_score=EXCLUDED.days_to_cover_score,
+                volume_surge_score=EXCLUDED.volume_surge_score,
+                ftd_score=EXCLUDED.ftd_score, market_cap_score=EXCLUDED.market_cap_score,
+                float_score=EXCLUDED.float_score,
+                price_divergence_score=EXCLUDED.price_divergence_score
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("squeeze_scores: upserted %d rows for %s", len(rows), run_date)
+    except Exception as exc:
+        logger.warning("save_squeeze_scores failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 7. RED FLAG SCORES
+# ==============================================================================
+
+_RED_FLAG_DDL = """
+CREATE TABLE IF NOT EXISTS red_flag_scores (
+    date               TEXT    NOT NULL,
+    ticker             TEXT    NOT NULL,
+    red_flag_score     REAL,
+    risk_level         TEXT,
+    restatement_score  REAL,
+    accruals_score     REAL,
+    accruals_ratio     REAL,
+    gaap_score         REAL,
+    payout_score       REAL,
+    payout_ratio_fcf   REAL,
+    rev_quality_score  REAL,
+    data_quality       TEXT,
+    top_flag           TEXT,
+    PRIMARY KEY (date, ticker)
+);
+"""
+
+def save_red_flag_scores(df: Any, run_date: str | None = None) -> None:
+    """Upsert red flag screener results into red_flag_scores."""
+    try:
+        import pandas as pd
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return
+        run_date = run_date or _today()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_RED_FLAG_DDL)
+
+        def _f(row, col):
+            v = row.get(col)
+            return float(v) if v is not None and pd.notna(v) else None
+
+        rows = []
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                run_date, ticker,
+                _f(row, "red_flag_score"), str(row.get("risk_level") or ""),
+                _f(row, "restatement_score"), _f(row, "accruals_score"),
+                _f(row, "accruals_ratio"), _f(row, "gaap_score"),
+                _f(row, "payout_score"), _f(row, "payout_ratio_fcf"),
+                _f(row, "rev_quality_score"), str(row.get("data_quality") or ""),
+                str(row.get("top_flag") or ""),
+            ))
+        cur.executemany(
+            """
+            INSERT INTO red_flag_scores
+                (date, ticker, red_flag_score, risk_level, restatement_score,
+                 accruals_score, accruals_ratio, gaap_score, payout_score,
+                 payout_ratio_fcf, rev_quality_score, data_quality, top_flag)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, ticker) DO UPDATE SET
+                red_flag_score=EXCLUDED.red_flag_score, risk_level=EXCLUDED.risk_level,
+                restatement_score=EXCLUDED.restatement_score,
+                accruals_score=EXCLUDED.accruals_score, accruals_ratio=EXCLUDED.accruals_ratio,
+                gaap_score=EXCLUDED.gaap_score, payout_score=EXCLUDED.payout_score,
+                payout_ratio_fcf=EXCLUDED.payout_ratio_fcf,
+                rev_quality_score=EXCLUDED.rev_quality_score,
+                data_quality=EXCLUDED.data_quality, top_flag=EXCLUDED.top_flag
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("red_flag_scores: upserted %d rows for %s", len(rows), run_date)
+    except Exception as exc:
+        logger.warning("save_red_flag_scores failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 8. FUNDAMENTAL COMPUTED SCORES
+# ==============================================================================
+
+_FUNDAMENTAL_SCORES_DDL = """
+CREATE TABLE IF NOT EXISTS fundamental_scores (
+    date                  TEXT    NOT NULL,
+    ticker                TEXT    NOT NULL,
+    composite             REAL,
+    extended_composite    REAL,
+    score_valuation       REAL,
+    score_growth          REAL,
+    score_quality         REAL,
+    score_balance         REAL,
+    score_earnings        REAL,
+    score_analyst         REAL,
+    score_dcf_valuation   REAL,
+    score_peer_relative   REAL,
+    score_accounting_quality REAL,
+    pe_forward            REAL,
+    pe_trailing           REAL,
+    revenue_growth_yoy    REAL,
+    earnings_growth_yoy   REAL,
+    operating_margin      REAL,
+    roe                   REAL,
+    PRIMARY KEY (date, ticker)
+);
+"""
+
+def save_fundamental_scores(df: Any, run_date: str | None = None) -> None:
+    """Upsert computed fundamental scores into fundamental_scores."""
+    try:
+        import pandas as pd
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return
+        run_date = run_date or _today()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_FUNDAMENTAL_SCORES_DDL)
+
+        def _f(row, col):
+            v = row.get(col)
+            return float(v) if v is not None and pd.notna(v) else None
+
+        rows = []
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                run_date, ticker,
+                _f(row, "composite"), _f(row, "extended_composite"),
+                _f(row, "score_valuation"), _f(row, "score_growth"),
+                _f(row, "score_quality"), _f(row, "score_balance"),
+                _f(row, "score_earnings"), _f(row, "score_analyst"),
+                _f(row, "score_dcf_valuation"), _f(row, "score_peer_relative"),
+                _f(row, "score_accounting_quality"),
+                _f(row, "pe_forward"), _f(row, "pe_trailing"),
+                _f(row, "revenue_growth_yoy"), _f(row, "earnings_growth_yoy"),
+                _f(row, "operating_margin"), _f(row, "roe"),
+            ))
+        cur.executemany(
+            """
+            INSERT INTO fundamental_scores
+                (date, ticker, composite, extended_composite, score_valuation,
+                 score_growth, score_quality, score_balance, score_earnings,
+                 score_analyst, score_dcf_valuation, score_peer_relative,
+                 score_accounting_quality, pe_forward, pe_trailing,
+                 revenue_growth_yoy, earnings_growth_yoy, operating_margin, roe)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (date, ticker) DO UPDATE SET
+                composite=EXCLUDED.composite, extended_composite=EXCLUDED.extended_composite,
+                score_valuation=EXCLUDED.score_valuation, score_growth=EXCLUDED.score_growth,
+                score_quality=EXCLUDED.score_quality, score_balance=EXCLUDED.score_balance,
+                score_earnings=EXCLUDED.score_earnings, score_analyst=EXCLUDED.score_analyst,
+                score_dcf_valuation=EXCLUDED.score_dcf_valuation,
+                score_peer_relative=EXCLUDED.score_peer_relative,
+                score_accounting_quality=EXCLUDED.score_accounting_quality,
+                pe_forward=EXCLUDED.pe_forward, pe_trailing=EXCLUDED.pe_trailing,
+                revenue_growth_yoy=EXCLUDED.revenue_growth_yoy,
+                earnings_growth_yoy=EXCLUDED.earnings_growth_yoy,
+                operating_margin=EXCLUDED.operating_margin, roe=EXCLUDED.roe
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("fundamental_scores: upserted %d rows for %s", len(rows), run_date)
+    except Exception as exc:
+        logger.warning("save_fundamental_scores failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 9. CATALYST WATCHLIST HISTORY
+# ==============================================================================
+
+_CATALYST_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS catalyst_history (
+    date       TEXT    NOT NULL,
+    ticker     TEXT    NOT NULL,
+    composite  REAL,
+    rank       INTEGER,
+    delta      INTEGER,
+    PRIMARY KEY (date, ticker)
+);
+CREATE INDEX IF NOT EXISTS catalyst_history_ticker_idx ON catalyst_history (ticker);
+"""
+
+def save_catalyst_history(history: dict, run_date: str | None = None) -> None:
+    """
+    Upsert watchlist_history.json content into catalyst_history.
+
+    history is { ticker: [{ date, composite, rank, delta }, ...] }
+    """
+    if not history:
+        return
+    run_date = run_date or _today()
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_CATALYST_HISTORY_DDL)
+        rows = []
+        for ticker, entries in history.items():
+            t = ticker.strip().upper()
+            for entry in (entries if isinstance(entries, list) else [entries]):
+                entry_date = entry.get("date", run_date)
+                rows.append((
+                    entry_date, t,
+                    float(entry["composite"]) if entry.get("composite") is not None else None,
+                    int(entry["rank"])         if entry.get("rank")      is not None else None,
+                    int(entry["delta"])        if entry.get("delta")     is not None else None,
+                ))
+        if rows:
+            cur.executemany(
+                """
+                INSERT INTO catalyst_history (date, ticker, composite, rank, delta)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (date, ticker) DO UPDATE SET
+                    composite=EXCLUDED.composite,
+                    rank=EXCLUDED.rank,
+                    delta=EXCLUDED.delta
+                """,
+                rows,
+            )
+        conn.commit()
+        conn.close()
+        logger.info("catalyst_history: upserted %d rows", len(rows))
+    except Exception as exc:
+        logger.warning("save_catalyst_history failed (non-fatal): %s", exc)

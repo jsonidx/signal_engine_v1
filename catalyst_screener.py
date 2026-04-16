@@ -1222,6 +1222,11 @@ def update_watchlist(
         })
 
     _save_watchlist_history(history, history_path)
+    try:
+        from utils.supabase_persist import save_catalyst_history
+        save_catalyst_history(history)
+    except Exception as _exc:
+        pass  # non-fatal
 
     # Tickers on watchlist that weren't scanned → go to MANUALLY ADDED section
     scanned_set = {t for t, _ in ranked}
@@ -1438,6 +1443,11 @@ def _main_continue(args, universe):
         export = results.drop(columns=["flags"])
         export.to_csv(path, index=False)
         print(f"\n  📁 Exported to: {path}")
+        try:
+            from utils.supabase_persist import save_catalyst_scores
+            save_catalyst_scores(export, datetime.now().strftime("%Y-%m-%d"))
+        except Exception as _exc:
+            pass  # non-fatal
 
         # Update watchlist
         if args.update_watchlist:

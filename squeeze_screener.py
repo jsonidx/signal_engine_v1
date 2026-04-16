@@ -967,6 +967,12 @@ def save_results(results: List[SqueezeScore], output_dir: str = OUTPUT_DIR) -> s
 
     df = pd.DataFrame(rows)
     df.to_csv(path, index=False)
+    try:
+        from utils.supabase_persist import save_squeeze_scores
+        from datetime import date as _date
+        save_squeeze_scores(df, _date.today().isoformat())
+    except Exception as _exc:
+        pass  # non-fatal
     return path
 
 

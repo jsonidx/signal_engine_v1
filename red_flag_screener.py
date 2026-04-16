@@ -695,8 +695,15 @@ def main():
             "data_quality": r["data_quality"],
             "top_flag": r["flags"][0] if r["flags"] else "",
         })
-    pd.DataFrame(rows).to_csv(path, index=False)
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(path, index=False)
     print(f"\n  📁 Exported: {path}\n")
+    try:
+        from utils.supabase_persist import save_red_flag_scores
+        from datetime import date as _date
+        save_red_flag_scores(df_out, _date.today().isoformat())
+    except Exception as _exc:
+        pass  # non-fatal
 
 
 if __name__ == "__main__":

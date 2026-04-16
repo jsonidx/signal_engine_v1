@@ -933,10 +933,15 @@ def main():
         row = {k: v for k, v in r.items() if k not in ("flags", "scores")}
         row.update({f"score_{k}": v for k, v in r["scores"].items()})
         export_rows.append(row)
-    pd.DataFrame(export_rows).sort_values("composite", ascending=False).to_csv(
-        export_path, index=False
-    )
+    df_export = pd.DataFrame(export_rows).sort_values("composite", ascending=False)
+    df_export.to_csv(export_path, index=False)
     print(f"\n  📁 Exported: {export_path}")
+    try:
+        from utils.supabase_persist import save_fundamental_scores
+        from datetime import date as _date
+        save_fundamental_scores(df_export, _date.today().isoformat())
+    except Exception as _exc:
+        pass  # non-fatal
 
     print(f"\n{'█' * 60}")
     print(f"  ⚠️  Fundamental data from Yahoo Finance — may lag 1–3 months.")
