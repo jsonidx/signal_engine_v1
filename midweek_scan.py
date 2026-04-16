@@ -38,12 +38,18 @@ warnings.filterwarnings("ignore")
 
 try:
     from config import (
-        PORTFOLIO_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION,
+        PORTFOLIO_NAV as _CONFIG_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION,
         RISK_PARAMS, OUTPUT_DIR,
     )
 except ImportError:
     OUTPUT_DIR = "./signals_output"
-    PORTFOLIO_NAV = 50_000
+    _CONFIG_NAV = 50_000
+
+try:
+    from utils.db import load_portfolio_nav
+    PORTFOLIO_NAV = load_portfolio_nav(fallback=_CONFIG_NAV)
+except Exception:
+    PORTFOLIO_NAV = _CONFIG_NAV
 
 REPORT_DIR = "./weekly_reports"
 

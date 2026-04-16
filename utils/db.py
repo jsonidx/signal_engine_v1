@@ -125,3 +125,26 @@ def managed_local_connection(db_path: str) -> Generator[sqlite3.Connection, None
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Portfolio NAV helper — always reads from Supabase, falls back to config
+# ---------------------------------------------------------------------------
+
+def load_portfolio_nav(fallback: float = 0.0) -> float:
+    """
+    Return the current portfolio NAV from Supabase portfolio_settings (key='cash_eur').
+    Falls back to `fallback` (typically config.PORTFOLIO_NAV) if DB is unreachable
+    or the row doesn't exist.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM portfolio_settings WHERE key = 'cash_eur'")
+        row = cur.fetchone()
+        conn.close()
+        if row and float(row["value"]) > 0:
+            return float(row["value"])
+    except Exception:
+        pass
+    return fallback

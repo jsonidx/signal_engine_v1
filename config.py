@@ -13,7 +13,7 @@ from datetime import datetime
 # ============================================================
 # PORTFOLIO PARAMETERS
 # ============================================================
-PORTFOLIO_NAV = 0          # Total portfolio value in EUR
+PORTFOLIO_NAV = 0               # Fallback only — live value read from Supabase portfolio_settings (key='cash_eur')
 EQUITY_ALLOCATION = 0.65        # 65% to equities
 CRYPTO_ALLOCATION = 0.25        # 25% to crypto
 CASH_BUFFER = 0.10              # 10% cash reserve (dry powder)

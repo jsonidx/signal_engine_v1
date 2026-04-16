@@ -91,18 +91,24 @@ except ImportError:
 
 try:
     from config import (
-        OUTPUT_DIR, PORTFOLIO_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION,
+        OUTPUT_DIR, PORTFOLIO_NAV as _CONFIG_NAV, CRYPTO_ALLOCATION, EQUITY_ALLOCATION,
         AI_MODEL_DEFAULT, AI_MODEL_PREMIUM, AI_MODEL_FALLBACK, AI_PREMIUM_THRESHOLD,
     )
 except ImportError:
     OUTPUT_DIR = "./signals_output"
-    PORTFOLIO_NAV = 50_000
+    _CONFIG_NAV = 50_000
     CRYPTO_ALLOCATION = 0.25
     EQUITY_ALLOCATION = 0.65
     AI_MODEL_DEFAULT   = "grok-4-1-fast-reasoning"
     AI_MODEL_PREMIUM   = "grok-4.20-0309-reasoning"
     AI_MODEL_FALLBACK  = "grok-4-1-fast-reasoning"
     AI_PREMIUM_THRESHOLD = 0.85
+
+try:
+    from utils.db import load_portfolio_nav
+    PORTFOLIO_NAV = load_portfolio_nav(fallback=_CONFIG_NAV)
+except Exception:
+    PORTFOLIO_NAV = _CONFIG_NAV
 
 # ─── Regime filter (optional — degrades gracefully) ───────────────────────────
 try:
