@@ -139,6 +139,15 @@ WEIGHT_REL_STRENGTH_SECTOR = 0.15   # 20-day momentum rank within sector peers
 TOP50_STREAK_MIN   = 3   # days of consecutive top-50 membership → auto-include
 TOP50_HISTORY_DAYS = 5   # rolling history window to maintain
 
+# ── Swing-trader force-include gates ─────────────────────────────────────────
+# Tickers that hit ANY of these thresholds are injected into the watchlist
+# regardless of their momentum rank — these are "about to move" setups.
+FORCE_VOL_RATIO_MIN   = 2.0   # 5d/20d volume ratio — institutional accumulation
+FORCE_PRICE_5D_MIN    = 0.03  # +3% in 5 days confirming the vol surge
+FORCE_BB_PERCENTILE   = 15    # BB width below 15th pct = coiled spring
+FORCE_NEAR_HIGH_PCT   = 0.05  # within 5% of 52w high alongside the squeeze
+FORCE_EARNINGS_DAYS   = 21    # earnings within 21 days — pre-earnings window
+
 # Curated liquid ADRs to inject before the ETF constituent scan.
 # These are frequently absent from US-only index ETFs.
 LIQUID_ADRS: list = [
@@ -238,6 +247,11 @@ _SECTOR_MAP: dict = {}
 # Module-level quality metrics populated by _compute_prescreen_scores.
 # { ticker: {"atr_pct": float, "beta": float} }
 _QUALITY_CACHE: dict = {}
+
+# Populated by _compute_prescreen_scores — {ticker: set[tag_str]}
+# Tags: "VOL_BREAKOUT", "SQUEEZE_SETUP"
+# "EARNINGS_WINDOW" is added later by _fetch_earnings_tags()
+_FORCE_TAGS: dict = {}
 
 
 # ==============================================================================
@@ -802,10 +816,12 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
       0.15  earnings_surprise_rank  — best 1-day return in last 60d (proxy)
       0.15  rel_strength_vs_sector  — 20-day rank within sector peer group
 
-    Side-effect: populates module-level _QUALITY_CACHE with
-    { ticker: {"atr_pct": float, "beta": float} } for the quality gate.
+    Side-effects:
+      - Populates _QUALITY_CACHE: { ticker: {"atr_pct": float, "beta": float} }
+      - Populates _FORCE_TAGS:    { ticker: set[str] } for swing-trade gates
+        Tags written here: "VOL_BREAKOUT", "SQUEEZE_SETUP"
     """
-    global _QUALITY_CACHE  # noqa: PLW0603
+    global _QUALITY_CACHE, _FORCE_TAGS  # noqa: PLW0603
 
     # One batch download: 1 year of OHLCV + SPY for beta calculation
     download_list = list(dict.fromkeys(list(tickers) + ["SPY"]))
@@ -893,6 +909,33 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
             beta = 1.0
 
         quality[t] = {"atr_pct": round(atr_pct, 2), "beta": round(beta, 4)}
+
+        # ── Swing-trade force-include gate detection ───────────────────────────
+        tags: set = set()
+
+        # VOL_BREAKOUT: unusual volume surge + price confirming upward
+        if v is not None and len(v) >= 20 and len(c) >= 6:
+            vr = vol_ratios.get(t, 1.0)
+            ret_5d = float(c.iloc[-1] / c.iloc[-6] - 1) if c.iloc[-6] > 0 else 0.0
+            if vr >= FORCE_VOL_RATIO_MIN and ret_5d >= FORCE_PRICE_5D_MIN:
+                tags.add("VOL_BREAKOUT")
+
+        # SQUEEZE_SETUP: Bollinger squeeze + near 52w high
+        if len(c) >= 55:
+            try:
+                sma20  = c.rolling(20).mean()
+                std20  = c.rolling(20).std()
+                bb_w   = ((sma20 + 2 * std20 - (sma20 - 2 * std20)) / sma20).dropna()
+                if len(bb_w) >= 50:
+                    pct = float((bb_w < bb_w.iloc[-1]).mean() * 100)
+                    nh  = near_highs.get(t, 0.0)
+                    if pct <= FORCE_BB_PERCENTILE and nh >= (1 - FORCE_NEAR_HIGH_PCT):
+                        tags.add("SQUEEZE_SETUP")
+            except Exception:
+                pass
+
+        if tags:
+            _FORCE_TAGS[t] = tags
 
     _QUALITY_CACHE = quality
 
@@ -1096,21 +1139,86 @@ def build_master_universe(indices: list = None) -> list:
 # Public API — momentum pre-screen
 # ==============================================================================
 
+def _fetch_earnings_tags(candidates: list, days: int = None) -> dict:
+    """
+    Check earnings proximity for *candidates* and return {ticker: {"EARNINGS_WINDOW"}}.
+
+    Uses a thread pool (max 20 workers) with a per-ticker timeout so this
+    never blocks the pipeline for more than ~60 seconds even on a slow network.
+
+    Only called on the "just missed" set (ranks top_n+1 … top_n*2) so the
+    total number of yfinance info calls stays small (~100-200).
+    """
+    import concurrent.futures
+    from datetime import timezone
+
+    if days is None:
+        days = FORCE_EARNINGS_DAYS
+
+    tags: dict = {}
+
+    def _check(ticker: str) -> tuple:
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info or {}
+            ts = info.get("earningsTimestamp")
+            if ts and ts > 0:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+                dte = (dt - datetime.utcnow()).days
+                if 0 <= dte <= days:
+                    return ticker, dte
+            # Fallback: calendar
+            try:
+                cal = yf.Ticker(ticker).calendar
+                if isinstance(cal, dict):
+                    ed = cal.get("Earnings Date")
+                    if ed:
+                        ed = ed[0] if isinstance(ed, list) else ed
+                        if hasattr(ed, "to_pydatetime"):
+                            ed = ed.to_pydatetime().replace(tzinfo=None)
+                        dte = (ed - datetime.utcnow()).days
+                        if 0 <= dte <= days:
+                            return ticker, dte
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return ticker, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {pool.submit(_check, t): t for t in candidates}
+        for fut in concurrent.futures.as_completed(futures, timeout=60):
+            try:
+                ticker, dte = fut.result()
+                if dte is not None:
+                    tags[ticker] = {"EARNINGS_WINDOW"}
+            except Exception:
+                pass
+
+    return tags
+
+
 def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     """
-    Narrow *tickers* to top *top_n* quality-filtered momentum candidates.
+    Narrow *tickers* to top *top_n* quality-filtered momentum candidates,
+    plus swing-trade force-includes for tickers that show early-move signals.
 
     Pipeline:
-      1. Score all tickers with 5-factor composite (also populates _QUALITY_CACHE).
+      1. Score all tickers with 5-factor composite (also populates _QUALITY_CACHE
+         and _FORCE_TAGS with VOL_BREAKOUT / SQUEEZE_SETUP tags).
       2. Take top top_n by score.
       3. Drop high-volatility / high-beta tickers (ATR%>6 or beta>2) unless protected.
-      4. Force-include Tier 1 watchlist tickers.
-      5. Force-include persistent favourites (3-day top-50 streak).
-      6. Save today's top-50 to top50_history.json for streak tracking.
+      4. Force-include Tier 1 watchlist tickers and persistent favourites.
+      5. Force-include tickers with VOL_BREAKOUT or SQUEEZE_SETUP tags.
+      6. Run earnings proximity check on "just missed" set → force-include
+         any ticker with earnings ≤ FORCE_EARNINGS_DAYS days away.
+      7. Save today's top-50 to top50_history.json for streak tracking.
 
     Returns tickers sorted by score descending;
-    protected tickers not in the scored set appear at the end.
+    forced/protected tickers not in the scored set appear at the end.
     """
+    global _FORCE_TAGS  # noqa: PLW0603
+
     if top_n is None:
         top_n = UNIVERSE_PRESCREEN_TOP_N
 
@@ -1119,7 +1227,8 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     protected  = tier1 | persistent
 
     t0 = time.time()
-    scores = _compute_prescreen_scores(tickers)
+    _FORCE_TAGS = {}  # reset for this run
+    scores = _compute_prescreen_scores(tickers)  # populates _FORCE_TAGS
 
     # Save top-50 for persistence tracking (before quality gate)
     sorted_by_score = sorted(scores, key=lambda t: scores[t], reverse=True)
@@ -1127,21 +1236,55 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
 
     top_set = set(sorted_by_score[:top_n])
 
-    # Quality gate — drop volatile tickers unless they're protected
-    to_drop = _apply_quality_gate(top_set, protected)
+    # Quality gate — drop volatile tickers unless they're protected or force-tagged
+    force_ohlcv = {t for t, tags in _FORCE_TAGS.items() if tags}
+    protected_and_forced = protected | force_ohlcv
+    to_drop = _apply_quality_gate(top_set, protected_and_forced)
     if to_drop:
         logger.info("Quality gate dropped %d tickers: %s", len(to_drop), sorted(to_drop))
         print(f"  Quality gate: dropped {len(to_drop)} high-vol/beta ticker(s)")
     top_set -= to_drop
 
-    # Force-inject protected tickers that may not have made the cut
+    # Force-inject protected tickers
     top_set |= protected
 
-    # Sort final list by score; unscored protected tickers go to end
+    # Force-inject OHLCV-based swing setups (VOL_BREAKOUT, SQUEEZE_SETUP)
+    ohlcv_forced = force_ohlcv - top_set
+    if ohlcv_forced:
+        top_set |= ohlcv_forced
+        tag_summary = {}
+        for t in ohlcv_forced:
+            for tag in _FORCE_TAGS.get(t, set()):
+                tag_summary.setdefault(tag, []).append(t)
+        for tag, tagged in sorted(tag_summary.items()):
+            print(f"  Force-include [{tag}]: {len(tagged)} tickers — {', '.join(sorted(tagged)[:8])}"
+                  + (" ..." if len(tagged) > 8 else ""))
+
+    # Earnings force-include: check "just missed" set for upcoming earnings
+    # Only tickers ranked top_n+1 … top_n*2 that aren't already in top_set
+    just_missed = [t for t in sorted_by_score[top_n: top_n * 2] if t not in top_set]
+    if just_missed:
+        print(f"  Checking earnings proximity for {len(just_missed)} 'just missed' tickers...",
+              end=" ", flush=True)
+        earnings_tags = _fetch_earnings_tags(just_missed)
+        new_earnings = {t for t in earnings_tags if t not in top_set}
+        if new_earnings:
+            top_set |= new_earnings
+            for t in new_earnings:
+                _FORCE_TAGS.setdefault(t, set()).add("EARNINGS_WINDOW")
+            print(f"{len(new_earnings)} added → {', '.join(sorted(new_earnings))}")
+        else:
+            print("none")
+
+    # Sort final list by score; unscored/forced tickers go to end
     result = sorted(top_set, key=lambda t: scores.get(t, -1.0), reverse=True)
 
     elapsed = time.time() - t0
-    msg = f"Pre-screen: {len(tickers)} → {len(result)} in {elapsed:.1f}s"
+    forced_count = len(ohlcv_forced) + len(
+        {t for t in result if "EARNINGS_WINDOW" in _FORCE_TAGS.get(t, set())}
+    )
+    msg = (f"Pre-screen: {len(tickers)} → {len(result)} in {elapsed:.1f}s"
+           f" ({forced_count} force-included)")
     print(f"  {msg}")
     logger.info(msg)
     return result
@@ -1215,20 +1358,28 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
         for t in new_persistents:
             filtered_lines.append(t)
 
-    # Universe (auto) block
+    # Universe (auto) block — annotate force-included tickers with inline tags
+    force_tagged = {t.upper() for t, tags in _FORCE_TAGS.items() if tags}
+    forced_in_auto = [t for t in auto_tickers if t.upper() in force_tagged]
+
     filtered_lines.append("")
     filtered_lines.append(
         f"# ── UNIVERSE (auto) — top {len(auto_tickers)} by momentum prescreen  [{stamp}] ──"
     )
     for t in auto_tickers:
-        filtered_lines.append(t)
+        tags = _FORCE_TAGS.get(t.upper(), set())
+        if tags:
+            tag_str = ",".join(sorted(tags))
+            filtered_lines.append(f"{t}  # [{tag_str}]")
+        else:
+            filtered_lines.append(t)
     filtered_lines.append("")
 
     watchlist_path.write_text("\n".join(filtered_lines) + "\n")
     total_written = len(tier1_set) + len(new_persistents) + len(auto_tickers)
     print(
         f"  Watchlist updated: {len(tier1_set)} Tier 1 + {len(new_persistents)} persistent "
-        f"+ {len(auto_tickers)} dynamic  →  watchlist.txt"
+        f"+ {len(auto_tickers)} dynamic ({len(forced_in_auto)} force-included)  →  watchlist.txt"
     )
     print(
         f"\nINFO: Final universe: {len(auto_tickers)} dynamic + "
@@ -1245,11 +1396,13 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
             status = "Tier-1"
         else:
             status = "Dynamic only"
+        force_tags = sorted(_FORCE_TAGS.get(t, set()))
         ranked_universe[t] = {
             "rank": rank,
             "total": len(top_tickers),
             "status": status,
             "factors": "mom/vol-surge/near-high/earnings/sector-RS",
+            "force_tags": force_tags,
         }
     ranked_path = _BASE_DIR / "ranked_universe.json"
     ranked_path.write_text(json.dumps(ranked_universe, indent=2))
@@ -1260,24 +1413,27 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
         from utils.db import get_connection
         conn = get_connection()
         cur = conn.cursor()
-        # Build full list with tiers
+        # Build full list with tiers + force tags
         sync_rows = []
         for t in tier1_set:
-            sync_rows.append((t.upper(), "TIER1", "universe_builder"))
+            sync_rows.append((t.upper(), "TIER1", "universe_builder", None))
         for t in new_persistents:
-            sync_rows.append((t.upper(), "PERSISTENT", "universe_builder"))
+            sync_rows.append((t.upper(), "PERSISTENT", "universe_builder", None))
         for t in auto_tickers:
-            sync_rows.append((t.upper(), "AUTO", "universe_builder"))
+            tags = sorted(_FORCE_TAGS.get(t.upper(), set()))
+            tag_str = ",".join(tags) if tags else None
+            sync_rows.append((t.upper(), "AUTO", "universe_builder", tag_str))
         # Delete rows no longer in the current universe, then upsert
         cur.execute("DELETE FROM user_watchlists WHERE source = 'universe_builder'")
         if sync_rows:
             cur.executemany(
                 """
-                INSERT INTO user_watchlists (ticker, tier, source, category)
-                VALUES (%s, %s, %s, 'equity')
+                INSERT INTO user_watchlists (ticker, tier, source, category, notes)
+                VALUES (%s, %s, %s, 'equity', %s)
                 ON CONFLICT (ticker) DO UPDATE
                   SET tier = EXCLUDED.tier,
                       source = EXCLUDED.source,
+                      notes = EXCLUDED.notes,
                       added_at = now()
                 """,
                 sync_rows,
