@@ -2,7 +2,7 @@
  * src/lib/supabase.ts — Supabase client singleton
  *
  * Environment variables (set in dashboard/frontend/.env.local):
- *   VITE_SUPABASE_URL      — https://your-project-ref.supabase.co
+ *   VITE_SUPABASE_URL      — https://<your-project-ref>.supabase.co
  *   VITE_SUPABASE_ANON_KEY — eyJ... (from Supabase Settings → API)
  */
 import { createClient } from '@supabase/supabase-js'

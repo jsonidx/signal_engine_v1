@@ -1255,6 +1255,39 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
     ranked_path.write_text(json.dumps(ranked_universe, indent=2))
     print(f"INFO: Saved ranked_universe.json with {len(ranked_universe)} tickers for AI Quant")
 
+    # Sync watchlist to Supabase user_watchlists (replaces stale rows)
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        # Build full list with tiers
+        sync_rows = []
+        for t in tier1_set:
+            sync_rows.append((t.upper(), "TIER1", "universe_builder"))
+        for t in new_persistents:
+            sync_rows.append((t.upper(), "PERSISTENT", "universe_builder"))
+        for t in auto_tickers:
+            sync_rows.append((t.upper(), "AUTO", "universe_builder"))
+        # Delete rows no longer in the current universe, then upsert
+        cur.execute("DELETE FROM user_watchlists WHERE source = 'universe_builder'")
+        if sync_rows:
+            cur.executemany(
+                """
+                INSERT INTO user_watchlists (ticker, tier, source, category)
+                VALUES (%s, %s, %s, 'equity')
+                ON CONFLICT (ticker) DO UPDATE
+                  SET tier = EXCLUDED.tier,
+                      source = EXCLUDED.source,
+                      added_at = now()
+                """,
+                sync_rows,
+            )
+        conn.commit()
+        conn.close()
+        print(f"INFO: Synced {len(sync_rows)} tickers to Supabase user_watchlists")
+    except Exception as exc:
+        print(f"WARN: Supabase watchlist sync failed (non-fatal): {exc}")
+
 
 # ==============================================================================
 # CLI
