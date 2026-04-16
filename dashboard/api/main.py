@@ -2140,15 +2140,19 @@ async def screeners_catalysts(min_score: float = Query(5.0, ge=0.0)):
         records = []
         for _, row in df.iterrows():
             records.append({
-                "ticker":         str(row.get("ticker", "")),
-                "total_score":    _safe_float(row.get("composite") or row.get("total_score")),
-                "squeeze_setup":  _safe_float(row.get("squeeze_score")),
-                "volume_breakout": _safe_float(row.get("volume_score")),
+                "ticker":           str(row.get("ticker", "")),
+                "total_score":      _safe_float(row.get("composite") or row.get("total_score")),
+                "squeeze_setup":    _safe_float(row.get("squeeze_score")),
+                "volume_breakout":  _safe_float(row.get("volume_score")),
                 "dark_pool_signal": _safe_float(row.get("dark_pool_score")),
-                "options_score":  _safe_float(row.get("options_score")),
-                "technical_score": _safe_float(row.get("technical_score")),
-                "n_flags":        _safe_int(row.get("n_flags")),
-                "setup_details":  str(row.get("flags", "")),
+                "options_score":    _safe_float(row.get("options_score")),
+                "technical_score":  _safe_float(row.get("technical_score")),
+                "earnings_score":   _safe_float(row.get("earnings_score")),
+                "analyst_score":    _safe_float(row.get("analyst_score")),
+                "days_to_earnings": _safe_int(row.get("days_to_earnings")),
+                "upgrades_7d":      _safe_int(row.get("upgrades_7d")),
+                "n_flags":          _safe_int(row.get("n_flags")),
+                "setup_details":    str(row.get("flags", "")),
             })
 
         result = {

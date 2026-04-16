@@ -269,6 +269,10 @@ export interface CatalystScreenerRow {
   squeeze_setup: number
   volume_breakout: number
   dark_pool: number
+  earnings_score: number
+  analyst_score: number
+  days_to_earnings: number | null
+  upgrades_7d: number
   override_applied: boolean
   override_flag?: string
 }

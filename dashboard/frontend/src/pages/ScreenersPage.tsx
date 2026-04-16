@@ -470,6 +470,8 @@ function CatalystsTab() {
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Squeeze setup score: combines float short %, borrow cost, and volume buildup." onClick={() => toggle('squeeze_setup' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Squeeze</span></th>
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Volume breakout score: abnormal volume vs 20-day average." onClick={() => toggle('volume_breakout' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Vol Break</span></th>
                 <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Dark pool score: off-exchange block flow signal strength." onClick={() => toggle('dark_pool' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Dark Pool</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Earnings proximity score (0–5). Higher = earnings sooner. Shows days to next report." onClick={() => toggle('earnings_score' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Earnings</span></th>
+                <th className="px-4 py-2.5 text-left cursor-pointer select-none" title="Analyst upgrade clustering score (0–6). Counts upgrades/PT raises in last 7 days." onClick={() => toggle('analyst_score' as keyof CatalystScreenerRow)}><span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Analyst</span></th>
                 <th className="px-4 py-2.5 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Override</th>
               </tr>
             </thead>
@@ -497,6 +499,30 @@ function CatalystsTab() {
                   </td>
                   <td className="px-4 py-2.5">
                     <Badge label={row.dark_pool?.toFixed(1) ?? '—'} color={row.dark_pool > 1 ? 'green' : 'gray'} />
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {row.earnings_score > 0 ? (
+                      <span title={row.days_to_earnings != null ? `${row.days_to_earnings}d to earnings` : undefined}>
+                        <Badge
+                          label={row.days_to_earnings != null ? `${row.days_to_earnings}d` : row.earnings_score.toFixed(0)}
+                          color={row.earnings_score >= 4 ? 'amber' : row.earnings_score >= 2 ? 'blue' : 'gray'}
+                        />
+                      </span>
+                    ) : (
+                      <span className="font-mono text-xs text-text-tertiary">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {row.analyst_score > 0 ? (
+                      <span title={row.upgrades_7d ? `${row.upgrades_7d} upgrade(s) in 7 days` : undefined}>
+                        <Badge
+                          label={row.upgrades_7d ? `↑${row.upgrades_7d}` : row.analyst_score.toFixed(0)}
+                          color={row.analyst_score >= 3 ? 'green' : row.analyst_score >= 1 ? 'blue' : 'gray'}
+                        />
+                      </span>
+                    ) : (
+                      <span className="font-mono text-xs text-text-tertiary">—</span>
+                    )}
                   </td>
                   <td className="px-4 py-2.5">
                     {row.override_applied ? (
