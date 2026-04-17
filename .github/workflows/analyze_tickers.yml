@@ -26,7 +26,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run deep-dive analysis
-        run: python3 ai_quant.py --no-cache --tickers $TICKERS
+        run: python3 ai_quant.py --no-cache --force-ai --tickers $TICKERS
         env:
           TICKERS: ${{ github.event.inputs.tickers }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

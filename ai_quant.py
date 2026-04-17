@@ -1787,7 +1787,8 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
                 continue
 
         result = analyze_ticker(
-            ticker, verbose=args.verbose, raw_output=args.raw, use_cache=False
+            ticker, verbose=args.verbose, raw_output=args.raw, use_cache=False,
+            force_ai=getattr(args, "force_ai", False),
         )
         if result:
             result["selection_rank"]   = i
@@ -3018,7 +3019,8 @@ def update_watchlist_from_screen(
 # ==============================================================================
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
-                   use_cache: bool = True, llm: str = "grok") -> Optional[dict]:
+                   use_cache: bool = True, llm: str = "grok",
+                   force_ai: bool = False) -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
     Returns parsed thesis dict, or None on failure.
@@ -3072,13 +3074,17 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
             # Resolver's agreement score uses MODULE_WEIGHTS; prefer it over simple vote
             signals["signal_agreement_score"] = resolved["signal_agreement_score"]
 
-            if resolved["skip_claude"]:
+            if resolved["skip_claude"] and not force_ai:
                 flags = resolved.get("override_flags", [])
                 flag0 = flags[0] if flags else "pre-resolved block"
                 print(f"  [{ticker}] Claude skipped — {flag0}")
                 thesis = _make_neutral_thesis(ticker, signals, resolved)
                 save_thesis(thesis)
                 return thesis
+            elif resolved["skip_claude"] and force_ai:
+                flags = resolved.get("override_flags", [])
+                flag0 = flags[0] if flags else "pre-resolved block"
+                print(f"  [{ticker}] --force-ai: overriding skip_claude ({flag0}) — calling AI anyway")
         except Exception as exc:
             logger.warning("Conflict resolver failed for %s: %s", ticker, exc)
 
@@ -3529,6 +3535,8 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Show collection progress")
     parser.add_argument("--no-cache", action="store_true",
                         help="Force fresh analysis, ignoring today's cached results")
+    parser.add_argument("--force-ai", action="store_true",
+                        help="Bypass conflict-resolver skip_claude blocks — always call the AI")
     parser.add_argument("--cache-show", action="store_true",
                         help="Show recent cached results and exit")
     # ── Top-N priority selection args ─────────────────────────────────────────
