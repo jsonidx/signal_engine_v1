@@ -3,10 +3,12 @@
 scripts/telegram_bot.py — Telegram command bot for Signal Engine.
 
 Commands:
-  /run          — trigger daily_pipeline (--skip-ai, €0.00)
-  /run full     — trigger full pipeline with AI synthesis (~€0.03)
-  /status       — show last GitHub Actions run result
-  /help         — list commands
+  /run              — trigger daily_pipeline (--skip-ai, €0.00)
+  /run full         — trigger full pipeline with AI synthesis (~€0.03)
+  /analyze TSLA     — fresh signals + AI thesis for one ticker
+  /analyze TSLA NVDA AMD  — deep dive for multiple tickers
+  /status           — show last GitHub Actions run result
+  /help             — list commands
 
 Run:
   python3 scripts/telegram_bot.py
@@ -19,12 +21,16 @@ import os
 import sys
 import time
 import logging
+import threading
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Load .env from project root ───────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
+# Add project root to path so ai_quant imports work
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 _env_path = _ROOT / ".env"
 if _env_path.exists():
     for line in _env_path.read_text().splitlines():
@@ -38,8 +44,9 @@ BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 GH_TOKEN    = os.environ.get("GITHUB_TOKEN", "")
 GH_REPO     = os.environ.get("GITHUB_REPO", "jsonidx/signal_engine_v1")
-WORKFLOW_ID        = "daily_pipeline.yml"
-WORKFLOW_ID_MANUAL = "manual_pipeline.yml"
+WORKFLOW_ID          = "daily_pipeline.yml"
+WORKFLOW_ID_MANUAL   = "manual_pipeline.yml"
+WORKFLOW_ID_ANALYZE  = "analyze_tickers.yml"
 
 POLL_INTERVAL   = 3    # seconds between Telegram polls
 GH_POLL_WAIT    = 20   # seconds between GitHub run status checks
@@ -233,12 +240,36 @@ def wait_for_run(skip_ai: bool, manual_ai: bool = False) -> None:
     tg_send(f"⏰ Timed out waiting for run after {GH_TIMEOUT//60} min.\n{run_url}")
 
 
+# ── Analyze helpers ───────────────────────────────────────────────────────────
+
+def gh_trigger_analyze(tickers: list[str]) -> bool:
+    """Dispatch analyze_tickers.yml with the given tickers. Returns True on success."""
+    ticker_str = " ".join(tickers)
+    try:
+        r = requests.post(
+            f"{GH_API}/actions/workflows/{WORKFLOW_ID_ANALYZE}/dispatches",
+            json={"ref": "main", "inputs": {"tickers": ticker_str}},
+            headers=GH_HEADERS,
+            timeout=15,
+        )
+        if r.status_code == 204:
+            log.info("gh_trigger_analyze OK — tickers=%s", ticker_str)
+            return True
+        log.error("gh_trigger_analyze HTTP %d: %s", r.status_code, r.text)
+        return False
+    except Exception as exc:
+        log.error("gh_trigger_analyze failed: %s", exc)
+        return False
+
+
 # ── Command router ────────────────────────────────────────────────────────────
 HELP_TEXT = (
     "📡 <b>Signal Engine Bot</b>\n\n"
     "/run — trigger pipeline (data only, €0.00)\n"
     "/run full — trigger daily pipeline with AI (~€0.03)\n"
     "/run ai — trigger manual pipeline, full xAI/Grok run (~€0.03–0.05)\n"
+    "/analyze TSLA — deep dive: fresh signals + AI thesis for one ticker\n"
+    "/analyze TSLA NVDA AMD — deep dive for multiple tickers\n"
     "/status — last pipeline run result\n"
     "/help — show this message"
 )
@@ -251,8 +282,24 @@ def handle_command(text: str, chat_id: str) -> None:
     if lower.startswith("/help"):
         tg_send(HELP_TEXT, chat_id)
 
+    elif lower.startswith("/analyze"):
+        parts = text.split()[1:]  # everything after /analyze
+        tickers = [p.upper() for p in parts if p.isalpha()]
+        if not tickers:
+            tg_send("Usage: /analyze TSLA\n       /analyze TSLA NVDA AMD", chat_id)
+            return
+        ticker_str = " ".join(tickers)
+        if gh_trigger_analyze(tickers):
+            tg_send(
+                f"🔍 <b>Deep dive triggered</b> — {ticker_str}\n"
+                f"Running on GitHub Actions (~2–4 min per ticker).\n"
+                f"Results will arrive here when done.",
+                chat_id,
+            )
+        else:
+            tg_send("❌ Failed to trigger analyze workflow. Check GITHUB_TOKEN permissions.", chat_id)
+
     elif lower.startswith("/run"):
-        import threading
         if "ai" in lower.split():
             t = threading.Thread(target=wait_for_run, args=(False,), kwargs={"manual_ai": True}, daemon=True)
         else:

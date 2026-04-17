@@ -1,0 +1,56 @@
+name: Analyze Tickers (Deep Dive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Space-separated tickers to analyze (e.g. TSLA NVDA AMD)'
+        required: true
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record start time
+        run: echo "START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run deep-dive analysis
+        run: python3 ai_quant.py --no-cache --tickers $TICKERS
+        env:
+          TICKERS: ${{ github.event.inputs.tickers }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          python3 scripts/notify_analyze_result.py \
+            --tickers "$TICKERS" \
+            --status "${{ job.status }}" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "$(echo "scale=1; ($(date +%s) - ${START_TIME:-$(date +%s)}) / 60" | bc)"
+        env:
+          TICKERS: ${{ github.event.inputs.tickers }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
