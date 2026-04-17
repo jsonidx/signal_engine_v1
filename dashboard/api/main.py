@@ -1632,9 +1632,76 @@ async def deepdive_tickers():
                 "stop_loss":              None,
             })
 
+    # Enrich with live prices (yfinance batch, 5-min cache)
+    if tickers:
+        all_syms = [t["ticker"] for t in tickers]
+        live_prices = _fetch_current_prices(all_syms, cache_ttl=TTL_SHORT)
+        for t in tickers:
+            lp = live_prices.get(t["ticker"])
+            if lp is not None:
+                t["current_price"] = lp
+
     result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
     _cache.set(cache_key, result, TTL_SHORT)
     return result
+
+
+@app.get("/api/deepdive/live-zones")
+async def deepdive_live_zones():
+    """Batch live buy zones for all analyzed tickers. Powers zone-overlap filter."""
+    cache_key = "deepdive_live_zones"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    if not _HAS_ACTION_ZONES:
+        return {"data_available": False, "zones": {}}
+
+    conn = _db_connect()
+    analyzed: list[str] = []
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT ticker FROM thesis_cache WHERE entry_low IS NOT NULL AND entry_high IS NOT NULL"
+            ).fetchall()
+            conn.close()
+            analyzed = [r["ticker"] for r in rows]
+        except Exception:
+            pass
+
+    if not analyzed:
+        out = {"data_available": True, "zones": {}}
+        _cache.set(cache_key, out, TTL_SHORT)
+        return out
+
+    loop = asyncio.get_event_loop()
+
+    async def _zone_for(ticker: str):
+        ck = f"action_zones_{ticker}"
+        cached = _cache.get(ck)
+        if cached and cached.get("data_available") and "buy_zone_low" in cached:
+            return ticker, float(cached["buy_zone_low"]), float(cached["buy_zone_high"])
+        try:
+            z = await loop.run_in_executor(None, _compute_action_zones, ticker)
+            if z:
+                return ticker, float(z["buy_zone_low"]), float(z["buy_zone_high"])
+        except Exception:
+            pass
+        return ticker, None, None
+
+    results = await asyncio.gather(*[_zone_for(t) for t in analyzed], return_exceptions=True)
+
+    zones: dict = {}
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        ticker, low, high = r
+        if low is not None and high is not None:
+            zones[ticker] = {"buy_zone_low": round(low, 2), "buy_zone_high": round(high, 2)}
+
+    out = {"data_available": True, "zones": zones}
+    _cache.set(cache_key, out, TTL_SHORT)
+    return out
 
 
 @app.get("/api/signals/outcomes")

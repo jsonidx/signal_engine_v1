@@ -32,7 +32,11 @@ interface DeepDiveTicker {
   stop_loss: number | null
 }
 
-type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR'
+type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR' | 'IN_ENTRY' | 'ZONE_OVERLAP'
+
+interface LiveZoneMap {
+  [ticker: string]: { buy_zone_low: number; buy_zone_high: number }
+}
 type SortMode = 'direction' | 'rr'
 
 function fmtDateTime(iso: string | null): { date: string; time: string } | null {
@@ -62,6 +66,15 @@ function useDeepDiveTickers() {
     queryKey: ['deepdive', 'tickers'],
     queryFn: () =>
       axios.get('/api/deepdive/tickers').then(r => (r.data?.data ?? []) as DeepDiveTicker[]),
+    staleTime: 0, // always refetch live prices on mount
+  })
+}
+
+function useDeepDiveLiveZones() {
+  return useQuery({
+    queryKey: ['deepdive', 'live-zones'],
+    queryFn: () =>
+      axios.get('/api/deepdive/live-zones').then(r => (r.data?.zones ?? {}) as LiveZoneMap),
     staleTime: 5 * 60 * 1000,
   })
 }
@@ -95,6 +108,21 @@ function sortByRR(a: DeepDiveTicker, b: DeepDiveTicker) {
   if (rb === null) return -1
   if (rb !== ra) return rb - ra
   return (b.conviction ?? 0) - (a.conviction ?? 0)
+}
+
+function isInAiEntryZone(t: DeepDiveTicker): boolean {
+  if (t.current_price == null || t.entry_low == null || t.entry_high == null) return false
+  return t.current_price >= t.entry_low && t.current_price <= t.entry_high
+}
+
+function hasZoneOverlap(t: DeepDiveTicker, liveZones: LiveZoneMap): boolean {
+  if (t.current_price == null || t.entry_low == null || t.entry_high == null) return false
+  const lz = liveZones[t.ticker]
+  if (!lz) return false
+  // price must be inside BOTH the AI entry zone and the live buy zone
+  const inAi   = t.current_price >= t.entry_low && t.current_price <= t.entry_high
+  const inLive = t.current_price >= lz.buy_zone_low && t.current_price <= lz.buy_zone_high
+  return inAi && inLive
 }
 
 function AgreementBar({ score }: { score: number | null }) {
@@ -335,12 +363,14 @@ function Section({
 }
 
 const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
-  { value: 'ALL',      label: 'All' },
-  { value: 'ANALYZED', label: 'Analyzed' },
-  { value: 'BULL',    label: 'Bull' },
-  { value: 'BEAR',    label: 'Bear' },
-  { value: 'NEUTRAL', label: 'Neutral' },
-  { value: 'HIGH_RR', label: 'R:R ≥2' },
+  { value: 'ALL',          label: 'All' },
+  { value: 'ANALYZED',     label: 'Analyzed' },
+  { value: 'BULL',         label: 'Bull' },
+  { value: 'BEAR',         label: 'Bear' },
+  { value: 'NEUTRAL',      label: 'Neutral' },
+  { value: 'HIGH_RR',      label: 'R:R ≥2' },
+  { value: 'IN_ENTRY',     label: 'In Entry Zone' },
+  { value: 'ZONE_OVERLAP', label: 'Hot Entry' },
 ]
 
 export function DeepDivePage() {
@@ -348,6 +378,7 @@ export function DeepDivePage() {
   const [sortMode, setSortMode] = useState<SortMode>('direction')
   const { data: tickers, isLoading: loadingTickers, isError, error, refetch } = useDeepDiveTickers()
   const { data: openTickers = [] } = useOpenPositionTickers()
+  const { data: liveZones = {} } = useDeepDiveLiveZones()
 
   const openSet = useMemo(() => new Set(openTickers), [openTickers])
 
@@ -364,7 +395,11 @@ export function DeepDivePage() {
         ? analyzed
         : filter === 'HIGH_RR'
           ? analyzed.filter(t => (computeRR(t) ?? 0) >= 2)
-          : analyzed.filter(t => t.direction === filter)
+          : filter === 'IN_ENTRY'
+            ? analyzed.filter(isInAiEntryZone)
+            : filter === 'ZONE_OVERLAP'
+              ? analyzed.filter(t => hasZoneOverlap(t, liveZones))
+              : analyzed.filter(t => t.direction === filter)
 
     // Universe tickers: show when filter is ALL only (hide for direction/RR filters)
     const filteredUniverse = filter === 'ALL' ? universe : []
@@ -382,7 +417,7 @@ export function DeepDivePage() {
     })
 
     return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse }
-  }, [tickers, filter, sortMode, openSet])
+  }, [tickers, filter, sortMode, openSet, liveZones])
 
   const totalShown = analyzedRows.length + universeRows.length
 
@@ -403,10 +438,14 @@ export function DeepDivePage() {
                     ? 'bg-accent-red/20 text-accent-red border-accent-red/40'
                     : value === 'NEUTRAL'
                       ? 'bg-text-tertiary/20 text-text-secondary border-text-tertiary/30'
-                      : value === 'HIGH_RR'
+                      : value === 'HIGH_RR' || value === 'IN_ENTRY'
                         ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
-                        : 'bg-bg-elevated text-text-primary border-border-active'
-                : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+                        : value === 'ZONE_OVERLAP'
+                          ? 'bg-accent-amber/20 text-accent-amber border-accent-amber/40'
+                          : 'bg-bg-elevated text-text-primary border-border-active'
+                : value === 'ZONE_OVERLAP'
+                  ? 'text-accent-amber/60 border-accent-amber/20 hover:text-accent-amber hover:border-accent-amber/40'
+                  : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
             )}
           >
             {label}
