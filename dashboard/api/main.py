@@ -5201,13 +5201,18 @@ async def get_workflow_report_text():
 
 # ─── Model Accuracy Benchmark ─────────────────────────────────────────────────
 
+MAG7 = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+
+
 @app.get("/api/thesis/benchmark")
-async def thesis_benchmark(days: int = 90):
+async def thesis_benchmark(days: int = 90, tickers: str = ""):
     """
     Per-model accuracy stats from thesis_outcomes JOIN thesis_cache.
     Returns summary scorecards + recent per-ticker outcomes.
+    Optional ?tickers=AAPL,MSFT,... to filter to specific tickers.
     """
-    cache_key = f"thesis_benchmark:{days}"
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else []
+    cache_key = f"thesis_benchmark:{days}:{','.join(sorted(ticker_list))}"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
@@ -5217,9 +5222,11 @@ async def thesis_benchmark(days: int = 90):
         cutoff = str(_date.today() - timedelta(days=days))
 
         conn = _db_connect()
+        ticker_filter = "AND o.ticker = ANY(%s)" if ticker_list else ""
+        params_extra  = (ticker_list,) if ticker_list else ()
 
         # ── Model summary ──────────────────────────────────────────────────────
-        summary_rows = conn.execute("""
+        summary_rows = conn.execute(f"""
             SELECT
                 COALESCE(tc.model_used, 'unknown') AS model,
                 COUNT(*)                            AS theses,
@@ -5229,7 +5236,6 @@ async def thesis_benchmark(days: int = 90):
                 SUM(CASE WHEN o.outcome IN ('HIT_TARGET1','HIT_TARGET2') THEN 1 ELSE 0 END) AS wins,
                 SUM(CASE WHEN o.outcome = 'HIT_STOP'   THEN 1 ELSE 0 END) AS losses,
                 SUM(CASE WHEN o.outcome = 'OPEN'       THEN 1 ELSE 0 END) AS open_count,
-                -- best available return: 30d actual > 7d actual > outcome-implied
                 AVG(CASE
                     WHEN o.return_30d IS NOT NULL THEN o.return_30d
                     WHEN o.return_7d  IS NOT NULL THEN o.return_7d
@@ -5251,10 +5257,10 @@ async def thesis_benchmark(days: int = 90):
                 SUM(CASE WHEN o.direction = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral_count
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
-            WHERE o.thesis_date >= %s
+            WHERE o.thesis_date >= %s {ticker_filter}
             GROUP BY COALESCE(tc.model_used, 'unknown')
             ORDER BY theses DESC
-        """, (cutoff,)).fetchall()
+        """, (cutoff,) + params_extra).fetchall()
 
         summary = []
         for r in summary_rows:
@@ -5285,7 +5291,7 @@ async def thesis_benchmark(days: int = 90):
             })
 
         # ── Per-ticker outcomes ────────────────────────────────────────────────
-        recent_rows = conn.execute("""
+        recent_rows = conn.execute(f"""
             SELECT
                 o.thesis_date, o.ticker, o.direction, o.conviction,
                 o.outcome, o.hit_target_1, o.hit_target_2, o.hit_stop,
@@ -5296,9 +5302,9 @@ async def thesis_benchmark(days: int = 90):
                 COALESCE(tc.model_used, 'unknown') AS model
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
-            WHERE o.thesis_date >= %s
+            WHERE o.thesis_date >= %s {ticker_filter}
             ORDER BY o.thesis_date DESC, o.ticker
-        """, (cutoff,)).fetchall()
+        """, (cutoff,) + params_extra).fetchall()
 
         def _outcome_return(r) -> float | None:
             """Best available return: 30d > 7d > outcome-implied from prices."""
@@ -5330,10 +5336,11 @@ async def thesis_benchmark(days: int = 90):
         conn.close()
 
         result = {
-            "data_available": True,
-            "days":    days,
-            "summary": _json_safe(summary),
-            "recent":  _json_safe(recent),
+            "data_available":   True,
+            "days":             days,
+            "ticker_filter":    ticker_list,
+            "summary":          _json_safe(summary),
+            "recent":           _json_safe(recent),
         }
         _cache.set(cache_key, result, TTL_LONG)
         return result
@@ -5341,6 +5348,135 @@ async def thesis_benchmark(days: int = 90):
     except Exception:
         log.exception("thesis_benchmark error")
         return _no_data("thesis_benchmark failed")
+
+
+@app.get("/api/thesis/buyhold")
+async def thesis_buyhold(tickers: str = "", days: int = 365):
+    """
+    For each ticker, compare:
+      - AI thesis avg return (outcome-implied or 30d)
+      - Buy-and-hold return: bought at each thesis entry price, held to today
+    Returns per-ticker rows + aggregate summary.
+    """
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else MAG7
+    cache_key   = f"thesis_buyhold:{','.join(sorted(ticker_list))}:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from datetime import date as _date, timedelta
+        cutoff = str(_date.today() - timedelta(days=days))
+
+        conn = _db_connect()
+        rows = conn.execute(f"""
+            SELECT o.ticker, o.thesis_date, o.entry_price, o.direction,
+                   o.outcome, o.return_30d, o.return_7d,
+                   o.target_1, o.target_2, o.stop_loss,
+                   o.hit_target_1, o.hit_target_2, o.hit_stop,
+                   COALESCE(tc.model_used, 'unknown') AS model
+            FROM thesis_outcomes o
+            JOIN thesis_cache tc ON tc.id = o.thesis_id
+            WHERE o.ticker = ANY(%s) AND o.thesis_date >= %s
+              AND o.entry_price IS NOT NULL AND o.entry_price > 0
+            ORDER BY o.ticker, o.thesis_date
+        """, (ticker_list, cutoff)).fetchall()
+        conn.close()
+
+        # Fetch current prices for all tickers
+        current_prices = _fetch_current_prices(ticker_list)
+
+        # Group by ticker
+        from collections import defaultdict
+        by_ticker: dict = defaultdict(list)
+        for r in rows:
+            by_ticker[r["ticker"]].append(r)
+
+        def _ai_return(r) -> float | None:
+            if r["return_30d"] is not None: return float(r["return_30d"])
+            if r["return_7d"]  is not None: return float(r["return_7d"])
+            ep   = float(r["entry_price"])
+            bear = r["direction"] == "BEAR"
+            if r["outcome"] == "HIT_TARGET1" and r["target_1"]:
+                raw = (float(r["target_1"]) - ep) / ep * 100
+                return -raw if bear else raw
+            if r["outcome"] == "HIT_TARGET2" and r["target_2"]:
+                raw = (float(r["target_2"]) - ep) / ep * 100
+                return -raw if bear else raw
+            if r["outcome"] == "HIT_STOP" and r["stop_loss"]:
+                raw = (float(r["stop_loss"]) - ep) / ep * 100
+                return -raw if bear else raw
+            return None
+
+        data = []
+        for ticker in ticker_list:
+            thesis_rows = by_ticker.get(ticker, [])
+            cur = current_prices.get(ticker)
+
+            ai_returns   = [v for r in thesis_rows if (v := _ai_return(r)) is not None]
+            bh_returns   = []
+            if cur:
+                for r in thesis_rows:
+                    ep = float(r["entry_price"])
+                    bh_returns.append((cur - ep) / ep * 100)
+
+            wins   = sum(1 for r in thesis_rows if r["outcome"] in ("HIT_TARGET1", "HIT_TARGET2"))
+            losses = sum(1 for r in thesis_rows if r["outcome"] == "HIT_STOP")
+            resolved = wins + losses
+
+            # Earliest entry date for simple long-term hold calculation
+            first_entry = thesis_rows[0]["entry_price"] if thesis_rows else None
+            first_date  = str(thesis_rows[0]["thesis_date"]) if thesis_rows else None
+            longterm_return = None
+            if first_entry and cur:
+                longterm_return = round((cur - float(first_entry)) / float(first_entry) * 100, 2)
+
+            data.append({
+                "ticker":             ticker,
+                "theses":             len(thesis_rows),
+                "current_price":      cur,
+                "first_thesis_date":  first_date,
+                "ai_avg_return":      round(sum(ai_returns) / len(ai_returns), 2) if ai_returns else None,
+                "bh_avg_return":      round(sum(bh_returns) / len(bh_returns), 2) if bh_returns else None,
+                "longterm_return":    longterm_return,
+                "ai_win_rate":        round(wins / resolved * 100, 1) if resolved > 0 else None,
+                "wins":               wins,
+                "losses":             losses,
+                "open_count":         sum(1 for r in thesis_rows if r["outcome"] == "OPEN"),
+                "advantage":          round(
+                    sum(ai_returns) / len(ai_returns) - sum(bh_returns) / len(bh_returns), 2
+                ) if ai_returns and bh_returns else None,
+            })
+
+        # Sort: tickers with most theses first
+        data.sort(key=lambda x: x["theses"], reverse=True)
+
+        # Aggregate across all tickers
+        all_ai  = [r["ai_avg_return"]  for r in data if r["ai_avg_return"]  is not None]
+        all_bh  = [r["bh_avg_return"]  for r in data if r["bh_avg_return"]  is not None]
+        aggregate = {
+            "tickers_with_data": sum(1 for r in data if r["theses"] > 0),
+            "total_theses":      sum(r["theses"] for r in data),
+            "avg_ai_return":     round(sum(all_ai) / len(all_ai), 2) if all_ai else None,
+            "avg_bh_return":     round(sum(all_bh) / len(all_bh), 2) if all_bh else None,
+            "avg_advantage":     round(
+                sum(all_ai) / len(all_ai) - sum(all_bh) / len(all_bh), 2
+            ) if all_ai and all_bh else None,
+        }
+
+        result = {
+            "data_available": True,
+            "days":           days,
+            "tickers":        ticker_list,
+            "aggregate":      aggregate,
+            "data":           _json_safe(data),
+        }
+        _cache.set(cache_key, result, TTL_MEDIUM)
+        return result
+
+    except Exception:
+        log.exception("thesis_buyhold error")
+        return _no_data("thesis_buyhold failed")
 
 
 # ─── Settings ─────────────────────────────────────────────────────────────────

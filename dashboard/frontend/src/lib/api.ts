@@ -786,6 +786,35 @@ export interface BenchmarkModelSummary {
   neutral_count:     number
 }
 
+export interface BuyHoldRow {
+  ticker:            string
+  theses:            number
+  current_price:     number | null
+  first_thesis_date: string | null
+  ai_avg_return:     number | null
+  bh_avg_return:     number | null
+  longterm_return:   number | null
+  ai_win_rate:       number | null
+  wins:              number
+  losses:            number
+  open_count:        number
+  advantage:         number | null
+}
+
+export interface BuyHoldResponse {
+  data_available: boolean
+  days:           number
+  tickers:        string[]
+  aggregate: {
+    tickers_with_data: number
+    total_theses:      number
+    avg_ai_return:     number | null
+    avg_bh_return:     number | null
+    avg_advantage:     number | null
+  }
+  data: BuyHoldRow[]
+}
+
 export interface LivePerformanceRow {
   ticker:        string
   direction:     string
@@ -1214,8 +1243,11 @@ export const api = {
   hotEntryHistory: (ticker: string, days = 30): Promise<{ data_available: boolean; data: { run_date: string; rank: number; hot_score: number; status: string; rank_change: string }[] }> =>
     client.get('/api/hot-entry/history', { params: { ticker, days } }).then(r => r.data),
 
-  thesisBenchmark: (days = 90): Promise<{ data_available: boolean; days: number; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
-    client.get('/api/thesis/benchmark', { params: { days } }).then(r => r.data),
+  thesisBenchmark: (days = 90, tickers = ''): Promise<{ data_available: boolean; days: number; ticker_filter: string[]; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
+    client.get('/api/thesis/benchmark', { params: { days, tickers } }).then(r => r.data),
+
+  thesisBuyHold: (tickers = '', days = 365): Promise<BuyHoldResponse> =>
+    client.get('/api/thesis/buyhold', { params: { tickers, days } }).then(r => r.data),
 
   thesisLivePerformance: (): Promise<{ data_available: boolean; count: number; as_of: string; data: LivePerformanceRow[] }> =>
     client.get('/api/thesis/live-performance').then(r => r.data),

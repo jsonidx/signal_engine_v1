@@ -10,7 +10,7 @@ import { MonoNumber } from '../components/ui/MonoNumber'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth, type BenchmarkModelSummary, type BenchmarkOutcomeRow, type LivePerformanceRow } from '../lib/api'
+import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth, type BenchmarkModelSummary, type BenchmarkOutcomeRow, type LivePerformanceRow, type BuyHoldRow } from '../lib/api'
 import { clsx } from 'clsx'
 
 // ─── Override flag badge ───────────────────────────────────────────────────────
@@ -586,6 +586,110 @@ function LivePerformancePanel() {
   )
 }
 
+// ─── Buy & Hold comparison ────────────────────────────────────────────────────
+
+const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA']
+
+function advantageColor(v: number | null): string {
+  if (v == null) return 'text-text-tertiary'
+  if (v > 2)  return 'text-accent-green font-semibold'
+  if (v > 0)  return 'text-accent-green'
+  if (v > -2) return 'text-accent-red'
+  return 'text-accent-red font-semibold'
+}
+
+function BuyHoldPanel({ tickerFilter }: { tickerFilter: string }) {
+  const tickers = tickerFilter || MAG7.join(',')
+  const { data, isLoading } = useQuery({
+    queryKey: ['thesis', 'buyhold', tickers],
+    queryFn: () => api.thesisBuyHold(tickers, 365),
+    staleTime: 0,
+  })
+
+  const rows: BuyHoldRow[] = (data?.data ?? []).filter(r => r.theses > 0)
+  const agg = data?.aggregate
+
+  if (isLoading) return <LoadingSkeleton rows={4} />
+  if (!data?.data_available || rows.length === 0) {
+    return (
+      <div className="bg-bg-surface border border-border-subtle rounded p-6 text-center font-mono text-xs text-text-tertiary">
+        No thesis data for selected tickers yet.
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Aggregate banner */}
+      {agg && (
+        <div className="grid grid-cols-4 gap-3">
+          {[
+            { label: 'Total Theses', value: String(agg.total_theses), color: 'text-text-primary' },
+            { label: 'AI Avg Return', value: agg.avg_ai_return != null ? `${agg.avg_ai_return > 0 ? '+' : ''}${agg.avg_ai_return.toFixed(1)}%` : '—', color: agg.avg_ai_return != null ? (agg.avg_ai_return >= 0 ? 'text-accent-green' : 'text-accent-red') : 'text-text-tertiary' },
+            { label: 'Buy & Hold Avg', value: agg.avg_bh_return != null ? `${agg.avg_bh_return > 0 ? '+' : ''}${agg.avg_bh_return.toFixed(1)}%` : '—', color: agg.avg_bh_return != null ? (agg.avg_bh_return >= 0 ? 'text-accent-green' : 'text-accent-red') : 'text-text-tertiary' },
+            { label: 'AI Advantage', value: agg.avg_advantage != null ? `${agg.avg_advantage > 0 ? '+' : ''}${agg.avg_advantage.toFixed(1)}%` : '—', color: advantageColor(agg.avg_advantage) },
+          ].map(({ label, value, color }) => (
+            <div key={label} className="bg-bg-surface border border-border-subtle rounded p-3 text-center">
+              <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-1">{label}</div>
+              <div className={clsx('font-mono text-lg font-bold', color)}>{value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Per-ticker table */}
+      <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+        <div className="px-4 py-3 border-b border-border-subtle">
+          <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+            Per-Ticker: AI Active Trading vs Buy &amp; Hold (12 months)
+          </span>
+        </div>
+        <table className="w-full">
+          <thead>
+            <tr className="border-b border-border-subtle">
+              {['Ticker', 'Theses', 'Win Rate', 'AI Avg Return', 'Buy & Hold', 'AI Advantage', 'Long-term Hold', 'First Thesis'].map(h => (
+                <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.ticker} className="border-b border-border-subtle/40 last:border-0 hover:bg-bg-elevated transition-colors">
+                <td className="px-3 py-3 font-mono text-sm font-bold text-text-primary">{r.ticker}</td>
+                <td className="px-3 py-3 font-mono text-xs text-text-secondary text-center">
+                  {r.theses}
+                  <span className="text-text-tertiary text-[10px] ml-1">({r.wins}W/{r.losses}L/{r.open_count}O)</span>
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', winRateColor(r.ai_win_rate ? r.ai_win_rate / 100 : null))}>
+                  {r.ai_win_rate != null ? `${r.ai_win_rate}%` : '—'}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', r.ai_avg_return == null ? 'text-text-tertiary' : r.ai_avg_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                  {r.ai_avg_return != null ? `${r.ai_avg_return > 0 ? '+' : ''}${r.ai_avg_return.toFixed(1)}%` : '—'}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', r.bh_avg_return == null ? 'text-text-tertiary' : r.bh_avg_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                  {r.bh_avg_return != null ? `${r.bh_avg_return > 0 ? '+' : ''}${r.bh_avg_return.toFixed(1)}%` : '—'}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs font-semibold', advantageColor(r.advantage))}>
+                  {r.advantage != null ? `${r.advantage > 0 ? '+' : ''}${r.advantage.toFixed(1)}%` : '—'}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', r.longterm_return == null ? 'text-text-tertiary' : r.longterm_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                  {r.longterm_return != null ? `${r.longterm_return > 0 ? '+' : ''}${r.longterm_return.toFixed(1)}%` : '—'}
+                </td>
+                <td className="px-3 py-3 font-mono text-[10px] text-text-tertiary">{r.first_thesis_date ?? '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="px-4 py-2.5 border-t border-border-subtle/50 bg-bg-elevated">
+          <p className="font-mono text-[10px] text-text-tertiary">
+            AI Avg Return = avg outcome per thesis (30d return or outcome-implied) · Buy &amp; Hold = bought at each thesis entry price, held to today · Long-term Hold = from first thesis date to today · AI Advantage = AI return minus B&amp;H return
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Collapsible section ──────────────────────────────────────────────────────
 
 function CollapsibleSection({ label, children, defaultOpen = false }: {
@@ -677,9 +781,13 @@ export function ResolutionPage() {
   const [benchDays, setBenchDays] = useState(90)
   const [modelFilter, setModelFilter] = useState('all')
   const [capital, setCapital] = useState(2000)
+  const [tickerInput, setTickerInput]   = useState('')
+  const [tickerFilter, setTickerFilter] = useState('')
+  const isMag7 = tickerFilter === MAG7.join(',')
+
   const { data: bench, isLoading: benchLoading, refetch: refetchBench } = useQuery({
-    queryKey: ['thesis', 'benchmark', benchDays],
-    queryFn: () => api.thesisBenchmark(benchDays),
+    queryKey: ['thesis', 'benchmark', benchDays, tickerFilter],
+    queryFn: () => api.thesisBenchmark(benchDays, tickerFilter),
     staleTime: 0,
   })
   const benchSummary = bench?.summary ?? []
@@ -845,7 +953,7 @@ export function ResolutionPage() {
         <Tabs.Content value="benchmark">
           <div className="space-y-5">
             {/* Controls row */}
-            <div className="flex items-center gap-4 flex-wrap">
+            <div className="flex items-center gap-3 flex-wrap">
               <div className="flex items-center gap-2">
                 <span className="font-mono text-[10px] text-text-tertiary">Window:</span>
                 {[30, 60, 90, 180].map(d => (
@@ -868,6 +976,39 @@ export function ResolutionPage() {
                   onChange={e => setCapital(Math.max(1, Number(e.target.value) || 2000))}
                   className="w-24 px-2 py-0.5 font-mono text-xs bg-bg-elevated border border-border-subtle rounded text-text-primary text-right focus:outline-none focus:border-accent-blue"
                 />
+              </div>
+              {/* Ticker filter */}
+              <div className="flex items-center gap-1.5 ml-auto">
+                <button
+                  onClick={() => {
+                    const next = isMag7 ? '' : MAG7.join(',')
+                    setTickerFilter(next)
+                    setTickerInput(next)
+                  }}
+                  className={clsx('font-mono text-[10px] px-2 py-1 rounded border transition-colors',
+                    isMag7
+                      ? 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple'
+                      : 'border-border-subtle text-text-tertiary hover:text-text-secondary'
+                  )}
+                >
+                  Mag-7
+                </button>
+                <input
+                  type="text"
+                  placeholder="AAPL,TSLA,..."
+                  value={tickerInput}
+                  onChange={e => setTickerInput(e.target.value.toUpperCase())}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') setTickerFilter(tickerInput.trim())
+                    if (e.key === 'Escape') { setTickerFilter(''); setTickerInput('') }
+                  }}
+                  className="w-36 px-2 py-0.5 font-mono text-xs bg-bg-elevated border border-border-subtle rounded text-text-primary focus:outline-none focus:border-accent-blue placeholder-text-tertiary/40"
+                />
+                {tickerFilter && (
+                  <button onClick={() => { setTickerFilter(''); setTickerInput('') }}
+                    className="font-mono text-[10px] text-text-tertiary hover:text-text-primary px-1"
+                  >✕</button>
+                )}
               </div>
               <button onClick={() => refetchBench()} className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors">
                 <RefreshCw size={11} />
@@ -896,6 +1037,13 @@ export function ResolutionPage() {
                     capital={capital}
                   />
                 )}
+
+                {/* Buy & Hold comparison — always shown, defaults to Mag-7 */}
+                <CollapsibleSection label={`vs Buy & Hold${tickerFilter ? ` — ${tickerFilter}` : ' — Mag-7'}`} defaultOpen={true}>
+                  <div className="p-4">
+                    <BuyHoldPanel tickerFilter={tickerFilter} />
+                  </div>
+                </CollapsibleSection>
 
                 {/* Collapsible: Monthly Breakdown */}
                 {months.length > 0 && (
