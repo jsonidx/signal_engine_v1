@@ -1526,12 +1526,22 @@ async def deepdive_tickers():
     if conn is not None:
         try:
             rows = conn.execute("""
-                SELECT ticker, date, direction, conviction, signal_agreement_score,
-                       time_horizon, data_quality, thesis, bull_probability,
-                       bear_probability, neutral_probability, created_at,
-                       entry_low, entry_high, target_1, target_2, stop_loss
-                FROM thesis_cache
-                ORDER BY date DESC, created_at DESC
+                SELECT tc.ticker, tc.date, tc.direction, tc.conviction, tc.signal_agreement_score,
+                       tc.time_horizon, tc.data_quality, tc.thesis, tc.bull_probability,
+                       tc.bear_probability, tc.neutral_probability, tc.created_at,
+                       tc.entry_low, tc.entry_high, tc.target_1, tc.target_2, tc.stop_loss,
+                       ss.rank AS equity_rank
+                FROM thesis_cache tc
+                LEFT JOIN (
+                    SELECT ticker, rank
+                    FROM screener_signals
+                    WHERE date = (SELECT MAX(date) FROM screener_signals)
+                ) ss ON ss.ticker = tc.ticker
+                WHERE tc.ticker NOT IN (
+                    SELECT ticker FROM blacklist
+                    WHERE expires_at IS NULL OR expires_at > NOW()
+                )
+                ORDER BY tc.date DESC, tc.created_at DESC
             """).fetchall()
             conn.close()
 
@@ -1563,6 +1573,7 @@ async def deepdive_tickers():
                     "target_1":               r["target_1"],
                     "target_2":               r["target_2"],
                     "stop_loss":              r["stop_loss"],
+                    "equity_rank":            r["equity_rank"],
                 })
         except Exception:
             log.exception("deepdive_tickers: thesis_cache read error")
@@ -2394,6 +2405,10 @@ async def rankings_latest():
             FROM   daily_rankings
             WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
               AND  rank <= 20
+              AND  ticker NOT IN (
+                       SELECT ticker FROM blacklist
+                       WHERE expires_at IS NULL OR expires_at > NOW()
+                   )
             ORDER  BY rank ASC
             """
         )
@@ -2574,6 +2589,10 @@ async def signals_candidates():
                    is_open_position, run_date
             FROM   candidate_snapshots
             WHERE  run_date = (SELECT MAX(run_date) FROM candidate_snapshots)
+              AND  ticker NOT IN (
+                       SELECT ticker FROM blacklist
+                       WHERE expires_at IS NULL OR expires_at > NOW()
+                   )
             ORDER  BY priority_score DESC
             """
         )
@@ -2719,6 +2738,242 @@ async def rankings_history(
     except Exception as e:
         log.exception("rankings_history error")
         return _no_data(str(e))
+
+
+@app.get("/api/hot-entry/rankings")
+async def hot_entry_rankings():
+    """
+    Ranked hot-entry candidates for today.
+
+    Scoring formula (higher = better buy today):
+      score = is_hot_bonus(50) + prob_t1 * t1_upside_pct * 2 + min(rr,3)*3 + conviction
+
+    Saves a daily snapshot to hot_entry_rankings on first call of the day.
+    Returns ranked rows with rank numbers and rank_change vs yesterday.
+    """
+    cache_key = "hot_entry_rankings"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from datetime import date as _date, timedelta
+        import math
+
+        today = _date.today()
+        conn = _db_connect()
+
+        # ── 1. Pull thesis_cache (with equity_rank) ───────────────────────────
+        tc_rows = conn.execute("""
+            SELECT tc.ticker, tc.direction, tc.conviction,
+                   tc.entry_low, tc.entry_high, tc.target_1, tc.target_2, tc.stop_loss,
+                   ss.rank AS equity_rank
+            FROM thesis_cache tc
+            LEFT JOIN (
+                SELECT ticker, rank FROM screener_signals
+                WHERE date = (SELECT MAX(date) FROM screener_signals)
+            ) ss ON ss.ticker = tc.ticker
+            WHERE tc.ticker NOT IN (
+                SELECT ticker FROM blacklist
+                WHERE expires_at IS NULL OR expires_at > NOW()
+            )
+              AND tc.entry_low IS NOT NULL AND tc.entry_high IS NOT NULL
+            ORDER BY tc.date DESC, tc.created_at DESC
+        """).fetchall()
+
+        # Deduplicate — keep latest thesis per ticker
+        seen: set = set()
+        theses: list = []
+        for r in tc_rows:
+            t = r["ticker"]
+            if t not in seen:
+                seen.add(t)
+                theses.append(dict(r))
+
+        # ── 2. Pull latest daily_rankings for prob_t1/t2 and live targets ─────
+        rk_rows = conn.execute("""
+            SELECT ticker, prob_t1, prob_t2, t1_price, t2_price
+            FROM daily_rankings
+            WHERE run_date = (SELECT MAX(run_date) FROM daily_rankings)
+        """).fetchall()
+        rk_map = {r["ticker"]: r for r in rk_rows}
+
+        # ── 3. Pull live prices via yfinance ──────────────────────────────────
+        tickers_needed = [t["ticker"] for t in theses]
+        fund_map: dict = _fetch_current_prices(tickers_needed) if tickers_needed else {}
+
+        # ── 4. Pull live buy zones ────────────────────────────────────────────
+        live_zone_key = "deepdive_live_zones"
+        lz_cached = _cache.get(live_zone_key)
+        live_zones: dict = lz_cached.get("zones", {}) if lz_cached else {}
+
+        # ── 5. Score each thesis ticker ───────────────────────────────────────
+        def _score_row(t: dict, price: float | None) -> dict | None:
+            el, eh = t["entry_low"], t["entry_high"]
+            if el is None or eh is None or price is None:
+                return None
+            in_ai = el <= price <= eh
+            lz = live_zones.get(t["ticker"])
+            in_live = lz and lz.get("buy_zone_low", 0) <= price <= lz.get("buy_zone_high", 0)
+            is_hot = bool(in_ai and in_live)
+            if not in_ai:
+                return None  # not in any zone — skip
+
+            entry_mid = (el + eh) / 2
+            rk = rk_map.get(t["ticker"], {})
+            t1_ai = t["target_1"]
+            t1_live = rk.get("t1_price") if rk else None
+            t1_med = (t1_ai + t1_live) / 2 if t1_ai and t1_live else (t1_ai or t1_live)
+            t2_ai = t["target_2"]
+            t2_live = rk.get("t2_price") if rk else None
+            t2_med = (t2_ai + t2_live) / 2 if t2_ai and t2_live else (t2_ai or t2_live)
+
+            t1_upside = ((t1_med - entry_mid) / entry_mid * 100) if t1_med else None
+            t2_upside = ((t2_med - entry_mid) / entry_mid * 100) if t2_med else None
+
+            stop = t["stop_loss"]
+            sp_pct = abs((stop - entry_mid) / entry_mid * 100) if stop else None
+            rr_val = (abs(t1_upside) / sp_pct) if t1_upside and sp_pct and sp_pct > 0 else None
+
+            prob_t1 = float(rk.get("prob_t1") or 0) if rk else 0.0
+            prob_t2 = float(rk.get("prob_t2") or 0) if rk else 0.0
+            conviction = int(t.get("conviction") or 0)
+
+            score = 0.0
+            if is_hot:
+                score += 50
+            if prob_t1 and t1_upside:
+                score += prob_t1 * abs(t1_upside) * 2
+            if rr_val:
+                score += min(rr_val, 3) * 3
+            score += conviction
+
+            return {
+                "ticker":        t["ticker"],
+                "is_hot":        is_hot,
+                "status":        "HOT" if is_hot else "IN_ZONE",
+                "hot_score":     round(score, 2),
+                "current_price": price,
+                "entry_low":     el,
+                "entry_high":    eh,
+                "t1_median":     round(t1_med, 2) if t1_med else None,
+                "t2_median":     round(t2_med, 2) if t2_med else None,
+                "prob_t1":       prob_t1 or None,
+                "prob_t2":       prob_t2 or None,
+                "t1_upside_pct": round(t1_upside, 2) if t1_upside else None,
+                "t2_upside_pct": round(t2_upside, 2) if t2_upside else None,
+                "rr":            round(rr_val, 2) if rr_val else None,
+                "conviction":    conviction,
+                "equity_rank":   t.get("equity_rank"),
+                "direction":     t.get("direction"),
+            }
+
+        scored = []
+        for t in theses:
+            price = fund_map.get(t["ticker"])
+            row = _score_row(t, price)
+            if row:
+                scored.append(row)
+
+        scored.sort(key=lambda r: r["hot_score"], reverse=True)
+
+        # ── 6. Pull yesterday's ranks for rank_change ─────────────────────────
+        yesterday = today - timedelta(days=1)
+        prev_rows = conn.execute(
+            "SELECT ticker, rank FROM hot_entry_rankings WHERE run_date = %s",
+            (yesterday,)
+        ).fetchall()
+        prev_rank = {r["ticker"]: r["rank"] for r in prev_rows}
+
+        # ── 7. Assign ranks + compute rank_change ─────────────────────────────
+        records = []
+        for i, row in enumerate(scored, 1):
+            prev = prev_rank.get(row["ticker"])
+            if prev is None:
+                rank_change = "NEW"
+            else:
+                delta = prev - i
+                rank_change = f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "—")
+            records.append({**row, "rank": i, "rank_change": rank_change, "run_date": str(today)})
+
+        # ── 8. Snapshot to DB once per day ────────────────────────────────────
+        existing = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM hot_entry_rankings WHERE run_date = %s", (today,)
+        ).fetchone()
+        if existing["cnt"] == 0 and records:
+            for rec in records:
+                conn.execute("""
+                    INSERT INTO hot_entry_rankings
+                        (run_date, rank, ticker, hot_score, status, is_hot,
+                         current_price, entry_low, entry_high,
+                         t1_median, t2_median, prob_t1, prob_t2,
+                         t1_upside_pct, rr, conviction, equity_rank, rank_change)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (run_date, ticker) DO NOTHING
+                """, (
+                    today, rec["rank"], rec["ticker"], rec["hot_score"],
+                    rec["status"], rec["is_hot"], rec["current_price"],
+                    rec["entry_low"], rec["entry_high"],
+                    rec["t1_median"], rec["t2_median"],
+                    rec["prob_t1"], rec["prob_t2"],
+                    rec["t1_upside_pct"], rec["rr"],
+                    rec["conviction"], rec["equity_rank"], rec["rank_change"]
+                ))
+            conn.commit()
+
+        conn.close()
+
+        result = {
+            "data_available": True,
+            "count": len(records),
+            "as_of": str(today),
+            "data": _json_safe(records),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception:
+        log.exception("hot_entry_rankings error")
+        return _no_data("hot_entry_rankings failed")
+
+
+@app.get("/api/hot-entry/history")
+async def hot_entry_history(
+    ticker: str = Query(..., description="Ticker symbol"),
+    days:   int = Query(30, ge=1, le=365),
+):
+    """Rank history for a single ticker in the hot-entry table."""
+    cache_key = f"hot_entry_history:{ticker.upper()}:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from datetime import date as _date, timedelta
+        cutoff = _date.today() - timedelta(days=days)
+        conn = _db_connect()
+        rows = conn.execute(
+            """
+            SELECT run_date, rank, hot_score, status, rank_change
+            FROM hot_entry_rankings
+            WHERE ticker = %s AND run_date >= %s
+            ORDER BY run_date DESC
+            """,
+            (ticker.upper(), cutoff)
+        ).fetchall()
+        conn.close()
+
+        records = [{"run_date": str(r["run_date"]), "rank": r["rank"],
+                    "hot_score": float(r["hot_score"] or 0),
+                    "status": r["status"], "rank_change": r["rank_change"]} for r in rows]
+        result = {"data_available": bool(records), "ticker": ticker.upper(),
+                  "count": len(records), "data": records}
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception:
+        log.exception("hot_entry_history error")
+        return _no_data("hot_entry_history failed")
 
 
 @app.get("/api/screeners/crypto")
@@ -3683,6 +3938,112 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _apply_thesis_calibration(ticker: str, model: str, min_sample: int = 5) -> bool:
+    """
+    Adjust the latest thesis_cache targets for `ticker` using the model's historical
+    avg calibration error vs T1 and T2 (from thesis_outcomes).
+
+    Only applies when the model has >= min_sample resolved outcomes.
+    Returns True if calibration was applied.
+    """
+    try:
+        conn = _db_connect()
+
+        # Fetch calibration factors for this model
+        cal = conn.execute("""
+            SELECT
+                COUNT(*)  FILTER (WHERE o.outcome IN ('HIT_TARGET1','HIT_TARGET2','HIT_STOP')) AS n,
+                AVG(
+                    CASE
+                        WHEN o.outcome = 'HIT_TARGET1' AND o.entry_price > 0 AND o.target_1 IS NOT NULL
+                            THEN (o.target_1 - o.entry_price) / o.entry_price * 100
+                                * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                        WHEN o.outcome = 'HIT_TARGET2' AND o.entry_price > 0 AND o.target_2 IS NOT NULL
+                            THEN (o.target_2 - o.entry_price) / o.entry_price * 100
+                                * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                        WHEN o.outcome = 'HIT_STOP'    AND o.entry_price > 0 AND o.stop_loss IS NOT NULL
+                            THEN (o.stop_loss - o.entry_price) / o.entry_price * 100
+                                * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                    END
+                ) AS avg_outcome_return,
+                AVG(o.vs_target_1_pct) FILTER (WHERE o.vs_target_1_pct IS NOT NULL) AS avg_vs_t1,
+                AVG(o.vs_target_2_pct) FILTER (WHERE o.vs_target_2_pct IS NOT NULL) AS avg_vs_t2
+            FROM thesis_outcomes o
+            JOIN thesis_cache tc ON tc.id = o.thesis_id
+            WHERE tc.model_used = %s
+        """, (model,)).fetchone()
+
+        if not cal or (cal["n"] or 0) < min_sample:
+            conn.close()
+            return False
+
+        avg_vs_t1 = float(cal["avg_vs_t1"]) if cal["avg_vs_t1"] is not None else None
+        avg_vs_t2 = float(cal["avg_vs_t2"]) if cal["avg_vs_t2"] is not None else None
+
+        if avg_vs_t1 is None and avg_vs_t2 is None:
+            conn.close()
+            return False
+
+        # Fetch the latest thesis for this ticker
+        thesis = conn.execute("""
+            SELECT id, target_1, target_2, direction
+            FROM thesis_cache
+            WHERE ticker = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (ticker,)).fetchone()
+
+        if not thesis:
+            conn.close()
+            return False
+
+        t1_raw = thesis["target_1"]
+        t2_raw = thesis["target_2"]
+        direction = thesis["direction"]
+        bear = direction == "BEAR"
+
+        # Calibration: if avg_vs_t1 = -2%, model overshoots by 2% → lower target by 2%
+        # For BEAR: target_1 < entry_price, so a negative vs_t1 means price didn't fall enough
+        # The correction is symmetric: multiply target by (1 + avg_vs_t1/100)
+        updates = {}
+        if t1_raw and avg_vs_t1 is not None:
+            factor = 1 + avg_vs_t1 / 100
+            updates["target_1"] = round(float(t1_raw) * factor, 2)
+
+        if t2_raw and avg_vs_t2 is not None:
+            factor = 1 + avg_vs_t2 / 100
+            updates["target_2"] = round(float(t2_raw) * factor, 2)
+
+        if not updates:
+            conn.close()
+            return False
+
+        set_clause = ", ".join(f"{k} = %s" for k in updates)
+        conn.execute(
+            f"UPDATE thesis_cache SET {set_clause} WHERE id = %s",
+            (*updates.values(), thesis["id"])
+        )
+        conn.commit()
+
+        detail = {
+            "model":    model,
+            "sample_n": int(cal["n"]),
+            "t1_raw":   float(t1_raw) if t1_raw else None,
+            "t1_cal":   updates.get("target_1"),
+            "t1_bias":  round(avg_vs_t1, 2) if avg_vs_t1 is not None else None,
+            "t2_raw":   float(t2_raw) if t2_raw else None,
+            "t2_cal":   updates.get("target_2"),
+            "t2_bias":  round(avg_vs_t2, 2) if avg_vs_t2 is not None else None,
+        }
+        log.info("Calibration applied to %s: %s", ticker, detail)
+        conn.close()
+        return detail
+
+    except Exception:
+        log.exception("_apply_thesis_calibration failed for %s / %s", ticker, model)
+        return False
+
+
 @app.get("/api/ticker/{symbol}/analyze/status")
 async def ticker_analyze_status(symbol: str):
     """Poll whether a background analysis job has completed."""
@@ -3712,9 +4073,18 @@ async def ticker_analyze_status(symbol: str):
             cost_usd   = row["cost_usd"]
     except Exception:
         pass
+    # Apply historical calibration to the freshly saved targets
+    calibration = None
+    if model_used:
+        try:
+            calibration = _apply_thesis_calibration(sym, model_used)
+        except Exception:
+            log.exception("calibration apply error for %s", sym)
+
     return {
         "status": "done", "symbol": sym, "started_at": job.get("started_at"),
         "used_model": model_used, "cost_usd": cost_usd,
+        "calibration": calibration if calibration else None,
     }
 
 
@@ -4764,3 +5134,248 @@ async def get_workflow_report_text():
         if "pipeline_reports" in msg and "does not exist" in msg:
             raise HTTPException(status_code=404, detail="No pipeline report yet — will be available after the next workflow run completes")
         raise HTTPException(status_code=500, detail=msg)
+
+
+# ─── Model Accuracy Benchmark ─────────────────────────────────────────────────
+
+@app.get("/api/thesis/benchmark")
+async def thesis_benchmark(days: int = 90):
+    """
+    Per-model accuracy stats from thesis_outcomes JOIN thesis_cache.
+    Returns summary scorecards + recent per-ticker outcomes.
+    """
+    cache_key = f"thesis_benchmark:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        from datetime import date as _date, timedelta
+        cutoff = str(_date.today() - timedelta(days=days))
+
+        conn = _db_connect()
+
+        # ── Model summary ──────────────────────────────────────────────────────
+        summary_rows = conn.execute("""
+            SELECT
+                COALESCE(tc.model_used, 'unknown') AS model,
+                COUNT(*)                            AS theses,
+                SUM(CASE WHEN o.hit_target_1 THEN 1 ELSE 0 END)  AS t1_hits,
+                SUM(CASE WHEN o.hit_target_2 THEN 1 ELSE 0 END)  AS t2_hits,
+                SUM(CASE WHEN o.hit_stop    THEN 1 ELSE 0 END)   AS stop_hits,
+                SUM(CASE WHEN o.outcome IN ('HIT_TARGET1','HIT_TARGET2') THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN o.outcome = 'HIT_STOP'   THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN o.outcome = 'OPEN'       THEN 1 ELSE 0 END) AS open_count,
+                -- best available return: 30d actual > 7d actual > outcome-implied
+                AVG(CASE
+                    WHEN o.return_30d IS NOT NULL THEN o.return_30d
+                    WHEN o.return_7d  IS NOT NULL THEN o.return_7d
+                    WHEN o.outcome = 'HIT_TARGET1' AND o.entry_price > 0 AND o.target_1 IS NOT NULL
+                        THEN (o.target_1 - o.entry_price) / o.entry_price * 100
+                            * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                    WHEN o.outcome = 'HIT_TARGET2' AND o.entry_price > 0 AND o.target_2 IS NOT NULL
+                        THEN (o.target_2 - o.entry_price) / o.entry_price * 100
+                            * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                    WHEN o.outcome = 'HIT_STOP' AND o.entry_price > 0 AND o.stop_loss IS NOT NULL
+                        THEN (o.stop_loss - o.entry_price) / o.entry_price * 100
+                            * CASE WHEN o.direction = 'BEAR' THEN -1 ELSE 1 END
+                    END
+                ) AS avg_return_30d,
+                AVG(CASE WHEN o.days_to_target_1 IS NOT NULL THEN o.days_to_target_1 END) AS avg_days_to_t1,
+                AVG(CASE WHEN o.vs_target_1_pct IS NOT NULL THEN o.vs_target_1_pct END)   AS avg_vs_t1_pct,
+                SUM(CASE WHEN o.direction = 'BULL' THEN 1 ELSE 0 END) AS bull_count,
+                SUM(CASE WHEN o.direction = 'BEAR' THEN 1 ELSE 0 END) AS bear_count,
+                SUM(CASE WHEN o.direction = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral_count
+            FROM thesis_outcomes o
+            JOIN thesis_cache tc ON tc.id = o.thesis_id
+            WHERE o.thesis_date >= %s
+            GROUP BY COALESCE(tc.model_used, 'unknown')
+            ORDER BY theses DESC
+        """, (cutoff,)).fetchall()
+
+        summary = []
+        for r in summary_rows:
+            theses  = r["theses"] or 0
+            wins    = r["wins"] or 0
+            losses  = r["losses"] or 0
+            resolved = wins + losses
+            win_rate = round(wins / resolved * 100, 1) if resolved > 0 else None
+            t1_rate  = round((r["t1_hits"] or 0) / theses * 100, 1) if theses > 0 else None
+            t2_rate  = round((r["t2_hits"] or 0) / theses * 100, 1) if theses > 0 else None
+            stop_rate = round((r["stop_hits"] or 0) / theses * 100, 1) if theses > 0 else None
+            summary.append({
+                "model":          r["model"],
+                "theses":         theses,
+                "wins":           wins,
+                "losses":         losses,
+                "open_count":     r["open_count"] or 0,
+                "win_rate_pct":   win_rate,
+                "t1_hit_rate_pct": t1_rate,
+                "t2_hit_rate_pct": t2_rate,
+                "stop_rate_pct":  stop_rate,
+                "avg_return_30d": round(float(r["avg_return_30d"]), 2) if r["avg_return_30d"] else None,
+                "avg_days_to_t1": round(float(r["avg_days_to_t1"]), 1) if r["avg_days_to_t1"] else None,
+                "avg_vs_t1_pct":  round(float(r["avg_vs_t1_pct"]), 2) if r["avg_vs_t1_pct"] else None,
+                "bull_count":     r["bull_count"] or 0,
+                "bear_count":     r["bear_count"] or 0,
+                "neutral_count":  r["neutral_count"] or 0,
+            })
+
+        # ── Per-ticker outcomes ────────────────────────────────────────────────
+        recent_rows = conn.execute("""
+            SELECT
+                o.thesis_date, o.ticker, o.direction, o.conviction,
+                o.outcome, o.hit_target_1, o.hit_target_2, o.hit_stop,
+                o.return_7d, o.return_30d,
+                o.days_to_target_1, o.days_to_target_2, o.days_to_stop,
+                o.vs_target_1_pct, o.vs_target_2_pct,
+                o.entry_price, o.target_1, o.target_2, o.stop_loss,
+                COALESCE(tc.model_used, 'unknown') AS model
+            FROM thesis_outcomes o
+            JOIN thesis_cache tc ON tc.id = o.thesis_id
+            WHERE o.thesis_date >= %s
+            ORDER BY o.thesis_date DESC, o.ticker
+        """, (cutoff,)).fetchall()
+
+        def _outcome_return(r) -> float | None:
+            """Best available return: 30d > 7d > outcome-implied from prices."""
+            if r["return_30d"] is not None:
+                return float(r["return_30d"])
+            if r["return_7d"] is not None:
+                return float(r["return_7d"])
+            ep = r["entry_price"]
+            if not ep or ep <= 0:
+                return None
+            bear = r["direction"] == "BEAR"
+            if r["outcome"] == "HIT_TARGET1" and r["target_1"]:
+                raw = (r["target_1"] - ep) / ep * 100
+                return -raw if bear else raw
+            if r["outcome"] == "HIT_TARGET2" and r["target_2"]:
+                raw = (r["target_2"] - ep) / ep * 100
+                return -raw if bear else raw
+            if r["outcome"] == "HIT_STOP" and r["stop_loss"]:
+                raw = (r["stop_loss"] - ep) / ep * 100
+                return -raw if bear else raw
+            return None
+
+        recent = []
+        for r in recent_rows:
+            row = dict(r)
+            row["outcome_return_pct"] = _outcome_return(r)
+            recent.append(row)
+
+        conn.close()
+
+        result = {
+            "data_available": True,
+            "days":    days,
+            "summary": _json_safe(summary),
+            "recent":  _json_safe(recent),
+        }
+        _cache.set(cache_key, result, TTL_LONG)
+        return result
+
+    except Exception:
+        log.exception("thesis_benchmark error")
+        return _no_data("thesis_benchmark failed")
+
+
+# ─── Settings ─────────────────────────────────────────────────────────────────
+
+SETTINGS_SCHEMA = [
+    # key, label, group, type, default, description, options (for select)
+    # ── AI Analysis ───────────────────────────────────────────────────────────
+    ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
+     "Model used for all standard ai_quant runs",
+     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6"]),
+    ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.20-0309-reasoning",
+     "Model used for high-conviction / manual deep-dive re-runs",
+     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "claude-opus-4-7"]),
+    ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
+     "Retry model if primary call fails",
+     ["grok-4-1-fast-reasoning", "claude-sonnet-4-6"]),
+    ("ai_min_conviction_score","Min Conviction Score",     "AI Analysis",   "number",  "13",
+     "Minimum composite catalyst score for a ticker to qualify for AI analysis (0–100)"),
+    # ── Calibration ───────────────────────────────────────────────────────────
+    ("calibration_min_sample", "Min Sample for Calibration","Calibration",  "number",  "20",
+     "Minimum resolved thesis outcomes required before applying target calibration"),
+    ("calibration_window",     "Calibration Window",       "Calibration",   "number",  "60",
+     "Max number of most-recent resolved outcomes to use for bias calculation"),
+    # ── Portfolio & Sizing ────────────────────────────────────────────────────
+    ("kelly_fraction",         "Kelly Fraction",           "Portfolio",     "number",  "0.25",
+     "Fraction of Kelly criterion to use for position sizing (0.25 = quarter-Kelly)"),
+    ("max_position_equity_pct","Max Equity Position %",    "Portfolio",     "number",  "8",
+     "Maximum single equity position as % of portfolio"),
+    ("max_position_crypto_pct","Max Crypto Position %",    "Portfolio",     "number",  "10",
+     "Maximum single crypto position as % of portfolio"),
+    # ── Universe ──────────────────────────────────────────────────────────────
+    ("universe_prescreen_top_n","Universe Top-N",          "Universe",      "number",  "200",
+     "Number of tickers to pre-screen from index constituents each run"),
+    ("universe_min_dollar_vol", "Min Dollar Volume ($)",   "Universe",      "number",  "3000000",
+     "Minimum 30-day avg dollar volume to include in universe"),
+    ("universe_min_price",      "Min Share Price ($)",     "Universe",      "number",  "1.5",
+     "Minimum share price for universe inclusion"),
+    ("universe_atr_pct_max",    "Max ATR % (20d)",         "Universe",      "number",  "6.0",
+     "Exclude tickers with 20-day ATR% above this threshold"),
+    ("universe_beta_max",       "Max Beta (60d vs SPY)",   "Universe",      "number",  "2.0",
+     "Exclude tickers with 60-day beta above this"),
+    # ── Alerts ────────────────────────────────────────────────────────────────
+    ("telegram_bot_token",      "Telegram Bot Token",      "Alerts",        "secret",  "",
+     "Bot token from @BotFather — stored encrypted, never shown in full"),
+    ("telegram_chat_id",        "Telegram Chat ID",        "Alerts",        "string",  "",
+     "Chat or channel ID to send alerts to"),
+]
+
+@app.get("/api/settings")
+async def get_settings():
+    """Return all settings with current values (from strategy_config) merged with schema defaults."""
+    try:
+        conn = _db_connect()
+        rows = conn.execute("SELECT key, value FROM strategy_config").fetchall()
+        conn.close()
+        stored = {r["key"]: r["value"] for r in rows}
+
+        groups: dict = {}
+        for key, label, group, typ, default, desc, *rest in SETTINGS_SCHEMA:
+            options = rest[0] if rest else None
+            value = stored.get(key, default)
+            display_value = "••••••••" if typ == "secret" and value else value
+            groups.setdefault(group, []).append({
+                "key":     key,
+                "label":   label,
+                "type":    typ,
+                "value":   display_value,
+                "default": default,
+                "description": desc,
+                **({"options": options} if options else {}),
+            })
+
+        return {"data_available": True, "groups": groups}
+    except Exception:
+        log.exception("get_settings error")
+        return _no_data("settings unavailable")
+
+
+@app.put("/api/settings/{key}")
+async def update_setting(key: str, body: dict):
+    """Upsert a single setting into strategy_config."""
+    valid_keys = {row[0] for row in SETTINGS_SCHEMA}
+    if key not in valid_keys:
+        raise HTTPException(status_code=400, detail=f"Unknown setting key: {key}")
+
+    value = str(body.get("value", ""))
+    try:
+        conn = _db_connect()
+        conn.execute("""
+            INSERT INTO strategy_config (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """, (key, value))
+        conn.commit()
+        conn.close()
+        # Bust cache so next run picks up new values
+        _cache._store.pop("settings", None)
+        return {"saved": True, "key": key, "value": value}
+    except Exception:
+        log.exception("update_setting error for %s", key)
+        raise HTTPException(status_code=500, detail="Failed to save setting")

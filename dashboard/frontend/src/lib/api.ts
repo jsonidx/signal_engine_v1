@@ -735,6 +735,81 @@ export interface AiSelectionResponse {
 
 // ─── Daily Top-20 Rankings ────────────────────────────────────────────────────
 
+export interface HotEntryRow {
+  rank:           number
+  rank_change:    string
+  ticker:         string
+  run_date:       string
+  status:         'HOT' | 'IN_ZONE'
+  is_hot:         boolean
+  hot_score:      number
+  current_price:  number | null
+  entry_low:      number | null
+  entry_high:     number | null
+  t1_median:      number | null
+  t2_median:      number | null
+  prob_t1:        number | null
+  prob_t2:        number | null
+  t1_upside_pct:  number | null
+  t2_upside_pct:  number | null
+  rr:             number | null
+  conviction:     number | null
+  equity_rank:    number | null
+  direction:      'BULL' | 'BEAR' | 'NEUTRAL' | null
+}
+
+export interface SettingItem {
+  key:         string
+  label:       string
+  type:        'select' | 'number' | 'string' | 'secret'
+  value:       string
+  default:     string
+  description: string
+  options?:    string[]
+}
+
+export interface BenchmarkModelSummary {
+  model:             string
+  theses:            number
+  wins:              number
+  losses:            number
+  open_count:        number
+  win_rate_pct:      number | null
+  t1_hit_rate_pct:   number | null
+  t2_hit_rate_pct:   number | null
+  stop_rate_pct:     number | null
+  avg_return_30d:    number | null
+  avg_days_to_t1:    number | null
+  avg_vs_t1_pct:     number | null
+  bull_count:        number
+  bear_count:        number
+  neutral_count:     number
+}
+
+export interface BenchmarkOutcomeRow {
+  thesis_date:       string
+  ticker:            string
+  model:             string
+  direction:         string
+  conviction:        number
+  outcome:           string
+  hit_target_1:      boolean
+  hit_target_2:      boolean
+  hit_stop:          boolean
+  return_7d:         number | null
+  return_30d:        number | null
+  days_to_target_1:  number | null
+  days_to_target_2:  number | null
+  days_to_stop:      number | null
+  vs_target_1_pct:     number | null
+  vs_target_2_pct:     number | null
+  entry_price:         number | null
+  target_1:            number | null
+  target_2:            number | null
+  stop_loss:           number | null
+  outcome_return_pct:  number | null
+}
+
 export interface Top20RankingRow {
   run_date:        string
   rank:            number
@@ -1113,6 +1188,21 @@ export const api = {
 
   rankingsHistory: (ticker?: string, days = 30): Promise<RankingsHistoryResponse> =>
     client.get('/api/rankings/history', { params: { ticker, days } }).then(r => r.data),
+
+  hotEntryRankings: (): Promise<{ data_available: boolean; count: number; as_of: string; data: HotEntryRow[] }> =>
+    client.get('/api/hot-entry/rankings').then(r => r.data),
+
+  hotEntryHistory: (ticker: string, days = 30): Promise<{ data_available: boolean; data: { run_date: string; rank: number; hot_score: number; status: string; rank_change: string }[] }> =>
+    client.get('/api/hot-entry/history', { params: { ticker, days } }).then(r => r.data),
+
+  thesisBenchmark: (days = 90): Promise<{ data_available: boolean; days: number; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
+    client.get('/api/thesis/benchmark', { params: { days } }).then(r => r.data),
+
+  getSettings: (): Promise<{ data_available: boolean; groups: Record<string, SettingItem[]> }> =>
+    client.get('/api/settings').then(r => r.data),
+
+  updateSetting: (key: string, value: string): Promise<{ saved: boolean; key: string; value: string }> =>
+    client.put(`/api/settings/${key}`, { value }).then(r => r.data),
 
   // Universe
   universeStats: (): Promise<UniverseStats> =>

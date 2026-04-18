@@ -10,6 +10,7 @@ import {
   FileText,
   RefreshCw,
   ListOrdered,
+  Settings,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useRegime } from '../../hooks/useRegime'
@@ -27,6 +28,7 @@ const NAV_ITEMS = [
   { path: '/rankings',   label: 'Daily Top-20',       icon: ListOrdered,     shortcut: 'k' },
   { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText,     shortcut: 'r' },
   { path: '/backtest',   label: 'Backtest',           icon: BarChart2,       shortcut: 'b' },
+  { path: '/settings',   label: 'Settings',           icon: Settings,        shortcut: ',' },
 ]
 
 function ETClock() {

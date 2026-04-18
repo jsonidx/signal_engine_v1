@@ -1,15 +1,16 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import * as Tabs from '@radix-ui/react-tabs'
-import { Check, Minus } from 'lucide-react'
+import { Check, Minus, RefreshCw } from 'lucide-react'
 import { format } from 'date-fns'
+import { useNavigate } from 'react-router-dom'
 import { Shell } from '../components/layout/Shell'
 import { MetricCard } from '../components/ui/MetricCard'
 import { MonoNumber } from '../components/ui/MonoNumber'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth } from '../lib/api'
+import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth, type BenchmarkModelSummary, type BenchmarkOutcomeRow } from '../lib/api'
 import { clsx } from 'clsx'
 
 // ─── Override flag badge ───────────────────────────────────────────────────────
@@ -381,6 +382,184 @@ function OutcomesTable({ outcomes }: { outcomes: ThesisOutcome[] }) {
   )
 }
 
+// ─── By-Model benchmark ───────────────────────────────────────────────────────
+
+function modelLabel(model: string): string {
+  if (model === 'unknown') return 'Unknown (legacy)'
+  return model.replace('claude-', 'Claude ').replace('grok-', 'Grok ')
+}
+
+function modelColor(model: string): string {
+  if (model.includes('claude')) return 'text-accent-purple border-accent-purple/30 bg-accent-purple/10'
+  if (model.includes('grok'))   return 'text-accent-blue   border-accent-blue/30   bg-accent-blue/10'
+  return 'text-text-tertiary border-border-subtle bg-bg-elevated'
+}
+
+function ModelCard({ m, capital }: { m: BenchmarkModelSummary; capital: number }) {
+  const resolved = m.wins + m.losses
+  const wr = m.win_rate_pct
+  const wrColor = wr == null ? 'text-text-tertiary' : wr >= 55 ? 'text-accent-green font-semibold' : wr >= 40 ? 'text-accent-amber' : 'text-accent-red'
+  const t1Color = m.t1_hit_rate_pct == null ? 'text-text-tertiary' : m.t1_hit_rate_pct >= 40 ? 'text-accent-green font-semibold' : m.t1_hit_rate_pct >= 25 ? 'text-accent-amber' : 'text-accent-red'
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-3">
+      <div className={clsx('inline-flex items-center px-2 py-0.5 rounded border font-mono text-[10px] font-semibold', modelColor(m.model))}>
+        {modelLabel(m.model)}
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-center">
+        <div>
+          <div className="font-mono text-lg font-bold text-text-primary">{m.theses}</div>
+          <div className="font-mono text-[9px] uppercase text-text-tertiary">theses</div>
+        </div>
+        <div>
+          <div className={clsx('font-mono text-lg font-bold', wrColor)}>
+            {wr != null ? `${wr}%` : '—'}
+          </div>
+          <div className="font-mono text-[9px] uppercase text-text-tertiary">win rate</div>
+          <div className="font-mono text-[9px] text-text-tertiary">{m.wins}W / {m.losses}L · {m.open_count} open</div>
+        </div>
+        <div>
+          <div className={clsx('font-mono text-lg font-bold', t1Color)}>
+            {m.t1_hit_rate_pct != null ? `${m.t1_hit_rate_pct}%` : '—'}
+          </div>
+          <div className="font-mono text-[9px] uppercase text-text-tertiary">T1 hit rate</div>
+        </div>
+      </div>
+      <div className="border-t border-border-subtle/50 pt-2 grid grid-cols-2 gap-x-4 gap-y-1">
+        {[
+          ['T2 hit rate',   m.t2_hit_rate_pct   != null ? `${m.t2_hit_rate_pct}%`   : '—'],
+          ['Stop rate',     m.stop_rate_pct      != null ? `${m.stop_rate_pct}%`     : '—'],
+          ['Avg vs T1',     m.avg_vs_t1_pct      != null ? `${m.avg_vs_t1_pct > 0 ? '+' : ''}${m.avg_vs_t1_pct}%` : '—'],
+          ['Avg days→T1',   m.avg_days_to_t1     != null ? `${m.avg_days_to_t1}d`   : '—'],
+          ['Avg 30d return',m.avg_return_30d      != null ? `${m.avg_return_30d > 0 ? '+' : ''}${m.avg_return_30d}%` : '—'],
+          ['Bull / Bear',   `${m.bull_count} / ${m.bear_count}`],
+        ].map(([label, value]) => (
+          <div key={label} className="flex justify-between gap-2">
+            <span className="font-mono text-[10px] text-text-tertiary">{label}</span>
+            <span className="font-mono text-[10px] text-text-secondary">{value}</span>
+          </div>
+        ))}
+      </div>
+      {/* Capital forecast */}
+      {m.avg_return_30d != null && (
+        <div className="border-t border-border-subtle/50 pt-2 space-y-1">
+          <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
+            If €{capital.toLocaleString()} per trade
+          </div>
+          {(() => {
+            const avgProfit = Math.round(capital * m.avg_return_30d / 100)
+            const totalProfit = Math.round(capital * m.avg_return_30d / 100 * (m.wins + m.losses))
+            return (
+              <div className="flex justify-between gap-2">
+                <div className="text-center">
+                  <div className={clsx('font-mono text-sm font-bold', avgProfit >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {avgProfit >= 0 ? '+' : ''}€{avgProfit}
+                  </div>
+                  <div className="font-mono text-[9px] text-text-tertiary">avg per trade</div>
+                </div>
+                <div className="text-center">
+                  <div className={clsx('font-mono text-sm font-bold', totalProfit >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {totalProfit >= 0 ? '+' : ''}€{totalProfit}
+                  </div>
+                  <div className="font-mono text-[9px] text-text-tertiary">total ({m.wins + m.losses} resolved)</div>
+                </div>
+              </div>
+            )
+          })()}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BenchmarkOutcomesTable({ rows, modelFilter, setModelFilter, models, capital }: {
+  rows: BenchmarkOutcomeRow[]
+  modelFilter: string
+  setModelFilter: (m: string) => void
+  models: string[]
+  capital: number
+}) {
+  const navigate = useNavigate()
+  const filtered = modelFilter === 'all' ? rows : rows.filter(r => r.model === modelFilter)
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border-subtle">
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+          Per-Thesis Outcomes <span className="normal-case text-text-tertiary/60">({filtered.length})</span>
+        </span>
+        <div className="flex gap-1.5">
+          {models.map(m => (
+            <button key={m} onClick={() => setModelFilter(m)}
+              className={clsx('font-mono text-[9px] px-2 py-0.5 rounded border transition-colors',
+                modelFilter === m
+                  ? 'bg-accent-blue/20 border-accent-blue/40 text-accent-blue'
+                  : 'border-border-subtle text-text-tertiary hover:text-text-secondary'
+              )}
+            >
+              {m === 'all' ? 'All' : modelLabel(m)}
+            </button>
+          ))}
+        </div>
+      </div>
+      {filtered.length === 0 ? (
+        <div className="py-8 text-center font-mono text-xs text-text-tertiary">No outcomes for selected model.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-border-subtle">
+                {['Date','Ticker','Model','Dir','Conv','Outcome','T1','T2','Stop','7d ret','30d ret',`Profit (30d)`, 'vs T1','Days→T1'].map(h => (
+                  <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary whitespace-nowrap">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((r, i) => (
+                <tr key={i} onClick={() => navigate(`/ticker/${r.ticker}`)}
+                  className="border-b border-border-subtle/40 last:border-0 hover:bg-bg-elevated cursor-pointer transition-colors"
+                >
+                  <td className="px-3 py-2 font-mono text-[10px] text-text-tertiary">{r.thesis_date}</td>
+                  <td className="px-3 py-2 font-mono text-xs font-semibold text-text-primary">{r.ticker}</td>
+                  <td className="px-3 py-2">
+                    <span className={clsx('font-mono text-[9px] px-1.5 py-0.5 rounded border', modelColor(r.model))}>
+                      {modelLabel(r.model)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className={clsx('font-mono text-[10px] font-semibold',
+                      r.direction === 'BULL' ? 'text-accent-green' : r.direction === 'BEAR' ? 'text-accent-red' : 'text-text-tertiary'
+                    )}>{r.direction}</span>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-[10px] text-text-secondary text-center">{r.conviction ?? '—'}</td>
+                  <td className="px-3 py-2">{outcomeChip(r.outcome as ThesisOutcome['outcome'])}</td>
+                  <td className="px-3 py-2 text-center font-mono text-xs">{r.hit_target_1 ? '✓' : '·'}</td>
+                  <td className="px-3 py-2 text-center font-mono text-xs">{r.hit_target_2 ? '✓' : '·'}</td>
+                  <td className="px-3 py-2 text-center font-mono text-xs">{r.hit_stop ? '✗' : '·'}</td>
+                  <td className={clsx('px-3 py-2 font-mono text-[10px]', r.return_7d == null ? 'text-text-tertiary' : r.return_7d >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {r.return_7d != null ? `${r.return_7d >= 0 ? '+' : ''}${r.return_7d.toFixed(1)}%` : '—'}
+                  </td>
+                  <td className={clsx('px-3 py-2 font-mono text-[10px]', r.return_30d == null ? 'text-text-tertiary' : r.return_30d >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {r.return_30d != null ? `${r.return_30d >= 0 ? '+' : ''}${r.return_30d.toFixed(1)}%` : '—'}
+                  </td>
+                  <td className={clsx('px-3 py-2 font-mono text-[10px] font-semibold', r.outcome_return_pct == null ? 'text-text-tertiary' : r.outcome_return_pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {r.outcome_return_pct != null ? `${r.outcome_return_pct >= 0 ? '+' : ''}€${Math.round(capital * r.outcome_return_pct / 100)}` : '—'}
+                  </td>
+                  <td className={clsx('px-3 py-2 font-mono text-[10px]', r.vs_target_1_pct == null ? 'text-text-tertiary' : r.vs_target_1_pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                    {r.vs_target_1_pct != null ? `${r.vs_target_1_pct >= 0 ? '+' : ''}${r.vs_target_1_pct.toFixed(1)}%` : '—'}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-[10px] text-text-tertiary">
+                    {r.days_to_target_1 != null ? `${r.days_to_target_1}d` : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Tab style ────────────────────────────────────────────────────────────────
 
 const TAB_STYLE =
@@ -453,10 +632,26 @@ export function ResolutionPage() {
   const months = accuracy?.by_month ?? []
   const outcomeRows = outcomes?.data ?? []
 
+  // By Model tab
+  const [benchDays, setBenchDays] = useState(90)
+  const [modelFilter, setModelFilter] = useState('all')
+  const [capital, setCapital] = useState(2000)
+  const { data: bench, isLoading: benchLoading, refetch: refetchBench } = useQuery({
+    queryKey: ['thesis', 'benchmark', benchDays],
+    queryFn: () => api.thesisBenchmark(benchDays),
+    staleTime: 0,
+  })
+  const benchSummary = bench?.summary ?? []
+  const benchRecent  = bench?.recent  ?? []
+  const benchModels  = ['all', ...Array.from(new Set(benchRecent.map(r => r.model)))]
+
   return (
     <Shell title="Resolution & Accuracy">
-      <Tabs.Root defaultValue="resolution">
+      <Tabs.Root defaultValue="benchmark">
         <Tabs.List className="flex border-b border-border-subtle mb-5 -mx-6 px-6">
+          <Tabs.Trigger value="benchmark" className={TAB_STYLE}>
+            By Model
+          </Tabs.Trigger>
           <Tabs.Trigger value="resolution" className={TAB_STYLE}>
             Resolution Log
           </Tabs.Trigger>
@@ -599,6 +794,66 @@ export function ResolutionPage() {
 
             {/* Accuracy matrix */}
             <AccuracyMatrixPanel />
+          </div>
+        </Tabs.Content>
+
+        {/* ── By Model tab ── */}
+        <Tabs.Content value="benchmark">
+          <div className="space-y-5">
+            {/* Controls row */}
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10px] text-text-tertiary">Window:</span>
+                {[30, 60, 90, 180].map(d => (
+                  <button key={d} onClick={() => setBenchDays(d)}
+                    className={clsx('font-mono text-[10px] px-2 py-1 rounded border transition-colors',
+                      benchDays === d
+                        ? 'bg-accent-blue/20 border-accent-blue/40 text-accent-blue'
+                        : 'border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active'
+                    )}
+                  >
+                    {d}d
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-[10px] text-text-tertiary">Capital €</span>
+                <input
+                  type="number"
+                  value={capital}
+                  onChange={e => setCapital(Math.max(1, Number(e.target.value) || 2000))}
+                  className="w-24 px-2 py-0.5 font-mono text-xs bg-bg-elevated border border-border-subtle rounded text-text-primary text-right focus:outline-none focus:border-accent-blue"
+                />
+              </div>
+              <button onClick={() => refetchBench()} className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors">
+                <RefreshCw size={11} />
+              </button>
+            </div>
+
+            {benchLoading ? (
+              <LoadingSkeleton rows={6} />
+            ) : benchSummary.length === 0 ? (
+              <EmptyState message="No thesis outcomes yet" command="python thesis_checker.py" />
+            ) : (
+              <>
+                <div className={clsx('grid gap-4',
+                  benchSummary.length === 1 ? 'grid-cols-1 max-w-sm'
+                  : benchSummary.length === 2 ? 'grid-cols-2'
+                  : 'grid-cols-3'
+                )}>
+                  {benchSummary.map(m => <ModelCard key={m.model} m={m} capital={capital} />)}
+                </div>
+                {benchRecent.length > 0 && (
+                  <BenchmarkOutcomesTable
+                    rows={benchRecent}
+                    modelFilter={modelFilter}
+                    setModelFilter={setModelFilter}
+                    models={benchModels}
+                    capital={capital}
+                  />
+                )}
+              </>
+            )}
           </div>
         </Tabs.Content>
 

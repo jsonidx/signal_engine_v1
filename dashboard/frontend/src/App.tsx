@@ -12,6 +12,7 @@ import { ScreenersPage } from './pages/ScreenersPage'
 import { BacktestPage } from './pages/BacktestPage'
 import { ResolutionPage } from './pages/ResolutionPage'
 import { RankingsPage } from './pages/RankingsPage'
+import { SettingsPage } from './pages/SettingsPage'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
 // ─── Keyboard shortcut handler (inside router context) ────────────────────────
@@ -141,6 +142,16 @@ export default function App() {
               <PrivateRoute>
                 <ErrorBoundary pageName="Daily Top-20">
                   <RankingsPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Settings">
+                  <SettingsPage />
                 </ErrorBoundary>
               </PrivateRoute>
             }

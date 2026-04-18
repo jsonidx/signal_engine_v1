@@ -1139,6 +1139,19 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
       <div className="flex items-center gap-2 font-mono text-xs text-accent-green">
         ✓ AI analysis complete
         {doneModel && <ModelBadge model={doneModel} cost={doneCost} />}
+        {(job as any).calibration && (() => {
+          const c = (job as any).calibration
+          const model = (c.model ?? '').replace('claude-','Claude ').replace('grok-','Grok ')
+          const t1 = c.t1_bias != null ? `T1 ${c.t1_bias > 0 ? '+' : ''}${c.t1_bias}%` : null
+          const t2 = c.t2_bias != null ? `T2 ${c.t2_bias > 0 ? '+' : ''}${c.t2_bias}%` : null
+          const biases = [t1, t2].filter(Boolean).join(' · ')
+          return (
+            <span title={`Calibrated using ${c.sample_n} resolved ${model} outcomes`}
+              className="font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-blue/10 text-accent-blue border-accent-blue/30 cursor-help">
+              ⟳ calibrated via {model} ({biases})
+            </span>
+          )
+        })()}
       </div>
     )
   }

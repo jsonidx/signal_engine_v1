@@ -1,13 +1,15 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity, ChevronDown, ChevronRight, Download, Circle, CheckCircle2, XCircle, Clock, Cpu, Copy } from 'lucide-react'
+import { Grid3x3, ListOrdered, FileText, Send, Loader2, CheckCircle, AlertTriangle, Star, X, Plus, Brain, Activity, ChevronDown, ChevronRight, Download, Circle, CheckCircle2, XCircle, Clock, Cpu, Copy, Zap, RefreshCw } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import axios from 'axios'
 import { Shell } from '../components/layout/Shell'
 import { AiSelectionTable } from '../components/AiSelectionTable'
 import { CandidateSnapshotsTable } from '../components/CandidateSnapshotsTable'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
+import { ConvictionDots } from '../components/ui/ConvictionDots'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { useRegime } from '../hooks/useRegime'
 import { useHeatmap } from '../hooks/useHeatmap'
@@ -18,6 +20,272 @@ import {
   useEquityScreener,
 } from '../hooks/usePortfolio'
 import { api } from '../lib/api'
+
+// ─── Hot Entry Panel ──────────────────────────────────────────────────────────
+
+function RankChangePill({ value }: { value: string }) {
+  if (value === 'NEW') return (
+    <span className="font-mono text-[9px] px-1 py-0.5 rounded border bg-accent-blue/15 text-accent-blue border-accent-blue/30">NEW</span>
+  )
+  if (!value || value === '—') return <span className="font-mono text-[10px] text-text-tertiary/40">—</span>
+  const delta = parseInt(value, 10)
+  if (isNaN(delta)) return <span className="font-mono text-[10px] text-text-tertiary">{value}</span>
+  if (delta > 0) return (
+    <span className="font-mono text-[9px] px-1 py-0.5 rounded border bg-accent-green/15 text-accent-green border-accent-green/30">▲{value}</span>
+  )
+  return (
+    <span className="font-mono text-[9px] px-1 py-0.5 rounded border bg-accent-red/15 text-accent-red border-accent-red/30">▼{value}</span>
+  )
+}
+
+function HotEntryPanel() {
+  const navigate = useNavigate()
+  const [capital, setCapital] = useState(2000)
+
+  const { data, isLoading, refetch, isFetching } = useQuery({
+    queryKey: ['hot-entry', 'rankings'],
+    queryFn: api.hotEntryRankings,
+    staleTime: 5 * 60 * 1000,
+    refetchInterval: 15 * 60 * 1000,
+  })
+
+  const rows = data?.data ?? []
+  const hasHot  = rows.some(r => r.is_hot)
+  const hasRows = rows.length > 0
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border-subtle">
+        <div className="flex items-center gap-2">
+          <Zap size={13} className={hasHot ? 'text-accent-green' : hasRows ? 'text-accent-amber' : 'text-text-tertiary'} />
+          <div>
+            <h2 className="font-mono text-xs font-semibold text-text-primary">Hot Entry — Buy Today</h2>
+            <p className="font-mono text-[10px] text-text-tertiary mt-0.5">
+              {isLoading ? 'Loading…'
+                : !hasRows ? 'No tickers in entry zone right now'
+                : hasHot
+                  ? `${rows.filter(r => r.is_hot).length} HOT · ${rows.filter(r => !r.is_hot).length} in zone · scored by EV + R:R + conviction`
+                  : `${rows.length} ticker${rows.length !== 1 ? 's' : ''} in AI entry zone · scored by EV + R:R + conviction`}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {/* Capital input */}
+          <div className="flex items-center gap-1.5">
+            <span className="font-mono text-[10px] text-text-tertiary">Capital €</span>
+            <input
+              type="number"
+              value={capital}
+              onChange={e => setCapital(Math.max(1, Number(e.target.value) || 2000))}
+              className="w-20 px-2 py-0.5 font-mono text-xs bg-bg-elevated border border-border-subtle rounded text-text-primary text-right focus:outline-none focus:border-accent-blue"
+            />
+          </div>
+          <button onClick={() => navigate('/deepdive')} className="font-mono text-[10px] text-accent-blue hover:underline">
+            Full Deep Dive →
+          </button>
+          <button onClick={() => refetch()} disabled={isFetching} className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40">
+            <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      {isLoading ? (
+        <div className="px-4 py-3"><LoadingSkeleton rows={3} /></div>
+      ) : !hasRows ? (
+        <div className="px-4 py-6 text-center font-mono text-xs text-text-tertiary">
+          No tickers in entry zone right now — check back after market open or run Deep Dive.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left" aria-label="Hot entry candidates">
+            <thead>
+              <tr className="border-b border-border-subtle bg-bg-elevated/30">
+                <th className="px-3 py-2 text-center font-mono text-[9px] uppercase tracking-widest text-text-tertiary w-12">Rank</th>
+                <th className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Ticker</th>
+                <th className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Conv</th>
+                <th className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Price / Zone</th>
+                <th className="px-3 py-2 text-center font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
+                  <div>T1 target</div>
+                  <div className="text-text-tertiary/50 normal-case">% · median · P · profit</div>
+                </th>
+                <th className="px-3 py-2 text-center font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
+                  <div>T2 target</div>
+                  <div className="text-text-tertiary/50 normal-case">% · median · P · profit</div>
+                </th>
+                <th className="px-3 py-2 text-center font-mono text-[9px] uppercase tracking-widest text-text-tertiary">R:R</th>
+                <th className="px-3 py-2 text-center font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Score</th>
+                <th className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(row => {
+                const isBear = row.direction === 'BEAR'
+                const entry = row.entry_low != null && row.entry_high != null
+                  ? (row.entry_low + row.entry_high) / 2 : null
+                const priceDelta = entry != null && row.current_price != null
+                  ? ((row.current_price - entry) / entry) * 100 : null
+                // For BEAR trades, profit is made when price falls — flip sign for display
+                const dirMult = isBear ? -1 : 1
+
+                return (
+                  <tr
+                    key={row.ticker}
+                    onClick={() => navigate(`/ticker/${row.ticker}`)}
+                    className={clsx(
+                      'border-b border-border-subtle/50 last:border-0 cursor-pointer transition-colors',
+                      row.is_hot ? 'hover:bg-accent-green/5' : 'hover:bg-bg-elevated'
+                    )}
+                  >
+                    {/* Rank + change */}
+                    <td className="px-3 py-3 text-center">
+                      <div className={clsx(
+                        'font-mono text-sm font-bold',
+                        row.rank === 1 ? 'text-accent-green' : row.rank <= 3 ? 'text-text-primary' : 'text-text-secondary'
+                      )}>
+                        #{row.rank}
+                      </div>
+                      <div className="mt-0.5">
+                        <RankChangePill value={row.rank_change} />
+                      </div>
+                    </td>
+
+                    {/* Ticker */}
+                    <td className="px-3 py-3">
+                      <div className="font-mono text-sm font-semibold text-text-primary">{row.ticker}</div>
+                      {row.equity_rank != null && (
+                        <div className="font-mono text-[10px] text-text-tertiary">eq #{row.equity_rank}</div>
+                      )}
+                    </td>
+
+                    {/* Conviction */}
+                    <td className="px-3 py-3">
+                      <ConvictionDots conviction={row.conviction ?? 0} />
+                    </td>
+
+                    {/* Price / Zone */}
+                    <td className="px-3 py-3">
+                      <div className="font-mono text-xs text-text-primary">
+                        ${row.current_price?.toFixed(2) ?? '—'}
+                      </div>
+                      {row.entry_low != null && row.entry_high != null && (
+                        <div className="font-mono text-[10px] text-text-tertiary whitespace-nowrap">
+                          {row.entry_low}–{row.entry_high}
+                          {priceDelta != null && (
+                            <span className={clsx('ml-1', Math.abs(priceDelta) < 1 ? 'text-accent-green' : 'text-accent-amber')}>
+                              ({priceDelta >= 0 ? '+' : ''}{priceDelta.toFixed(1)}%)
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </td>
+
+                    {/* T1 */}
+                    <td className="px-3 py-3 text-center">
+                      {row.t1_upside_pct != null ? (
+                        <div className="space-y-0.5">
+                          <div className={clsx('font-mono text-xs font-semibold', row.t1_upside_pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                            {row.t1_upside_pct >= 0 ? '+' : ''}{row.t1_upside_pct.toFixed(1)}%
+                          </div>
+                          {row.t1_median != null && <div className="font-mono text-[10px] text-text-tertiary">${row.t1_median.toFixed(2)}</div>}
+                          {row.prob_t1 != null && (
+                            <div className={clsx('font-mono text-[10px]', row.prob_t1 >= 0.65 ? 'text-accent-green' : row.prob_t1 >= 0.5 ? 'text-accent-amber' : 'text-text-tertiary')}>
+                              {Math.round(row.prob_t1 * 100)}% hit
+                            </div>
+                          )}
+                          {(() => {
+                            const rawProfit = capital * row.t1_upside_pct / 100 * dirMult
+                            const prob = row.prob_t1 ?? (row.conviction != null ? 0.1 + row.conviction * 0.14 : null)
+                            const isEstimated = row.prob_t1 == null && prob != null
+                            const ev = prob != null ? rawProfit * prob : null
+                            return (
+                              <div className={clsx('font-mono text-[10px] font-semibold border-t border-border-subtle/40 pt-0.5 mt-0.5', rawProfit >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                                {rawProfit >= 0 ? '+' : ''}€{Math.round(rawProfit)}
+                                {ev != null && (
+                                  <span className="text-text-tertiary font-normal ml-1">
+                                    (EV €{Math.round(ev)}{isEstimated ? '*' : ''})
+                                  </span>
+                                )}
+                              </div>
+                            )
+                          })()}
+                        </div>
+                      ) : <span className="font-mono text-xs text-text-tertiary">—</span>}
+                    </td>
+
+                    {/* T2 */}
+                    <td className="px-3 py-3 text-center">
+                      {row.t2_upside_pct != null ? (
+                        <div className="space-y-0.5">
+                          <div className={clsx('font-mono text-xs font-semibold', row.t2_upside_pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                            {row.t2_upside_pct >= 0 ? '+' : ''}{row.t2_upside_pct.toFixed(1)}%
+                          </div>
+                          {row.t2_median != null && <div className="font-mono text-[10px] text-text-tertiary">${row.t2_median.toFixed(2)}</div>}
+                          {row.prob_t2 != null && (
+                            <div className={clsx('font-mono text-[10px]', row.prob_t2 >= 0.5 ? 'text-accent-green' : row.prob_t2 >= 0.35 ? 'text-accent-amber' : 'text-text-tertiary')}>
+                              {Math.round(row.prob_t2 * 100)}% hit
+                            </div>
+                          )}
+                          {(() => {
+                            const rawProfit = capital * row.t2_upside_pct / 100 * dirMult
+                            const prob = row.prob_t2 ?? (row.conviction != null ? (0.1 + row.conviction * 0.14) * 0.6 : null)
+                            const isEstimated = row.prob_t2 == null && prob != null
+                            const ev = prob != null ? rawProfit * prob : null
+                            return (
+                              <div className={clsx('font-mono text-[10px] font-semibold border-t border-border-subtle/40 pt-0.5 mt-0.5', rawProfit >= 0 ? 'text-accent-green' : 'text-accent-red')}>
+                                {rawProfit >= 0 ? '+' : ''}€{Math.round(rawProfit)}
+                                {ev != null && (
+                                  <span className="text-text-tertiary font-normal ml-1">
+                                    (EV €{Math.round(ev)}{isEstimated ? '*' : ''})
+                                  </span>
+                                )}
+                              </div>
+                            )
+                          })()}
+                        </div>
+                      ) : <span className="font-mono text-xs text-text-tertiary">—</span>}
+                    </td>
+
+                    {/* R:R */}
+                    <td className="px-3 py-3 text-center">
+                      {row.rr != null ? (
+                        <span className={clsx('font-mono text-xs', row.rr >= 2 ? 'text-accent-green font-semibold' : row.rr >= 1 ? 'text-text-secondary' : 'text-accent-amber')}>
+                          {row.rr.toFixed(1)}R
+                        </span>
+                      ) : <span className="font-mono text-xs text-text-tertiary">—</span>}
+                    </td>
+
+                    {/* Hot score */}
+                    <td className="px-3 py-3 text-center">
+                      <span className="font-mono text-xs text-text-tertiary">{row.hot_score.toFixed(0)}</span>
+                    </td>
+
+                    {/* Status badge */}
+                    <td className="px-3 py-3">
+                      {row.is_hot ? (
+                        <span className="inline-flex items-center gap-1 font-mono text-[9px] px-1.5 py-0.5 rounded border bg-accent-green/15 text-accent-green border-accent-green/30 font-semibold whitespace-nowrap">
+                          <Zap size={8} /> HOT
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 font-mono text-[9px] px-1.5 py-0.5 rounded border bg-accent-amber/10 text-accent-amber border-accent-amber/20 whitespace-nowrap">
+                          IN ZONE
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          <div className="px-4 py-2 border-t border-border-subtle/50 font-mono text-[9px] text-text-tertiary">
+            EV = capital × upside × hit probability · * estimated from conviction (no pipeline prob available)
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -729,6 +997,9 @@ export function HomePage() {
             <p className="font-mono text-xs leading-relaxed">{alert?.text}</p>
           </div>
         </div>
+
+        {/* Hot Entry — buy today */}
+        <HotEntryPanel />
 
         {/* Candidate Pool — full width so Reason column has room */}
         <CandidateSnapshotsTable />
