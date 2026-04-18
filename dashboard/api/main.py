@@ -3938,7 +3938,18 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _apply_thesis_calibration(ticker: str, model: str, min_sample: int = 5) -> bool:
+def _get_setting(key: str, default: str) -> str:
+    """Read a single value from strategy_config, falling back to default."""
+    try:
+        conn = _db_connect()
+        row = conn.execute("SELECT value FROM strategy_config WHERE key = %s", (key,)).fetchone()
+        conn.close()
+        return row["value"] if row and row["value"] is not None else default
+    except Exception:
+        return default
+
+
+def _apply_thesis_calibration(ticker: str, model: str, min_sample: int | None = None) -> bool:
     """
     Adjust the latest thesis_cache targets for `ticker` using the model's historical
     avg calibration error vs T1 and T2 (from thesis_outcomes).
@@ -3946,13 +3957,26 @@ def _apply_thesis_calibration(ticker: str, model: str, min_sample: int = 5) -> b
     Only applies when the model has >= min_sample resolved outcomes.
     Returns True if calibration was applied.
     """
+    if min_sample is None:
+        min_sample = int(_get_setting("calibration_min_sample", "20"))
+    window = int(_get_setting("calibration_window", "60"))
+
     try:
         conn = _db_connect()
 
-        # Fetch calibration factors for this model
+        # Fetch calibration factors for this model (most recent `window` resolved outcomes)
         cal = conn.execute("""
+            WITH recent AS (
+                SELECT o.*
+                FROM thesis_outcomes o
+                JOIN thesis_cache tc ON tc.id = o.thesis_id
+                WHERE tc.model_used = %s
+                  AND o.outcome IN ('HIT_TARGET1','HIT_TARGET2','HIT_STOP')
+                ORDER BY o.thesis_date DESC
+                LIMIT %s
+            )
             SELECT
-                COUNT(*)  FILTER (WHERE o.outcome IN ('HIT_TARGET1','HIT_TARGET2','HIT_STOP')) AS n,
+                COUNT(*) AS n,
                 AVG(
                     CASE
                         WHEN o.outcome = 'HIT_TARGET1' AND o.entry_price > 0 AND o.target_1 IS NOT NULL
@@ -3968,10 +3992,8 @@ def _apply_thesis_calibration(ticker: str, model: str, min_sample: int = 5) -> b
                 ) AS avg_outcome_return,
                 AVG(o.vs_target_1_pct) FILTER (WHERE o.vs_target_1_pct IS NOT NULL) AS avg_vs_t1,
                 AVG(o.vs_target_2_pct) FILTER (WHERE o.vs_target_2_pct IS NOT NULL) AS avg_vs_t2
-            FROM thesis_outcomes o
-            JOIN thesis_cache tc ON tc.id = o.thesis_id
-            WHERE tc.model_used = %s
-        """, (model,)).fetchone()
+            FROM recent o
+        """, (model, window)).fetchone()
 
         if not cal or (cal["n"] or 0) < min_sample:
             conn.close()

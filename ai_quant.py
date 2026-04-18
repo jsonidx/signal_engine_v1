@@ -105,6 +105,22 @@ except ImportError:
     AI_PREMIUM_THRESHOLD = 0.85
 
 try:
+    # Override model config with values from strategy_config table (set via Settings page)
+    from utils.db import get_connection as _get_conn
+    _sc_conn = _get_conn()
+    _sc_cur  = _sc_conn.cursor()
+    _sc_cur.execute("SELECT key, value FROM strategy_config WHERE key IN ('ai_model_default','ai_model_premium','ai_model_fallback')")
+    for _row in _sc_cur.fetchall():
+        if _row["value"]:
+            if _row["key"] == "ai_model_default":  AI_MODEL_DEFAULT  = _row["value"]
+            if _row["key"] == "ai_model_premium":   AI_MODEL_PREMIUM  = _row["value"]
+            if _row["key"] == "ai_model_fallback":  AI_MODEL_FALLBACK = _row["value"]
+    _sc_conn.close()
+    del _sc_conn, _sc_cur, _row
+except Exception:
+    pass  # DB unavailable — fall back to config.py values
+
+try:
     from utils.db import load_portfolio_nav
     PORTFOLIO_NAV = load_portfolio_nav(fallback=_CONFIG_NAV)
 except Exception:
