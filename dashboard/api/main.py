@@ -3535,80 +3535,121 @@ async def resolution_accuracy_matrix(
 @app.get("/api/backtest/results")
 async def backtest_results():
     """
-    Return backtest results. Prefers data/backtest_results.json if it exists,
-    otherwise reads from signals_output/backtest_equity_metrics.csv.
+    Return backtest results. Reads walk-forward windows from Supabase backtest_runs
+    (most recent run_date). Falls back to CSV if Supabase has no data.
     """
     cache_key = "backtest_results"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
 
-    # 1) Try pre-built JSON
-    json_file = DATA_DIR / "backtest_results.json"
-    if json_file.exists():
+    try:
+        conn = _db_connect()
+        # Fetch the most recent full run from Supabase
+        db_rows = conn.execute("""
+            SELECT DISTINCT ON (window_start)
+                   window_start, window_end, sharpe, max_drawdown, hit_rate,
+                   turnover, best_factor, worst_factor, factor_ic,
+                   optimized_weights, n_weeks, tickers_included
+            FROM backtest_runs
+            WHERE run_date = (SELECT MAX(run_date) FROM backtest_runs)
+            ORDER BY window_start, id DESC
+        """).fetchall()
+        conn.close()
+    except Exception:
+        db_rows = []
+
+    windows = []
+    factor_ic_agg: dict = {}
+    worst_window = None
+    worst_dd = 0.0
+
+    for r in db_rows:
+        dd = float(r["max_drawdown"] or 0)
+        sharpe = float(r["sharpe"] or 0)
+        hr = float(r["hit_rate"] or 0)
+        win = {
+            "period_start":     str(r["window_start"]),
+            "period_end":       str(r["window_end"]),
+            "total_return_pct": 0,   # not stored per-window
+            "sharpe":           sharpe,
+            "max_drawdown_pct": dd * 100,
+            "hit_rate_pct":     hr * 100,
+            "n_trades":         int(r["n_weeks"] or 0),
+            "best_factor":      r["best_factor"] or "",
+            "worst_factor":     r["worst_factor"] or "",
+        }
+        windows.append(win)
+        if dd < worst_dd:
+            worst_dd = dd
+            worst_window = {"start": str(r["window_start"]), "end": str(r["window_end"]), "drawdown_pct": dd * 100}
+        # Aggregate factor IC across windows (JSONB arrives already parsed)
         try:
-            with open(json_file) as f:
-                data = json.load(f)
-            result = {"data_available": True, **data}
-            _cache.set(cache_key, result, TTL_LONG)
-            return result
+            ic_data = r["factor_ic"] or {}
+            if isinstance(ic_data, str):
+                ic_data = json.loads(ic_data)
+            for factor, val in ic_data.items():
+                factor_ic_agg.setdefault(factor, []).append(float(val))
         except Exception:
             pass
 
-    # 2) Build from CSV outputs
-    metrics_file   = SIGNALS_DIR / "backtest_equity_metrics.csv"
-    eq_curve_file  = SIGNALS_DIR / "backtest_equity_equity_curve.csv"
+    # Build factor IC table
+    factor_ic_table = []
+    for factor, vals in factor_ic_agg.items():
+        mean_ic = sum(vals) / len(vals) if vals else 0
+        factor_ic_table.append({
+            "factor": factor,
+            "mean_ic": round(mean_ic, 4),
+            "ic_ir": 0,
+            "contribution_pct": 0,
+            "current_weight": 0,
+            "suggested_weight": 0,
+        })
+    factor_ic_table.sort(key=lambda x: abs(x["mean_ic"]), reverse=True)
 
-    if not metrics_file.exists():
-        result = _no_data("backtest_equity_metrics.csv not found")
-        _cache.set(cache_key, result, TTL_LONG)
-        return result
+    oos_sharpe = None
+    if windows:
+        valid_sharpes = [w["sharpe"] for w in windows if w["sharpe"] != 0]
+        oos_sharpe = round(sum(valid_sharpes) / len(valid_sharpes), 3) if valid_sharpes else None
 
-    try:
-        metrics = pd.read_csv(metrics_file)
-        # metrics is key/value rows: label, value
-        raw_m = dict(zip(metrics.iloc[:, 0], metrics.iloc[:, 1])) if len(metrics.columns) >= 2 else {}
-        m = _json_safe(raw_m)
-
-        equity_curve = []
-        period_start, period_end = None, None
-        if eq_curve_file.exists():
+    # Still read aggregate metrics from CSV if available (CAGR, Sortino, etc.)
+    metrics: dict = {}
+    equity_curve = []
+    metrics_file  = SIGNALS_DIR / "backtest_equity_metrics.csv"
+    eq_curve_file = SIGNALS_DIR / "backtest_equity_equity_curve.csv"
+    if metrics_file.exists():
+        try:
+            mdf = pd.read_csv(metrics_file)
+            raw_m = dict(zip(mdf.iloc[:, 0], mdf.iloc[:, 1])) if len(mdf.columns) >= 2 else {}
+            metrics = _json_safe(raw_m)
+        except Exception:
+            pass
+    if eq_curve_file.exists():
+        try:
             ec = pd.read_csv(eq_curve_file)
             equity_curve = _json_safe(ec.to_dict(orient="records"))
-            if len(ec) > 0 and "date" in ec.columns:
-                period_start = str(ec["date"].iloc[0])
-                period_end   = str(ec["date"].iloc[-1])
+        except Exception:
+            pass
 
-        # Build a synthetic single window from aggregate metrics so the
-        # frontend's windows[] array is non-empty and renders correctly.
-        synthetic_window = {
-            "period_start":      period_start or "",
-            "period_end":        period_end   or "",
-            "total_return_pct":  (_safe_float(m.get("total_return_port")) or 0) * 100,
-            "sharpe":            _safe_float(m.get("sharpe")) or 0,
-            "max_drawdown_pct":  (_safe_float(m.get("max_drawdown")) or 0) * 100,
-            "hit_rate_pct":      (_safe_float(m.get("hit_rate_weekly")) or 0) * 100,
-            "n_trades":          0,
-        }
-
-        result = {
-            "data_available":    True,
-            "label":             m.get("label", "Equity Multi-Factor"),
-            "metrics":           m,
-            "equity_curve":      equity_curve,
-            "windows":           [synthetic_window],
-            "overall_sharpe":    _safe_float(m.get("sharpe_ratio") or m.get("sharpe")),
-            "spy_sharpe":        _safe_float(m.get("cagr_bench")),  # best proxy available
-            "factor_ic_table":   [],
-            "worst_window":      None,
-            "weight_recommendations": {},
-        }
+    if not windows and not metrics:
+        result = _no_data("No backtest data — run: python backtest.py --run-full")
         _cache.set(cache_key, result, TTL_LONG)
         return result
 
-    except Exception as e:
-        log.exception("backtest_results error")
-        return _no_data(str(e))
+    result = {
+        "data_available":         True,
+        "label":                  "Equity Multi-Factor",
+        "metrics":                metrics,
+        "equity_curve":           equity_curve,
+        "windows":                windows,
+        "overall_sharpe":         oos_sharpe,
+        "spy_sharpe":             _safe_float(metrics.get("cagr_bench")),
+        "factor_ic_table":        factor_ic_table,
+        "worst_window":           worst_window,
+        "weight_recommendations": {},
+    }
+    _cache.set(cache_key, result, TTL_LONG)
+    return result
 
 
 # ==============================================================================
