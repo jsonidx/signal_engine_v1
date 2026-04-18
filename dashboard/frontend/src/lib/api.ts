@@ -786,6 +786,25 @@ export interface BenchmarkModelSummary {
   neutral_count:     number
 }
 
+export interface LivePerformanceRow {
+  ticker:        string
+  direction:     string
+  conviction:    number
+  thesis_date:   string
+  model:         string
+  entry_price:   number | null
+  current_price: number | null
+  target_1:      number | null
+  target_2:      number | null
+  stop_loss:     number | null
+  pnl_pct:       number | null
+  pct_to_t1:     number | null
+  pct_to_t2:     number | null
+  pct_to_stop:   number | null
+  progress_t1:   number | null
+  status:        string
+}
+
 export interface BenchmarkOutcomeRow {
   thesis_date:       string
   ticker:            string
@@ -1197,6 +1216,9 @@ export const api = {
 
   thesisBenchmark: (days = 90): Promise<{ data_available: boolean; days: number; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
     client.get('/api/thesis/benchmark', { params: { days } }).then(r => r.data),
+
+  thesisLivePerformance: (): Promise<{ data_available: boolean; count: number; as_of: string; data: LivePerformanceRow[] }> =>
+    client.get('/api/thesis/live-performance').then(r => r.data),
 
   getSettings: (): Promise<{ data_available: boolean; groups: Record<string, SettingItem[]> }> =>
     client.get('/api/settings').then(r => r.data),

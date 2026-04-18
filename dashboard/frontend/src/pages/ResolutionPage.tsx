@@ -10,7 +10,7 @@ import { MonoNumber } from '../components/ui/MonoNumber'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth, type BenchmarkModelSummary, type BenchmarkOutcomeRow } from '../lib/api'
+import { api, type AccuracyMatrixCell, type ThesisOutcome, type ThesisAccuracyMonth, type BenchmarkModelSummary, type BenchmarkOutcomeRow, type LivePerformanceRow } from '../lib/api'
 import { clsx } from 'clsx'
 
 // ─── Override flag badge ───────────────────────────────────────────────────────
@@ -560,6 +560,146 @@ function BenchmarkOutcomesTable({ rows, modelFilter, setModelFilter, models, cap
   )
 }
 
+// ─── Live Performance panel ───────────────────────────────────────────────────
+
+const STATUS_COLOR: Record<string, string> = {
+  HIT_T2:     'bg-accent-green/25 text-accent-green  border-accent-green/50',
+  HIT_T1:     'bg-accent-green/15 text-accent-green  border-accent-green/30',
+  ADVANCING:  'bg-accent-blue/15  text-accent-blue   border-accent-blue/30',
+  FLAT:       'bg-text-tertiary/10 text-text-tertiary border-text-tertiary/20',
+  RETREATING: 'bg-accent-amber/15 text-accent-amber  border-accent-amber/30',
+  AT_STOP:    'bg-accent-red/15   text-accent-red    border-accent-red/30',
+}
+
+function LiveStatusBadge({ status }: { status: string }) {
+  return (
+    <span className={clsx('font-mono text-[10px] px-1.5 py-0.5 rounded border whitespace-nowrap', STATUS_COLOR[status] ?? STATUS_COLOR.FLAT)}>
+      {status.replace('_', ' ')}
+    </span>
+  )
+}
+
+function ProgressBar({ progress, status }: { progress: number | null; status: string }) {
+  const pct = Math.min(100, Math.max(0, (progress ?? 0) * 100))
+  const color = status === 'HIT_T1' || status === 'HIT_T2'
+    ? 'bg-accent-green'
+    : status === 'AT_STOP' ? 'bg-accent-red'
+    : status === 'ADVANCING' ? 'bg-accent-blue'
+    : status === 'RETREATING' ? 'bg-accent-amber'
+    : 'bg-text-tertiary/40'
+  return (
+    <div className="w-full h-1.5 bg-bg-elevated rounded-full overflow-hidden">
+      <div className={clsx('h-full rounded-full transition-all', color)} style={{ width: `${pct}%` }} />
+    </div>
+  )
+}
+
+function LivePerformancePanel() {
+  const { data, isLoading, refetch } = useQuery({
+    queryKey: ['thesis', 'live-performance'],
+    queryFn: api.thesisLivePerformance,
+    staleTime: 0,
+    refetchInterval: 5 * 60 * 1000,
+  })
+
+  const rows: LivePerformanceRow[] = data?.data ?? []
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+          Open Theses — Live Price vs Targets
+        </span>
+        <button onClick={() => refetch()} className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors ml-auto">
+          <RefreshCw size={11} />
+        </button>
+        {data?.as_of && (
+          <span className="font-mono text-[10px] text-text-tertiary">
+            {data.as_of}
+          </span>
+        )}
+      </div>
+
+      {isLoading ? (
+        <LoadingSkeleton rows={6} />
+      ) : rows.length === 0 ? (
+        <EmptyState message="No open theses tracked" command="python thesis_checker.py" />
+      ) : (
+        <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-border-subtle">
+                  {['Ticker', 'Dir', 'Model', 'Date', 'Entry', 'Now', 'P&L', 'Progress→T1', '→T1', '→T2', '→Stop', 'Status'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary whitespace-nowrap">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => {
+                  const pnlPos = r.pnl_pct != null && r.pnl_pct >= 0
+                  return (
+                    <tr key={i} className="border-b border-border-subtle/40 last:border-0 hover:bg-bg-elevated transition-colors">
+                      <td className="px-3 py-2.5 font-mono text-xs font-semibold text-text-primary">{r.ticker}</td>
+                      <td className="px-3 py-2.5">
+                        <span className={clsx('font-mono text-[10px] font-semibold',
+                          r.direction === 'BULL' ? 'text-accent-green' : r.direction === 'BEAR' ? 'text-accent-red' : 'text-text-tertiary'
+                        )}>{r.direction}</span>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <span className={clsx('font-mono text-[9px] px-1.5 py-0.5 rounded border', modelColor(r.model))}>
+                          {modelLabel(r.model)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5 font-mono text-[10px] text-text-tertiary">{r.thesis_date}</td>
+                      <td className="px-3 py-2.5 font-mono text-[11px] text-text-secondary">
+                        {r.entry_price != null ? r.entry_price.toFixed(2) : '—'}
+                      </td>
+                      <td className="px-3 py-2.5 font-mono text-[11px] text-text-primary font-semibold">
+                        {r.current_price != null ? r.current_price.toFixed(2) : '—'}
+                      </td>
+                      <td className={clsx('px-3 py-2.5 font-mono text-xs font-semibold',
+                        r.pnl_pct == null ? 'text-text-tertiary' : pnlPos ? 'text-accent-green' : 'text-accent-red'
+                      )}>
+                        {r.pnl_pct != null ? `${pnlPos ? '+' : ''}${r.pnl_pct.toFixed(1)}%` : '—'}
+                      </td>
+                      <td className="px-3 py-2.5 w-28">
+                        <ProgressBar progress={r.progress_t1} status={r.status} />
+                      </td>
+                      <td className={clsx('px-3 py-2.5 font-mono text-[10px]',
+                        r.pct_to_t1 == null ? 'text-text-tertiary' : r.pct_to_t1 <= 0 ? 'text-accent-green' : 'text-accent-amber'
+                      )}>
+                        {r.pct_to_t1 != null ? `${r.pct_to_t1 > 0 ? '+' : ''}${r.pct_to_t1.toFixed(1)}%` : '—'}
+                      </td>
+                      <td className="px-3 py-2.5 font-mono text-[10px] text-text-tertiary">
+                        {r.pct_to_t2 != null ? `${r.pct_to_t2 > 0 ? '+' : ''}${r.pct_to_t2.toFixed(1)}%` : '—'}
+                      </td>
+                      <td className={clsx('px-3 py-2.5 font-mono text-[10px]',
+                        r.pct_to_stop == null ? 'text-text-tertiary' : r.pct_to_stop <= 5 ? 'text-accent-red' : 'text-text-tertiary'
+                      )}>
+                        {r.pct_to_stop != null ? `${r.pct_to_stop.toFixed(1)}%` : '—'}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <LiveStatusBadge status={r.status} />
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div className="font-mono text-[10px] text-text-tertiary">
+        P&amp;L = direction-adjusted · Progress = how far price has moved toward T1 from entry · →T1/T2/Stop = remaining % to reach level
+      </div>
+    </div>
+  )
+}
+
 // ─── Tab style ────────────────────────────────────────────────────────────────
 
 const TAB_STYLE =
@@ -652,6 +792,9 @@ export function ResolutionPage() {
           <Tabs.Trigger value="benchmark" className={TAB_STYLE}>
             By Model
           </Tabs.Trigger>
+          <Tabs.Trigger value="live" className={TAB_STYLE}>
+            Live
+          </Tabs.Trigger>
           <Tabs.Trigger value="resolution" className={TAB_STYLE}>
             Resolution Log
           </Tabs.Trigger>
@@ -659,6 +802,11 @@ export function ResolutionPage() {
             Claude Accuracy
           </Tabs.Trigger>
         </Tabs.List>
+
+        {/* ── Live Performance tab ── */}
+        <Tabs.Content value="live">
+          <LivePerformancePanel />
+        </Tabs.Content>
 
         {/* ── Resolution Log tab ── */}
         <Tabs.Content value="resolution">
