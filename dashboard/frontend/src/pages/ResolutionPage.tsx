@@ -185,12 +185,7 @@ function AccuracyMatrixPanel() {
   )
 }
 
-// ─── Accuracy helpers (absorbed from AccuracyPage) ────────────────────────────
-
-function pct(v: number | null, decimals = 1): string {
-  if (v == null) return '—'
-  return `${v > 0 ? '+' : ''}${v.toFixed(decimals)}%`
-}
+// ─── Accuracy helpers ─────────────────────────────────────────────────────────
 
 function accuracyColor(v: number | null): string {
   if (v == null) return 'text-text-tertiary'
@@ -219,23 +214,6 @@ function correctBadge(v: 1 | 0 | null) {
   if (v === 1) return <span className="text-accent-green font-mono text-xs">✓</span>
   if (v === 0) return <span className="text-accent-red   font-mono text-xs">✗</span>
   return <span className="text-text-tertiary font-mono text-xs">—</span>
-}
-
-function StatCard({ label, value, sub, color }: {
-  label: string
-  value: string
-  sub?: string
-  color?: string
-}) {
-  return (
-    <div className="bg-bg-surface border border-border-subtle rounded p-4">
-      <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">{label}</div>
-      <div className={clsx('font-mono text-[28px] font-semibold leading-none', color ?? 'text-text-primary')}>
-        {value}
-      </div>
-      {sub && <div className="font-mono text-[10px] text-text-tertiary mt-1">{sub}</div>}
-    </div>
-  )
 }
 
 function MonthlyTable({ months }: { months: ThesisAccuracyMonth[] }) {
@@ -284,98 +262,6 @@ function MonthlyTable({ months }: { months: ThesisAccuracyMonth[] }) {
               <td className="px-4 py-3 font-mono text-xs text-text-secondary">{m.traded}</td>
             </tr>
           ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-function OutcomesTable({ outcomes }: { outcomes: ThesisOutcome[] }) {
-  const [show, setShow] = useState<'all' | 'resolved' | 'open'>('all')
-
-  const filtered = outcomes.filter(o => {
-    if (show === 'resolved') return o.outcome !== 'OPEN'
-    if (show === 'open')     return o.outcome === 'OPEN'
-    return true
-  })
-
-  return (
-    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
-      <div className="px-4 py-3 border-b border-border-subtle flex items-center justify-between">
-        <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-          Individual Thesis Outcomes
-        </div>
-        <div className="flex gap-1">
-          {(['all', 'resolved', 'open'] as const).map(f => (
-            <button
-              key={f}
-              onClick={() => setShow(f)}
-              className={clsx(
-                'font-mono text-[10px] px-2 py-1 rounded border transition-colors',
-                show === f
-                  ? 'bg-accent-blue/15 text-accent-blue border-accent-blue/30'
-                  : 'text-text-tertiary border-text-tertiary/20 hover:text-text-secondary'
-              )}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
-      </div>
-      <table className="w-full">
-        <thead>
-          <tr className="border-b border-border-subtle">
-            {['Date', 'Ticker', 'Dir', 'Conv', 'Entry', 'T1', 'Stop', '7d', '14d', '30d', 'vs T1', 'Outcome', 'OK', 'Traded'].map(h => (
-              <th key={h} className="px-3 py-2 text-left font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-                {h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {filtered.map((o, i) => (
-            <tr key={i} className="border-b border-border-subtle/50 hover:bg-bg-elevated transition-colors">
-              <td className="px-3 py-2.5 font-mono text-[11px] text-text-tertiary">{o.thesis_date}</td>
-              <td className="px-3 py-2.5 font-mono text-xs text-text-primary font-semibold">{o.ticker}</td>
-              <td className="px-3 py-2.5">
-                <DirectionBadge direction={o.direction} size="sm" />
-              </td>
-              <td className="px-3 py-2.5 font-mono text-xs text-text-secondary">{o.conviction ?? '—'}</td>
-              <td className="px-3 py-2.5 font-mono text-[11px] text-text-secondary">
-                {o.entry_price != null ? o.entry_price.toFixed(2) : '—'}
-              </td>
-              <td className="px-3 py-2.5 font-mono text-[11px] text-accent-green/80">
-                {o.target_1 != null ? o.target_1.toFixed(2) : '—'}
-              </td>
-              <td className="px-3 py-2.5 font-mono text-[11px] text-accent-red/80">
-                {o.stop_loss != null ? o.stop_loss.toFixed(2) : '—'}
-              </td>
-              <td className="px-3 py-2.5">
-                <MonoNumber value={o.return_7d}  suffix="%" decimals={1} colorBySign />
-              </td>
-              <td className="px-3 py-2.5">
-                <MonoNumber value={o.return_14d} suffix="%" decimals={1} colorBySign />
-              </td>
-              <td className="px-3 py-2.5">
-                <MonoNumber value={o.return_30d} suffix="%" decimals={1} colorBySign />
-              </td>
-              <td className="px-3 py-2.5">
-                <MonoNumber value={o.vs_target_1_pct} suffix="%" decimals={1} colorBySign />
-              </td>
-              <td className="px-3 py-2.5">{outcomeChip(o.outcome)}</td>
-              <td className="px-3 py-2.5">{correctBadge(o.claude_correct)}</td>
-              <td className="px-3 py-2.5 font-mono text-[11px] text-text-tertiary">
-                {o.was_traded ? <span className="text-accent-blue">Y</span> : 'N'}
-              </td>
-            </tr>
-          ))}
-          {filtered.length === 0 && (
-            <tr>
-              <td colSpan={14} className="px-4 py-6 text-center font-mono text-xs text-text-tertiary">
-                No outcomes yet
-              </td>
-            </tr>
-          )}
         </tbody>
       </table>
     </div>
@@ -700,6 +586,28 @@ function LivePerformancePanel() {
   )
 }
 
+// ─── Collapsible section ──────────────────────────────────────────────────────
+
+function CollapsibleSection({ label, children, defaultOpen = false }: {
+  label: string
+  children: React.ReactNode
+  defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between px-4 py-3 hover:bg-bg-elevated transition-colors"
+      >
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">{label}</span>
+        <span className="font-mono text-[10px] text-text-tertiary">{open ? '▲ hide' : '▼ show'}</span>
+      </button>
+      {open && <div className="border-t border-border-subtle">{children}</div>}
+    </div>
+  )
+}
+
 // ─── Tab style ────────────────────────────────────────────────────────────────
 
 const TAB_STYLE =
@@ -732,14 +640,9 @@ export function ResolutionPage() {
     retry: 1,
   })
 
-  // Accuracy tab data
-  const { data: accuracy, isLoading: aLoading } = useQuery({
+  const { data: accuracy } = useQuery({
     queryKey: ['thesis', 'accuracy'],
     queryFn: api.thesisAccuracy,
-  })
-  const { data: outcomes, isLoading: oLoading } = useQuery({
-    queryKey: ['thesis', 'outcomes', 90],
-    queryFn: () => api.thesisOutcomes(90),
   })
 
   type NormRow = {
@@ -768,9 +671,7 @@ export function ResolutionPage() {
     skip_claude: r.skip_claude ?? false,
   }))
 
-  const at = accuracy?.all_time
   const months = accuracy?.by_month ?? []
-  const outcomeRows = outcomes?.data ?? []
 
   // By Model tab
   const [benchDays, setBenchDays] = useState(90)
@@ -797,9 +698,6 @@ export function ResolutionPage() {
           </Tabs.Trigger>
           <Tabs.Trigger value="resolution" className={TAB_STYLE}>
             Resolution Log
-          </Tabs.Trigger>
-          <Tabs.Trigger value="accuracy" className={TAB_STYLE}>
-            Claude Accuracy
           </Tabs.Trigger>
         </Tabs.List>
 
@@ -940,8 +838,6 @@ export function ResolutionPage() {
               )}
             </div>
 
-            {/* Accuracy matrix */}
-            <AccuracyMatrixPanel />
           </div>
         </Tabs.Content>
 
@@ -1000,81 +896,21 @@ export function ResolutionPage() {
                     capital={capital}
                   />
                 )}
+
+                {/* Collapsible: Monthly Breakdown */}
+                {months.length > 0 && (
+                  <CollapsibleSection label="Monthly Breakdown">
+                    <MonthlyTable months={months} />
+                  </CollapsibleSection>
+                )}
+
+                {/* Collapsible: Accuracy Matrix */}
+                <CollapsibleSection label="Accuracy Matrix (regime × conviction)">
+                  <AccuracyMatrixPanel />
+                </CollapsibleSection>
               </>
             )}
           </div>
-        </Tabs.Content>
-
-        {/* ── Claude Accuracy tab ── */}
-        <Tabs.Content value="accuracy">
-          {(aLoading || oLoading) ? (
-            <LoadingSkeleton rows={6} />
-          ) : !accuracy?.data_available ? (
-            <EmptyState
-              message="No thesis outcomes yet"
-              command="python thesis_checker.py"
-            />
-          ) : (
-            <div className="space-y-5">
-              {/* All-time stat cards */}
-              <div className="grid grid-cols-4 gap-4">
-                <StatCard
-                  label="Direction Accuracy"
-                  value={at?.direction_accuracy_pct != null ? `${at.direction_accuracy_pct.toFixed(0)}%` : '—'}
-                  sub={`${at?.correct ?? 0} correct / ${at?.wrong ?? 0} wrong`}
-                  color={accuracyColor(at?.direction_accuracy_pct ?? null)}
-                />
-                <StatCard
-                  label="Target 1 Hit Rate"
-                  value={at?.target_hit_rate_pct != null ? `${at.target_hit_rate_pct.toFixed(0)}%` : '—'}
-                  sub={`${at?.hit_target_1 ?? 0} of ${at?.resolved ?? 0} resolved`}
-                  color={at?.target_hit_rate_pct != null && at.target_hit_rate_pct >= 40 ? 'text-accent-green' : 'text-accent-amber'}
-                />
-                <StatCard
-                  label="Avg 30d Return"
-                  value={at?.avg_return_30d != null ? pct(at.avg_return_30d) : '—'}
-                  sub="vs entry price on thesis date"
-                  color={at?.avg_return_30d != null ? (at.avg_return_30d >= 0 ? 'text-accent-green' : 'text-accent-red') : undefined}
-                />
-                <StatCard
-                  label="Avg vs Target 1"
-                  value={at?.avg_vs_target_1_pct != null ? pct(at.avg_vs_target_1_pct) : '—'}
-                  sub="negative = price fell short of target"
-                  color={at?.avg_vs_target_1_pct != null ? (at.avg_vs_target_1_pct >= 0 ? 'text-accent-green' : 'text-text-secondary') : undefined}
-                />
-              </div>
-
-              {/* Secondary stat row */}
-              {at && (
-                <div className="grid grid-cols-4 gap-4">
-                  <div className="bg-bg-surface border border-border-subtle rounded p-3 flex justify-between items-center">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Total Theses</span>
-                    <span className="font-mono text-sm text-text-primary">{at.total}</span>
-                  </div>
-                  <div className="bg-bg-surface border border-border-subtle rounded p-3 flex justify-between items-center">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Resolved</span>
-                    <span className="font-mono text-sm text-text-secondary">{at.resolved}</span>
-                  </div>
-                  <div className="bg-bg-surface border border-border-subtle rounded p-3 flex justify-between items-center">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Stop Hit Rate</span>
-                    <span className="font-mono text-sm text-accent-red">
-                      {at.stop_hit_rate_pct != null ? `${at.stop_hit_rate_pct.toFixed(0)}%` : '—'}
-                    </span>
-                  </div>
-                  <div className="bg-bg-surface border border-border-subtle rounded p-3 flex justify-between items-center">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Stops Hit</span>
-                    <span className="font-mono text-sm text-accent-red">{at.hit_stop_first}</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Monthly breakdown */}
-              {months.length > 0 && <MonthlyTable months={months} />}
-
-              {/* Individual outcomes */}
-              <OutcomesTable outcomes={outcomeRows} />
-            </div>
-          )}
         </Tabs.Content>
       </Tabs.Root>
     </Shell>
