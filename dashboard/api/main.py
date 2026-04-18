@@ -5401,3 +5401,109 @@ async def update_setting(key: str, body: dict):
     except Exception:
         log.exception("update_setting error for %s", key)
         raise HTTPException(status_code=500, detail="Failed to save setting")
+
+
+@app.get("/api/thesis/live-performance")
+async def thesis_live_performance():
+    """
+    Open thesis_outcomes enriched with live prices.
+    Computes current P&L %, distance to T1/T2/stop, and a progress status.
+    """
+    cache_key = "thesis_live_performance"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        conn = _db_connect()
+        rows = conn.execute("""
+            SELECT o.ticker, o.direction, o.conviction, o.thesis_date,
+                   o.entry_price, o.target_1, o.target_2, o.stop_loss,
+                   COALESCE(tc.model_used, 'unknown') AS model
+            FROM thesis_outcomes o
+            JOIN thesis_cache tc ON tc.id = o.thesis_id
+            WHERE o.outcome = 'OPEN'
+              AND o.entry_price IS NOT NULL
+            ORDER BY o.thesis_date DESC
+        """).fetchall()
+        conn.close()
+
+        tickers = list({r["ticker"] for r in rows})
+        prices  = _fetch_current_prices(tickers) if tickers else {}
+
+        def _status(direction, cur, entry, t1, t2, stop):
+            bear = direction == "BEAR"
+            if stop and (cur <= stop if bear else cur <= stop):
+                return "AT_STOP"
+            if t2 and (cur <= t2 if bear else cur >= t2):
+                return "HIT_T2"
+            if t1 and (cur <= t1 if bear else cur >= t1):
+                return "HIT_T1"
+            if entry:
+                pnl = (entry - cur) / entry if bear else (cur - entry) / entry
+                if pnl > 0.02:
+                    return "ADVANCING"
+                if pnl < -0.02:
+                    return "RETREATING"
+            return "FLAT"
+
+        STATUS_SORT = {"HIT_T2": 0, "HIT_T1": 1, "ADVANCING": 2, "FLAT": 3, "RETREATING": 4, "AT_STOP": 5}
+
+        data = []
+        for r in rows:
+            cur   = prices.get(r["ticker"])
+            entry = float(r["entry_price"]) if r["entry_price"] else None
+            t1    = float(r["target_1"])    if r["target_1"]    else None
+            t2    = float(r["target_2"])    if r["target_2"]    else None
+            stop  = float(r["stop_loss"])   if r["stop_loss"]   else None
+            bear  = r["direction"] == "BEAR"
+
+            pnl_pct       = None
+            pct_to_t1     = None
+            pct_to_t2     = None
+            pct_to_stop   = None
+            progress_t1   = None  # 0–1 how far toward T1 from entry
+
+            if cur and entry:
+                raw_pnl  = (entry - cur) / entry if bear else (cur - entry) / entry
+                pnl_pct  = round(raw_pnl * 100, 2)
+                if t1:
+                    pct_to_t1 = round(((t1 - cur) / cur * 100) * (-1 if bear else 1), 2)
+                    total_move = abs(t1 - entry)
+                    done_move  = abs(cur - entry)
+                    progress_t1 = round(min(1.0, done_move / total_move), 3) if total_move > 0 else 0
+                if t2:
+                    pct_to_t2 = round(((t2 - cur) / cur * 100) * (-1 if bear else 1), 2)
+                if stop:
+                    pct_to_stop = round(((stop - cur) / cur * 100) * (-1 if bear else 1), 2)
+
+            status = _status(r["direction"], cur, entry, t1, t2, stop) if cur else "NO_PRICE"
+
+            data.append({
+                "ticker":       r["ticker"],
+                "direction":    r["direction"],
+                "conviction":   r["conviction"],
+                "thesis_date":  str(r["thesis_date"]),
+                "model":        r["model"],
+                "entry_price":  entry,
+                "current_price":cur,
+                "target_1":     t1,
+                "target_2":     t2,
+                "stop_loss":    stop,
+                "pnl_pct":      pnl_pct,
+                "pct_to_t1":    pct_to_t1,
+                "pct_to_t2":    pct_to_t2,
+                "pct_to_stop":  pct_to_stop,
+                "progress_t1":  progress_t1,
+                "status":       status,
+            })
+
+        data.sort(key=lambda r: (STATUS_SORT.get(r["status"], 9), -(r["pnl_pct"] or 0)))
+
+        result = {"data_available": True, "count": len(data), "data": _json_safe(data)}
+        _cache.set(cache_key, result, TTL_MEDIUM)
+        return result
+
+    except Exception:
+        log.exception("thesis_live_performance error")
+        return _no_data("thesis_live_performance failed")
