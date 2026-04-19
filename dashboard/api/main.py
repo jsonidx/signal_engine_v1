@@ -5351,52 +5351,53 @@ async def thesis_benchmark(days: int = 90, tickers: str = ""):
 
 
 @app.get("/api/thesis/buyhold")
-async def thesis_buyhold(tickers: str = "", days: int = 365):
+async def thesis_buyhold(tickers: str = ""):
     """
-    For each ticker, compare:
-      - AI thesis avg return (outcome-implied or 30d)
-      - Buy-and-hold return: bought at each thesis entry price, held to today
-    Returns per-ticker rows + aggregate summary.
+    Strategy comparison from first thesis date → today.
+
+    For each ticker:
+      - Buy & Hold: bought at entry price on first thesis date, held to today
+      - AI Trading: sum of all trade returns (resolved: outcome-implied; open: current P&L)
+
+    This answers: "since we started analysing this stock, which approach made more money?"
     """
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else MAG7
-    cache_key   = f"thesis_buyhold:{','.join(sorted(ticker_list))}:{days}"
+    cache_key   = f"thesis_buyhold2:{','.join(sorted(ticker_list))}"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
 
     try:
-        from datetime import date as _date, timedelta
-        cutoff = str(_date.today() - timedelta(days=days))
-
         conn = _db_connect()
-        rows = conn.execute(f"""
+        # ALL theses ever for these tickers — no days cutoff, we want full history
+        rows = conn.execute("""
             SELECT o.ticker, o.thesis_date, o.entry_price, o.direction,
                    o.outcome, o.return_30d, o.return_7d,
-                   o.target_1, o.target_2, o.stop_loss,
-                   o.hit_target_1, o.hit_target_2, o.hit_stop,
-                   COALESCE(tc.model_used, 'unknown') AS model
+                   o.target_1, o.target_2, o.stop_loss
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
-            WHERE o.ticker = ANY(%s) AND o.thesis_date >= %s
+            WHERE o.ticker = ANY(%s)
               AND o.entry_price IS NOT NULL AND o.entry_price > 0
-            ORDER BY o.ticker, o.thesis_date
-        """, (ticker_list, cutoff)).fetchall()
+            ORDER BY o.ticker, o.thesis_date ASC
+        """, (ticker_list,)).fetchall()
         conn.close()
 
-        # Fetch current prices for all tickers
         current_prices = _fetch_current_prices(ticker_list)
 
-        # Group by ticker
         from collections import defaultdict
         by_ticker: dict = defaultdict(list)
         for r in rows:
             by_ticker[r["ticker"]].append(r)
 
-        def _ai_return(r) -> float | None:
-            if r["return_30d"] is not None: return float(r["return_30d"])
-            if r["return_7d"]  is not None: return float(r["return_7d"])
+        def _trade_return(r, cur_price) -> float | None:
+            """Best return for a thesis: resolved → outcome-implied; open → current P&L."""
             ep   = float(r["entry_price"])
             bear = r["direction"] == "BEAR"
+            # Resolved outcomes — use actual or implied return
+            if r["return_30d"] is not None:
+                return float(r["return_30d"])
+            if r["return_7d"] is not None:
+                return float(r["return_7d"])
             if r["outcome"] == "HIT_TARGET1" and r["target_1"]:
                 raw = (float(r["target_1"]) - ep) / ep * 100
                 return -raw if bear else raw
@@ -5406,67 +5407,91 @@ async def thesis_buyhold(tickers: str = "", days: int = 365):
             if r["outcome"] == "HIT_STOP" and r["stop_loss"]:
                 raw = (float(r["stop_loss"]) - ep) / ep * 100
                 return -raw if bear else raw
+            # Open thesis — use current price as exit
+            if r["outcome"] == "OPEN" and cur_price:
+                raw = (cur_price - ep) / ep * 100
+                return -raw if bear else raw
             return None
 
         data = []
+        earliest_overall: str | None = None
+
         for ticker in ticker_list:
-            thesis_rows = by_ticker.get(ticker, [])
-            cur = current_prices.get(ticker)
+            t_rows = by_ticker.get(ticker, [])
+            cur    = current_prices.get(ticker)
 
-            ai_returns   = [v for r in thesis_rows if (v := _ai_return(r)) is not None]
-            bh_returns   = []
-            if cur:
-                for r in thesis_rows:
-                    ep = float(r["entry_price"])
-                    bh_returns.append((cur - ep) / ep * 100)
+            if not t_rows:
+                data.append({
+                    "ticker": ticker, "theses": 0,
+                    "first_thesis_date": None, "first_entry_price": None,
+                    "current_price": cur,
+                    "bh_return": None, "ai_total_return": None,
+                    "ai_avg_return": None, "advantage": None,
+                    "wins": 0, "losses": 0, "open_count": 0, "ai_win_rate": None,
+                    "trades": [],
+                })
+                continue
 
-            wins   = sum(1 for r in thesis_rows if r["outcome"] in ("HIT_TARGET1", "HIT_TARGET2"))
-            losses = sum(1 for r in thesis_rows if r["outcome"] == "HIT_STOP")
+            first_entry = float(t_rows[0]["entry_price"])
+            first_date  = str(t_rows[0]["thesis_date"])
+            if earliest_overall is None or first_date < earliest_overall:
+                earliest_overall = first_date
+
+            # Buy & Hold: bought at first thesis price, held to today
+            bh_return = round((cur - first_entry) / first_entry * 100, 2) if cur else None
+
+            # AI Trading: sum all trade returns
+            trade_returns = [v for r in t_rows if (v := _trade_return(r, cur)) is not None]
+            ai_total      = round(sum(trade_returns), 2)        if trade_returns else None
+            ai_avg        = round(sum(trade_returns) / len(trade_returns), 2) if trade_returns else None
+
+            wins     = sum(1 for r in t_rows if r["outcome"] in ("HIT_TARGET1", "HIT_TARGET2"))
+            losses   = sum(1 for r in t_rows if r["outcome"] == "HIT_STOP")
+            open_cnt = sum(1 for r in t_rows if r["outcome"] == "OPEN")
             resolved = wins + losses
+            win_rate = round(wins / resolved * 100, 1) if resolved > 0 else None
 
-            # Earliest entry date for simple long-term hold calculation
-            first_entry = thesis_rows[0]["entry_price"] if thesis_rows else None
-            first_date  = str(thesis_rows[0]["thesis_date"]) if thesis_rows else None
-            longterm_return = None
-            if first_entry and cur:
-                longterm_return = round((cur - float(first_entry)) / float(first_entry) * 100, 2)
+            advantage = round(ai_total - bh_return, 2) if ai_total is not None and bh_return is not None else None
 
             data.append({
                 "ticker":             ticker,
-                "theses":             len(thesis_rows),
-                "current_price":      cur,
+                "theses":             len(t_rows),
                 "first_thesis_date":  first_date,
-                "ai_avg_return":      round(sum(ai_returns) / len(ai_returns), 2) if ai_returns else None,
-                "bh_avg_return":      round(sum(bh_returns) / len(bh_returns), 2) if bh_returns else None,
-                "longterm_return":    longterm_return,
-                "ai_win_rate":        round(wins / resolved * 100, 1) if resolved > 0 else None,
+                "first_entry_price":  round(first_entry, 2),
+                "current_price":      cur,
+                "bh_return":          bh_return,         # buy first thesis date, hold to today
+                "ai_total_return":    ai_total,           # sum of all trade returns
+                "ai_avg_return":      ai_avg,             # per-trade avg
+                "advantage":          advantage,           # AI total − B&H
                 "wins":               wins,
                 "losses":             losses,
-                "open_count":         sum(1 for r in thesis_rows if r["outcome"] == "OPEN"),
-                "advantage":          round(
-                    sum(ai_returns) / len(ai_returns) - sum(bh_returns) / len(bh_returns), 2
-                ) if ai_returns and bh_returns else None,
+                "open_count":         open_cnt,
+                "ai_win_rate":        win_rate,
             })
 
-        # Sort: tickers with most theses first
         data.sort(key=lambda x: x["theses"], reverse=True)
 
-        # Aggregate across all tickers
-        all_ai  = [r["ai_avg_return"]  for r in data if r["ai_avg_return"]  is not None]
-        all_bh  = [r["bh_avg_return"]  for r in data if r["bh_avg_return"]  is not None]
+        # Aggregate (only tickers that have data)
+        with_data  = [r for r in data if r["theses"] > 0]
+        bh_vals    = [r["bh_return"]       for r in with_data if r["bh_return"]       is not None]
+        ai_vals    = [r["ai_total_return"]  for r in with_data if r["ai_total_return"] is not None]
+        adv_vals   = [r["advantage"]        for r in with_data if r["advantage"]       is not None]
         aggregate = {
-            "tickers_with_data": sum(1 for r in data if r["theses"] > 0),
-            "total_theses":      sum(r["theses"] for r in data),
-            "avg_ai_return":     round(sum(all_ai) / len(all_ai), 2) if all_ai else None,
-            "avg_bh_return":     round(sum(all_bh) / len(all_bh), 2) if all_bh else None,
-            "avg_advantage":     round(
-                sum(all_ai) / len(all_ai) - sum(all_bh) / len(all_bh), 2
-            ) if all_ai and all_bh else None,
+            "tickers_with_data":    len(with_data),
+            "total_theses":         sum(r["theses"] for r in with_data),
+            "earliest_thesis_date": earliest_overall,
+            "avg_bh_return":        round(sum(bh_vals)  / len(bh_vals),  2) if bh_vals  else None,
+            "avg_ai_total_return":  round(sum(ai_vals)  / len(ai_vals),  2) if ai_vals  else None,
+            "avg_advantage":        round(sum(adv_vals) / len(adv_vals), 2) if adv_vals else None,
+            "verdict": (
+                "AI trading ahead" if adv_vals and sum(adv_vals) / len(adv_vals) > 2
+                else "Buy & Hold ahead" if adv_vals and sum(adv_vals) / len(adv_vals) < -2
+                else "Too close to call"
+            ),
         }
 
         result = {
             "data_available": True,
-            "days":           days,
             "tickers":        ticker_list,
             "aggregate":      aggregate,
             "data":           _json_safe(data),

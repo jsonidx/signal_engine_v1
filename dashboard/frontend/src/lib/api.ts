@@ -787,30 +787,32 @@ export interface BenchmarkModelSummary {
 }
 
 export interface BuyHoldRow {
-  ticker:            string
-  theses:            number
-  current_price:     number | null
-  first_thesis_date: string | null
-  ai_avg_return:     number | null
-  bh_avg_return:     number | null
-  longterm_return:   number | null
-  ai_win_rate:       number | null
-  wins:              number
-  losses:            number
-  open_count:        number
-  advantage:         number | null
+  ticker:             string
+  theses:             number
+  first_thesis_date:  string | null
+  first_entry_price:  number | null
+  current_price:      number | null
+  bh_return:          number | null
+  ai_total_return:    number | null
+  ai_avg_return:      number | null
+  advantage:          number | null
+  ai_win_rate:        number | null
+  wins:               number
+  losses:             number
+  open_count:         number
 }
 
 export interface BuyHoldResponse {
   data_available: boolean
-  days:           number
   tickers:        string[]
   aggregate: {
-    tickers_with_data: number
-    total_theses:      number
-    avg_ai_return:     number | null
-    avg_bh_return:     number | null
-    avg_advantage:     number | null
+    tickers_with_data:    number
+    total_theses:         number
+    earliest_thesis_date: string | null
+    avg_bh_return:        number | null
+    avg_ai_total_return:  number | null
+    avg_advantage:        number | null
+    verdict:              string
   }
   data: BuyHoldRow[]
 }
@@ -1246,8 +1248,8 @@ export const api = {
   thesisBenchmark: (days = 90, tickers = ''): Promise<{ data_available: boolean; days: number; ticker_filter: string[]; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
     client.get('/api/thesis/benchmark', { params: { days, tickers } }).then(r => r.data),
 
-  thesisBuyHold: (tickers = '', days = 365): Promise<BuyHoldResponse> =>
-    client.get('/api/thesis/buyhold', { params: { tickers, days } }).then(r => r.data),
+  thesisBuyHold: (tickers = ''): Promise<BuyHoldResponse> =>
+    client.get('/api/thesis/buyhold', { params: { tickers } }).then(r => r.data),
 
   thesisLivePerformance: (): Promise<{ data_available: boolean; count: number; as_of: string; data: LivePerformanceRow[] }> =>
     client.get('/api/thesis/live-performance').then(r => r.data),

@@ -590,19 +590,30 @@ function LivePerformancePanel() {
 
 const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA']
 
+function pctColor(v: number | null) {
+  if (v == null) return 'text-text-tertiary'
+  return v >= 0 ? 'text-accent-green' : 'text-accent-red'
+}
+
 function advantageColor(v: number | null): string {
   if (v == null) return 'text-text-tertiary'
-  if (v > 2)  return 'text-accent-green font-semibold'
-  if (v > 0)  return 'text-accent-green'
-  if (v > -2) return 'text-accent-red'
+  if (v > 2)   return 'text-accent-green font-semibold'
+  if (v > 0)   return 'text-accent-green'
+  if (v > -2)  return 'text-accent-red'
   return 'text-accent-red font-semibold'
+}
+
+function verdictStyle(verdict: string) {
+  if (verdict.includes('AI')) return 'text-accent-green bg-accent-green/10 border-accent-green/30'
+  if (verdict.includes('Buy')) return 'text-accent-amber bg-accent-amber/10 border-accent-amber/30'
+  return 'text-text-tertiary bg-bg-elevated border-border-subtle'
 }
 
 function BuyHoldPanel({ tickerFilter }: { tickerFilter: string }) {
   const tickers = tickerFilter || MAG7.join(',')
   const { data, isLoading } = useQuery({
     queryKey: ['thesis', 'buyhold', tickers],
-    queryFn: () => api.thesisBuyHold(tickers, 365),
+    queryFn: () => api.thesisBuyHold(tickers),
     staleTime: 0,
   })
 
@@ -612,42 +623,50 @@ function BuyHoldPanel({ tickerFilter }: { tickerFilter: string }) {
   if (isLoading) return <LoadingSkeleton rows={4} />
   if (!data?.data_available || rows.length === 0) {
     return (
-      <div className="bg-bg-surface border border-border-subtle rounded p-6 text-center font-mono text-xs text-text-tertiary">
+      <div className="py-6 text-center font-mono text-xs text-text-tertiary">
         No thesis data for selected tickers yet.
       </div>
     )
   }
 
+  const fmt = (v: number | null) => v != null ? `${v > 0 ? '+' : ''}${v.toFixed(1)}%` : '—'
+
   return (
     <div className="space-y-4">
-      {/* Aggregate banner */}
+      {/* Verdict + aggregate banner */}
       {agg && (
-        <div className="grid grid-cols-4 gap-3">
-          {[
-            { label: 'Total Theses', value: String(agg.total_theses), color: 'text-text-primary' },
-            { label: 'AI Avg Return', value: agg.avg_ai_return != null ? `${agg.avg_ai_return > 0 ? '+' : ''}${agg.avg_ai_return.toFixed(1)}%` : '—', color: agg.avg_ai_return != null ? (agg.avg_ai_return >= 0 ? 'text-accent-green' : 'text-accent-red') : 'text-text-tertiary' },
-            { label: 'Buy & Hold Avg', value: agg.avg_bh_return != null ? `${agg.avg_bh_return > 0 ? '+' : ''}${agg.avg_bh_return.toFixed(1)}%` : '—', color: agg.avg_bh_return != null ? (agg.avg_bh_return >= 0 ? 'text-accent-green' : 'text-accent-red') : 'text-text-tertiary' },
-            { label: 'AI Advantage', value: agg.avg_advantage != null ? `${agg.avg_advantage > 0 ? '+' : ''}${agg.avg_advantage.toFixed(1)}%` : '—', color: advantageColor(agg.avg_advantage) },
-          ].map(({ label, value, color }) => (
-            <div key={label} className="bg-bg-surface border border-border-subtle rounded p-3 text-center">
-              <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-1">{label}</div>
-              <div className={clsx('font-mono text-lg font-bold', color)}>{value}</div>
+        <div className="space-y-3">
+          <div className={clsx('flex items-center justify-between px-4 py-3 rounded border font-mono', verdictStyle(agg.verdict))}>
+            <div className="space-y-0.5">
+              <div className="text-[9px] uppercase tracking-widest opacity-70">
+                Since {agg.earliest_thesis_date} · {agg.total_theses} theses on {agg.tickers_with_data} tickers
+              </div>
+              <div className="text-sm font-bold">{agg.verdict}</div>
             </div>
-          ))}
+            <div className="flex gap-8 text-right">
+              <div>
+                <div className="text-[9px] uppercase opacity-70 mb-0.5">Buy &amp; Hold avg</div>
+                <div className={clsx('text-lg font-bold', pctColor(agg.avg_bh_return))}>{fmt(agg.avg_bh_return)}</div>
+              </div>
+              <div>
+                <div className="text-[9px] uppercase opacity-70 mb-0.5">AI trading total</div>
+                <div className={clsx('text-lg font-bold', pctColor(agg.avg_ai_total_return))}>{fmt(agg.avg_ai_total_return)}</div>
+              </div>
+              <div>
+                <div className="text-[9px] uppercase opacity-70 mb-0.5">AI advantage</div>
+                <div className={clsx('text-lg font-bold', advantageColor(agg.avg_advantage))}>{fmt(agg.avg_advantage)}</div>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
       {/* Per-ticker table */}
       <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
-        <div className="px-4 py-3 border-b border-border-subtle">
-          <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
-            Per-Ticker: AI Active Trading vs Buy &amp; Hold (12 months)
-          </span>
-        </div>
         <table className="w-full">
           <thead>
-            <tr className="border-b border-border-subtle">
-              {['Ticker', 'Theses', 'Win Rate', 'AI Avg Return', 'Buy & Hold', 'AI Advantage', 'Long-term Hold', 'First Thesis'].map(h => (
+            <tr className="border-b border-border-subtle bg-bg-elevated">
+              {['Ticker', 'Since', 'Entry→Now', 'Buy & Hold', 'AI Total Return', 'Avg/Trade', 'Win Rate', 'AI Advantage', 'Trades'].map(h => (
                 <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary whitespace-nowrap">{h}</th>
               ))}
             </tr>
@@ -656,33 +675,39 @@ function BuyHoldPanel({ tickerFilter }: { tickerFilter: string }) {
             {rows.map(r => (
               <tr key={r.ticker} className="border-b border-border-subtle/40 last:border-0 hover:bg-bg-elevated transition-colors">
                 <td className="px-3 py-3 font-mono text-sm font-bold text-text-primary">{r.ticker}</td>
-                <td className="px-3 py-3 font-mono text-xs text-text-secondary text-center">
-                  {r.theses}
-                  <span className="text-text-tertiary text-[10px] ml-1">({r.wins}W/{r.losses}L/{r.open_count}O)</span>
+                <td className="px-3 py-3 font-mono text-[10px] text-text-tertiary whitespace-nowrap">{r.first_thesis_date ?? '—'}</td>
+                <td className="px-3 py-3 font-mono text-[10px] text-text-tertiary">
+                  {r.first_entry_price != null && r.current_price != null
+                    ? `${r.first_entry_price.toFixed(0)} → ${r.current_price.toFixed(0)}`
+                    : '—'}
                 </td>
-                <td className={clsx('px-3 py-3 font-mono text-xs', winRateColor(r.ai_win_rate ? r.ai_win_rate / 100 : null))}>
+                <td className={clsx('px-3 py-3 font-mono text-sm font-semibold', pctColor(r.bh_return))}>
+                  {fmt(r.bh_return)}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-sm font-semibold', pctColor(r.ai_total_return))}>
+                  {fmt(r.ai_total_return)}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', pctColor(r.ai_avg_return))}>
+                  {fmt(r.ai_avg_return)}
+                </td>
+                <td className={clsx('px-3 py-3 font-mono text-xs', winRateColor(r.ai_win_rate != null ? r.ai_win_rate / 100 : null))}>
                   {r.ai_win_rate != null ? `${r.ai_win_rate}%` : '—'}
                 </td>
-                <td className={clsx('px-3 py-3 font-mono text-xs', r.ai_avg_return == null ? 'text-text-tertiary' : r.ai_avg_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
-                  {r.ai_avg_return != null ? `${r.ai_avg_return > 0 ? '+' : ''}${r.ai_avg_return.toFixed(1)}%` : '—'}
-                </td>
-                <td className={clsx('px-3 py-3 font-mono text-xs', r.bh_avg_return == null ? 'text-text-tertiary' : r.bh_avg_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
-                  {r.bh_avg_return != null ? `${r.bh_avg_return > 0 ? '+' : ''}${r.bh_avg_return.toFixed(1)}%` : '—'}
-                </td>
-                <td className={clsx('px-3 py-3 font-mono text-xs font-semibold', advantageColor(r.advantage))}>
+                <td className={clsx('px-3 py-3 font-mono text-sm font-bold', advantageColor(r.advantage))}>
                   {r.advantage != null ? `${r.advantage > 0 ? '+' : ''}${r.advantage.toFixed(1)}%` : '—'}
                 </td>
-                <td className={clsx('px-3 py-3 font-mono text-xs', r.longterm_return == null ? 'text-text-tertiary' : r.longterm_return >= 0 ? 'text-accent-green' : 'text-accent-red')}>
-                  {r.longterm_return != null ? `${r.longterm_return > 0 ? '+' : ''}${r.longterm_return.toFixed(1)}%` : '—'}
+                <td className="px-3 py-3 font-mono text-[10px] text-text-tertiary whitespace-nowrap">
+                  {r.theses} <span className="opacity-60">({r.wins}W·{r.losses}L·{r.open_count}O)</span>
                 </td>
-                <td className="px-3 py-3 font-mono text-[10px] text-text-tertiary">{r.first_thesis_date ?? '—'}</td>
               </tr>
             ))}
           </tbody>
         </table>
         <div className="px-4 py-2.5 border-t border-border-subtle/50 bg-bg-elevated">
           <p className="font-mono text-[10px] text-text-tertiary">
-            AI Avg Return = avg outcome per thesis (30d return or outcome-implied) · Buy &amp; Hold = bought at each thesis entry price, held to today · Long-term Hold = from first thesis date to today · AI Advantage = AI return minus B&amp;H return
+            Buy &amp; Hold = bought at first thesis entry price, held to today ·
+            AI Total Return = sum of all trade returns (resolved: outcome-implied; open: current P&amp;L) ·
+            AI Advantage = AI total − B&amp;H
           </p>
         </div>
       </div>
