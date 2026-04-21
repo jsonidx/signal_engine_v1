@@ -166,7 +166,7 @@ def _fetch_fred_yield_curve() -> Optional[float]:
     url     = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={FRED_YIELD_CURVE_SERIES}"
     headers = {"User-Agent": FRED_USER_AGENT}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         df = pd.read_csv(io.StringIO(resp.text))
         df.columns = [c.strip() for c in df.columns]
