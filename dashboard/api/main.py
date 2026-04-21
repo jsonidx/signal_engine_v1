@@ -4483,7 +4483,7 @@ async def ticker_analogs(symbol: str, limit: int = Query(12, ge=1, le=50)):
         # Determine this ticker's current direction from thesis_cache
         current = conn.execute("""
             SELECT direction, conviction, signal_agreement_score
-            FROM thesis_cache WHERE ticker = ?
+            FROM thesis_cache WHERE ticker = %s
             ORDER BY date DESC, created_at DESC LIMIT 1
         """, (sym,)).fetchone()
         direction = current["direction"] if current else "BULL"
@@ -4498,9 +4498,9 @@ async def ticker_analogs(symbol: str, limit: int = Query(12, ge=1, le=50)):
                    outcome, claude_correct
             FROM thesis_outcomes
             WHERE outcome NOT IN ('OPEN', 'EXPIRED')
-              AND direction = ?
+              AND direction = %s
             ORDER BY thesis_date DESC
-            LIMIT ?
+            LIMIT %s
         """, (direction, limit)).fetchall()
         conn.close()
 
