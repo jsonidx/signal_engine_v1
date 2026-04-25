@@ -841,6 +841,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
         logger.warning("save_filing_catalysts failed (non-fatal): %s", exc)
 
 
+def fetch_filing_catalysts(
+    ticker: str,
+    as_of_date: "date | None" = None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Fetch filing_catalysts rows for *ticker*, filtered to point-in-time safety.
+
+    Parameters
+    ----------
+    ticker      : equity ticker (case-insensitive)
+    as_of_date  : if provided, returns only rows with filing_date <= as_of_date
+                  (anti-lookahead guard); defaults to today
+    limit       : max rows returned (most-recent ownership records first)
+
+    Returns empty list on any DB error — callers must not crash.
+    """
+    try:
+        cutoff = (as_of_date or date.today()).isoformat()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                ticker, filing_date, event_date, filing_type, accession_number,
+                issuer, holder_name, summary,
+                ownership_accumulation_flag, dilution_risk_flag,
+                derivative_exposure_flag, large_holder_flag,
+                shares_beneficially_owned, pct_class, shares_offered,
+                source_url, source
+            FROM filing_catalysts
+            WHERE ticker = %s
+              AND filing_date <= %s
+            ORDER BY
+                ownership_accumulation_flag DESC,
+                large_holder_flag DESC,
+                filing_date DESC
+            LIMIT %s
+            """,
+            (ticker.upper(), cutoff, limit),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.debug("fetch_filing_catalysts failed (non-fatal): %s", exc)
+        return []
+
+
 # ==============================================================================
 # 9. RED FLAG SCORES
 # ==============================================================================

@@ -150,6 +150,14 @@ class SqueezeScore:
     compression_recovery_score: float = 0.0    # 3-month drawdown + recovery pattern score
     volume_confirmation_flag: bool = False      # True = volume surge confirming squeeze ignition
     squeeze_state: str = "false"               # "false" | "active" | "completed"
+    # CHUNK-06: effective-float fields
+    effective_float_estimate: float = 0.0
+    large_holder_ownership_pct: float = 0.0
+    effective_short_float_ratio: float = 0.0
+    effective_float_score: float = 0.0
+    extreme_float_lock_flag: bool = False
+    large_holder_concentration_flag: bool = False
+    effective_float_confidence: str = "unknown"
 
     @property
     def ev_score(self) -> float:
@@ -544,6 +552,18 @@ def _load_si_history(ticker: str, as_of_date: "date | None" = None) -> list:
     try:
         from utils.supabase_persist import fetch_short_interest_history
         return fetch_short_interest_history(ticker, as_of_date=as_of_date)
+    except Exception:
+        return []
+
+
+def _load_filing_catalysts(ticker: str, as_of_date: "date | None" = None) -> list:
+    """
+    Load filing_catalysts rows for use in effective-float analysis.
+    Returns empty list on any failure (non-fatal).
+    """
+    try:
+        from utils.supabase_persist import fetch_filing_catalysts
+        return fetch_filing_catalysts(ticker, as_of_date=as_of_date)
     except Exception:
         return []
 
@@ -947,6 +967,7 @@ def compute_squeeze_score(
     finviz: dict,
     ftd_df: pd.DataFrame,
     si_history: list | None = None,
+    filing_catalysts: list | None = None,
 ) -> SqueezeScore:
     """
     Compute the full SqueezeScore for a single ticker.
@@ -954,9 +975,15 @@ def compute_squeeze_score(
     si_history: pre-fetched rows from short_interest_history. If None the
     screener will call _load_si_history() to fetch from DB (may be empty on
     first run — that is expected and handled gracefully).
+
+    filing_catalysts: pre-fetched rows from filing_catalysts for CHUNK-06
+    effective-float analysis.  If None the screener fetches from DB.
     """
     if si_history is None:
         si_history = _load_si_history(ticker)
+
+    if filing_catalysts is None:
+        filing_catalysts = _load_filing_catalysts(ticker)
 
     pos = score_positioning(data, finviz, si_history=si_history)
     mech = score_mechanics(data, finviz, ftd_df)
@@ -966,9 +993,53 @@ def compute_squeeze_score(
     squeeze_state = detect_recent_squeeze(data)
     recent_sq = squeeze_state == "completed"   # backward-compat flag
 
+    # ── CHUNK-06: effective-float signal ──────────────────────────────────────
+    from effective_float_analyzer import (
+        analyze_effective_float,
+        compute_effective_short_float_ratio,
+        compute_effective_float_score,
+    )
+
+    float_shares = data.get("float_shares") or 0
+    shares_outstanding = data.get("shares_outstanding") or 0
+    short_pct_raw = data.get("short_pct_float") or 0
+    shares_short = round(short_pct_raw * float_shares) if (float_shares > 0 and short_pct_raw > 0) else 0
+
+    ef_result = analyze_effective_float(
+        ticker=ticker,
+        reported_float=float_shares or None,
+        shares_outstanding=shares_outstanding or None,
+        large_holder_records=filing_catalysts,
+    )
+
+    # Inject shares_short to get the ratio + score
+    ef_ratio = compute_effective_short_float_ratio(
+        shares_short=shares_short or None,
+        effective_float_estimate=ef_result["effective_float_estimate"],
+    )
+    ef_score = compute_effective_float_score(ef_ratio)
+    ef_result["effective_short_float_ratio"] = ef_ratio
+    ef_result["effective_float_score"] = ef_score
+
+    if ef_result["extreme_float_lock_flag"]:
+        pos["flags"].append(
+            f"Effective float locked: {ef_result['large_holder_ownership_pct']:.1f}% "
+            f"held by large holders (effective SI: {ef_ratio:.1%})"
+        )
+    elif ef_result["large_holder_concentration_flag"]:
+        pos["flags"].append(
+            f"Large-holder concentration: {ef_result['large_holder_ownership_pct']:.1f}% "
+            f"(effective SI: {ef_ratio:.1%})"
+        )
+
+    # Add effective-float score as a small additive secondary component (weight 0.03).
+    # Max is already defined inside each sub-scorer; we tack on to raw/max after the fact.
+    ef_weight = 0.03
+    ef_contribution = ef_score * ef_weight   # 0–0.3 addition to raw score
+
     # Raw composite (normalize to 100)
-    raw = pos["score"] + mech["score"] + struct["score"]
-    max_raw = pos["max"] + mech["max"] + struct["max"]
+    raw = pos["score"] + mech["score"] + struct["score"] + ef_contribution
+    max_raw = pos["max"] + mech["max"] + struct["max"] + 10 * ef_weight
     final_score = round((raw / max_raw) * 100, 1) if max_raw > 0 else 0.0
 
     # Only zero score on completed squeezes; active squeezes preserve their score
@@ -993,6 +1064,13 @@ def compute_squeeze_score(
         "float_score": struct.get("float_score", 0),
         "price_divergence_score": struct.get("div_score", 0),
         "compression_recovery_score": struct.get("comp_rec_score", 0),
+        # CHUNK-06 effective-float fields
+        "effective_float_score": ef_score,
+        "effective_float_estimate": ef_result["effective_float_estimate"],
+        "large_holder_ownership_pct": ef_result["large_holder_ownership_pct"],
+        "effective_short_float_ratio": ef_ratio,
+        "extreme_float_lock_flag": float(ef_result["extreme_float_lock_flag"]),
+        "large_holder_concentration_flag": float(ef_result["large_holder_concentration_flag"]),
     }
 
     short_pct = pos.get("short_pct", 0)
@@ -1016,6 +1094,14 @@ def compute_squeeze_score(
         compression_recovery_score=struct.get("comp_rec_score", 0.0),
         volume_confirmation_flag=mech.get("volume_confirmation_flag", False),
         squeeze_state=squeeze_state,
+        # CHUNK-06 effective-float fields
+        effective_float_estimate=ef_result["effective_float_estimate"],
+        large_holder_ownership_pct=ef_result["large_holder_ownership_pct"],
+        effective_short_float_ratio=ef_ratio,
+        effective_float_score=ef_score,
+        extreme_float_lock_flag=ef_result["extreme_float_lock_flag"],
+        large_holder_concentration_flag=ef_result["large_holder_concentration_flag"],
+        effective_float_confidence=ef_result["effective_float_confidence"],
     )
 
 
