@@ -693,7 +693,156 @@ def fetch_short_interest_history(
 
 
 # ==============================================================================
-# 8. RED FLAG SCORES
+# 8. FILING CATALYSTS  (CHUNK-07 / CHUNK-13 Phase 2B slice)
+# ==============================================================================
+
+_FILING_CATALYSTS_DDL = """
+CREATE TABLE IF NOT EXISTS filing_catalysts (
+    ticker                      TEXT        NOT NULL,
+    filing_date                 DATE        NOT NULL,
+    event_date                  DATE,
+    filing_type                 TEXT        NOT NULL,
+    accession_number            TEXT,
+    issuer                      TEXT,
+    holder_name                 TEXT,
+    summary                     TEXT,
+    ownership_accumulation_flag BOOLEAN     DEFAULT FALSE,
+    dilution_risk_flag          BOOLEAN     DEFAULT FALSE,
+    derivative_exposure_flag    BOOLEAN     DEFAULT FALSE,
+    large_holder_flag           BOOLEAN     DEFAULT FALSE,
+    shares_beneficially_owned   BIGINT,
+    pct_class                   REAL,
+    shares_offered              BIGINT,
+    source_url                  TEXT,
+    source                      TEXT        NOT NULL DEFAULT 'edgar_search',
+    source_timestamp            TIMESTAMPTZ,
+    created_at                  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (ticker, filing_date, filing_type, COALESCE(accession_number, ''))
+);
+"""
+
+# Postgres doesn't allow COALESCE in primary key definition — use a unique index instead
+_FILING_CATALYSTS_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
+    ON filing_catalysts (ticker, filing_date, filing_type,
+                         COALESCE(accession_number, ''));
+"""
+
+
+def save_filing_catalysts(records: list[dict]) -> None:
+    """
+    Upsert SEC filing catalyst records into filing_catalysts.
+
+    Each record should contain at minimum: ticker, filing_date, filing_type.
+    All flag fields default to FALSE if not provided.
+    Idempotent: same (ticker, filing_date, filing_type, accession_number)
+    updates the existing row.
+    """
+    if not records:
+        return
+    try:
+        from datetime import date as _date
+        conn = _conn()
+        cur = conn.cursor()
+
+        # Use a simpler PK scheme compatible with Postgres — drop the COALESCE PK
+        # and let the ON CONFLICT rely on the unique index instead.
+        cur.execute("""
+CREATE TABLE IF NOT EXISTS filing_catalysts (
+    ticker                      TEXT        NOT NULL,
+    filing_date                 DATE        NOT NULL,
+    event_date                  DATE,
+    filing_type                 TEXT        NOT NULL,
+    accession_number            TEXT,
+    issuer                      TEXT,
+    holder_name                 TEXT,
+    summary                     TEXT,
+    ownership_accumulation_flag BOOLEAN     DEFAULT FALSE,
+    dilution_risk_flag          BOOLEAN     DEFAULT FALSE,
+    derivative_exposure_flag    BOOLEAN     DEFAULT FALSE,
+    large_holder_flag           BOOLEAN     DEFAULT FALSE,
+    shares_beneficially_owned   BIGINT,
+    pct_class                   REAL,
+    shares_offered              BIGINT,
+    source_url                  TEXT,
+    source                      TEXT        NOT NULL DEFAULT 'edgar_search',
+    source_timestamp            TIMESTAMPTZ,
+    created_at                  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ DEFAULT NOW()
+);
+""")
+        cur.execute("""
+CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
+    ON filing_catalysts (ticker, filing_date, filing_type,
+                         COALESCE(accession_number, ''));
+""")
+
+        today = _date.today().isoformat()
+        rows = []
+        for rec in records:
+            ticker = str(rec.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                ticker,
+                str(rec.get("filing_date") or today),
+                str(rec["event_date"]) if rec.get("event_date") else None,
+                str(rec.get("filing_type", "UNKNOWN")),
+                rec.get("accession_number"),
+                rec.get("issuer"),
+                rec.get("holder_name"),
+                rec.get("summary"),
+                bool(rec.get("ownership_accumulation_flag", False)),
+                bool(rec.get("dilution_risk_flag", False)),
+                bool(rec.get("derivative_exposure_flag", False)),
+                bool(rec.get("large_holder_flag", False)),
+                int(rec["shares_beneficially_owned"]) if rec.get("shares_beneficially_owned") is not None else None,
+                float(rec["pct_class"]) if rec.get("pct_class") is not None else None,
+                int(rec["shares_offered"]) if rec.get("shares_offered") is not None else None,
+                rec.get("source_url"),
+                rec.get("source", "edgar_search"),
+                rec.get("source_timestamp"),
+            ))
+
+        cur.executemany(
+            """
+            INSERT INTO filing_catalysts
+                (ticker, filing_date, event_date, filing_type, accession_number,
+                 issuer, holder_name, summary,
+                 ownership_accumulation_flag, dilution_risk_flag,
+                 derivative_exposure_flag, large_holder_flag,
+                 shares_beneficially_owned, pct_class, shares_offered,
+                 source_url, source, source_timestamp, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+            ON CONFLICT (ticker, filing_date, filing_type, COALESCE(accession_number, ''))
+            DO UPDATE SET
+                event_date                  = EXCLUDED.event_date,
+                issuer                      = EXCLUDED.issuer,
+                holder_name                 = EXCLUDED.holder_name,
+                summary                     = EXCLUDED.summary,
+                ownership_accumulation_flag = EXCLUDED.ownership_accumulation_flag,
+                dilution_risk_flag          = EXCLUDED.dilution_risk_flag,
+                derivative_exposure_flag    = EXCLUDED.derivative_exposure_flag,
+                large_holder_flag           = EXCLUDED.large_holder_flag,
+                shares_beneficially_owned   = EXCLUDED.shares_beneficially_owned,
+                pct_class                   = EXCLUDED.pct_class,
+                shares_offered              = EXCLUDED.shares_offered,
+                source_url                  = EXCLUDED.source_url,
+                source_timestamp            = EXCLUDED.source_timestamp,
+                updated_at                  = NOW()
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("filing_catalysts: upserted %d records", len(rows))
+    except Exception as exc:
+        logger.warning("save_filing_catalysts failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 9. RED FLAG SCORES
 # ==============================================================================
 
 _RED_FLAG_DDL = """

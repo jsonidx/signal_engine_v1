@@ -36,6 +36,7 @@ IMPORTANT: This is NOT investment advice. SEC data is informational.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import warnings
@@ -63,6 +64,13 @@ SEC_RATE_LIMIT = 0.15  # seconds between requests
 EDGAR_BASE = "https://efts.sec.gov/LATEST"
 EDGAR_FILINGS = "https://data.sec.gov"
 EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+
+# Filing classification sets
+_OWNERSHIP_FORMS = frozenset({"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"})
+_DILUTION_FORMS  = frozenset({"424B5", "S-3", "S-3ASR", "F-3"})
+
+# Threshold: pct_class >= this → large_holder_flag
+_LARGE_HOLDER_PCT_THRESHOLD = 10.0
 
 
 # ==============================================================================
@@ -268,14 +276,205 @@ def get_institutional_filings(ticker: str) -> list:
 
 
 # ==============================================================================
-# SECTION 4: ACTIVIST STAKES (13D/13G)
+# SECTION 4: FILING CATALYST PARSERS  (CHUNK-07)
+# Pure functions — unit-testable without live EDGAR calls.
+# ==============================================================================
+
+def _parse_pct_class(text: str) -> Optional[float]:
+    """
+    Extract the percent-of-class figure from 13D/13G filing text.
+
+    Looks for patterns such as:
+        Percent of class: 22.2%
+        Percent of Class Represented by Amount in Row (11): 22.2
+        aggregate percent of class: 22.2%
+    """
+    patterns = [
+        r"percent\s+of\s+class\s*(?:represented\s+by\s+amount\s+in\s+row\s*\(?1[12]\)?)?\s*[:\-]?\s*([\d,]+\.?\d*)\s*%?",
+        r"(?:aggregate\s+)?percent\s+of\s+(?:the\s+)?(?:outstanding\s+)?(?:shares\s+of\s+)?(?:common\s+)?(?:stock|class)(?:\s+of\s+\w+)?\s*[:\-]?\s*([\d,]+\.?\d*)\s*%?",
+        r"\(1[12]\)\s*([\d,]+\.?\d*)\s*%",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if 0 < val <= 100:
+                    return val
+            except (ValueError, AttributeError):
+                continue
+    return None
+
+
+def _parse_beneficial_shares(text: str) -> Optional[int]:
+    """
+    Extract shares beneficially owned from 13D/13G filing text.
+
+    Looks for patterns such as:
+        Amount beneficially owned: 7,824,100
+        aggregate amount beneficially owned: 7,824,100
+        Sole voting power: 7,824,100
+    """
+    patterns = [
+        r"(?:aggregate\s+)?amount\s+beneficially\s+owned\s*[:\-]?\s*([\d,]+)",
+        r"(?:total\s+)?shares\s+beneficially\s+owned\s*[:\-]?\s*([\d,]+)",
+        r"(?:11\)|row\s+11)\s*[:\-]?\s*([\d,]+)",
+        r"sole\s+(?:voting|dispositive)\s+power\s*[:\-]?\s*([\d,]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                val = int(m.group(1).replace(",", ""))
+                if val > 0:
+                    return val
+            except (ValueError, AttributeError):
+                continue
+    return None
+
+
+def _parse_shares_offered(text: str) -> Optional[int]:
+    """
+    Extract the number of shares offered from a dilution filing.
+
+    Looks for patterns such as:
+        up to 5,000,000 shares
+        up to 5 million shares
+        offer and sell shares of common stock having an aggregate offering price of up to $100,000,000
+        an aggregate of 3,500,000 shares
+    """
+    # Named-number patterns (e.g. "5 million")
+    _WORD_NUMS = {
+        "hundred": 100, "thousand": 1_000, "million": 1_000_000,
+        "billion": 1_000_000_000,
+    }
+    # Try numeric first
+    patterns = [
+        r"up\s+to\s+([\d,]+)\s+shares",
+        r"aggregate\s+(?:amount\s+)?of\s+([\d,]+)\s+shares",
+        r"offer(?:ing)?\s+(?:and\s+sell\s+)?(?:up\s+to\s+)?([\d,]+)\s+shares",
+        r"issuance\s+of\s+(?:up\s+to\s+)?([\d,]+)\s+shares",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                val = int(m.group(1).replace(",", ""))
+                if val > 0:
+                    return val
+            except (ValueError, AttributeError):
+                continue
+
+    # Word-number patterns: "up to 5 million shares"
+    m = re.search(
+        r"up\s+to\s+([\d,.]+)\s+(hundred|thousand|million|billion)\s+shares",
+        text, re.IGNORECASE,
+    )
+    if m:
+        try:
+            base = float(m.group(1).replace(",", ""))
+            mult = _WORD_NUMS.get(m.group(2).lower(), 1)
+            val = int(base * mult)
+            if val > 0:
+                return val
+        except (ValueError, AttributeError):
+            pass
+
+    return None
+
+
+def _detect_derivative_exposure(text: str) -> bool:
+    """
+    Return True if the text clearly mentions derivative instruments such as
+    call options, warrants, or swaps.
+
+    Conservative: only flags obvious derivative language.
+    Does not estimate economic exposure.
+    """
+    patterns = [
+        r"\bcall\s+options?\b",
+        r"\bwarrants?\b",
+        r"\bswaps?\b",
+        r"\bderivatives?\b",
+        r"\boptions?\s+exercisable\b",
+        r"\bshares?\s+issuable\s+upon\s+exercise\b",
+        r"\bconvertible\s+(?:notes?|securities|preferred)\b",
+    ]
+    for pat in patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _detect_atm_language(text: str) -> bool:
+    """
+    Return True if the text contains at-the-market or equity distribution language
+    indicative of a dilution event.
+    """
+    patterns = [
+        r"\bat[\s\-]the[\s\-]market\b",
+        r"\batm\s+offering\b",
+        r"\bsales\s+agreement\b",
+        r"\bequity\s+distribution\s+agreement\b",
+        r"\bprospectus\s+supplement\b",
+        r"\bmay\s+offer\s+and\s+sell\b",
+        r"\bshelf\s+registration\b",
+        r"\baggregate\s+offering\s+(?:price|proceeds)\b",
+    ]
+    for pat in patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
+
+
+def classify_filing(form_type: str, title: str = "", text: str = "") -> dict:
+    """
+    Classify a SEC filing and return a dict of flags and parsed fields.
+
+    Returns:
+        ownership_accumulation_flag  — True for 13D/13G family
+        dilution_risk_flag           — True for 424B5/S-3 or ATM language
+        derivative_exposure_flag     — True if derivative language detected
+        large_holder_flag            — True if pct_class >= _LARGE_HOLDER_PCT_THRESHOLD
+        pct_class                    — float | None
+        shares_beneficially_owned    — int | None
+        shares_offered               — int | None
+    """
+    combined = f"{title} {text}"
+    form_upper = (form_type or "").upper().strip()
+
+    ownership_flag = form_upper in {f.upper() for f in _OWNERSHIP_FORMS}
+    dilution_flag = (form_upper in {f.upper() for f in _DILUTION_FORMS}
+                     or _detect_atm_language(combined))
+
+    pct_class = _parse_pct_class(combined) if ownership_flag or text else None
+    shares_owned = _parse_beneficial_shares(combined) if ownership_flag or text else None
+    shares_offered = _parse_shares_offered(combined) if dilution_flag or text else None
+    deriv_flag = _detect_derivative_exposure(combined)
+    large_flag = (pct_class is not None and pct_class >= _LARGE_HOLDER_PCT_THRESHOLD)
+
+    return {
+        "ownership_accumulation_flag": ownership_flag,
+        "dilution_risk_flag": dilution_flag,
+        "derivative_exposure_flag": deriv_flag,
+        "large_holder_flag": large_flag,
+        "pct_class": pct_class,
+        "shares_beneficially_owned": shares_owned,
+        "shares_offered": shares_offered,
+    }
+
+
+# ==============================================================================
+# SECTION 4B: ACTIVIST STAKES (13D/13G)  — extended for CHUNK-07
 # ==============================================================================
 
 def get_activist_filings(ticker: str, days_back: int = 365) -> list:
     """
-    Find 13D and 13G filings — these indicate 5%+ ownership stakes.
-    A 13D specifically means the investor intends to influence management.
-    This is the most powerful catalyst trigger.
+    Find 13D and 13G filings — 5%+ ownership stakes and activist positions.
+    Extended (CHUNK-07): adds accession_number, source_url, holder_name,
+    ownership_accumulation_flag, large_holder_flag, derivative_exposure_flag,
+    and parsed pct_class / shares_beneficially_owned where available in the
+    EDGAR search hit metadata.
     """
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     today = datetime.now().strftime("%Y-%m-%d")
@@ -293,11 +492,36 @@ def get_activist_filings(ticker: str, days_back: int = 365) -> list:
         hits = data.get("hits", {}).get("hits", [])
         for hit in hits[:10]:
             source = hit.get("_source", {})
+            filing_date = source.get("file_date", "")
+            form_type = source.get("form_type", form)
+            display_names = source.get("display_names", [])
+            holder_name = display_names[0] if display_names else "Unknown"
+            accession_no = source.get("accession_no", "") or hit.get("_id", "")
+
+            # Build a direct EDGAR search link using the accession number
+            source_url = (
+                f"https://efts.sec.gov/LATEST/search-index?q=%22{accession_no}%22"
+                if accession_no else
+                f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&forms={form}"
+            )
+
+            # Classify using form type (text not fetched at this stage for speed)
+            flags = classify_filing(form_type, title="")
+
             results.append({
-                "date": source.get("file_date", ""),
-                "filer": source.get("display_names", ["Unknown"])[0],
-                "form": source.get("form_type", ""),
-                "description": f"5%+ ownership stake ({form})",
+                "date": filing_date,
+                "filer": holder_name,
+                "form": form_type,
+                "description": f"5%+ ownership stake ({form_type})",
+                # Extended fields for CHUNK-07
+                "accession_number": accession_no,
+                "holder_name": holder_name,
+                "source_url": source_url,
+                "ownership_accumulation_flag": flags["ownership_accumulation_flag"],
+                "large_holder_flag": flags["large_holder_flag"],
+                "derivative_exposure_flag": flags["derivative_exposure_flag"],
+                "pct_class": flags["pct_class"],
+                "shares_beneficially_owned": flags["shares_beneficially_owned"],
             })
 
     return results
@@ -342,6 +566,135 @@ def get_material_events(ticker: str, days_back: int = 90) -> list:
 
 
 # ==============================================================================
+# SECTION 5B: DILUTION FILINGS (424B5 / S-3)  — CHUNK-07
+# ==============================================================================
+
+def get_dilution_filings(ticker: str, days_back: int = 365) -> list:
+    """
+    Find dilution-risk filings: 424B5, S-3, S-3ASR, F-3.
+
+    These forms indicate that the issuer is selling new shares (or has a
+    shelf registration that enables future sales). They are relevant context
+    for squeeze candidates: high short interest + imminent dilution risk can
+    suppress a squeeze before it ignites.
+
+    Returns a list of dicts with dilution_risk_flag, shares_offered, and
+    other metadata. Callers should persist via build_filing_catalyst_records().
+
+    Note: does NOT change the squeeze score — that is CHUNK-16's job.
+    """
+    cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    results = []
+    for form in ["424B5", "S-3", "S-3ASR", "F-3"]:
+        url = (f"https://efts.sec.gov/LATEST/search-index?"
+               f"q=%22{ticker}%22&forms={form}&dateRange=custom"
+               f"&startdt={cutoff}&enddt={today}")
+
+        data = _sec_request(url)
+        if not data:
+            continue
+
+        hits = data.get("hits", {}).get("hits", [])
+        for hit in hits[:10]:
+            source = hit.get("_source", {})
+            filing_date = source.get("file_date", "")
+            form_type = source.get("form_type", form)
+            display_names = source.get("display_names", [])
+            issuer = display_names[0] if display_names else ticker
+            accession_no = source.get("accession_no", "") or hit.get("_id", "")
+
+            # Use the filing description/entity_name as a lightweight title proxy
+            title_proxy = source.get("entity_name", "") or source.get("description", "")
+            flags = classify_filing(form_type, title=title_proxy)
+
+            source_url = (
+                f"https://efts.sec.gov/LATEST/search-index?q=%22{accession_no}%22"
+                if accession_no else
+                f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&forms={form}"
+            )
+
+            results.append({
+                "date": filing_date,
+                "filer": issuer,
+                "form": form_type,
+                "description": f"Potential dilution filing ({form_type})",
+                "accession_number": accession_no,
+                "issuer": issuer,
+                "source_url": source_url,
+                "dilution_risk_flag": flags["dilution_risk_flag"],
+                "shares_offered": flags["shares_offered"],
+                "derivative_exposure_flag": flags["derivative_exposure_flag"],
+            })
+
+    return results
+
+
+def build_filing_catalyst_records(
+    ticker: str,
+    activist_filings: list,
+    dilution_filings: list,
+) -> list:
+    """
+    Normalize activist and dilution filing lists into filing_catalysts records
+    ready for persistence via save_filing_catalysts().
+
+    Called after get_activist_filings() and get_dilution_filings() to produce
+    a single list of records with a consistent schema.
+    """
+    from datetime import datetime as _dt
+    records = []
+    now_ts = _dt.utcnow().isoformat() + "Z"
+
+    for f in activist_filings:
+        records.append({
+            "ticker": ticker,
+            "filing_date": f.get("date", ""),
+            "event_date": f.get("date", ""),
+            "filing_type": f.get("form", ""),
+            "accession_number": f.get("accession_number"),
+            "issuer": ticker,
+            "holder_name": f.get("holder_name") or f.get("filer"),
+            "summary": f.get("description", ""),
+            "ownership_accumulation_flag": f.get("ownership_accumulation_flag", True),
+            "dilution_risk_flag": False,
+            "derivative_exposure_flag": f.get("derivative_exposure_flag", False),
+            "large_holder_flag": f.get("large_holder_flag", False),
+            "shares_beneficially_owned": f.get("shares_beneficially_owned"),
+            "pct_class": f.get("pct_class"),
+            "shares_offered": None,
+            "source_url": f.get("source_url"),
+            "source": "edgar_search",
+            "source_timestamp": now_ts,
+        })
+
+    for f in dilution_filings:
+        records.append({
+            "ticker": ticker,
+            "filing_date": f.get("date", ""),
+            "event_date": f.get("date", ""),
+            "filing_type": f.get("form", ""),
+            "accession_number": f.get("accession_number"),
+            "issuer": f.get("issuer", ticker),
+            "holder_name": None,
+            "summary": f.get("description", ""),
+            "ownership_accumulation_flag": False,
+            "dilution_risk_flag": f.get("dilution_risk_flag", True),
+            "derivative_exposure_flag": f.get("derivative_exposure_flag", False),
+            "large_holder_flag": False,
+            "shares_beneficially_owned": None,
+            "pct_class": None,
+            "shares_offered": f.get("shares_offered"),
+            "source_url": f.get("source_url"),
+            "source": "edgar_search",
+            "source_timestamp": now_ts,
+        })
+
+    return records
+
+
+# ==============================================================================
 # SECTION 6: COMPOSITE SEC SCORE
 # ==============================================================================
 
@@ -356,7 +709,12 @@ def score_sec_signals(ticker: str) -> dict:
     - Recent 8-K filings (events): +1
     - Institutional 13F mentions: +1
 
-    Returns dict with score, max, flags.
+    Extended (CHUNK-07):
+    - Checks for 424B5/S-3 dilution filings (informational only — no score change)
+    - Persists all detected catalysts to filing_catalysts table
+    - Returns dilution_risk_flag and ownership_accumulation_flag in output dict
+
+    Returns dict with score, max, flags, dilution_risk_flag, ownership_accumulation_flag.
     """
     score = 0
     flags = []
@@ -379,13 +737,31 @@ def score_sec_signals(ticker: str) -> dict:
         score += 1
         flags.append(f"Insider cluster: {insider['unique_filers']} different insiders filing")
 
-    # Activist stakes
+    # Activist stakes (13D/13G) — extended with ownership parsing
     print(f" activist...", end="", flush=True)
     activists = get_activist_filings(ticker, days_back=365)
+    ownership_accumulation_flag = len(activists) > 0
     if activists:
         score += 3
         recent = activists[0]
         flags.append(f"ACTIVIST FILING: {recent['form']} by {recent['filer']} on {recent['date']}")
+        if recent.get("pct_class"):
+            flags.append(f"  Ownership: {recent['pct_class']:.1f}% of class")
+        if recent.get("large_holder_flag"):
+            flags.append(f"  LARGE HOLDER (≥{_LARGE_HOLDER_PCT_THRESHOLD:.0f}%)")
+
+    # Dilution risk (424B5 / S-3 / S-3ASR) — informational, no score change
+    print(f" dilution...", end="", flush=True)
+    dilution_filings = get_dilution_filings(ticker, days_back=365)
+    dilution_risk_flag = any(f.get("dilution_risk_flag") for f in dilution_filings)
+    if dilution_risk_flag:
+        recent_dil = dilution_filings[0]
+        flags.append(
+            f"DILUTION RISK: {recent_dil['form']} filed {recent_dil.get('date', 'N/A')} "
+            f"(informational — may suppress squeeze)"
+        )
+        if recent_dil.get("shares_offered"):
+            flags.append(f"  Shares offered: {recent_dil['shares_offered']:,}")
 
     # Material events
     print(f" events...", end="", flush=True)
@@ -405,9 +781,24 @@ def score_sec_signals(ticker: str) -> dict:
     elif inst:
         flags.append(f"Some institutional filings: {len(inst)} 13F mentions")
 
+    # Persist all detected catalysts (non-fatal)
+    try:
+        from utils.supabase_persist import save_filing_catalysts
+        catalyst_records = build_filing_catalyst_records(ticker, activists, dilution_filings)
+        if catalyst_records:
+            save_filing_catalysts(catalyst_records)
+    except Exception as _exc:
+        pass  # non-fatal
+
     print(f" done.")
 
-    return {"score": score, "max": 8, "flags": flags}
+    return {
+        "score": score,
+        "max": 8,
+        "flags": flags,
+        "dilution_risk_flag": dilution_risk_flag,
+        "ownership_accumulation_flag": ownership_accumulation_flag,
+    }
 
 
 # ==============================================================================
