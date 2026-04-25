@@ -417,16 +417,150 @@ def get_ftd_for_ticker(ticker: str, ftd_df: pd.DataFrame) -> float:
 
 
 # ==============================================================================
-# SECTION 2: SIGNAL SCORING
+# SECTION 2: SI PERSISTENCE HELPERS  (CHUNK-02)
+# ==============================================================================
+
+def compute_si_persistence_score(
+    history_rows: list,
+    latest_short_pct: float,
+    score_date: "date | None" = None,
+) -> dict:
+    """
+    Compute SI persistence score from historical short-interest rows.
+
+    Returns a dict with:
+        si_persistence_score   — 0–10 signal score
+        si_persistence_count   — number of distinct reporting periods seen
+        si_trend_direction     — "rising" | "falling" | "stable" | "unknown"
+
+    Anti-lookahead rules (point-in-time safety):
+    1. Only rows where publication_date <= score_date are considered.
+    2. Prefer distinct settlement_date values when available; each unique
+       settlement_date counts as one FINRA reporting period.
+    3. When settlement_date is absent (e.g. yfinance snapshots), use
+       publication_date but only count rows as distinct periods when spaced
+       >= 10 calendar days apart.  This prevents consecutive daily yfinance
+       runs from inflating the distinct-period count.
+    4. Fewer than 2 distinct periods → neutral score (5.0), not maximum.
+       The signal must earn its score through accumulating real history.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    score_date = score_date or _date.today()
+
+    def _parse(val) -> "_date | None":
+        if val is None:
+            return None
+        if isinstance(val, _date):
+            return val
+        try:
+            return _date.fromisoformat(str(val)[:10])
+        except (ValueError, TypeError):
+            return None
+
+    # ── Step 1: filter to point-in-time safe rows ─────────────────────────────
+    safe: list = []
+    for r in (history_rows or []):
+        pub = _parse(r.get("publication_date"))
+        if pub is not None and pub <= score_date:
+            safe.append(r)
+
+    if not safe:
+        return {"si_persistence_score": 5.0, "si_persistence_count": 0, "si_trend_direction": "unknown"}
+
+    # ── Step 2: deduplicate into distinct reporting periods ───────────────────
+    # Sort chronologically so the gap-rule applies to the earliest available date.
+    def _row_sort_key(r):
+        return _parse(r.get("settlement_date")) or _parse(r.get("publication_date")) or _date.min
+
+    safe_sorted = sorted(safe, key=_row_sort_key)
+
+    distinct: list = []
+    seen_settlements: set = set()
+
+    for row in safe_sorted:
+        s_date = _parse(row.get("settlement_date"))
+        p_date = _parse(row.get("publication_date"))
+
+        if s_date is not None:
+            # True FINRA row: settlement date is the canonical period identifier.
+            if s_date not in seen_settlements:
+                seen_settlements.add(s_date)
+                distinct.append(row)
+        else:
+            # yfinance snapshot: apply the 10-day gap rule to avoid counting
+            # consecutive daily runs as separate FINRA reporting periods.
+            if not distinct:
+                distinct.append(row)
+            else:
+                last_p = _parse(distinct[-1].get("publication_date")) or _date.min
+                if p_date is not None and (p_date - last_p).days >= 10:
+                    distinct.append(row)
+
+    count = len(distinct)
+
+    if count < 2:
+        return {"si_persistence_score": 5.0, "si_persistence_count": count, "si_trend_direction": "unknown"}
+
+    # ── Step 3: extract SI values from distinct periods (oldest → newest) ─────
+    si_vals = [float(r["short_pct_float"]) for r in distinct if r.get("short_pct_float") is not None]
+
+    if not si_vals:
+        return {"si_persistence_score": 5.0, "si_persistence_count": count, "si_trend_direction": "unknown"}
+
+    # ── Step 4: compute trend ─────────────────────────────────────────────────
+    trend = "stable"
+    if len(si_vals) >= 2:
+        delta = si_vals[-1] - si_vals[0]
+        if delta >= 0.05:
+            trend = "rising"
+        elif delta <= -0.05:
+            trend = "falling"
+
+    # ── Step 5: score ─────────────────────────────────────────────────────────
+    if count >= 3 and all(v >= 0.40 for v in si_vals):
+        score = 10.0
+    elif count >= 3 and all(v >= 0.30 for v in si_vals):
+        score = 8.0
+    elif trend == "rising" and count >= 2:
+        score = 7.0
+    elif trend == "falling":
+        score = 3.0
+    else:
+        score = 5.0
+
+    return {
+        "si_persistence_score": score,
+        "si_persistence_count": count,
+        "si_trend_direction": trend,
+    }
+
+
+def _load_si_history(ticker: str, as_of_date: "date | None" = None) -> list:
+    """
+    Load SI history from Supabase for use in score_positioning().
+    Returns empty list on any failure (non-fatal — screener must not crash).
+    """
+    try:
+        from utils.supabase_persist import fetch_short_interest_history
+        return fetch_short_interest_history(ticker, as_of_date=as_of_date)
+    except Exception:
+        return []
+
+
+# ==============================================================================
+# SECTION 3: SIGNAL SCORING
 # ==============================================================================
 # Each scoring function returns: {"score": float, "max": float, "flags": List[str]}
 # Scores are on a 0–10 scale within each function; weights applied in composite.
 
-def score_positioning(data: dict, finviz: dict) -> dict:
+def score_positioning(data: dict, finviz: dict, si_history: list | None = None) -> dict:
     """
     Positioning signals (~45% of composite).
-    - pct_float_short: primary fuel for squeeze
-    - short_pnl_estimate: are shorts already losing? (pressure to cover)
+    - pct_float_short:    primary fuel for squeeze                  weight 0.20
+    - short_pnl_estimate: are shorts already losing?                weight 0.10
+    - si_persistence:     SI elevated across multiple FINRA periods  weight 0.05
+    Total max = 3.5 (same as before Phase 2A).
     """
     score = 0.0
     flags = []
@@ -454,13 +588,10 @@ def score_positioning(data: dict, finviz: dict) -> dict:
         short_pct_score = 1.0
 
     # ── Signal 2: short P&L estimate ─────────────────────────────────────────
-    # If current price > avg_price_60d, shorts who entered in the past 60 days
-    # are on average underwater → adds pressure to cover
     pnl_score = 0.0
     current_price = data.get("price", 0)
     avg_entry = data.get("avg_price_60d", current_price)
     if current_price > 0 and avg_entry > 0:
-        # Positive ratio = shorts are losing (price has risen above avg entry)
         pnl_gap = (current_price - avg_entry) / avg_entry
         if pnl_gap >= 0.30:
             pnl_score = 10.0
@@ -472,19 +603,35 @@ def score_positioning(data: dict, finviz: dict) -> dict:
             pnl_score = 4.0
             flags.append(f"Shorts mildly underwater: +{pnl_gap:.1%} above 60d avg entry")
         elif pnl_gap <= -0.20:
-            # Shorts are comfortable — mild negative signal (they won't cover yet)
             pnl_score = 0.0
             flags.append(f"Shorts profitable: {pnl_gap:.1%} vs 60d avg entry")
         else:
             pnl_score = 1.0
 
-    # Weighted sub-total for positioning group: 20 pts max (short_pct) + 15 pts max (pnl)
-    # We return the component scores for the composite to weight
+    # ── Signal 3: SI persistence across reporting periods ────────────────────
+    persistence = compute_si_persistence_score(si_history or [], short_pct)
+    si_persistence_score = persistence["si_persistence_score"]
+    si_persistence_count = persistence["si_persistence_count"]
+    si_trend = persistence["si_trend_direction"]
+
+    if si_persistence_count >= 3 and si_persistence_score >= 8.0:
+        flags.append(
+            f"SI persistent: {si_persistence_count} reporting periods at high SI "
+            f"(trend: {si_trend})"
+        )
+    elif si_persistence_count >= 2 and si_trend == "rising":
+        flags.append(f"SI rising across {si_persistence_count} periods")
+
+    # Weighted sub-total: 0.20 + 0.10 + 0.05 = max 3.5 (unchanged from Phase 1)
+    # pnl weight reduced from 0.15 → 0.10 to make room for SI persistence (0.05)
     return {
-        "score": short_pct_score * 0.20 + pnl_score * 0.15,
-        "max": 10 * 0.20 + 10 * 0.15,   # 2.0 + 1.5 = 3.5 (scaled to 100 later)
+        "score": short_pct_score * 0.20 + pnl_score * 0.10 + si_persistence_score * 0.05,
+        "max": 10 * 0.20 + 10 * 0.10 + 10 * 0.05,   # 2.0 + 1.0 + 0.5 = 3.5
         "short_pct_score": round(short_pct_score, 2),
         "short_pnl_score": round(pnl_score, 2),
+        "si_persistence_score": round(si_persistence_score, 2),
+        "si_persistence_count": si_persistence_count,
+        "si_trend_direction": si_trend,
         "flags": flags,
         "short_pct": short_pct,
     }
@@ -760,16 +907,58 @@ def estimate_juice_target(short_pct: float, days_to_cover: float, price: float) 
 # SECTION 3: COMPOSITE SCORER
 # ==============================================================================
 
+def _build_si_snapshot(ticker: str, data: dict, sq: "SqueezeScore") -> dict:
+    """
+    Build a short_interest_history record from a just-computed SqueezeScore.
+
+    publication_date = today (when the system first observed these values).
+    settlement_date  = None (yfinance does not expose FINRA settlement dates).
+    source           = "yfinance_snapshot".
+
+    shares_short is computed from SI% × float when not directly available from
+    yfinance (which does not surface sharesShort in the .info dict reliably).
+    """
+    from datetime import date as _date, datetime as _dt
+    today = _date.today().isoformat()
+    float_shares = data.get("float_shares", 0) or 0
+    short_pct = data.get("short_pct_float", 0) or 0
+    shares_short = round(short_pct * float_shares) if (float_shares > 0 and short_pct > 0) else None
+
+    return {
+        "ticker": ticker,
+        "publication_date": today,
+        "settlement_date": None,
+        "snapshot_date": today,
+        "source": "yfinance_snapshot",
+        "source_timestamp": _dt.utcnow().isoformat() + "Z",
+        "shares_short": shares_short,
+        "short_pct_float": short_pct if short_pct > 0 else None,
+        "float_shares": float_shares if float_shares > 0 else None,
+        "avg_volume_30d": data.get("volume_avg_30d"),
+        "computed_dtc_30d": sq.computed_dtc_30d if sq.computed_dtc_30d > 0 else None,
+        "vendor_short_ratio": data.get("short_ratio_dtc"),
+        "data_confidence_score": 0.5,   # yfinance SI has reporting lag and rounding
+    }
+
+
 def compute_squeeze_score(
     ticker: str,
     data: dict,
     finviz: dict,
     ftd_df: pd.DataFrame,
+    si_history: list | None = None,
 ) -> SqueezeScore:
     """
     Compute the full SqueezeScore for a single ticker.
+
+    si_history: pre-fetched rows from short_interest_history. If None the
+    screener will call _load_si_history() to fetch from DB (may be empty on
+    first run — that is expected and handled gracefully).
     """
-    pos = score_positioning(data, finviz)
+    if si_history is None:
+        si_history = _load_si_history(ticker)
+
+    pos = score_positioning(data, finviz, si_history=si_history)
     mech = score_mechanics(data, finviz, ftd_df)
     struct = score_structure(data)
 
@@ -795,6 +984,7 @@ def compute_squeeze_score(
     signal_breakdown = {
         "pct_float_short_score": pos.get("short_pct_score", 0),
         "short_pnl_score": pos.get("short_pnl_score", 0),
+        "si_persistence_score": pos.get("si_persistence_score", 5.0),
         "days_to_cover_score": mech.get("dtc_score", 0),
         "volume_surge_score": mech.get("vol_score", 0),
         "ftd_score": mech.get("ftd_score", 0),
@@ -903,6 +1093,7 @@ def run_screener(
 
     # ── Main scan loop ────────────────────────────────────────────────────────
     results: List[SqueezeScore] = []
+    si_snapshots: List[dict] = []
     total = len(tickers)
 
     for i, ticker in enumerate(tickers):
@@ -920,9 +1111,12 @@ def run_screener(
             finviz = fetch_finviz_data(ticker)
             time.sleep(1.0)   # Finviz rate limit: ~1 req/sec safe
 
-        # 3. Compute score
+        # 3. Compute score (SI history is fetched inside compute_squeeze_score)
         sq = compute_squeeze_score(ticker, data, finviz, ftd_df)
         results.append(sq)
+
+        # 4. Collect SI snapshot for persistence (batch-saved after scan)
+        si_snapshots.append(_build_si_snapshot(ticker, data, sq))
 
         # Brief pause between yfinance .info calls (skipped when bulk history is active)
         if not include_finviz and not _hist_cache:
@@ -930,6 +1124,14 @@ def run_screener(
 
     if verbose:
         print(f"\r  Scan complete: {len(results)} tickers analyzed" + " " * 20)
+
+    # ── Persist SI snapshots (non-fatal if DB unavailable) ───────────────────
+    if si_snapshots:
+        try:
+            from utils.supabase_persist import save_short_interest_history
+            save_short_interest_history(si_snapshots)
+        except Exception as _exc:
+            logger.debug("SI snapshot persistence failed (non-fatal): %s", _exc)
 
     # Sort by chosen key descending
     if sort_by == "ev":

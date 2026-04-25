@@ -5,16 +5,25 @@ Unit tests for Phase 0 + Phase 1 squeeze screener fixes:
   - compression_recovery_score signal (CHUNK-04)
   - vol_score excluded from composite (CHUNK-05)
   - SqueezeScore new fields
+
+Phase 2A additions (CHUNK-02):
+  - compute_si_persistence_score: neutral with no/one history, daily-duplicate
+    deduplication, three-period high score, rising/falling trend detection
+  - Anti-lookahead: future publication_date rows must be filtered out
+  - _build_si_snapshot: field correctness and computed_dtc_30d propagation
 """
 
 import pandas as pd
 import numpy as np
 import pytest
+from datetime import date, timedelta
 
 from squeeze_screener import (
     detect_recent_squeeze,
     score_mechanics,
     score_structure,
+    compute_si_persistence_score,
+    _build_si_snapshot,
     SqueezeScore,
 )
 
@@ -253,3 +262,182 @@ class TestSqueezeScoreNewFields:
         assert d["squeeze_state"] == "active"
         assert d["volume_confirmation_flag"] is True
         assert d["compression_recovery_score"] == 7.0
+
+
+# =============================================================================
+# CHUNK-02: compute_si_persistence_score tests
+# =============================================================================
+
+def _si_row(pub_date, si_pct, settlement_date=None):
+    """Helper: build a minimal short_interest_history-style row."""
+    return {
+        "publication_date": pub_date,
+        "settlement_date": settlement_date,
+        "short_pct_float": si_pct,
+    }
+
+
+class TestSIPersistenceScore:
+
+    # 1. neutral with no history
+    def test_neutral_with_no_history(self):
+        result = compute_si_persistence_score([], latest_short_pct=0.80)
+        assert result["si_persistence_score"] == pytest.approx(5.0)
+        assert result["si_persistence_count"] == 0
+        assert result["si_trend_direction"] == "unknown"
+
+    # 2. neutral with exactly one period (no matter how high SI is)
+    def test_neutral_with_one_period(self):
+        rows = [_si_row("2024-01-15", 0.80)]
+        result = compute_si_persistence_score(rows, 0.80, score_date=date(2024, 2, 1))
+        assert result["si_persistence_score"] == pytest.approx(5.0)
+        assert result["si_persistence_count"] == 1
+        assert result["si_trend_direction"] == "unknown"
+
+    # 3. daily duplicates are collapsed to one distinct period
+    def test_daily_duplicates_count_as_one_period(self):
+        # Three consecutive days — same SI, no settlement_date → 10-day gap rule
+        rows = [
+            _si_row("2024-01-15", 0.80),
+            _si_row("2024-01-16", 0.80),
+            _si_row("2024-01-17", 0.80),
+        ]
+        result = compute_si_persistence_score(rows, 0.80, score_date=date(2024, 2, 1))
+        assert result["si_persistence_count"] == 1
+        assert result["si_persistence_score"] == pytest.approx(5.0)
+
+    # 4. three periods spaced ≥10 days apart with SI > 40% → score 10
+    def test_high_score_for_three_spaced_periods_above_40pct(self):
+        rows = [
+            _si_row("2024-01-01", 0.45),
+            _si_row("2024-01-15", 0.47),
+            _si_row("2024-02-01", 0.50),
+        ]
+        result = compute_si_persistence_score(rows, 0.50, score_date=date(2024, 2, 10))
+        assert result["si_persistence_score"] == pytest.approx(10.0)
+        assert result["si_persistence_count"] == 3
+
+    # 4b. three periods with SI > 30% but not all > 40% → score 8
+    def test_score_8_for_three_spaced_periods_above_30pct(self):
+        rows = [
+            _si_row("2024-01-01", 0.31),
+            _si_row("2024-01-15", 0.33),
+            _si_row("2024-02-01", 0.35),
+        ]
+        result = compute_si_persistence_score(rows, 0.35, score_date=date(2024, 2, 10))
+        assert result["si_persistence_score"] == pytest.approx(8.0)
+
+    # 5. rising trend across 2+ spaced periods → score 7, trend "rising"
+    def test_rising_trend_two_spaced_periods(self):
+        rows = [
+            _si_row("2024-01-01", 0.20),
+            _si_row("2024-01-15", 0.28),  # +8pp → rising
+        ]
+        result = compute_si_persistence_score(rows, 0.28, score_date=date(2024, 2, 1))
+        assert result["si_trend_direction"] == "rising"
+        assert result["si_persistence_score"] == pytest.approx(7.0)
+        assert result["si_persistence_count"] == 2
+
+    # 6. falling trend → score 3, trend "falling"
+    def test_falling_trend_penalizes_score(self):
+        rows = [
+            _si_row("2024-01-01", 0.55),
+            _si_row("2024-01-15", 0.42),  # -13pp → falling
+        ]
+        result = compute_si_persistence_score(rows, 0.42, score_date=date(2024, 2, 1))
+        assert result["si_trend_direction"] == "falling"
+        assert result["si_persistence_score"] == pytest.approx(3.0)
+
+    # 7. anti-lookahead: future rows (pub_date > score_date) must be excluded
+    def test_filters_future_publication_dates(self):
+        score_date = date(2024, 2, 1)
+        rows = [
+            _si_row("2024-01-01", 0.45),            # past — included
+            _si_row("2024-01-15", 0.47),            # past — included
+            _si_row("2024-02-10", 0.55),            # FUTURE — must be excluded
+            _si_row("2024-03-01", 0.60),            # FUTURE — must be excluded
+        ]
+        result = compute_si_persistence_score(rows, 0.47, score_date=score_date)
+        # Only two past rows pass, and they are spaced 14 days apart (≥10)
+        assert result["si_persistence_count"] == 2
+        # Both past rows have SI < 40% but one period is rising → 7 or 5 depending on delta
+        # delta = 0.47 - 0.45 = 0.02 — not enough for "rising" (needs >= 0.05)
+        assert result["si_trend_direction"] == "stable"
+        assert result["si_persistence_score"] == pytest.approx(5.0)
+
+    # 7b. confirm future rows would change the score if NOT filtered
+    def test_future_rows_would_inflate_score_without_filter(self):
+        score_date = date(2024, 2, 1)
+        future_only = [_si_row("2024-02-10", 0.55), _si_row("2024-03-01", 0.60)]
+        result = compute_si_persistence_score(future_only, 0.60, score_date=score_date)
+        # All rows are future → filtered out → neutral
+        assert result["si_persistence_count"] == 0
+        assert result["si_persistence_score"] == pytest.approx(5.0)
+
+    # 8. settlement_date rows each count as distinct periods regardless of gap
+    def test_settlement_date_rows_each_count_once(self):
+        # Three rows with distinct settlement dates on consecutive days — no gap needed
+        rows = [
+            _si_row("2024-01-15", 0.42, settlement_date="2024-01-14"),
+            _si_row("2024-01-16", 0.44, settlement_date="2024-01-28"),
+            _si_row("2024-01-30", 0.46, settlement_date="2024-02-11"),
+        ]
+        result = compute_si_persistence_score(rows, 0.46, score_date=date(2024, 2, 20))
+        assert result["si_persistence_count"] == 3
+        assert result["si_persistence_score"] == pytest.approx(10.0)
+
+
+# =============================================================================
+# CHUNK-02: _build_si_snapshot tests
+# =============================================================================
+
+class TestBuildSiSnapshot:
+
+    def _make_data(self, short_pct, float_shares, avg_vol_30d, short_ratio_dtc):
+        import pandas as pd
+        hist = pd.DataFrame({"Close": [40.0] * 60, "Volume": [1e6] * 60})
+        return {
+            "ticker": "CAR",
+            "short_pct_float": short_pct,
+            "float_shares": float_shares,
+            "volume_avg_30d": avg_vol_30d,
+            "short_ratio_dtc": short_ratio_dtc,
+        }
+
+    def _make_sq(self, computed_dtc_30d):
+        return SqueezeScore(
+            ticker="CAR", final_score=55.0, signal_breakdown={},
+            juice_target=60.0, recent_squeeze=False,
+            computed_dtc_30d=computed_dtc_30d,
+        )
+
+    def test_shares_short_computed_from_pct_and_float(self):
+        # SI=80%, float=10.1M → shares_short ≈ 8,080,000
+        data = self._make_data(0.80, 10_100_000, 840_000, 3.5)
+        sq = self._make_sq(9.619)
+        snap = _build_si_snapshot("CAR", data, sq)
+        assert snap["shares_short"] == pytest.approx(8_080_000, rel=1e-3)
+
+    def test_computed_dtc_propagated_from_squeeze_score(self):
+        data = self._make_data(0.80, 10_100_000, 840_000, 3.5)
+        sq = self._make_sq(9.619)
+        snap = _build_si_snapshot("CAR", data, sq)
+        assert snap["computed_dtc_30d"] == pytest.approx(9.619)
+
+    def test_source_is_yfinance_snapshot(self):
+        data = self._make_data(0.30, 60_000_000, 3_000_000, 2.8)
+        sq = self._make_sq(6.0)
+        snap = _build_si_snapshot("CAR", data, sq)
+        assert snap["source"] == "yfinance_snapshot"
+
+    def test_settlement_date_is_none_for_yfinance(self):
+        data = self._make_data(0.30, 60_000_000, 3_000_000, 2.8)
+        sq = self._make_sq(6.0)
+        snap = _build_si_snapshot("CAR", data, sq)
+        assert snap["settlement_date"] is None
+
+    def test_data_confidence_score_is_conservative(self):
+        data = self._make_data(0.30, 60_000_000, 3_000_000, 2.8)
+        sq = self._make_sq(6.0)
+        snap = _build_si_snapshot("CAR", data, sq)
+        assert snap["data_confidence_score"] == pytest.approx(0.5)

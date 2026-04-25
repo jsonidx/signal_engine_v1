@@ -544,7 +544,156 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
 
 
 # ==============================================================================
-# 7. RED FLAG SCORES
+# 7. SHORT INTEREST HISTORY  (CHUNK-02 / CHUNK-13 Phase 2 slice)
+# ==============================================================================
+
+_SI_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS short_interest_history (
+    ticker                TEXT        NOT NULL,
+    publication_date      DATE        NOT NULL,
+    settlement_date       DATE,
+    snapshot_date         DATE        NOT NULL,
+    source                TEXT        NOT NULL DEFAULT 'yfinance_snapshot',
+    source_timestamp      TIMESTAMPTZ,
+    shares_short          REAL,
+    short_pct_float       REAL,
+    float_shares          REAL,
+    avg_volume_30d        REAL,
+    computed_dtc_30d      REAL,
+    vendor_short_ratio    REAL,
+    data_confidence_score REAL        DEFAULT 0.5,
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (ticker, publication_date, source)
+);
+"""
+
+
+def save_short_interest_history(records: list[dict]) -> None:
+    """
+    Upsert short-interest snapshots into short_interest_history.
+
+    Each record should contain at minimum: ticker, publication_date, source.
+    All other fields are optional and will be stored as NULL if missing.
+
+    Idempotent: repeated calls with the same (ticker, publication_date, source)
+    update the existing row rather than inserting duplicates. This means a daily
+    yfinance run always produces exactly one row per ticker per day, preventing
+    daily repeats from being misread as multiple FINRA reporting periods.
+    """
+    if not records:
+        return
+    try:
+        from datetime import date as _date
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SI_HISTORY_DDL)
+
+        def _v(rec, key):
+            v = rec.get(key)
+            return v if v is not None else None
+
+        rows = []
+        today = _date.today().isoformat()
+        for rec in records:
+            ticker = str(rec.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            publication_date = rec.get("publication_date") or today
+            snapshot_date = rec.get("snapshot_date") or today
+            source = rec.get("source") or "yfinance_snapshot"
+            rows.append((
+                ticker,
+                str(publication_date),
+                str(_v(rec, "settlement_date")) if rec.get("settlement_date") else None,
+                str(snapshot_date),
+                source,
+                _v(rec, "source_timestamp"),
+                _v(rec, "shares_short"),
+                _v(rec, "short_pct_float"),
+                _v(rec, "float_shares"),
+                _v(rec, "avg_volume_30d"),
+                _v(rec, "computed_dtc_30d"),
+                _v(rec, "vendor_short_ratio"),
+                float(rec["data_confidence_score"]) if rec.get("data_confidence_score") is not None else 0.5,
+            ))
+
+        cur.executemany(
+            """
+            INSERT INTO short_interest_history
+                (ticker, publication_date, settlement_date, snapshot_date,
+                 source, source_timestamp, shares_short, short_pct_float,
+                 float_shares, avg_volume_30d, computed_dtc_30d,
+                 vendor_short_ratio, data_confidence_score, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+            ON CONFLICT (ticker, publication_date, source) DO UPDATE SET
+                settlement_date       = EXCLUDED.settlement_date,
+                snapshot_date         = EXCLUDED.snapshot_date,
+                source_timestamp      = EXCLUDED.source_timestamp,
+                shares_short          = EXCLUDED.shares_short,
+                short_pct_float       = EXCLUDED.short_pct_float,
+                float_shares          = EXCLUDED.float_shares,
+                avg_volume_30d        = EXCLUDED.avg_volume_30d,
+                computed_dtc_30d      = EXCLUDED.computed_dtc_30d,
+                vendor_short_ratio    = EXCLUDED.vendor_short_ratio,
+                data_confidence_score = EXCLUDED.data_confidence_score,
+                updated_at            = NOW()
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("short_interest_history: upserted %d records", len(rows))
+    except Exception as exc:
+        logger.warning("save_short_interest_history failed (non-fatal): %s", exc)
+
+
+def fetch_short_interest_history(
+    ticker: str,
+    as_of_date: "date | None" = None,
+    limit: int = 10,
+) -> list[dict]:
+    """
+    Fetch recent short-interest history for a ticker, point-in-time safe.
+
+    Anti-lookahead: returns only rows where publication_date <= as_of_date.
+    If as_of_date is None, uses today (safe for live scoring).
+    Returns empty list on DB failure (non-fatal).
+
+    Results are ordered newest-first so callers can easily inspect the
+    most-recent SI values.
+    """
+    try:
+        from datetime import date as _date
+        cutoff = str(as_of_date or _date.today())
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SI_HISTORY_DDL)
+        cur.execute(
+            """
+            SELECT ticker, publication_date, settlement_date, snapshot_date,
+                   source, shares_short, short_pct_float, float_shares,
+                   avg_volume_30d, computed_dtc_30d, vendor_short_ratio,
+                   data_confidence_score
+            FROM short_interest_history
+            WHERE ticker = %s
+              AND publication_date <= %s
+            ORDER BY publication_date DESC
+            LIMIT %s
+            """,
+            (ticker.upper(), cutoff, limit),
+        )
+        cols = [c.name for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.debug("fetch_short_interest_history(%s) failed: %s", ticker, exc)
+        return []
+
+
+# ==============================================================================
+# 8. RED FLAG SCORES
 # ==============================================================================
 
 _RED_FLAG_DDL = """
