@@ -158,6 +158,8 @@ class SqueezeScore:
     extreme_float_lock_flag: bool = False
     large_holder_concentration_flag: bool = False
     effective_float_confidence: str = "unknown"
+    # CHUNK-14: explanation card
+    explanation: dict = field(default_factory=dict)
 
     @property
     def ev_score(self) -> float:
@@ -175,6 +177,9 @@ class SqueezeScore:
         d["ev_score"] = self.ev_score
         d["signal_breakdown"] = self.signal_breakdown
         d["flags"] = self.flags
+        # Flatten explanation for CSV / Supabase (avoid nested dict in CSV rows)
+        d["explanation_summary"] = self.explanation.get("summary", "") if self.explanation else ""
+        d["explanation_json"] = json.dumps(self.explanation) if self.explanation else "{}"
         return d
 
 
@@ -905,6 +910,339 @@ def detect_recent_squeeze(data: dict, lookback_days: int = 30) -> str:
     return "false"
 
 
+# ==============================================================================
+# SECTION 3.5: EXPLANATION CARDS (CHUNK-14)
+# ==============================================================================
+# Pure, deterministic explanation builder — no LLM, no randomness.
+# Produces structured JSON surfacing why a ticker ranked where it did.
+
+def _expl_driver(
+    key: str, label: str, value, display_value: str, reason: str, strength: float
+) -> dict:
+    return {
+        "key": key,
+        "label": label,
+        "value": value,
+        "display_value": display_value,
+        "reason": reason,
+        "strength": round(float(strength), 2),
+    }
+
+
+def _expl_summary(
+    ticker: str, final_score: float, squeeze_state: str, positive_drivers: list
+) -> str:
+    if squeeze_state == "completed":
+        return f"{ticker}: Squeeze appears completed — score zeroed. Monitor for re-setup."
+    if squeeze_state == "active":
+        return f"{ticker}: Active squeeze in progress — shorts still trapped."
+    quality = "strong" if final_score >= 70 else "moderate" if final_score >= 45 else "weak"
+    if not positive_drivers:
+        return f"{ticker}: {quality.capitalize()} squeeze setup with limited positive signals."
+    top = positive_drivers[0]["label"].lower()
+    if len(positive_drivers) >= 2:
+        second = positive_drivers[1]["label"].lower()
+        return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top} and {second}."
+    return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top}."
+
+
+def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
+    """
+    Build a deterministic, structured explanation for a SqueezeScore.
+
+    Pure function — no I/O, no LLM. The same inputs always produce the same
+    output.  Drivers are ranked by `strength` (0–10) descending.
+
+    Returns a dict suitable for JSON serialization:
+        summary, top_positive_drivers, top_negative_drivers,
+        warning_flags, data_quality_notes, setup_tags
+    """
+    bd = sq.signal_breakdown
+    pos_drivers: list = []
+    neg_drivers: list = []
+    warnings: list = []
+    dq_notes: list = []
+    tags: list = []
+
+    # ── 1. Short interest / positioning ───────────────────────────────────────
+    si_score = float(bd.get("pct_float_short_score", 0.0))
+    si_pct = sq.short_pct_float
+
+    if si_score >= 8.5:
+        pos_drivers.append(_expl_driver(
+            "short_pct_float", "Extreme short interest",
+            si_pct, f"{si_pct:.1%} of float short",
+            "Short interest is above the extreme-risk threshold.", si_score,
+        ))
+    elif si_score >= 7.0:
+        pos_drivers.append(_expl_driver(
+            "short_pct_float", "Very high short interest",
+            si_pct, f"{si_pct:.1%} of float short",
+            "Short interest is in the high-risk zone.", si_score,
+        ))
+    elif si_score >= 5.0:
+        pos_drivers.append(_expl_driver(
+            "short_pct_float", "Elevated short interest",
+            si_pct, f"{si_pct:.1%} of float short",
+            "Short interest is elevated — meaningful short fuel present.", si_score,
+        ))
+    elif si_score <= 2.0:
+        neg_drivers.append(_expl_driver(
+            "short_pct_float", "Low short interest",
+            si_pct, f"{si_pct:.1%} of float short",
+            "Short interest is low — limited squeeze fuel.",
+            max(1.0, 5.0 - si_score),
+        ))
+
+    # ── 2. Days-to-cover / mechanics ──────────────────────────────────────────
+    dtc_score = float(bd.get("days_to_cover_score", 0.0))
+    dtc = sq.computed_dtc_30d or sq.days_to_cover
+
+    if dtc_score >= 8.0:
+        pos_drivers.append(_expl_driver(
+            "computed_dtc_30d", "Very high computed DTC",
+            dtc, f"{dtc:.1f} days to cover",
+            "Float-adjusted DTC indicates shorts are heavily trapped.", dtc_score,
+        ))
+    elif dtc_score >= 6.0:
+        pos_drivers.append(_expl_driver(
+            "computed_dtc_30d", "Elevated DTC",
+            dtc, f"{dtc:.1f} days to cover",
+            "Elevated DTC — shorts face meaningful covering pressure.", dtc_score,
+        ))
+    elif dtc_score <= 2.0 and dtc > 0:
+        neg_drivers.append(_expl_driver(
+            "computed_dtc_30d", "Low days-to-cover",
+            dtc, f"{dtc:.1f} days to cover",
+            "Short covering demand is manageable — low mechanical pressure.",
+            max(1.0, 4.0 - dtc_score),
+        ))
+
+    # ── 3. SI persistence ─────────────────────────────────────────────────────
+    si_persist = float(bd.get("si_persistence_score", 5.0))
+    si_count = int(bd.get("si_persistence_count", 0))
+    si_trend = str(bd.get("si_trend_direction", "unknown"))
+
+    if si_persist >= 9.0:
+        period_str = f"{si_count} periods" if si_count else "multiple periods"
+        pos_drivers.append(_expl_driver(
+            "si_persistence_score", "Persistent extreme short interest",
+            si_persist, f"≥40% SI sustained across {period_str}",
+            "Short interest has been persistently extreme — structural short overhang.",
+            si_persist,
+        ))
+    elif si_persist >= 8.0:
+        period_str = f"{si_count} periods" if si_count else "multiple periods"
+        pos_drivers.append(_expl_driver(
+            "si_persistence_score", "Persistent high short interest",
+            si_persist, f"≥30% SI sustained across {period_str}",
+            "Short interest elevated over multiple FINRA reporting periods.", si_persist,
+        ))
+    elif si_persist >= 7.0 and si_trend == "rising":
+        pos_drivers.append(_expl_driver(
+            "si_persistence_score", "Rising short-interest trend",
+            si_persist, f"SI rising (score: {si_persist:.1f})",
+            "Short sellers are accumulating — rising pressure over time.", si_persist,
+        ))
+    elif si_persist <= 3.0:
+        neg_drivers.append(_expl_driver(
+            "si_persistence_score", "Declining or sparse SI history",
+            si_persist, f"SI persistence score: {si_persist:.1f}",
+            "Short interest is declining or has insufficient history to evaluate.",
+            max(1.0, 6.0 - si_persist),
+        ))
+
+    # ── 4. Compression-recovery ────────────────────────────────────────────────
+    comp_rec = float(bd.get("compression_recovery_score", 0.0))
+
+    if comp_rec >= 9.0:
+        pos_drivers.append(_expl_driver(
+            "compression_recovery_score", "Compression recovery",
+            comp_rec, "Strong compression-recovery pattern",
+            "Deep drawdown followed by recovery — classic coiled-spring setup.", comp_rec,
+        ))
+    elif comp_rec >= 6.0:
+        pos_drivers.append(_expl_driver(
+            "compression_recovery_score", "Compression recovery",
+            comp_rec, "Moderate compression-recovery pattern",
+            "Stock compressed then recovering with significant short interest still in place.",
+            comp_rec,
+        ))
+    elif comp_rec >= 3.0:
+        pos_drivers.append(_expl_driver(
+            "compression_recovery_score", "Early compression recovery",
+            comp_rec, "Early compression-recovery signal",
+            "Early signs of price recovery after a compression phase.", comp_rec,
+        ))
+
+    # ── 5. Effective float ─────────────────────────────────────────────────────
+    ef_score = float(bd.get("effective_float_score", 0.0))
+    ef_ratio = sq.effective_short_float_ratio
+    lh_pct = sq.large_holder_ownership_pct
+
+    if ef_score >= 9.0 or (sq.extreme_float_lock_flag and ef_ratio > 0):
+        pos_drivers.append(_expl_driver(
+            "effective_float_score", "Short interest exceeds effective float",
+            ef_ratio, f"{ef_ratio:.1%} effective SI ratio",
+            f"Shorts exceed freely-tradable supply ({lh_pct:.1f}% held by large holders).",
+            max(ef_score, 9.0),
+        ))
+    elif ef_score >= 6.0 or sq.large_holder_concentration_flag:
+        pos_drivers.append(_expl_driver(
+            "effective_float_score", "Effective float constraint",
+            ef_ratio, f"{lh_pct:.1f}% held by large holders",
+            "Significant large-holder concentration tightens available float.",
+            max(ef_score, 6.0),
+        ))
+
+    # ── 6. Price divergence ────────────────────────────────────────────────────
+    div_score = float(bd.get("price_divergence_score", 0.0))
+
+    if div_score >= 8.0:
+        pos_drivers.append(_expl_driver(
+            "price_divergence_score", "Squeeze ignition signal",
+            div_score, f"Price divergence score: {div_score:.1f}",
+            "Price rising significantly while high SI remains — early ignition detected.",
+            div_score,
+        ))
+    elif div_score >= 6.0:
+        pos_drivers.append(_expl_driver(
+            "price_divergence_score", "Price diverging from short interest",
+            div_score, f"Price divergence score: {div_score:.1f}",
+            "Price rising while shorts remain positioned — building pressure.", div_score,
+        ))
+
+    # ── 7. Volume confirmation ─────────────────────────────────────────────────
+    if sq.volume_confirmation_flag:
+        vol_score = float(bd.get("volume_surge_score", 0.0))
+        pos_drivers.append(_expl_driver(
+            "volume_confirmation_flag", "Volume confirmation",
+            vol_score, f"Volume surge (score: {vol_score:.1f})",
+            "Volume surge with positive price action — squeeze ignition signal.", vol_score,
+        ))
+    else:
+        # Timing note only — not a major negative driver
+        warnings.append({
+            "key": "volume_confirmation_flag",
+            "label": "No volume confirmation yet",
+            "reason": "Volume has not yet surged — potential setup, but catalyst still pending.",
+        })
+
+    # ── 8. Hard-to-borrow ─────────────────────────────────────────────────────
+    ctb_score = float(bd.get("cost_to_borrow_score", 0.0))
+    if ctb_score >= 8.0:
+        pos_drivers.append(_expl_driver(
+            "cost_to_borrow", "Hard-to-borrow",
+            ctb_score, "Hard-to-borrow (HTB)",
+            "Limited borrow supply creates direct covering pressure on shorts.", ctb_score,
+        ))
+
+    # ── 9. Fail-to-delivers ────────────────────────────────────────────────────
+    ftd_score = float(bd.get("ftd_score", 0.0))
+    if ftd_score >= 6.0:
+        pos_drivers.append(_expl_driver(
+            "ftd_score", "Elevated fail-to-delivers",
+            ftd_score, f"FTD score: {ftd_score:.1f}",
+            "High FTD count suggests settlement pressure on short sellers.", ftd_score,
+        ))
+
+    # ── 10. Squeeze state ──────────────────────────────────────────────────────
+    if sq.squeeze_state == "active":
+        pos_drivers.append(_expl_driver(
+            "squeeze_state", "Active squeeze in progress",
+            "active", "Active",
+            "Price has run significantly while SI remains elevated — squeeze is live.", 9.0,
+        ))
+    elif sq.squeeze_state == "completed":
+        neg_drivers.append(_expl_driver(
+            "squeeze_state", "Completed squeeze risk",
+            "completed", "Completed",
+            "Recent price run appears exhausted; score has been zeroed.", 10.0,
+        ))
+
+    # ── 11. Risk warnings (dilution, derivatives) ──────────────────────────────
+    _flag_text = " ".join(sq.flags or []).lower()
+    if any(kw in _flag_text for kw in ("dilut", "424b5", "s-3", "at-the-market", "equity distribution")):
+        warnings.append({
+            "key": "dilution_risk_flag",
+            "label": "Dilution risk",
+            "reason": "Recent SEC filing suggests possible share issuance — may absorb squeeze demand.",
+        })
+    if any(kw in _flag_text for kw in ("derivative", "convertible", "warrant")):
+        warnings.append({
+            "key": "derivative_exposure_flag",
+            "label": "Derivative exposure",
+            "reason": "Potential derivative instruments associated with a large-holder position.",
+        })
+
+    # ── 12. Data quality notes ─────────────────────────────────────────────────
+    if sq.effective_float_confidence == "unknown":
+        dq_notes.append({
+            "key": "effective_float_confidence",
+            "label": "Effective float confidence",
+            "value": "unknown",
+            "reason": "No 13G/13D filing data available; effective float defaults to reported float.",
+        })
+    elif sq.effective_float_confidence == "low":
+        dq_notes.append({
+            "key": "effective_float_confidence",
+            "label": "Effective float confidence",
+            "value": "low",
+            "reason": "Large-holder filing data is sparse; effective float estimate is approximate.",
+        })
+
+    # ── 13. Sort, limit ────────────────────────────────────────────────────────
+    pos_drivers.sort(key=lambda d: d["strength"], reverse=True)
+    neg_drivers.sort(key=lambda d: d["strength"], reverse=True)
+    pos_drivers = pos_drivers[:5]
+    neg_drivers = neg_drivers[:5]
+
+    # ── 14. Setup tags ─────────────────────────────────────────────────────────
+    if sq.squeeze_state == "active":
+        tags.append("ACTIVE_SQUEEZE")
+    elif sq.squeeze_state == "completed":
+        tags.append("COMPLETED_SQUEEZE")
+
+    if sq.short_pct_float >= 0.50:
+        tags.append("EXTREME_SHORT_INTEREST")
+    elif sq.short_pct_float >= 0.30:
+        tags.append("HIGH_SHORT_INTEREST")
+
+    if sq.extreme_float_lock_flag:
+        tags.append("FLOAT_LOCKED")
+    elif sq.large_holder_concentration_flag:
+        tags.append("FLOAT_CONSTRAINED")
+
+    if sq.volume_confirmation_flag:
+        tags.append("VOLUME_CONFIRMED")
+
+    if comp_rec >= 6.0:
+        tags.append("COMPRESSION_RECOVERY")
+
+    if sq.computed_dtc_30d >= 7.0 or dtc_score >= 7.0:
+        tags.append("HIGH_DTC")
+
+    if ctb_score >= 8.0:
+        tags.append("HARD_TO_BORROW")
+
+    if si_persist >= 7.0:
+        tags.append("PERSISTENT_SI")
+
+    if sq.final_score >= 60 and sq.squeeze_state not in ("completed", "active"):
+        tags.append("ARMED")
+
+    summary = _expl_summary(sq.ticker, sq.final_score, sq.squeeze_state, pos_drivers)
+
+    return {
+        "summary": summary,
+        "top_positive_drivers": pos_drivers,
+        "top_negative_drivers": neg_drivers,
+        "warning_flags": warnings,
+        "data_quality_notes": dq_notes,
+        "setup_tags": tags,
+    }
+
+
 def estimate_juice_target(short_pct: float, days_to_cover: float, price: float) -> float:
     """
     Rough estimate of potential squeeze upside (in %).
@@ -1056,6 +1394,8 @@ def compute_squeeze_score(
         "pct_float_short_score": pos.get("short_pct_score", 0),
         "short_pnl_score": pos.get("short_pnl_score", 0),
         "si_persistence_score": pos.get("si_persistence_score", 5.0),
+        "si_persistence_count": pos.get("si_persistence_count", 0),
+        "si_trend_direction": pos.get("si_trend_direction", "unknown"),
         "days_to_cover_score": mech.get("dtc_score", 0),
         "volume_surge_score": mech.get("vol_score", 0),
         "ftd_score": mech.get("ftd_score", 0),
@@ -1078,7 +1418,7 @@ def compute_squeeze_score(
     price = data.get("price", 0)
     juice = estimate_juice_target(short_pct, dtc, price)
 
-    return SqueezeScore(
+    sq = SqueezeScore(
         ticker=ticker,
         final_score=final_score,
         signal_breakdown=signal_breakdown,
@@ -1103,6 +1443,9 @@ def compute_squeeze_score(
         large_holder_concentration_flag=ef_result["large_holder_concentration_flag"],
         effective_float_confidence=ef_result["effective_float_confidence"],
     )
+    # CHUNK-14: build explanation card after all fields are populated
+    sq.explanation = build_squeeze_explanation(sq)
+    return sq
 
 
 # ==============================================================================
@@ -1270,26 +1613,38 @@ def print_results(results: List[SqueezeScore], top_n: int = 20, sort_by: str = "
 
     for r in results[:5]:
         print(f"\n  [{r.ticker}]  Score: {r.final_score:.1f}/100  |  "
-              f"Juice target: ~{r.juice_target:.0f}% upside")
+              f"Juice target: ~{r.juice_target:.0f}% upside  |  "
+              f"EV: {r.ev_score:.1f}")
         print(f"  Price: ${r.price:.2f}  |  Short%: {r.short_pct_float:.1%}  |  "
               f"DTC: {r.days_to_cover:.1f}d  |  "
               f"MktCap: ${r.market_cap_m:.0f}M  |  Float: {r.float_m:.1f}M shrs")
 
-        bd = r.signal_breakdown
-        print(f"  Scores — ShortPct: {bd.get('pct_float_short_score',0):.1f}  "
-              f"PnL: {bd.get('short_pnl_score',0):.1f}  "
-              f"DTC: {bd.get('days_to_cover_score',0):.1f}  "
-              f"Vol: {bd.get('volume_surge_score',0):.1f}  "
-              f"FTD: {bd.get('ftd_score',0):.1f}  "
-              f"CTB: {bd.get('cost_to_borrow_score',0):.1f}  "
-              f"MCap: {bd.get('market_cap_score',0):.1f}  "
-              f"Float: {bd.get('float_score',0):.1f}  "
-              f"Div: {bd.get('price_divergence_score',0):.1f}")
+        expl = r.explanation or {}
+        pos = expl.get("top_positive_drivers", [])
+        neg = expl.get("top_negative_drivers", [])
+        warn = expl.get("warning_flags", [])
+        dq = expl.get("data_quality_notes", [])
+        tags = expl.get("setup_tags", [])
 
-        if r.flags:
-            print(f"  Flags:")
-            for flag in r.flags[:6]:
-                print(f"    • {flag}")
+        if tags:
+            print(f"  Tags: {' · '.join(tags)}")
+
+        if pos:
+            print(f"  Why ranked:")
+            for i, d in enumerate(pos[:3], 1):
+                print(f"    {i}. {d['label']} — {d['display_value']}")
+
+        if neg:
+            print(f"  Negatives:")
+            for d in neg[:2]:
+                print(f"    ✗ {d['label']} — {d['display_value']}")
+
+        if warn or dq:
+            print(f"  Notes:")
+            for w in warn[:2]:
+                print(f"    • {w['label']}: {w['reason']}")
+            for q in dq[:1]:
+                print(f"    • {q['label']}: {q['reason']}")
 
 
 def save_results(results: List[SqueezeScore], output_dir: str = OUTPUT_DIR) -> str:
