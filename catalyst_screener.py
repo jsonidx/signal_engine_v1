@@ -256,8 +256,15 @@ def score_short_squeeze(data: dict) -> dict:
     """
     hist = data["history"]
     short_pct = data["short_pct_float"]
-    dtc = data["short_ratio_dtc"]
     float_shares = data["float_shares"]
+
+    # Self-computed DTC: (SI% × float_shares) / avg_vol_30d
+    # Vendor shortRatio uses shares_outstanding as denominator → underestimates float-adjusted DTC
+    _avg_vol = data.get("volume_avg_30d", data.get("volume_avg_20d", 0)) or 0
+    if float_shares > 0 and short_pct > 0 and _avg_vol > 0:
+        dtc = (short_pct * float_shares) / _avg_vol
+    else:
+        dtc = data.get("short_ratio_dtc", 0) or 0
 
     score = 0
     flags = []

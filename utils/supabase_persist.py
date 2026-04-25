@@ -446,24 +446,28 @@ def save_catalyst_scores(df: Any, run_date: str | None = None) -> None:
 
 _SQUEEZE_DDL = """
 CREATE TABLE IF NOT EXISTS squeeze_scores (
-    date                   TEXT    NOT NULL,
-    ticker                 TEXT    NOT NULL,
-    final_score            REAL,
-    juice_target           REAL,
-    recent_squeeze         BOOLEAN,
-    price                  REAL,
-    short_pct_float        REAL,
-    days_to_cover          REAL,
-    market_cap_m           REAL,
-    ev_score               REAL,
-    pct_float_short_score  REAL,
-    short_pnl_score        REAL,
-    days_to_cover_score    REAL,
-    volume_surge_score     REAL,
-    ftd_score              REAL,
-    market_cap_score       REAL,
-    float_score            REAL,
-    price_divergence_score REAL,
+    date                       TEXT    NOT NULL,
+    ticker                     TEXT    NOT NULL,
+    final_score                REAL,
+    juice_target               REAL,
+    recent_squeeze             BOOLEAN,
+    price                      REAL,
+    short_pct_float            REAL,
+    days_to_cover              REAL,
+    market_cap_m               REAL,
+    ev_score                   REAL,
+    pct_float_short_score      REAL,
+    short_pnl_score            REAL,
+    days_to_cover_score        REAL,
+    volume_surge_score         REAL,
+    ftd_score                  REAL,
+    market_cap_score           REAL,
+    float_score                REAL,
+    price_divergence_score     REAL,
+    computed_dtc_30d           REAL,
+    compression_recovery_score REAL,
+    volume_confirmation_flag   BOOLEAN,
+    squeeze_state              TEXT,
     PRIMARY KEY (date, ticker)
 );
 """
@@ -498,6 +502,9 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 _f(row, "days_to_cover_score"), _f(row, "volume_surge_score"),
                 _f(row, "ftd_score"), _f(row, "market_cap_score"),
                 _f(row, "float_score"), _f(row, "price_divergence_score"),
+                _f(row, "computed_dtc_30d"), _f(row, "compression_recovery_score"),
+                bool(row["volume_confirmation_flag"]) if "volume_confirmation_flag" in row else None,
+                str(row["squeeze_state"]) if "squeeze_state" in row and row["squeeze_state"] is not None else None,
             ))
         cur.executemany(
             """
@@ -506,8 +513,10 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                  short_pct_float, days_to_cover, market_cap_m, ev_score,
                  pct_float_short_score, short_pnl_score, days_to_cover_score,
                  volume_surge_score, ftd_score, market_cap_score,
-                 float_score, price_divergence_score)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 float_score, price_divergence_score,
+                 computed_dtc_30d, compression_recovery_score,
+                 volume_confirmation_flag, squeeze_state)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
                 final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
                 recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
@@ -519,7 +528,11 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 volume_surge_score=EXCLUDED.volume_surge_score,
                 ftd_score=EXCLUDED.ftd_score, market_cap_score=EXCLUDED.market_cap_score,
                 float_score=EXCLUDED.float_score,
-                price_divergence_score=EXCLUDED.price_divergence_score
+                price_divergence_score=EXCLUDED.price_divergence_score,
+                computed_dtc_30d=EXCLUDED.computed_dtc_30d,
+                compression_recovery_score=EXCLUDED.compression_recovery_score,
+                volume_confirmation_flag=EXCLUDED.volume_confirmation_flag,
+                squeeze_state=EXCLUDED.squeeze_state
             """,
             rows,
         )

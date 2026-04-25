@@ -138,7 +138,7 @@ class SqueezeScore:
     final_score: float                          # 0–100  (squeeze probability proxy)
     signal_breakdown: Dict[str, float]          # per-signal raw scores
     juice_target: float                         # estimated % upside if squeezed
-    recent_squeeze: bool                        # True = score zeroed out
+    recent_squeeze: bool                        # True = score zeroed out (completed squeeze)
     price: float = 0.0
     short_pct_float: float = 0.0               # e.g. 0.35 = 35%
     days_to_cover: float = 0.0
@@ -146,6 +146,10 @@ class SqueezeScore:
     float_m: float = 0.0                       # shares, millions
     flags: List[str] = field(default_factory=list)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    computed_dtc_30d: float = 0.0              # float-adjusted DTC: (SI%×float)/avg_vol_30d
+    compression_recovery_score: float = 0.0    # 3-month drawdown + recovery pattern score
+    volume_confirmation_flag: bool = False      # True = volume surge confirming squeeze ignition
+    squeeze_state: str = "false"               # "false" | "active" | "completed"
 
     @property
     def ev_score(self) -> float:
@@ -498,7 +502,16 @@ def score_mechanics(data: dict, finviz: dict, ftd_df: pd.DataFrame) -> dict:
     flags = []
 
     # ── Signal 1: days to cover ───────────────────────────────────────────────
-    dtc = (finviz.get("short_ratio") or data.get("short_ratio_dtc", 0)) or 0.0
+    # Self-computed DTC: (SI% × float_shares) / avg_vol_30d
+    # Vendor shortRatio uses shares_outstanding as denominator → underestimates float-adjusted DTC
+    _float = data.get("float_shares", 0) or 0
+    _si_pct = data.get("short_pct_float", 0) or 0
+    _avg_vol = data.get("volume_avg_30d", 0) or 0
+    if _float > 0 and _si_pct > 0 and _avg_vol > 0:
+        computed_dtc_30d = (_si_pct * _float) / _avg_vol
+    else:
+        computed_dtc_30d = (finviz.get("short_ratio") or data.get("short_ratio_dtc", 0)) or 0.0
+    dtc = computed_dtc_30d
     dtc_score = 0.0
     if dtc >= 10:
         dtc_score = 10.0
@@ -564,9 +577,11 @@ def score_mechanics(data: dict, finviz: dict, ftd_df: pd.DataFrame) -> dict:
         ctb_score = 10.0
         flags.append("Hard-to-borrow (HTB) — limited borrow supply")
 
-    # Weighted sub-total for mechanics group: 15+10+5+5 = 35% max
-    mech_score = dtc_score * 0.15 + vol_score * 0.10 + ftd_score * 0.05 + ctb_score * 0.05
-    mech_max = 10 * 0.15 + 10 * 0.10 + 10 * 0.05 + 10 * 0.05
+    # vol_score excluded from composite — pre-catalyst setups have quiet volume
+    # (volume is an ignition confirmation signal, not a setup prerequisite)
+    mech_score = dtc_score * 0.15 + ftd_score * 0.05 + ctb_score * 0.05
+    mech_max = 10 * 0.15 + 10 * 0.05 + 10 * 0.05
+    volume_confirmation_flag = vol_ratio >= 1.5 and price_5d_chg > 0
 
     return {
         "score": mech_score,
@@ -576,8 +591,10 @@ def score_mechanics(data: dict, finviz: dict, ftd_df: pd.DataFrame) -> dict:
         "ftd_score": round(ftd_score, 2),
         "ctb_score": round(ctb_score, 2),
         "days_to_cover": dtc,
+        "computed_dtc_30d": round(computed_dtc_30d, 2),
         "vol_ratio": round(vol_ratio, 2),
         "ftd_pct": round(ftd_pct, 4),
+        "volume_confirmation_flag": volume_confirmation_flag,
         "flags": flags,
     }
 
@@ -650,8 +667,38 @@ def score_structure(data: dict) -> dict:
             # Shorts winning: negative signal
             flags.append(f"Shorts winning: price down {price_20d:.1%} last 20d")
 
-    struct_score = mc_score * 0.07 + float_score * 0.07 + div_score * 0.06
-    struct_max = 10 * 0.07 + 10 * 0.07 + 10 * 0.06
+    # ── Signal 4: compression-recovery ───────────────────────────────────────
+    # 3-month drawdown followed by recovery, gated on SI ≥ 20%.
+    # CAR-class pattern: stock crushed on macro → shorts pile in → price starts recovering → squeeze.
+    comp_rec_score = 0.0
+    if not hist.empty and len(hist) >= 63:
+        short_pct = data.get("short_pct_float", 0) or 0
+        if short_pct >= 0.20:
+            hist_3m = hist["Close"].iloc[-63:]
+            open_3m = float(hist_3m.iloc[0])
+            low_3m = float(hist_3m.min())
+            current_now = float(hist_3m.iloc[-1])
+            if open_3m > 0 and low_3m > 0:
+                drawdown = (open_3m - low_3m) / open_3m
+                recovery = (current_now / low_3m) - 1
+                if drawdown >= 0.30 and recovery >= 0.15:
+                    comp_rec_score = 10.0
+                    flags.append(
+                        f"Compression-recovery: -{drawdown:.0%} drawdown then +{recovery:.0%} "
+                        f"recovery, SI {short_pct:.0%}"
+                    )
+                elif drawdown >= 0.20 and recovery >= 0.10:
+                    comp_rec_score = 6.0
+                    flags.append(
+                        f"Moderate compression-recovery: -{drawdown:.0%} / +{recovery:.0%}, "
+                        f"SI {short_pct:.0%}"
+                    )
+                elif drawdown >= 0.15 and recovery >= 0.07:
+                    comp_rec_score = 3.0
+                    flags.append(f"Early compression-recovery pattern, SI {short_pct:.0%}")
+
+    struct_score = mc_score * 0.07 + float_score * 0.07 + div_score * 0.06 + comp_rec_score * 0.04
+    struct_max = 10 * 0.07 + 10 * 0.07 + 10 * 0.06 + 10 * 0.04
 
     return {
         "score": struct_score,
@@ -659,30 +706,36 @@ def score_structure(data: dict) -> dict:
         "mc_score": round(mc_score, 2),
         "float_score": round(float_score, 2),
         "div_score": round(div_score, 2),
+        "comp_rec_score": round(comp_rec_score, 2),
         "flags": flags,
     }
 
 
-def detect_recent_squeeze(data: dict, lookback_days: int = 30) -> bool:
+def detect_recent_squeeze(data: dict, lookback_days: int = 30) -> str:
     """
-    Return True if the stock has already squeezed in the recent past.
-    Heuristic: price >50% above its low in the last `lookback_days`.
-    A completed squeeze has lower forward squeeze potential.
+    Return the squeeze state for the recent lookback window.
+
+    Returns:
+        "false"     — no recent squeeze detected
+        "active"    — price ran >50% from low but SI still ≥30% (shorts still trapped)
+        "completed" — price ran >50% from low and SI < 30% (squeeze exhausted, score zeroed)
     """
     hist = data.get("history", pd.DataFrame())
     if hist.empty or len(hist) < lookback_days:
-        return False
+        return "false"
 
     recent = hist["Close"].iloc[-lookback_days:]
-    low = recent.min()
-    high = recent.max()
-    current = hist["Close"].iloc[-1]
+    low = float(recent.min())
+    high = float(recent.max())
+    current = float(hist["Close"].iloc[-1])
 
-    # If the stock ran >50% from recent lows AND has pulled back <20% from high,
-    # the squeeze has likely already occurred.
     if low > 0 and (high / low - 1) >= 0.50 and (current / high) >= 0.80:
-        return True
-    return False
+        short_pct = data.get("short_pct_float", 0) or 0
+        # High SI with elevated price = squeeze still active; shorts remain trapped
+        if short_pct >= 0.30:
+            return "active"
+        return "completed"
+    return "false"
 
 
 def estimate_juice_target(short_pct: float, days_to_cover: float, price: float) -> float:
@@ -720,22 +773,24 @@ def compute_squeeze_score(
     mech = score_mechanics(data, finviz, ftd_df)
     struct = score_structure(data)
 
-    # recent_squeeze: zeroes out final score
-    recent_sq = detect_recent_squeeze(data)
+    # 3-state squeeze detection: "false" | "active" | "completed"
+    squeeze_state = detect_recent_squeeze(data)
+    recent_sq = squeeze_state == "completed"   # backward-compat flag
 
-    # Raw composite: scores are already pre-weighted (max sums to 1.0)
-    # pos.max + mech.max + struct.max = 0.35 + 0.35 + 0.20 = ...
-    # Actually: 3.5 + 3.5 + 2.0 = 9.0 → normalize to 100
+    # Raw composite (normalize to 100)
     raw = pos["score"] + mech["score"] + struct["score"]
     max_raw = pos["max"] + mech["max"] + struct["max"]
     final_score = round((raw / max_raw) * 100, 1) if max_raw > 0 else 0.0
 
-    if recent_sq:
+    # Only zero score on completed squeezes; active squeezes preserve their score
+    if squeeze_state == "completed":
         final_score = 0.0
 
     all_flags = pos["flags"] + mech["flags"] + struct["flags"]
-    if recent_sq:
+    if squeeze_state == "completed":
         all_flags.insert(0, "RECENT SQUEEZE detected — score zeroed out")
+    elif squeeze_state == "active":
+        all_flags.insert(0, "ACTIVE SQUEEZE in progress — SI still elevated, score preserved")
 
     signal_breakdown = {
         "pct_float_short_score": pos.get("short_pct_score", 0),
@@ -747,6 +802,7 @@ def compute_squeeze_score(
         "market_cap_score": struct.get("mc_score", 0),
         "float_score": struct.get("float_score", 0),
         "price_divergence_score": struct.get("div_score", 0),
+        "compression_recovery_score": struct.get("comp_rec_score", 0),
     }
 
     short_pct = pos.get("short_pct", 0)
@@ -766,6 +822,10 @@ def compute_squeeze_score(
         market_cap_m=round(data.get("market_cap", 0) / 1e6, 1) if data.get("market_cap") else 0.0,
         float_m=round(data.get("float_shares", 0) / 1e6, 2) if data.get("float_shares") else 0.0,
         flags=all_flags,
+        computed_dtc_30d=mech.get("computed_dtc_30d", 0.0),
+        compression_recovery_score=struct.get("comp_rec_score", 0.0),
+        volume_confirmation_flag=mech.get("volume_confirmation_flag", False),
+        squeeze_state=squeeze_state,
     )
 
 

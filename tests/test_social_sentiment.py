@@ -525,15 +525,15 @@ class TestPostSqueezeGuard:
 
     def test_guard_fires_when_squeeze_detected(self):
         """
-        Price up >50% from recent low AND still within 20% of high
-        → detect_recent_squeeze returns True.
+        Price up >50% from recent low AND still within 20% of high, low SI
+        → detect_recent_squeeze returns "completed".
         """
         from squeeze_screener import detect_recent_squeeze
 
-        # 30 days: starts at 10, jumps to 20 and holds → >50% run, <20% off high
+        # 30 days: starts at 10, jumps to 20 and holds → >50% run, <20% off high, SI=0 → completed
         prices = [10.0] * 15 + [20.0] * 15
         data = self._make_data_with_history(prices)
-        assert detect_recent_squeeze(data, lookback_days=30) is True
+        assert detect_recent_squeeze(data, lookback_days=30) == "completed"
 
     def test_guard_does_not_fire_for_steady_price(self):
         """Steady price — no squeeze detected."""
@@ -541,7 +541,7 @@ class TestPostSqueezeGuard:
 
         prices = [50.0] * 35
         data = self._make_data_with_history(prices)
-        assert detect_recent_squeeze(data, lookback_days=30) is False
+        assert detect_recent_squeeze(data, lookback_days=30) == "false"
 
     def test_guard_does_not_fire_when_price_pulled_back_sharply(self):
         """
@@ -552,7 +552,7 @@ class TestPostSqueezeGuard:
         # Ran from 10 → 16 → crashed to 9
         prices = [10.0] * 15 + [16.0] * 5 + [9.0] * 10
         data = self._make_data_with_history(prices)
-        assert detect_recent_squeeze(data, lookback_days=30) is False
+        assert detect_recent_squeeze(data, lookback_days=30) == "false"
 
     def test_composite_score_zeroed_when_guard_fires(self, tmp_path):
         """

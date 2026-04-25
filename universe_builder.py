@@ -249,7 +249,7 @@ _SECTOR_MAP: dict = {}
 _QUALITY_CACHE: dict = {}
 
 # Populated by _compute_prescreen_scores — {ticker: set[tag_str]}
-# Tags: "VOL_BREAKOUT", "SQUEEZE_SETUP"
+# Tags: "VOL_BREAKOUT", "VOLATILITY_COMPRESSION"
 # "EARNINGS_WINDOW" is added later by _fetch_earnings_tags()
 _FORCE_TAGS: dict = {}
 
@@ -819,7 +819,7 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
     Side-effects:
       - Populates _QUALITY_CACHE: { ticker: {"atr_pct": float, "beta": float} }
       - Populates _FORCE_TAGS:    { ticker: set[str] } for swing-trade gates
-        Tags written here: "VOL_BREAKOUT", "SQUEEZE_SETUP"
+        Tags written here: "VOL_BREAKOUT", "VOLATILITY_COMPRESSION"
     """
     global _QUALITY_CACHE, _FORCE_TAGS  # noqa: PLW0603
 
@@ -920,7 +920,7 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
             if vr >= FORCE_VOL_RATIO_MIN and ret_5d >= FORCE_PRICE_5D_MIN:
                 tags.add("VOL_BREAKOUT")
 
-        # SQUEEZE_SETUP: Bollinger squeeze + near 52w high
+        # VOLATILITY_COMPRESSION: Bollinger squeeze + near 52w high
         if len(c) >= 55:
             try:
                 sma20  = c.rolling(20).mean()
@@ -930,7 +930,7 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
                     pct = float((bb_w < bb_w.iloc[-1]).mean() * 100)
                     nh  = near_highs.get(t, 0.0)
                     if pct <= FORCE_BB_PERCENTILE and nh >= (1 - FORCE_NEAR_HIGH_PCT):
-                        tags.add("SQUEEZE_SETUP")
+                        tags.add("VOLATILITY_COMPRESSION")
             except Exception:
                 pass
 
@@ -1205,11 +1205,11 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
 
     Pipeline:
       1. Score all tickers with 5-factor composite (also populates _QUALITY_CACHE
-         and _FORCE_TAGS with VOL_BREAKOUT / SQUEEZE_SETUP tags).
+         and _FORCE_TAGS with VOL_BREAKOUT / VOLATILITY_COMPRESSION tags).
       2. Take top top_n by score.
       3. Drop high-volatility / high-beta tickers (ATR%>6 or beta>2) unless protected.
       4. Force-include Tier 1 watchlist tickers and persistent favourites.
-      5. Force-include tickers with VOL_BREAKOUT or SQUEEZE_SETUP tags.
+      5. Force-include tickers with VOL_BREAKOUT or VOLATILITY_COMPRESSION tags.
       6. Run earnings proximity check on "just missed" set → force-include
          any ticker with earnings ≤ FORCE_EARNINGS_DAYS days away.
       7. Save today's top-50 to top50_history.json for streak tracking.
@@ -1248,7 +1248,7 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     # Force-inject protected tickers
     top_set |= protected
 
-    # Force-inject OHLCV-based swing setups (VOL_BREAKOUT, SQUEEZE_SETUP)
+    # Force-inject OHLCV-based swing setups (VOL_BREAKOUT, VOLATILITY_COMPRESSION)
     ohlcv_forced = force_ohlcv - top_set
     if ohlcv_forced:
         top_set |= ohlcv_forced
