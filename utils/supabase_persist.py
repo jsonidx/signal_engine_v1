@@ -983,10 +983,7 @@ def fetch_squeeze_scores_for_replay(
         if tickers:
             placeholders = ",".join(["%s"] * len(tickers))
             query = f"""
-            SELECT date, ticker, final_score, price, short_pct_float,
-                   days_to_cover, computed_dtc_30d, compression_recovery_score,
-                   volume_confirmation_flag, squeeze_state,
-                   explanation_summary, explanation_json
+            SELECT *
             FROM squeeze_scores
             WHERE date >= %s AND date <= %s
               AND ticker IN ({placeholders})
@@ -996,10 +993,7 @@ def fetch_squeeze_scores_for_replay(
             params = [_start, _end] + [t.upper() for t in tickers] + [limit]
         else:
             query = """
-            SELECT date, ticker, final_score, price, short_pct_float,
-                   days_to_cover, computed_dtc_30d, compression_recovery_score,
-                   volume_confirmation_flag, squeeze_state,
-                   explanation_summary, explanation_json
+            SELECT *
             FROM squeeze_scores
             WHERE date >= %s AND date <= %s
             ORDER BY ticker, date
