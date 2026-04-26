@@ -442,7 +442,28 @@ def score_volatility_squeeze(data: dict) -> dict:
     return {"score": score, "max": 6, "flags": flags}
 
 
-def score_options_activity(data: dict) -> dict:
+def _score_iv_rank_for_squeeze(iv_rank: Optional[float]) -> float:
+    """
+    Map IV rank (0–100 scale) to a squeeze-context score (0–10).
+
+    High IV = market is pricing in a significant move, which can confirm
+    squeeze momentum OR indicate crowded positioning.  Used as context only
+    — not added directly to the squeeze final_score.
+    """
+    if iv_rank is None:
+        return 0.0
+    if iv_rank >= 80:
+        return 10.0
+    elif iv_rank >= 60:
+        return 7.0
+    elif iv_rank >= 40:
+        return 5.0
+    elif iv_rank >= 20:
+        return 3.0
+    return 1.0
+
+
+def score_options_activity(data: dict, iv_rank: Optional[float] = None) -> dict:
     """
     Unusual Options Activity.
 
@@ -455,22 +476,41 @@ def score_options_activity(data: dict) -> dict:
     - High call/put ratio (bullish positioning)
     - Unusual volume in near-term OTM calls (speculative bets)
     - Implied volatility skew changes
+
+    CHUNK-09: optional iv_rank (0–100 scale) adds IV context to the output
+    without changing the core score/max values used by catalyst_screener.
     """
     stock_obj = data["stock_obj"]
     score = 0
     flags = []
 
+    # CHUNK-09 tracking variables
+    total_call_vol = 0
+    total_put_vol = 0
+    total_call_oi = 0
+    total_put_oi = 0
+    unusual_call_activity_flag = False
+    options_chain_available = False
+
     try:
         # Get available expiration dates
         expirations = stock_obj.options
         if not expirations:
-            return {"score": 0, "max": 6, "flags": ["No options data available"]}
+            iv_rank_score = _score_iv_rank_for_squeeze(iv_rank)
+            return {
+                "score": 0, "max": 6, "flags": ["No options data available"],
+                "options_pressure_score": 0.0,
+                "iv_rank": iv_rank,
+                "iv_rank_score": iv_rank_score,
+                "iv_data_confidence": "high" if iv_rank is not None else "none",
+                "unusual_call_activity_flag": False,
+                "call_put_volume_ratio": None,
+                "call_put_oi_ratio": None,
+            }
+
+        options_chain_available = True
 
         # Look at nearest 2 expirations
-        total_call_vol = 0
-        total_put_vol = 0
-        total_call_oi = 0
-        total_put_oi = 0
         high_iv_calls = 0
 
         for exp in expirations[:2]:
@@ -513,6 +553,7 @@ def score_options_activity(data: dict) -> dict:
         # OTM call activity
         if high_iv_calls > 0:
             score += 2
+            unusual_call_activity_flag = True
             flags.append(f"Unusual OTM call activity detected")
 
         # Total options volume vs stock volume
@@ -522,10 +563,84 @@ def score_options_activity(data: dict) -> dict:
             score += 1
             flags.append(f"High options/stock volume ratio")
 
-    except Exception as e:
+    except Exception:
         flags.append(f"Options data unavailable")
 
-    return {"score": score, "max": 6, "flags": flags}
+    # CHUNK-09: compute auxiliary output fields
+    iv_rank_score = _score_iv_rank_for_squeeze(iv_rank)
+
+    call_put_volume_ratio = None
+    if total_call_vol > 0 and total_put_vol > 0:
+        call_put_volume_ratio = round(total_call_vol / total_put_vol, 2)
+
+    call_put_oi_ratio = None
+    if total_call_oi > 0 and total_put_oi > 0:
+        call_put_oi_ratio = round(total_call_oi / total_put_oi, 2)
+
+    # options_pressure_score: normalize existing 0-6 activity score to 0-10 scale
+    options_pressure_score = round(min(10.0, (score / 6.0) * 10.0), 1) if score > 0 else 0.0
+
+    if iv_rank is not None and options_chain_available:
+        iv_data_confidence = "high"
+    elif options_chain_available:
+        iv_data_confidence = "low"
+    else:
+        iv_data_confidence = "high" if iv_rank is not None else "none"
+
+    return {
+        "score": score,
+        "max": 6,
+        "flags": flags,
+        # CHUNK-09 extended fields
+        "options_pressure_score": options_pressure_score,
+        "iv_rank": iv_rank,
+        "iv_rank_score": iv_rank_score,
+        "iv_data_confidence": iv_data_confidence,
+        "unusual_call_activity_flag": unusual_call_activity_flag,
+        "call_put_volume_ratio": call_put_volume_ratio,
+        "call_put_oi_ratio": call_put_oi_ratio,
+    }
+
+
+def get_squeeze_options_context(ticker: str, iv_rank: Optional[float] = None) -> dict:
+    """
+    CHUNK-09: Fetch live options chain for *ticker* and return options/IV
+    context fields for the squeeze screener.
+
+    Wraps score_options_activity() with a fresh yf.Ticker so that
+    squeeze_screener.py does not need to pre-build a data dict.
+
+    Returns a neutral result dict on any failure — never raises.
+    Missing options data is non-fatal.
+    """
+    iv_rank_score = _score_iv_rank_for_squeeze(iv_rank)
+    _neutral = {
+        "score": 0,
+        "max": 6,
+        "flags": ["Options data unavailable"],
+        "options_pressure_score": 0.0,
+        "iv_rank": iv_rank,
+        "iv_rank_score": iv_rank_score,
+        "iv_data_confidence": "high" if iv_rank is not None else "none",
+        "unusual_call_activity_flag": False,
+        "call_put_volume_ratio": None,
+        "call_put_oi_ratio": None,
+    }
+    try:
+        stock_obj = yf.Ticker(ticker)
+        hist = stock_obj.history(period="5d")
+        if hist.empty:
+            return _neutral
+        price = float(hist["Close"].iloc[-1])
+        volume_current = float(hist["Volume"].iloc[-1])
+        data = {
+            "stock_obj": stock_obj,
+            "price": price,
+            "volume_current": volume_current,
+        }
+        return score_options_activity(data, iv_rank=iv_rank)
+    except Exception:
+        return _neutral
 
 
 def score_technical_setup(data: dict) -> dict:

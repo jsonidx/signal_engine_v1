@@ -541,3 +541,42 @@ class TestRiskFieldsInSqueezeScore:
         assert sq_clean.final_score == pytest.approx(sq_diluted.final_score)
         # But risk_score must differ
         assert sq_diluted.risk_score > sq_clean.risk_score
+
+
+# ── CHUNK-09: Options/IV fields in SqueezeScore ───────────────────────────────
+
+class TestOptionsIVFieldsInSqueezeScore:
+
+    def test_squeezescore_has_options_iv_fields_with_defaults(self):
+        """SqueezeScore dataclass must have CHUNK-09 fields with neutral defaults."""
+        sq = SqueezeScore(
+            ticker="TEST", final_score=55.0, signal_breakdown={},
+            juice_target=20.0, recent_squeeze=False,
+        )
+        assert hasattr(sq, "options_pressure_score")
+        assert hasattr(sq, "iv_rank")
+        assert hasattr(sq, "iv_rank_score")
+        assert hasattr(sq, "iv_data_confidence")
+        assert hasattr(sq, "unusual_call_activity_flag")
+        assert hasattr(sq, "call_put_volume_ratio")
+        assert hasattr(sq, "call_put_oi_ratio")
+        # Defaults must be neutral (no false penalty)
+        assert sq.options_pressure_score == 0.0
+        assert sq.iv_rank is None
+        assert sq.iv_rank_score == 0.0
+        assert sq.iv_data_confidence == "none"
+        assert sq.unusual_call_activity_flag is False
+
+    def test_options_fields_do_not_affect_final_score(self):
+        """Options fields are contextual only — they must not alter final_score."""
+        sq_no_opts = SqueezeScore(
+            ticker="TEST", final_score=60.0, signal_breakdown={},
+            juice_target=25.0, recent_squeeze=False,
+            options_pressure_score=0.0, iv_rank=None,
+        )
+        sq_with_opts = SqueezeScore(
+            ticker="TEST", final_score=60.0, signal_breakdown={},
+            juice_target=25.0, recent_squeeze=False,
+            options_pressure_score=9.0, iv_rank=85.0, iv_rank_score=10.0,
+        )
+        assert sq_no_opts.final_score == sq_with_opts.final_score

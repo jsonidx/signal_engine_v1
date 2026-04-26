@@ -1274,6 +1274,11 @@ class SqueezeOutcomeReplay:
             "risk_score": snap.get("risk_score"),
             "risk_level": snap.get("risk_level"),
             "dilution_risk_flag": snap.get("dilution_risk_flag"),
+            # CHUNK-09: options/IV fields (gracefully handles old rows that lack them)
+            "options_pressure_score": snap.get("options_pressure_score"),
+            "iv_rank": snap.get("iv_rank"),
+            "iv_rank_score": snap.get("iv_rank_score"),
+            "unusual_call_activity_flag": snap.get("unusual_call_activity_flag"),
         }
 
         # Forward returns
@@ -1369,6 +1374,13 @@ class SqueezeOutcomeReplay:
             metrics["risk_level_counts"] = df["risk_level"].dropna().value_counts().to_dict()
         else:
             metrics["risk_level_counts"] = {}
+
+        # CHUNK-09: optional options-pressure bucket (diagnostic, non-breaking)
+        if "options_pressure_score" in df.columns:
+            _ops = df["options_pressure_score"].dropna()
+            metrics["options_confirmed_count"] = int((_ops >= 7.0).sum())
+        else:
+            metrics["options_confirmed_count"] = 0
 
         return metrics
 

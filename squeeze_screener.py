@@ -171,6 +171,14 @@ class SqueezeScore:
     dilution_risk_flag: bool = False
     latest_dilution_filing_date: Optional[str] = None
     shares_offered_pct_float: Optional[float] = None
+    # CHUNK-09: options/IV context
+    options_pressure_score: float = 0.0
+    iv_rank: Optional[float] = None
+    iv_rank_score: float = 0.0
+    iv_data_confidence: str = "none"
+    unusual_call_activity_flag: bool = False
+    call_put_volume_ratio: Optional[float] = None
+    call_put_oi_ratio: Optional[float] = None
     # CHUNK-14: explanation card
     explanation: dict = field(default_factory=dict)
 
@@ -1243,7 +1251,62 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
                 "reason": "Potential derivative instruments associated with a large-holder position.",
             })
 
-    # ── 12. Data quality notes ─────────────────────────────────────────────────
+    # ── 12. Options / IV context (CHUNK-09) ───────────────────────────────────
+    opts_pressure = float(bd.get("options_pressure_score", 0.0))
+    _iv_rank_val = bd.get("iv_rank")        # 0–100 or None
+    _unusual_call = bool(bd.get("unusual_call_activity_flag", False))
+    _iv_conf = str(bd.get("iv_data_confidence", "none"))
+
+    if opts_pressure >= 7.0:
+        pos_drivers.append(_expl_driver(
+            "options_pressure_score", "Elevated options pressure",
+            opts_pressure, f"Options pressure score: {opts_pressure:.1f}",
+            "Elevated call activity and/or unusual OTM call volume detected.", opts_pressure,
+        ))
+    elif opts_pressure >= 4.0 or _unusual_call:
+        pos_drivers.append(_expl_driver(
+            "options_pressure_score", "Unusual call activity",
+            opts_pressure, f"Unusual call activity (score: {opts_pressure:.1f})",
+            "Elevated OTM call volume may indicate speculative positioning ahead of a move.",
+            max(opts_pressure, 4.0),
+        ))
+
+    if _iv_rank_val is not None:
+        if _iv_rank_val >= 80:
+            warnings.append({
+                "key": "high_iv_rank",
+                "label": "High IV rank",
+                "reason": (
+                    f"IV rank at {_iv_rank_val:.0f}% — options are richly priced; "
+                    "may indicate crowded positioning or elevated event risk."
+                ),
+            })
+        elif _iv_rank_val >= 60:
+            pos_drivers.append(_expl_driver(
+                "iv_rank", "Elevated IV rank",
+                _iv_rank_val, f"IV rank: {_iv_rank_val:.0f}%",
+                "Elevated implied volatility suggests the market is pricing in a significant move.",
+                5.0,
+            ))
+        elif _iv_rank_val < 20:
+            dq_notes.append({
+                "key": "iv_rank",
+                "label": "Compressed IV",
+                "value": _iv_rank_val,
+                "reason": (
+                    f"IV rank at {_iv_rank_val:.0f}% — options are inexpensive, "
+                    "which may provide a favourable risk/reward for call buyers on a confirmed setup."
+                ),
+            })
+    elif _iv_conf == "none":
+        dq_notes.append({
+            "key": "iv_data_confidence",
+            "label": "Options data unavailable",
+            "value": "none",
+            "reason": "No IV history or options chain data available; options context cannot be assessed.",
+        })
+
+    # ── 13. Data quality notes ─────────────────────────────────────────────────
     if sq.effective_float_confidence == "unknown":
         dq_notes.append({
             "key": "effective_float_confidence",
@@ -1259,13 +1322,13 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
             "reason": "Large-holder filing data is sparse; effective float estimate is approximate.",
         })
 
-    # ── 13. Sort, limit ────────────────────────────────────────────────────────
+    # ── 14. Sort, limit ────────────────────────────────────────────────────────
     pos_drivers.sort(key=lambda d: d["strength"], reverse=True)
     neg_drivers.sort(key=lambda d: d["strength"], reverse=True)
     pos_drivers = pos_drivers[:5]
     neg_drivers = neg_drivers[:5]
 
-    # ── 14. Setup tags (CHUNK-10: lifecycle state drives primary tag) ──────────
+    # ── 15. Setup tags (CHUNK-10: lifecycle state drives primary tag) ──────────
     _sq_state_tag = sq.squeeze_state.upper() if sq.squeeze_state else ""
     if _sq_state_tag == "ACTIVE" or sq.squeeze_state == "active":
         tags.append("ACTIVE_SQUEEZE")
@@ -1307,6 +1370,14 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
         tags.append("HIGH_RISK")
     if getattr(sq, "dilution_risk_flag", False):
         tags.append("DILUTION_RISK")
+
+    # CHUNK-09: options/IV tags
+    if opts_pressure >= 7.0:
+        tags.append("OPTIONS_CONFIRMED")
+    elif _unusual_call:
+        tags.append("UNUSUAL_CALL_ACTIVITY")
+    if _iv_rank_val is not None and _iv_rank_val >= 80:
+        tags.append("HIGH_IV_RANK")
 
     summary = _expl_summary(
         sq.ticker, sq.final_score, sq.squeeze_state, pos_drivers,
@@ -1508,6 +1579,13 @@ def compute_squeeze_score(
         price_extension_pct=_price_ext if _price_ext > 0 else None,
     )
 
+    # ── CHUNK-09: options / IV context ────────────────────────────────────────
+    from utils.supabase_persist import fetch_latest_iv_rank as _fetch_iv_rank
+    from catalyst_screener import get_squeeze_options_context as _get_opts_ctx
+    _iv_data = _fetch_iv_rank(ticker)
+    _iv_rank_val = _iv_data.get("iv_rank") if _iv_data else None
+    _opts = _get_opts_ctx(ticker, iv_rank=_iv_rank_val)
+
     signal_breakdown = {
         "pct_float_short_score": pos.get("short_pct_score", 0),
         "short_pnl_score": pos.get("short_pnl_score", 0),
@@ -1536,6 +1614,14 @@ def compute_squeeze_score(
         "risk_score": _risk["risk_score"],
         "risk_level": _risk["risk_level"],
         "dilution_risk_flag": float(_dilution_info["dilution_risk_flag"]),
+        # CHUNK-09 options/IV context
+        "options_pressure_score": _opts["options_pressure_score"],
+        "iv_rank": _opts.get("iv_rank"),
+        "iv_rank_score": _opts["iv_rank_score"],
+        "iv_data_confidence": _opts.get("iv_data_confidence", "none"),
+        "unusual_call_activity_flag": float(_opts.get("unusual_call_activity_flag", False)),
+        "call_put_volume_ratio": _opts.get("call_put_volume_ratio"),
+        "call_put_oi_ratio": _opts.get("call_put_oi_ratio"),
     }
 
     short_pct = pos.get("short_pct", 0)
@@ -1583,6 +1669,14 @@ def compute_squeeze_score(
             if _dilution_info["latest_dilution_filing_date"] else None
         ),
         shares_offered_pct_float=_dilution_info["shares_offered_pct_float"],
+        # CHUNK-09 options/IV context
+        options_pressure_score=_opts["options_pressure_score"],
+        iv_rank=_opts.get("iv_rank"),
+        iv_rank_score=_opts["iv_rank_score"],
+        iv_data_confidence=_opts.get("iv_data_confidence", "none"),
+        unusual_call_activity_flag=bool(_opts.get("unusual_call_activity_flag", False)),
+        call_put_volume_ratio=_opts.get("call_put_volume_ratio"),
+        call_put_oi_ratio=_opts.get("call_put_oi_ratio"),
     )
     # CHUNK-14: build explanation card after all fields are populated
     sq.explanation = build_squeeze_explanation(sq)

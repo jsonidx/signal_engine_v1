@@ -491,6 +491,14 @@ _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS dilution_risk_flag BOOLEAN;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS latest_dilution_filing_date TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS shares_offered_pct_float REAL;",
+    # CHUNK-09: options/IV context columns
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS options_pressure_score REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS iv_rank REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS iv_rank_score REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS iv_data_confidence TEXT;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS unusual_call_activity_flag BOOLEAN;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS call_put_volume_ratio REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS call_put_oi_ratio REAL;",
 ]
 
 def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
@@ -566,6 +574,14 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 bool(row["dilution_risk_flag"]) if "dilution_risk_flag" in row and row["dilution_risk_flag"] is not None else None,
                 str(row["latest_dilution_filing_date"]) if row.get("latest_dilution_filing_date") else None,
                 _f(row, "shares_offered_pct_float"),
+                # CHUNK-09: options/IV context
+                _f(row, "options_pressure_score"),
+                _f(row, "iv_rank"),
+                _f(row, "iv_rank_score"),
+                str(row["iv_data_confidence"]) if row.get("iv_data_confidence") else None,
+                bool(row["unusual_call_activity_flag"]) if "unusual_call_activity_flag" in row and row["unusual_call_activity_flag"] is not None else None,
+                _f(row, "call_put_volume_ratio"),
+                _f(row, "call_put_oi_ratio"),
             ))
         cur.executemany(
             """
@@ -580,8 +596,10 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                  explanation_summary, explanation_json,
                  state_confidence, state_reasons, state_warnings,
                  risk_score, risk_level, risk_flags, risk_warnings, risk_components,
-                 dilution_risk_flag, latest_dilution_filing_date, shares_offered_pct_float)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 dilution_risk_flag, latest_dilution_filing_date, shares_offered_pct_float,
+                 options_pressure_score, iv_rank, iv_rank_score, iv_data_confidence,
+                 unusual_call_activity_flag, call_put_volume_ratio, call_put_oi_ratio)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
                 final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
                 recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
@@ -610,7 +628,14 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 risk_components=EXCLUDED.risk_components,
                 dilution_risk_flag=EXCLUDED.dilution_risk_flag,
                 latest_dilution_filing_date=EXCLUDED.latest_dilution_filing_date,
-                shares_offered_pct_float=EXCLUDED.shares_offered_pct_float
+                shares_offered_pct_float=EXCLUDED.shares_offered_pct_float,
+                options_pressure_score=EXCLUDED.options_pressure_score,
+                iv_rank=EXCLUDED.iv_rank,
+                iv_rank_score=EXCLUDED.iv_rank_score,
+                iv_data_confidence=EXCLUDED.iv_data_confidence,
+                unusual_call_activity_flag=EXCLUDED.unusual_call_activity_flag,
+                call_put_volume_ratio=EXCLUDED.call_put_volume_ratio,
+                call_put_oi_ratio=EXCLUDED.call_put_oi_ratio
             """,
             rows,
         )
@@ -1294,3 +1319,89 @@ def save_catalyst_history(history: dict, run_date: str | None = None) -> None:
         logger.info("catalyst_history: upserted %d rows", len(rows))
     except Exception as exc:
         logger.warning("save_catalyst_history failed (non-fatal): %s", exc)
+
+
+# ==============================================================================
+# 10. IV RANK READ HELPER  (CHUNK-09)
+# ==============================================================================
+
+def fetch_latest_iv_rank(
+    ticker: str,
+    as_of_date: "date | str | None" = None,
+    lookback_days: int = 252,
+    min_history: int = 5,
+) -> "dict | None":
+    """
+    CHUNK-09: Read-only IV rank helper for squeeze_screener integration.
+
+    Queries iv_history for the past *lookback_days* rows (up to *as_of_date*
+    for point-in-time safety), computes IV rank as
+        (latest_iv30 − min_iv30) / (max_iv30 − min_iv30)
+    and returns a context dict.
+
+    Returns None when fewer than *min_history* rows exist (insufficient
+    history — not an error) or on any DB error.
+
+    Parameters
+    ----------
+    ticker        : equity ticker, case-insensitive
+    as_of_date    : upper bound on the date column; defaults to today
+    lookback_days : history window (default 252 trading days ≈ 1 year)
+    min_history   : minimum rows required before returning a rank
+    """
+    try:
+        from utils.db import managed_connection
+
+        ticker = ticker.upper().strip()
+        if as_of_date is not None:
+            cutoff = as_of_date.isoformat() if hasattr(as_of_date, "isoformat") else str(as_of_date)
+            query = """
+                SELECT iv30, date FROM iv_history
+                WHERE ticker = %s AND date <= %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (ticker, cutoff, lookback_days)
+        else:
+            query = """
+                SELECT iv30, date FROM iv_history
+                WHERE ticker = %s
+                ORDER BY date DESC
+                LIMIT %s
+            """
+            params = (ticker, lookback_days)
+
+        with managed_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(query, params)
+            db_rows = cur.fetchall()
+
+        if not db_rows or len(db_rows) < min_history:
+            return None
+
+        values = [float(r["iv30"]) for r in db_rows if r.get("iv30") is not None]
+        if len(values) < min_history:
+            return None
+
+        current_iv = values[0]
+        min_iv = min(values)
+        max_iv = max(values)
+
+        if max_iv > min_iv:
+            iv_rank = (current_iv - min_iv) / (max_iv - min_iv)
+            iv_rank = max(0.0, min(1.0, iv_rank))
+        else:
+            iv_rank = 0.5  # degenerate: all stored IVs identical
+
+        latest_date = db_rows[0]["date"]
+
+        return {
+            "iv_rank": round(iv_rank * 100.0, 1),  # 0–100 scale
+            "iv30": round(current_iv, 4),
+            "date": str(latest_date),
+            "history_count": len(values),
+        }
+
+    except Exception as exc:
+        logger.debug("fetch_latest_iv_rank(%s) failed: %s", ticker, exc)
+        return None

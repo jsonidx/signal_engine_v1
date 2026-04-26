@@ -393,14 +393,16 @@ class TestOutputPersistence:
         executemany_call = mock_cur.executemany.call_args
         assert executemany_call is not None
 
-        # The rows tuple must have 35 elements:
+        # The rows tuple must have 42 elements:
         # 22 original + explanation_summary + explanation_json (CHUNK-14)
         # + state_confidence + state_reasons + state_warnings (CHUNK-10)
         # + risk_score + risk_level + risk_flags + risk_warnings + risk_components
         #   + dilution_risk_flag + latest_dilution_filing_date + shares_offered_pct_float (CHUNK-16)
+        # + options_pressure_score + iv_rank + iv_rank_score + iv_data_confidence
+        #   + unusual_call_activity_flag + call_put_volume_ratio + call_put_oi_ratio (CHUNK-09)
         rows_arg = executemany_call[0][1]
         assert len(rows_arg) == 1
-        assert len(rows_arg[0]) == 35
+        assert len(rows_arg[0]) == 42
 
         # explanation_summary at index 22 should be a non-empty string
         assert isinstance(rows_arg[0][22], str)
@@ -513,3 +515,57 @@ class TestRiskWarningsInExplanation:
         result = build_squeeze_explanation(sq)
         assert "HIGH_RISK" not in result["setup_tags"]
         assert "EXTREME_RISK" not in result["setup_tags"]
+
+
+# ── CHUNK-09: Options/IV context in explanation ───────────────────────────────
+
+class TestOptionsIVInExplanation:
+
+    def test_high_options_pressure_surfaces_in_positive_drivers(self):
+        sq = _make_sq()
+        sq.signal_breakdown["options_pressure_score"] = 8.0
+        sq.signal_breakdown["iv_rank"] = 50.0
+        sq.signal_breakdown["iv_data_confidence"] = "high"
+        sq.signal_breakdown["unusual_call_activity_flag"] = False
+        result = build_squeeze_explanation(sq)
+        keys = [d["key"] for d in result["top_positive_drivers"]]
+        assert "options_pressure_score" in keys
+
+    def test_unusual_call_activity_flag_surfaces_in_positive_drivers(self):
+        sq = _make_sq()
+        sq.signal_breakdown["options_pressure_score"] = 3.0
+        sq.signal_breakdown["iv_rank"] = None
+        sq.signal_breakdown["iv_data_confidence"] = "none"
+        sq.signal_breakdown["unusual_call_activity_flag"] = True
+        result = build_squeeze_explanation(sq)
+        keys = [d["key"] for d in result["top_positive_drivers"]]
+        assert "options_pressure_score" in keys
+
+    def test_iv_rank_above_80_surfaces_as_warning(self):
+        sq = _make_sq()
+        sq.signal_breakdown["options_pressure_score"] = 0.0
+        sq.signal_breakdown["iv_rank"] = 85.0
+        sq.signal_breakdown["iv_data_confidence"] = "high"
+        sq.signal_breakdown["unusual_call_activity_flag"] = False
+        result = build_squeeze_explanation(sq)
+        warning_keys = [w["key"] for w in result["warning_flags"]]
+        assert "high_iv_rank" in warning_keys
+
+    def test_missing_iv_data_surfaces_as_dq_note(self):
+        sq = _make_sq()
+        sq.signal_breakdown["options_pressure_score"] = 0.0
+        sq.signal_breakdown["iv_rank"] = None
+        sq.signal_breakdown["iv_data_confidence"] = "none"
+        sq.signal_breakdown["unusual_call_activity_flag"] = False
+        result = build_squeeze_explanation(sq)
+        dq_keys = [n["key"] for n in result["data_quality_notes"]]
+        assert "iv_data_confidence" in dq_keys
+
+    def test_options_confirmed_tag_when_pressure_high(self):
+        sq = _make_sq()
+        sq.signal_breakdown["options_pressure_score"] = 7.5
+        sq.signal_breakdown["iv_rank"] = 55.0
+        sq.signal_breakdown["iv_data_confidence"] = "high"
+        sq.signal_breakdown["unusual_call_activity_flag"] = False
+        result = build_squeeze_explanation(sq)
+        assert "OPTIONS_CONFIRMED" in result["setup_tags"]
