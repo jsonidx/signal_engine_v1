@@ -104,7 +104,8 @@ def query_json_fields(cur, run_date):
 def query_gate_metrics(cur):
     metrics = {}
 
-    cur.execute(f"SELECT COUNT(DISTINCT date) AS n FROM squeeze_scores WHERE date > '{FIX_COMMIT_DATE}'")
+    # Days with post-fix (non-null squeeze_state) rows — catches same-day fix+run
+    cur.execute("SELECT COUNT(DISTINCT date) AS n FROM squeeze_scores WHERE squeeze_state IS NOT NULL")
     metrics["post_fix_days"] = cur.fetchone()["n"]
 
     cur.execute("SELECT COUNT(*) AS n FROM squeeze_scores WHERE squeeze_state IS NOT NULL")
@@ -167,23 +168,27 @@ def run_compile():
 
 
 def determine_verdict(latest_date, coverage, total):
-    if latest_date is None or latest_date <= FIX_COMMIT_DATE:
-        return "PARTIAL", "No post-fix pipeline run yet"
-
-    if total == 0:
-        return "PARTIAL", "Latest run has 0 rows"
+    if latest_date is None or total == 0:
+        return "PARTIAL", "No squeeze_scores rows found"
 
     squeeze_state_pct = coverage.get("squeeze_state", 0) / total
     risk_score_pct = coverage.get("risk_score", 0) / total
     explanation_json_pct = coverage.get("explanation_json", 0) / total
 
+    # Coverage-first: if CHUNK fields are populated the fix is working regardless
+    # of whether the run date is the same calendar day as the fix commit
     if (squeeze_state_pct >= PASS_THRESHOLD
             and risk_score_pct >= PASS_THRESHOLD
             and explanation_json_pct >= PASS_THRESHOLD):
         return "PASS", f"squeeze_state {squeeze_state_pct:.0%} / risk_score {risk_score_pct:.0%} / explanation_json {explanation_json_pct:.0%}"
 
+    # All zeros on an old-format run — expected pre-fix state
+    if squeeze_state_pct == 0 and risk_score_pct == 0 and latest_date <= FIX_COMMIT_DATE:
+        return "PARTIAL", f"No post-fix pipeline run yet (latest run {latest_date} is pre-fix)"
+
+    # Post-fix run exists but fields still null — real failure
     if squeeze_state_pct == 0 and risk_score_pct == 0:
-        return "FAIL", f"Post-fix rows exist but squeeze_state and risk_score are 0% non-null — check squeeze_screener.py → save_squeeze_scores() payload"
+        return "FAIL", "Post-fix rows exist but squeeze_state and risk_score are 0% non-null — check squeeze_screener.py → save_squeeze_scores() payload"
 
     return "PARTIAL", f"squeeze_state {squeeze_state_pct:.0%} / risk_score {risk_score_pct:.0%} / explanation_json {explanation_json_pct:.0%}"
 
