@@ -393,10 +393,12 @@ class TestOutputPersistence:
         executemany_call = mock_cur.executemany.call_args
         assert executemany_call is not None
 
-        # The rows tuple must have 24 elements (22 original + 2 explanation)
+        # The rows tuple must have 27 elements:
+        # 22 original + explanation_summary + explanation_json (CHUNK-14)
+        # + state_confidence + state_reasons + state_warnings (CHUNK-10)
         rows_arg = executemany_call[0][1]
         assert len(rows_arg) == 1
-        assert len(rows_arg[0]) == 24  # 22 original + explanation_summary + explanation_json
+        assert len(rows_arg[0]) == 27
 
         # explanation_summary at index 22 should be a non-empty string
         assert isinstance(rows_arg[0][22], str)
@@ -416,7 +418,8 @@ class TestSetupTags:
         assert "HIGH_SHORT_INTEREST" in result["setup_tags"]
 
     def test_armed_tag_for_high_score(self):
-        sq = _make_sq(final_score=65.0, squeeze_state="false")
+        # CHUNK-10: ARMED tag is driven by lifecycle state == "ARMED"
+        sq = _make_sq(final_score=65.0, squeeze_state="ARMED")
         result = build_squeeze_explanation(sq)
         assert "ARMED" in result["setup_tags"]
 
@@ -430,3 +433,37 @@ class TestSetupTags:
         sq = _make_sq(extreme_float_lock_flag=True)
         result = build_squeeze_explanation(sq)
         assert "FLOAT_LOCKED" in result["setup_tags"]
+
+
+# ── CHUNK-10: explanation uses lifecycle state ────────────────────────────────
+
+class TestLifecycleStateInExplanation:
+
+    def test_active_state_yields_active_squeeze_tag(self):
+        sq = _make_sq(squeeze_state="ACTIVE", short_pct_float=0.40)
+        result = build_squeeze_explanation(sq)
+        assert "ACTIVE_SQUEEZE" in result["setup_tags"]
+        assert "ARMED" not in result["setup_tags"]
+
+    def test_armed_state_yields_armed_tag(self):
+        sq = _make_sq(squeeze_state="ARMED", final_score=65.0)
+        result = build_squeeze_explanation(sq)
+        assert "ARMED" in result["setup_tags"]
+        assert "ACTIVE_SQUEEZE" not in result["setup_tags"]
+
+    def test_not_setup_state_yields_no_primary_lifecycle_tag(self):
+        sq = _make_sq(squeeze_state="NOT_SETUP", final_score=20.0)
+        result = build_squeeze_explanation(sq)
+        assert "ACTIVE_SQUEEZE" not in result["setup_tags"]
+        assert "ARMED" not in result["setup_tags"]
+
+    def test_active_state_produces_active_squeeze_positive_driver(self):
+        sq = _make_sq(squeeze_state="ACTIVE")
+        result = build_squeeze_explanation(sq)
+        driver_keys = [d["key"] for d in result["top_positive_drivers"]]
+        assert "squeeze_state" in driver_keys
+
+    def test_recent_squeeze_completed_produces_completed_squeeze_tag(self):
+        sq = _make_sq(squeeze_state="NOT_SETUP", final_score=0.0, recent_squeeze=True)
+        result = build_squeeze_explanation(sq)
+        assert "COMPLETED_SQUEEZE" in result["setup_tags"]

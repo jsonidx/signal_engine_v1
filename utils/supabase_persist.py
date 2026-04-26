@@ -474,10 +474,14 @@ CREATE TABLE IF NOT EXISTS squeeze_scores (
 );
 """
 
-# Idempotent migration: adds CHUNK-14 columns to tables created before this chunk.
+# Idempotent migrations: add columns introduced in CHUNK-14 and CHUNK-10.
 _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_summary TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_json JSONB;",
+    # CHUNK-10: lifecycle metadata columns
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_confidence TEXT;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_reasons JSONB;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_warnings JSONB;",
 ]
 
 def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
@@ -511,6 +515,15 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
             s = str(v).strip()
             return s if s not in ("", "{}") else None
 
+        def _lifecycle_json(row, col):
+            v = row.get(col)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+            if isinstance(v, list):
+                return _json.dumps(v)
+            s = str(v).strip()
+            return s if s not in ("", "[]") else None
+
         rows = []
         for _, row in df.iterrows():
             ticker = str(row.get("ticker", "")).strip().upper()
@@ -531,6 +544,10 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 str(row["squeeze_state"]) if "squeeze_state" in row and row["squeeze_state"] is not None else None,
                 str(row["explanation_summary"]) if row.get("explanation_summary") else None,
                 _explanation_json(row),
+                # CHUNK-10: lifecycle metadata
+                str(row["state_confidence"]) if row.get("state_confidence") else None,
+                _lifecycle_json(row, "state_reasons"),
+                _lifecycle_json(row, "state_warnings"),
             ))
         cur.executemany(
             """
@@ -542,8 +559,9 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                  float_score, price_divergence_score,
                  computed_dtc_30d, compression_recovery_score,
                  volume_confirmation_flag, squeeze_state,
-                 explanation_summary, explanation_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 explanation_summary, explanation_json,
+                 state_confidence, state_reasons, state_warnings)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
                 final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
                 recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
@@ -561,7 +579,10 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 volume_confirmation_flag=EXCLUDED.volume_confirmation_flag,
                 squeeze_state=EXCLUDED.squeeze_state,
                 explanation_summary=EXCLUDED.explanation_summary,
-                explanation_json=EXCLUDED.explanation_json
+                explanation_json=EXCLUDED.explanation_json,
+                state_confidence=EXCLUDED.state_confidence,
+                state_reasons=EXCLUDED.state_reasons,
+                state_warnings=EXCLUDED.state_warnings
             """,
             rows,
         )

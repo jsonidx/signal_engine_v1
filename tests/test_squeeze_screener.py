@@ -441,3 +441,47 @@ class TestBuildSiSnapshot:
         sq = self._make_sq(6.0)
         snap = _build_si_snapshot("CAR", data, sq)
         assert snap["data_confidence_score"] == pytest.approx(0.5)
+
+
+# ── CHUNK-10: lifecycle state integration ─────────────────────────────────────
+
+class TestLifecycleStateInSqueezeScore:
+
+    def test_squeeze_score_contains_squeeze_state_field(self):
+        """compute_squeeze_score must populate squeeze_state with a lifecycle value."""
+        from squeeze_screener import compute_squeeze_score
+        from unittest.mock import patch
+
+        data = _flat_data(short_pct_float=0.35)
+        with patch("squeeze_screener._load_filing_catalysts", return_value=[]):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                           si_history=[], filing_catalysts=[])
+
+        assert sq.squeeze_state in ("NOT_SETUP", "ARMED", "ACTIVE")
+
+    def test_squeeze_score_contains_state_confidence(self):
+        from squeeze_screener import compute_squeeze_score
+        from unittest.mock import patch
+
+        data = _flat_data(short_pct_float=0.35)
+        with patch("squeeze_screener._load_filing_catalysts", return_value=[]):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                           si_history=[], filing_catalysts=[])
+
+        assert sq.state_confidence in ("low", "medium", "high")
+        assert isinstance(sq.state_reasons, list)
+        assert isinstance(sq.state_warnings, list)
+
+    def test_low_si_ticker_is_not_setup(self):
+        from squeeze_screener import compute_squeeze_score
+        from unittest.mock import patch
+
+        data = _flat_data(short_pct_float=0.05)
+        with patch("squeeze_screener._load_filing_catalysts", return_value=[]):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                           si_history=[], filing_catalysts=[])
+
+        assert sq.squeeze_state == "NOT_SETUP"

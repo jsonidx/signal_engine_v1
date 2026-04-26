@@ -158,6 +158,10 @@ class SqueezeScore:
     extreme_float_lock_flag: bool = False
     large_holder_concentration_flag: bool = False
     effective_float_confidence: str = "unknown"
+    # CHUNK-10: lifecycle state metadata
+    state_confidence: str = "low"
+    state_reasons: List[str] = field(default_factory=list)
+    state_warnings: List[str] = field(default_factory=list)
     # CHUNK-14: explanation card
     explanation: dict = field(default_factory=dict)
 
@@ -180,6 +184,9 @@ class SqueezeScore:
         # Flatten explanation for CSV / Supabase (avoid nested dict in CSV rows)
         d["explanation_summary"] = self.explanation.get("summary", "") if self.explanation else ""
         d["explanation_json"] = json.dumps(self.explanation) if self.explanation else "{}"
+        # CHUNK-10: flatten lifecycle metadata for CSV/Supabase
+        d["state_reasons"] = json.dumps(self.state_reasons) if self.state_reasons else "[]"
+        d["state_warnings"] = json.dumps(self.state_warnings) if self.state_warnings else "[]"
         return d
 
 
@@ -930,12 +937,21 @@ def _expl_driver(
 
 
 def _expl_summary(
-    ticker: str, final_score: float, squeeze_state: str, positive_drivers: list
+    ticker: str, final_score: float, squeeze_state: str, positive_drivers: list,
+    recent_squeeze: bool = False,
 ) -> str:
-    if squeeze_state == "completed":
-        return f"{ticker}: Squeeze appears completed — score zeroed. Monitor for re-setup."
-    if squeeze_state == "active":
+    # CHUNK-10: use new lifecycle state values; fall back gracefully for old "completed"/"active"
+    _state = squeeze_state.upper() if squeeze_state else ""
+    if _state == "ACTIVE" or squeeze_state == "active":
         return f"{ticker}: Active squeeze in progress — shorts still trapped."
+    if recent_squeeze or squeeze_state == "completed":
+        return f"{ticker}: Squeeze appears completed — score zeroed. Monitor for re-setup."
+    if _state == "ARMED":
+        quality = "strong" if final_score >= 70 else "moderate"
+        if not positive_drivers:
+            return f"{ticker}: Armed squeeze setup — structural preconditions met, catalyst pending."
+        top = positive_drivers[0]["label"].lower()
+        return f"{ticker}: {quality.capitalize()} armed squeeze setup — {top} is the lead driver."
     quality = "strong" if final_score >= 70 else "moderate" if final_score >= 45 else "weak"
     if not positive_drivers:
         return f"{ticker}: {quality.capitalize()} squeeze setup with limited positive signals."
@@ -1146,14 +1162,16 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
             "High FTD count suggests settlement pressure on short sellers.", ftd_score,
         ))
 
-    # ── 10. Squeeze state ──────────────────────────────────────────────────────
-    if sq.squeeze_state == "active":
+    # ── 10. Squeeze state (CHUNK-10: uses new lifecycle state values) ──────────
+    _sq_state = sq.squeeze_state.upper() if sq.squeeze_state else ""
+    if _sq_state == "ACTIVE" or sq.squeeze_state == "active":
         pos_drivers.append(_expl_driver(
             "squeeze_state", "Active squeeze in progress",
-            "active", "Active",
+            sq.squeeze_state, "Active",
             "Price has run significantly while SI remains elevated — squeeze is live.", 9.0,
         ))
-    elif sq.squeeze_state == "completed":
+    elif sq.recent_squeeze or sq.squeeze_state == "completed":
+        # Completed squeeze: negative driver surfaced via recent_squeeze bool
         neg_drivers.append(_expl_driver(
             "squeeze_state", "Completed squeeze risk",
             "completed", "Completed",
@@ -1197,10 +1215,13 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
     pos_drivers = pos_drivers[:5]
     neg_drivers = neg_drivers[:5]
 
-    # ── 14. Setup tags ─────────────────────────────────────────────────────────
-    if sq.squeeze_state == "active":
+    # ── 14. Setup tags (CHUNK-10: lifecycle state drives primary tag) ──────────
+    _sq_state_tag = sq.squeeze_state.upper() if sq.squeeze_state else ""
+    if _sq_state_tag == "ACTIVE" or sq.squeeze_state == "active":
         tags.append("ACTIVE_SQUEEZE")
-    elif sq.squeeze_state == "completed":
+    elif _sq_state_tag == "ARMED":
+        tags.append("ARMED")
+    elif sq.recent_squeeze or sq.squeeze_state == "completed":
         tags.append("COMPLETED_SQUEEZE")
 
     if sq.short_pct_float >= 0.50:
@@ -1228,10 +1249,10 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
     if si_persist >= 7.0:
         tags.append("PERSISTENT_SI")
 
-    if sq.final_score >= 60 and sq.squeeze_state not in ("completed", "active"):
-        tags.append("ARMED")
-
-    summary = _expl_summary(sq.ticker, sq.final_score, sq.squeeze_state, pos_drivers)
+    summary = _expl_summary(
+        sq.ticker, sq.final_score, sq.squeeze_state, pos_drivers,
+        recent_squeeze=sq.recent_squeeze,
+    )
 
     return {
         "summary": summary,
@@ -1327,9 +1348,9 @@ def compute_squeeze_score(
     mech = score_mechanics(data, finviz, ftd_df)
     struct = score_structure(data)
 
-    # 3-state squeeze detection: "false" | "active" | "completed"
-    squeeze_state = detect_recent_squeeze(data)
-    recent_sq = squeeze_state == "completed"   # backward-compat flag
+    # Raw recent-squeeze detection (price-action based): "false" | "active" | "completed"
+    raw_squeeze_state = detect_recent_squeeze(data)
+    recent_sq = raw_squeeze_state == "completed"   # backward-compat flag
 
     # ── CHUNK-06: effective-float signal ──────────────────────────────────────
     from effective_float_analyzer import (
@@ -1381,14 +1402,28 @@ def compute_squeeze_score(
     final_score = round((raw / max_raw) * 100, 1) if max_raw > 0 else 0.0
 
     # Only zero score on completed squeezes; active squeezes preserve their score
-    if squeeze_state == "completed":
+    if raw_squeeze_state == "completed":
         final_score = 0.0
 
     all_flags = pos["flags"] + mech["flags"] + struct["flags"]
-    if squeeze_state == "completed":
+    if raw_squeeze_state == "completed":
         all_flags.insert(0, "RECENT SQUEEZE detected — score zeroed out")
-    elif squeeze_state == "active":
+    elif raw_squeeze_state == "active":
         all_flags.insert(0, "ACTIVE SQUEEZE in progress — SI still elevated, score preserved")
+
+    # ── CHUNK-10: lifecycle state classification ──────────────────────────────
+    from squeeze_state_machine import classify_squeeze_state as _classify_state
+    _lifecycle = _classify_state(
+        final_score=final_score,
+        short_pct_float=pos.get("short_pct") or None,
+        computed_dtc_30d=mech.get("computed_dtc_30d") or None,
+        compression_recovery_score=struct.get("comp_rec_score") or None,
+        effective_float_score=ef_score or None,
+        si_persistence_score=pos.get("si_persistence_score") or None,
+        volume_confirmation_flag=mech.get("volume_confirmation_flag"),
+        recent_squeeze_state=raw_squeeze_state,
+    )
+    squeeze_state = _lifecycle["state"]   # "NOT_SETUP" | "ARMED" | "ACTIVE"
 
     signal_breakdown = {
         "pct_float_short_score": pos.get("short_pct_score", 0),
@@ -1411,6 +1446,9 @@ def compute_squeeze_score(
         "effective_short_float_ratio": ef_ratio,
         "extreme_float_lock_flag": float(ef_result["extreme_float_lock_flag"]),
         "large_holder_concentration_flag": float(ef_result["large_holder_concentration_flag"]),
+        # CHUNK-10 lifecycle state
+        "lifecycle_state": squeeze_state,
+        "state_confidence": _lifecycle["state_confidence"],
     }
 
     short_pct = pos.get("short_pct", 0)
@@ -1442,6 +1480,10 @@ def compute_squeeze_score(
         extreme_float_lock_flag=ef_result["extreme_float_lock_flag"],
         large_holder_concentration_flag=ef_result["large_holder_concentration_flag"],
         effective_float_confidence=ef_result["effective_float_confidence"],
+        # CHUNK-10 lifecycle metadata
+        state_confidence=_lifecycle["state_confidence"],
+        state_reasons=_lifecycle["state_reasons"],
+        state_warnings=_lifecycle["state_warnings"],
     )
     # CHUNK-14: build explanation card after all fields are populated
     sq.explanation = build_squeeze_explanation(sq)

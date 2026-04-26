@@ -270,3 +270,42 @@ class TestCaseStudy:
         )
         assert len(df) == 1
         assert df.iloc[0]["outcome_label"] == "strong"  # 15% gain = strong
+
+
+# ── CHUNK-10: replay handles missing lifecycle state for old rows ─────────────
+
+class TestReplayHandlesMissingLifecycleState:
+
+    def test_old_row_without_squeeze_state_does_not_crash(self):
+        """Replay must not crash when old snapshot rows lack squeeze_state."""
+        old_row = {
+            "date": "2024-01-02",
+            "ticker": "OLD",
+            "final_score": 5.5,
+            "short_pct_float": 0.30,
+            "days_to_cover": 3.5,
+            "computed_dtc_30d": 3.5,
+            "compression_recovery_score": 4.0,
+            "volume_confirmation_flag": True,
+            # squeeze_state intentionally absent
+            "explanation_summary": "Old row.",
+            "explanation_json": None,
+        }
+        prices = _prices([100.0] + [110.0] * 35, start="2024-01-01")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[old_row])
+        df = replay.run(prices={"OLD": prices})
+
+        assert len(df) == 1
+        assert df.iloc[0]["squeeze_state"] is None or df.iloc[0]["squeeze_state"] == old_row.get("squeeze_state")
+
+    def test_replay_reads_new_squeeze_state_when_present(self):
+        """Replay must propagate squeeze_state from snapshot when present."""
+        snap = _snap("CAR", signal_date="2024-01-02")
+        snap["squeeze_state"] = "ARMED"
+        prices = _prices([100.0] + [110.0] * 35, start="2024-01-01")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"CAR": prices})
+
+        assert df.iloc[0]["squeeze_state"] == "ARMED"
