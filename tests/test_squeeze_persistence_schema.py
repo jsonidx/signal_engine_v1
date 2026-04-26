@@ -615,3 +615,49 @@ class TestOldPreChunkRowsCompatibility:
         assert tstz_row["risk_score"] == pytest.approx(30.0)
         assert tstz_row["squeeze_state"] == "ARMED"
         assert tstz_row["options_pressure_score"] == pytest.approx(5.0)
+
+
+class TestSmokeCheckDateNormalization:
+    """
+    Regression test: smoke check _iso() helper must not crash whether the DB
+    returns squeeze_scores.date as a datetime.date object (after the TEXT→DATE
+    migration) or as a plain string (pre-migration or mocked cursor).
+    """
+
+    def test_iso_normalizes_date_object(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from smoke_check_squeeze import _iso
+        import datetime
+        assert _iso(datetime.date(2026, 4, 27)) == "2026-04-27"
+
+    def test_iso_normalizes_string(self):
+        from scripts.smoke_check_squeeze import _iso
+        assert _iso("2026-04-27") == "2026-04-27"
+
+    def test_query_latest_run_with_date_objects(self):
+        """query_latest_run must return ISO strings even when cursor yields datetime.date."""
+        import datetime
+        from unittest.mock import MagicMock
+        from scripts.smoke_check_squeeze import query_latest_run
+
+        mock_row = {"date": datetime.date(2026, 4, 27), "row_count": 15}
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = [mock_row]
+
+        result = query_latest_run(mock_cur)
+        assert result[0]["date"] == "2026-04-27"
+        assert result[0]["row_count"] == 15
+
+    def test_query_latest_run_with_string_dates(self):
+        """query_latest_run must also work when cursor yields plain strings."""
+        from unittest.mock import MagicMock
+        from scripts.smoke_check_squeeze import query_latest_run
+
+        mock_row = {"date": "2026-04-27", "row_count": 15}
+        mock_cur = MagicMock()
+        mock_cur.fetchall.return_value = [mock_row]
+
+        result = query_latest_run(mock_cur)
+        assert result[0]["date"] == "2026-04-27"

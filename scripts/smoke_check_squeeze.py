@@ -50,6 +50,11 @@ CHUNK_FIELDS = [
 PASS_THRESHOLD = 0.90  # squeeze_state, risk_score, explanation_json must be ≥ 90% non-null
 
 
+def _iso(d) -> str:
+    """Normalize a DB date value (datetime.date or str) to an ISO string."""
+    return d.isoformat() if hasattr(d, "isoformat") else str(d)
+
+
 def query_latest_run(cur):
     cur.execute("""
         SELECT date, COUNT(*) AS row_count
@@ -58,7 +63,12 @@ def query_latest_run(cur):
         ORDER BY date DESC
         LIMIT 5
     """)
-    return [dict(r) for r in cur.fetchall()]
+    rows = []
+    for r in cur.fetchall():
+        row = dict(r)
+        row["date"] = _iso(row["date"])
+        rows.append(row)
+    return rows
 
 
 def query_field_coverage(cur, run_date):
@@ -109,7 +119,7 @@ def query_gate_metrics(cur):
     cur.execute("SELECT COUNT(*) AS n FROM squeeze_scores WHERE options_pressure_score IS NOT NULL")
     metrics["rows_with_options"] = cur.fetchone()["n"]
 
-    cur.execute("SELECT COUNT(DISTINCT report_date) AS n FROM short_interest_history")
+    cur.execute("SELECT COUNT(DISTINCT settlement_date) AS n FROM short_interest_history")
     metrics["si_history_periods"] = cur.fetchone()["n"]
 
     cur.execute("SELECT COUNT(DISTINCT ticker) AS n FROM filing_catalysts WHERE ownership_accumulation_flag = true")

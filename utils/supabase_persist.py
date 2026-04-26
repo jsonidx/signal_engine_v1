@@ -508,6 +508,16 @@ _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS unusual_call_activity_flag BOOLEAN;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS call_put_volume_ratio REAL;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS call_put_oi_ratio REAL;",
+    # Schema fix: migrate date column from TEXT to DATE (idempotent)
+    """
+    DO $$
+    BEGIN
+      IF (SELECT data_type FROM information_schema.columns
+          WHERE table_name = 'squeeze_scores' AND column_name = 'date') = 'text' THEN
+        ALTER TABLE squeeze_scores ALTER COLUMN date TYPE date USING date::date;
+      END IF;
+    END $$;
+    """,
 ]
 
 def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
