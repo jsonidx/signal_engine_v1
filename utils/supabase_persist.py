@@ -1405,3 +1405,77 @@ def fetch_latest_iv_rank(
     except Exception as exc:
         logger.debug("fetch_latest_iv_rank(%s) failed: %s", ticker, exc)
         return None
+
+
+# ==============================================================================
+# 11. SQUEEZE ALERT HELPERS  (CHUNK-15)
+# ==============================================================================
+
+def fetch_previous_squeeze_score_for_alert(
+    ticker: str,
+    before_date: "str | None" = None,
+) -> "dict | None":
+    """
+    CHUNK-15: Read the most-recent squeeze_scores row for *ticker* that is
+    strictly BEFORE *before_date* (the current run date).
+
+    Used for alert deduplication — compare latest run vs the previous one.
+
+    Returns None when:
+      - No prior row exists (first time this ticker appears)
+      - before_date is None and there is only one row for this ticker
+      - Any DB error occurs
+
+    Parameters
+    ----------
+    ticker      : equity ticker (case-insensitive)
+    before_date : ISO date string (YYYY-MM-DD) or None.
+                  When None, returns the second-most-recent row.
+    """
+    try:
+        from utils.db import managed_connection
+
+        ticker = ticker.upper().strip()
+        with managed_connection() as conn:
+            cur = conn.cursor()
+            if before_date is not None:
+                cur.execute(
+                    """
+                    SELECT date, ticker, final_score, squeeze_state,
+                           risk_level, dilution_risk_flag,
+                           options_pressure_score, unusual_call_activity_flag,
+                           explanation_summary, explanation_json
+                    FROM   squeeze_scores
+                    WHERE  ticker = %s
+                      AND  date < %s
+                    ORDER  BY date DESC
+                    LIMIT  1
+                    """,
+                    (ticker, before_date),
+                )
+            else:
+                # No cutoff: fetch last two rows, return the older one
+                cur.execute(
+                    """
+                    SELECT date, ticker, final_score, squeeze_state,
+                           risk_level, dilution_risk_flag,
+                           options_pressure_score, unusual_call_activity_flag,
+                           explanation_summary, explanation_json
+                    FROM   squeeze_scores
+                    WHERE  ticker = %s
+                    ORDER  BY date DESC
+                    LIMIT  2
+                    """,
+                    (ticker,),
+                )
+                rows = cur.fetchall()
+                if rows and len(rows) >= 2:
+                    return dict(rows[1])
+                return None
+
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    except Exception as exc:
+        logger.debug("fetch_previous_squeeze_score_for_alert(%s) failed: %s", ticker, exc)
+        return None

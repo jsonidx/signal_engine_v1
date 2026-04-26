@@ -40,6 +40,16 @@ if _env.exists():
             _k, _, _v = _line.partition("=")
             os.environ.setdefault(_k.strip(), _v.strip())
 
+# ── Project root on path so squeeze_alerts can be imported ───────────────────
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:
+    from squeeze_alerts import build_squeeze_alerts, format_alerts_section
+    _SQUEEZE_ALERTS_AVAILABLE = True
+except ImportError:
+    _SQUEEZE_ALERTS_AVAILABLE = False
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 DB_URL    = os.environ.get("DATABASE_URL", "")
@@ -334,6 +344,84 @@ def build_thesis_section(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ── Squeeze lifecycle alerts (CHUNK-15) ──────────────────────────────────────
+
+def _fetch_two_latest_squeeze_dates(conn) -> tuple[str | None, str | None]:
+    """Return (latest_date, previous_date) strings from squeeze_scores, or (None, None)."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT date FROM squeeze_scores
+            ORDER BY date DESC
+            LIMIT 2
+        """)
+        rows = cur.fetchall()
+        dates = [str(r["date"]) for r in rows]
+        latest   = dates[0] if len(dates) >= 1 else None
+        previous = dates[1] if len(dates) >= 2 else None
+        return latest, previous
+    except Exception as exc:
+        print(f"[notify] _fetch_two_latest_squeeze_dates failed: {exc}", file=sys.stderr)
+        return None, None
+
+
+def _fetch_squeeze_scores_for_date(conn, run_date: str) -> list[dict]:
+    """Fetch all squeeze_scores rows for *run_date*."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT date, ticker, final_score, squeeze_state,
+                   risk_level, dilution_risk_flag,
+                   options_pressure_score, unusual_call_activity_flag,
+                   explanation_summary, explanation_json
+            FROM   squeeze_scores
+            WHERE  date = %s
+            ORDER  BY final_score DESC NULLS LAST
+        """, (run_date,))
+        return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        print(f"[notify] _fetch_squeeze_scores_for_date failed: {exc}", file=sys.stderr)
+        return []
+
+
+def build_squeeze_alerts_section(conn) -> str:
+    """
+    CHUNK-15: Fetch latest + previous squeeze_scores, build lifecycle alerts,
+    and return a formatted Telegram section string (empty if no alerts or
+    if squeeze_alerts module is unavailable).
+    """
+    if not _SQUEEZE_ALERTS_AVAILABLE:
+        return ""
+    try:
+        latest_date, previous_date = _fetch_two_latest_squeeze_dates(conn)
+        if not latest_date:
+            return ""
+
+        current_rows  = _fetch_squeeze_scores_for_date(conn, latest_date)
+        previous_rows = (
+            _fetch_squeeze_scores_for_date(conn, previous_date)
+            if previous_date else []
+        )
+
+        # Build a lookup: ticker → previous row
+        prev_by_ticker = {r["ticker"]: r for r in previous_rows}
+
+        all_alerts: list[dict] = []
+        for row in current_rows:
+            ticker = str(row.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            prev_row = prev_by_ticker.get(ticker)
+            ticker_alerts = build_squeeze_alerts(row, prev_row)
+            all_alerts.extend(ticker_alerts)
+
+        return format_alerts_section(all_alerts)
+
+    except Exception as exc:
+        print(f"[notify] build_squeeze_alerts_section failed: {exc}", file=sys.stderr)
+        return ""
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -362,6 +450,7 @@ def main() -> None:
 
     rankings_section = ""
     thesis_section   = ""
+    squeeze_alerts_section = ""
 
     if conn:
         top10 = fetch_top10_rankings(conn)
@@ -376,12 +465,17 @@ def main() -> None:
         else:
             thesis_section = "\n<i>AI synthesis skipped (--skip-ai run).</i>"
 
+        # CHUNK-15: squeeze lifecycle alerts
+        squeeze_alerts_section = build_squeeze_alerts_section(conn)
+
         conn.close()
     else:
         rankings_section = "\n⚠️ Could not connect to database — no ranking data."
         thesis_section   = ""
 
-    full_message = "\n".join(filter(None, [header, rankings_section, thesis_section]))
+    full_message = "\n".join(filter(None, [
+        header, rankings_section, thesis_section, squeeze_alerts_section,
+    ]))
 
     # ── Send ──────────────────────────────────────────────────────────────────
     tg_send_chunked(full_message)
