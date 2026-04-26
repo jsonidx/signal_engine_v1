@@ -4118,7 +4118,7 @@ async def ticker_analyze_status(symbol: str):
     if proc and proc.returncode is None:
         return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
     # Finished — clear cache so fresh thesis is fetched
-    _cache._store.pop(f"signals_ticker_{sym}", None)
+    _cache._store.pop(f"signals_ticker:{sym}", None)
     # Pull model + cost from the freshly saved thesis if available
     model_used = cost_usd = None
     try:

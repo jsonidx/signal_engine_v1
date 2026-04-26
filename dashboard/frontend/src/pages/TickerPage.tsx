@@ -1095,20 +1095,20 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
   const qc = useQueryClient()
 
   // Poll for completion when running — auto-refresh ticker data when done
-  useQuery<AnalyzeStatus>({
+  const { data: statusData } = useQuery<AnalyzeStatus>({
     queryKey: ['analyze_status', symbol],
     queryFn: () => api.tickerAnalyzeStatus(symbol),
     refetchInterval: job?.status === 'running' ? 5000 : false,
     enabled: job?.status === 'running',
-    onSuccess: (data: AnalyzeStatus) => {
-      if (data.status === 'done') {
-        setJob(data)
-        // Invalidate ticker cache so page reloads thesis automatically
-        qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
-        qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
-      }
-    },
-  } as any)
+  })
+
+  useEffect(() => {
+    if (statusData?.status === 'done' && job?.status === 'running') {
+      setJob(statusData)
+      qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
+      qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
+    }
+  }, [statusData?.status])
 
   const handleRun = async () => {
     setError(null)
