@@ -1023,6 +1023,366 @@ class WalkForwardBacktest:
 
 
 # ==============================================================================
+# SECTION 5: SQUEEZE OUTCOME REPLAY  (CHUNK-11)
+# ==============================================================================
+
+def compute_forward_returns(
+    prices: pd.Series,
+    signal_date: "pd.Timestamp | str",
+    windows: Tuple[int, ...] = (5, 10, 20, 30),
+) -> dict:
+    """
+    Compute close-to-close forward returns for a given signal date.
+
+    Entry price = close on signal_date.
+    Future bars = bars with index STRICTLY after signal_date.
+
+    Returns dict with keys like fwd_5d, fwd_10d, fwd_20d, fwd_30d (floats).
+    Missing windows get None.  Returns {} if signal_date not found or prices empty.
+    """
+    if prices is None or prices.empty:
+        return {}
+    ts = pd.Timestamp(signal_date)
+    # find the position of signal_date in the index
+    idx = prices.index.searchsorted(ts, side="right")
+    if idx == 0:
+        entry_idx = prices.index.searchsorted(ts, side="left")
+        if entry_idx >= len(prices):
+            return {}
+        entry_price = float(prices.iloc[entry_idx])
+        future = prices.iloc[entry_idx + 1 :]
+    else:
+        # use the bar at or before signal_date as entry
+        entry_idx = prices.index.searchsorted(ts, side="right") - 1
+        if entry_idx < 0 or entry_idx >= len(prices):
+            return {}
+        entry_price = float(prices.iloc[entry_idx])
+        future = prices.iloc[entry_idx + 1 :]
+
+    if entry_price == 0:
+        return {}
+
+    result = {}
+    for w in windows:
+        if len(future) >= w:
+            fwd_price = float(future.iloc[w - 1])
+            result[f"fwd_{w}d"] = round((fwd_price - entry_price) / entry_price, 6)
+        else:
+            result[f"fwd_{w}d"] = None
+    return result
+
+
+def classify_squeeze_outcome(max_fwd_return: Optional[float]) -> str:
+    """
+    Label a squeeze outcome by its maximum forward return over any tracked window.
+
+    Returns one of: "none", "minor", "strong", "major"
+
+    Thresholds (conservative — squeezes are rare events):
+        >= 0.30  → major   (30%+ gain)
+        >= 0.15  → strong  (15–29%)
+        >= 0.05  → minor   (5–14%)
+        otherwise→ none
+    """
+    if max_fwd_return is None or max_fwd_return != max_fwd_return:  # NaN check
+        return "none"
+    r = float(max_fwd_return)
+    if r >= 0.30:
+        return "major"
+    if r >= 0.15:
+        return "strong"
+    if r >= 0.05:
+        return "minor"
+    return "none"
+
+
+def _extract_from_explanation(explanation_json_str: Optional[str], field_key: str) -> Optional[float]:
+    """
+    Extract a numeric score from explanation_json by matching driver key names.
+
+    explanation_json stores positive/negative drivers with a "key" field.
+    Searches top_positive_drivers and top_negative_drivers for field_key.
+    Returns the strength value if found, else None.
+    """
+    if not explanation_json_str:
+        return None
+    try:
+        data = json.loads(explanation_json_str) if isinstance(explanation_json_str, str) else explanation_json_str
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for section in ("top_positive_drivers", "top_negative_drivers"):
+        for driver in data.get(section, []):
+            if isinstance(driver, dict) and driver.get("key") == field_key:
+                v = driver.get("strength")
+                return float(v) if v is not None else None
+    return None
+
+
+def _fetch_prices_for_replay(
+    tickers: List[str],
+    start: str,
+    end: str,
+) -> Dict[str, pd.Series]:
+    """
+    Download adjusted close prices for *tickers* over [start, end].
+
+    Uses yfinance.  Returns dict of {ticker: pd.Series(Close)}.
+    Silently omits tickers that fail to download.
+    Extends the range by 40 trading days on each side to cover forward windows.
+    """
+    import datetime as _dt
+    _start_dt = pd.Timestamp(start) - pd.Timedelta(days=10)
+    _end_dt = pd.Timestamp(end) + pd.Timedelta(days=60)
+
+    prices: Dict[str, pd.Series] = {}
+    try:
+        raw = yf.download(
+            tickers,
+            start=_start_dt.strftime("%Y-%m-%d"),
+            end=_end_dt.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            progress=False,
+        )
+        if raw.empty:
+            return {}
+        close = raw["Close"] if "Close" in raw.columns else raw
+        if isinstance(close, pd.Series):
+            # single ticker returned as Series
+            t = tickers[0] if tickers else "UNKNOWN"
+            prices[t.upper()] = close.dropna()
+        else:
+            for t in close.columns:
+                s = close[t].dropna()
+                if not s.empty:
+                    prices[str(t).upper()] = s
+    except Exception as exc:
+        logger.warning("_fetch_prices_for_replay failed: %s", exc)
+    return prices
+
+
+def _print_replay_metrics(metrics: dict) -> None:
+    """Print a formatted summary of SqueezeOutcomeReplay.summary_metrics() output."""
+    print("\n" + "=" * 70)
+    print("SQUEEZE OUTCOME REPLAY — SUMMARY")
+    print("=" * 70)
+    print(f"  Signals analysed : {metrics.get('total_signals', 0)}")
+    print(f"  Date range       : {metrics.get('date_range', 'N/A')}")
+    print(f"  Tickers          : {metrics.get('ticker_count', 0)}")
+    print()
+    for w in (5, 10, 20, 30):
+        key = f"hit_rate_{w}d"
+        avg_key = f"avg_fwd_{w}d"
+        hr = metrics.get(key)
+        avg = metrics.get(avg_key)
+        hr_str = f"{hr:.1%}" if hr is not None else "N/A"
+        avg_str = f"{avg:+.2%}" if avg is not None else "N/A"
+        print(f"  {w:2d}d hit rate : {hr_str:>8}   avg return: {avg_str}")
+    print()
+    label_counts = metrics.get("outcome_label_counts", {})
+    if label_counts:
+        print("  Outcome labels:")
+        for label, cnt in sorted(label_counts.items()):
+            print(f"    {label:<8}: {cnt}")
+    print("=" * 70)
+
+
+class SqueezeOutcomeReplay:
+    """
+    Replay saved squeeze_scores snapshots against realised price history.
+
+    Point-in-time safe: all signal fields come exclusively from saved
+    squeeze_scores rows.  No live data or recomputed signals are used.
+
+    Usage
+    -----
+        replay = SqueezeOutcomeReplay(start_date="2024-01-01", end_date="2024-12-31")
+        df = replay.run()
+        print(replay.summary_metrics())
+    """
+
+    _FWD_WINDOWS = (5, 10, 20, 30)
+
+    def __init__(
+        self,
+        start_date: str,
+        end_date: str,
+        tickers: Optional[List[str]] = None,
+        min_score: float = 0.0,
+    ):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.tickers = [t.upper() for t in tickers] if tickers else None
+        self.min_score = min_score
+        self._snapshots: List[dict] = []
+        self._prices: Dict[str, pd.Series] = {}
+        self._results: pd.DataFrame = pd.DataFrame()
+
+    def load_snapshots(self, rows: Optional[List[dict]] = None) -> int:
+        """
+        Load signal snapshots from DB (or inject pre-loaded rows for testing).
+
+        Returns number of snapshots loaded after min_score filter.
+        """
+        if rows is not None:
+            self._snapshots = rows
+        else:
+            try:
+                from utils.supabase_persist import fetch_squeeze_scores_for_replay
+                self._snapshots = fetch_squeeze_scores_for_replay(
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    tickers=self.tickers,
+                )
+            except Exception as exc:
+                logger.warning("load_snapshots: DB fetch failed: %s", exc)
+                self._snapshots = []
+
+        if self.min_score > 0:
+            self._snapshots = [
+                s for s in self._snapshots
+                if (s.get("final_score") or 0.0) >= self.min_score
+            ]
+
+        logger.info("SqueezeOutcomeReplay: loaded %d snapshots", len(self._snapshots))
+        return len(self._snapshots)
+
+    def _build_replay_row(self, snap: dict, ticker_prices: Optional[pd.Series]) -> dict:
+        """
+        Build a single replay result row from a snapshot + price series.
+
+        All signal data comes from *snap* (the saved DB row).
+        Forward returns come from *ticker_prices* (may be None).
+        """
+        row: dict = {
+            "signal_date": snap.get("date"),
+            "ticker": snap.get("ticker"),
+            "final_score": snap.get("final_score"),
+            "squeeze_state": snap.get("squeeze_state"),
+            "short_pct_float": snap.get("short_pct_float"),
+            "computed_dtc_30d": snap.get("computed_dtc_30d"),
+            "compression_recovery_score": snap.get("compression_recovery_score"),
+            "volume_confirmation_flag": snap.get("volume_confirmation_flag"),
+            "si_persistence_score": _extract_from_explanation(
+                snap.get("explanation_json"), "si_persistence"
+            ),
+            "effective_float_score": _extract_from_explanation(
+                snap.get("explanation_json"), "effective_float"
+            ),
+        }
+
+        # Forward returns
+        fwd = {}
+        if ticker_prices is not None and not ticker_prices.empty and snap.get("date"):
+            fwd = compute_forward_returns(ticker_prices, snap["date"], self._FWD_WINDOWS)
+
+        for w in self._FWD_WINDOWS:
+            row[f"fwd_{w}d"] = fwd.get(f"fwd_{w}d")
+
+        # Max forward return and outcome label
+        valid_fwd = [v for v in (row.get(f"fwd_{w}d") for w in self._FWD_WINDOWS) if v is not None]
+        max_fwd = max(valid_fwd) if valid_fwd else None
+        row["max_fwd_return"] = max_fwd
+        row["outcome_label"] = classify_squeeze_outcome(max_fwd)
+
+        # Hit flags (price > entry)
+        for w in self._FWD_WINDOWS:
+            v = row.get(f"fwd_{w}d")
+            row[f"hit_{w}d"] = bool(v > 0) if v is not None else None
+
+        return row
+
+    def run(self, prices: Optional[Dict[str, pd.Series]] = None) -> pd.DataFrame:
+        """
+        Run the full replay.
+
+        Parameters
+        ----------
+        prices : optional pre-loaded price dict {ticker: pd.Series}.
+                 If None, fetches from yfinance (requires network).
+
+        Returns a DataFrame with one row per signal snapshot.
+        """
+        if not self._snapshots:
+            self.load_snapshots()
+
+        if not self._snapshots:
+            logger.warning("SqueezeOutcomeReplay.run(): no snapshots — returning empty DataFrame")
+            self._results = pd.DataFrame()
+            return self._results
+
+        # Resolve prices
+        if prices is not None:
+            self._prices = {k.upper(): v for k, v in prices.items()}
+        else:
+            unique_tickers = list({s["ticker"] for s in self._snapshots if s.get("ticker")})
+            self._prices = _fetch_prices_for_replay(unique_tickers, self.start_date, self.end_date)
+
+        rows = []
+        for snap in self._snapshots:
+            ticker = (snap.get("ticker") or "").upper()
+            rows.append(self._build_replay_row(snap, self._prices.get(ticker)))
+
+        self._results = pd.DataFrame(rows)
+        return self._results
+
+    def summary_metrics(self) -> dict:
+        """
+        Aggregate replay results into summary statistics.
+
+        Returns dict with hit_rate_Nd, avg_fwd_Nd, outcome_label_counts, etc.
+        Returns {"total_signals": 0} if run() hasn't been called yet.
+        """
+        df = self._results
+        if df.empty:
+            return {"total_signals": 0}
+
+        metrics: dict = {
+            "total_signals": len(df),
+            "ticker_count": df["ticker"].nunique() if "ticker" in df.columns else 0,
+            "date_range": (
+                f"{df['signal_date'].min()} – {df['signal_date'].max()}"
+                if "signal_date" in df.columns else "N/A"
+            ),
+        }
+
+        for w in self._FWD_WINDOWS:
+            col_hit = f"hit_{w}d"
+            col_fwd = f"fwd_{w}d"
+            hit_series = df[col_hit].dropna() if col_hit in df.columns else pd.Series(dtype=float)
+            fwd_series = df[col_fwd].dropna() if col_fwd in df.columns else pd.Series(dtype=float)
+            metrics[f"hit_rate_{w}d"] = float(hit_series.mean()) if not hit_series.empty else None
+            metrics[f"avg_fwd_{w}d"] = float(fwd_series.mean()) if not fwd_series.empty else None
+
+        if "outcome_label" in df.columns:
+            metrics["outcome_label_counts"] = df["outcome_label"].value_counts().to_dict()
+        else:
+            metrics["outcome_label_counts"] = {}
+
+        return metrics
+
+    @classmethod
+    def case_study(
+        cls,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        rows: Optional[List[dict]] = None,
+        prices: Optional[Dict[str, pd.Series]] = None,
+    ) -> pd.DataFrame:
+        """
+        Run a single-ticker replay and return its result DataFrame.
+
+        Convenience wrapper for ticker-level analysis.
+        If *rows* / *prices* are provided they are used directly (no DB/network calls).
+        """
+        replay = cls(start_date=start_date, end_date=end_date, tickers=[ticker])
+        replay.load_snapshots(rows=rows)
+        return replay.run(prices=prices)
+
+
+# ==============================================================================
 # SECTION 4: CLI
 # ==============================================================================
 
@@ -1036,6 +1396,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run all walk-forward windows")
     g.add_argument("--run-latest", action="store_true",
                    help="Run most recent window only (fast validation)")
+    g.add_argument("--squeeze-replay", action="store_true",
+                   help="Run squeeze outcome replay (requires --start and --end)")
     p.add_argument("--factor-ic", action="store_true",
                    help="Print IC table (use with --run-full or --run-latest)")
     p.add_argument("--suggest-weights", action="store_true",
@@ -1046,6 +1408,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="One-way transaction cost in bps (default: 5)")
     p.add_argument("--output-csv", type=str, default=None,
                    help="Save results DataFrame to CSV")
+    p.add_argument("--start", type=str, default=None,
+                   help="Start date for squeeze replay (YYYY-MM-DD)")
+    p.add_argument("--end", type=str, default=None,
+                   help="End date for squeeze replay (YYYY-MM-DD)")
     return p
 
 
@@ -1167,6 +1533,27 @@ def main():
             print("  Backtest results saved to Supabase.")
         except Exception as _exc:
             pass  # non-fatal
+
+    elif args.squeeze_replay:
+        if not args.start or not args.end:
+            print("ERROR: --squeeze-replay requires --start YYYY-MM-DD and --end YYYY-MM-DD")
+            sys.exit(1)
+        replay_tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
+        replay = SqueezeOutcomeReplay(
+            start_date=args.start,
+            end_date=args.end,
+            tickers=replay_tickers,
+        )
+        replay.load_snapshots()
+        if not replay._snapshots:
+            print(f"INFO: No squeeze_scores rows found for {args.start} – {args.end}.")
+            sys.exit(0)
+        df = replay.run()
+        metrics = replay.summary_metrics()
+        _print_replay_metrics(metrics)
+        if args.output_csv:
+            df.to_csv(args.output_csv, index=False)
+            print(f"\n  Results saved to: {args.output_csv}")
 
     elif args.factor_ic or args.suggest_weights:
         print("  --factor-ic / --suggest-weights must be combined with --run-full.")

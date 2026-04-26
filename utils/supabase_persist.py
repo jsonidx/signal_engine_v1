@@ -870,6 +870,106 @@ CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
         logger.warning("save_filing_catalysts failed (non-fatal): %s", exc)
 
 
+# ==============================================================================
+# 9. SQUEEZE REPLAY HELPERS  (CHUNK-11)
+# ==============================================================================
+
+def fetch_squeeze_scores_for_replay(
+    start_date: "date | str",
+    end_date: "date | str",
+    tickers: "list[str] | None" = None,
+    limit: int = 5000,
+) -> list[dict]:
+    """
+    Fetch saved squeeze_scores rows for point-in-time replay analysis.
+
+    Returns rows with all saved columns.  Returns [] on any DB error.
+
+    Parameters
+    ----------
+    start_date  : inclusive lower bound on `date` column
+    end_date    : inclusive upper bound on `date` column
+    tickers     : optional ticker filter; None = all tickers
+    limit       : max rows returned (newest first per ticker)
+    """
+    try:
+        _start = start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date)
+        _end = end_date.isoformat() if hasattr(end_date, "isoformat") else str(end_date)
+        conn = _conn()
+        cur = conn.cursor()
+        if tickers:
+            placeholders = ",".join(["%s"] * len(tickers))
+            query = f"""
+            SELECT date, ticker, final_score, price, short_pct_float,
+                   days_to_cover, computed_dtc_30d, compression_recovery_score,
+                   volume_confirmation_flag, squeeze_state,
+                   explanation_summary, explanation_json
+            FROM squeeze_scores
+            WHERE date >= %s AND date <= %s
+              AND ticker IN ({placeholders})
+            ORDER BY ticker, date
+            LIMIT %s
+            """
+            params = [_start, _end] + [t.upper() for t in tickers] + [limit]
+        else:
+            query = """
+            SELECT date, ticker, final_score, price, short_pct_float,
+                   days_to_cover, computed_dtc_30d, compression_recovery_score,
+                   volume_confirmation_flag, squeeze_state,
+                   explanation_summary, explanation_json
+            FROM squeeze_scores
+            WHERE date >= %s AND date <= %s
+            ORDER BY ticker, date
+            LIMIT %s
+            """
+            params = [_start, _end, limit]
+        cur.execute(query, params)
+        cols = [c.name for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.debug("fetch_squeeze_scores_for_replay failed: %s", exc)
+        return []
+
+
+def fetch_short_interest_history_for_replay(
+    ticker: str,
+    as_of_date: "date | str",
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Fetch the most-recent SI history rows for *ticker* up to *as_of_date*.
+
+    Used during replay to retrieve point-in-time SI context alongside a
+    saved squeeze_scores snapshot.  Returns [] on any DB error.
+    """
+    try:
+        cutoff = as_of_date.isoformat() if hasattr(as_of_date, "isoformat") else str(as_of_date)
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticker, publication_date, settlement_date, snapshot_date,
+                   shares_short, short_pct_float, float_shares,
+                   avg_volume_30d, computed_dtc_30d
+            FROM short_interest_history
+            WHERE ticker = %s
+              AND publication_date <= %s
+            ORDER BY publication_date DESC
+            LIMIT %s
+            """,
+            (ticker.upper(), cutoff, limit),
+        )
+        cols = [c.name for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.debug("fetch_short_interest_history_for_replay(%s) failed: %s", ticker, exc)
+        return []
+
+
 def fetch_filing_catalysts(
     ticker: str,
     as_of_date: "date | None" = None,
