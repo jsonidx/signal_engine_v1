@@ -72,11 +72,22 @@ done
 
 if [ "$SKIP_AI" = true ]; then
   echo "────────────────────────────────────────────────"
-  echo " --skip-ai: Step 13 skipped. Cost this run: €0.00"
+  echo " --skip-ai: Step 13 (AI synthesis) skipped. Cost this run: €0.00"
   echo " All data modules will run. Claude API will NOT."
+  echo " Steps 13a (candidate archive), 13b (thesis checker),"
+  echo " and 13c (daily ranking) still run — no API cost."
   echo "────────────────────────────────────────────────"
   echo ""
 fi
+
+# ── Run health tracking ────────────────────────────────
+# PIPELINE_HEALTH: SUCCESS | DEGRADED | FAILED
+# Modules append error lines to logs/pipeline_errors.log;
+# we summarise at the end and embed in pipeline_status.json.
+PIPELINE_HEALTH="SUCCESS"
+PIPELINE_ERRORS_LOG="logs/pipeline_errors.log"
+export PIPELINE_ERRORS_LOG
+: > "$PIPELINE_ERRORS_LOG"   # truncate / create
 
 echo "================================================"
 echo " Signal Engine v1 — $(date '+%Y-%m-%d %H:%M')"
@@ -165,10 +176,9 @@ echo ""
 # To override: python3 ai_quant.py --tickers AAPL,MSFT or --no-limit (high cost).
 step_start
 if [ "$SKIP_AI" = true ]; then
-  echo "Step 13: SKIPPED — no Anthropic API calls (--skip-ai flag set)"
+  echo "Step 13: AI synthesis SKIPPED (--skip-ai) — backfilling agreement scores only"
   python3 ai_quant.py --backfill-agreement
-  step_end "Step 13: AI Quant (skipped, backfill only)"
-  echo "Step 13 skipped — theses unchanged in ai_quant_cache.db"
+  step_end "Step 13: AI Quant (synthesis skipped; 13a/13b/13c still run)"
 else
   echo "Step 13: AI Quant synthesis (top 20 tickers — sonnet-4-6 + thinking)..."
   python3 ai_quant.py --top-n 20
@@ -323,6 +333,28 @@ echo "------------------------------------------------"
 printf "  %-45s %dm %02ds\n" "TOTAL" "$TOTAL_MINS" "$TOTAL_SECS"
 echo "================================================"
 
+# ── Compute run health ────────────────────────────────────
+# Grade DEGRADED if there are logged errors, FAILED if pipeline log contains
+# critical failure patterns (404 storms, DB errors, hard crashes).
+ERROR_COUNT=0
+if [ -f "$PIPELINE_ERRORS_LOG" ]; then
+  ERROR_COUNT=$(grep -c . "$PIPELINE_ERRORS_LOG" 2>/dev/null || echo 0)
+fi
+# Also scan the pipeline report itself for known hard-failure patterns
+REPORT_FILE="logs/pipeline_report.txt"
+CRITICAL_COUNT=0
+if [ -f "$REPORT_FILE" ]; then
+  CRITICAL_COUNT=$(grep -c \
+    -e "Traceback (most recent call last)" \
+    -e "CRITICAL\|FATAL\|SystemExit\|Could not connect to database" \
+    "$REPORT_FILE" 2>/dev/null || echo 0)
+fi
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  PIPELINE_HEALTH="FAILED"
+elif [ "$ERROR_COUNT" -gt 0 ]; then
+  PIPELINE_HEALTH="DEGRADED"
+fi
+
 # ── Write pipeline status file for dashboard ─────────────
 COST_ESTIMATE=$([ "$SKIP_AI" = true ] && echo "$0.00" || echo "~$0.18–0.54")
 SKIP_AI_JSON=$([ "$SKIP_AI" = true ] && echo "true" || echo "false")
@@ -332,7 +364,10 @@ cat > data/pipeline_status.json <<EOF
   "total_runtime_secs": ${TOTAL},
   "skip_ai": ${SKIP_AI_JSON},
   "cost_estimate": "${COST_ESTIMATE}",
-  "steps_completed": 18
+  "steps_completed": 18,
+  "health": "${PIPELINE_HEALTH}",
+  "error_count": ${ERROR_COUNT},
+  "critical_count": ${CRITICAL_COUNT}
 }
 EOF
 
@@ -343,6 +378,10 @@ if [ "$SKIP_AI" = true ]; then
   echo " Cost this run:  €0.00 (--skip-ai — Claude API skipped)"
 else
   echo " Cost this run:  ~$0.18–0.54 (20 × grok-4-1-fast-reasoning)"
+fi
+echo " Run health:     ${PIPELINE_HEALTH}"
+if [ "$ERROR_COUNT" -gt 0 ]; then
+  echo " Error count:    ${ERROR_COUNT} (see logs/pipeline_errors.log)"
 fi
 echo " Dashboard:      http://localhost:3000"
 echo "================================================"

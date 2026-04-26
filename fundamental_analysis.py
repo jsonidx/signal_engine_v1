@@ -52,6 +52,18 @@ try:
 except ImportError:
     OUTPUT_DIR = "./signals_output"
 
+try:
+    from utils.ticker_quarantine import quarantine as _quarantine, is_quarantined as _is_quarantined
+    _QUARANTINE_AVAILABLE = True
+except ImportError:
+    _QUARANTINE_AVAILABLE = False
+    def _quarantine(t, r): pass          # type: ignore[misc]
+    def _is_quarantined(t): return False # type: ignore[misc]
+
+# Per-run error deduplication
+_SEEN_FA_ERRORS: set = set()
+_FA_ERROR_COUNTS: dict = {}
+
 
 # ==============================================================================
 # SECTION 1: DATA COLLECTION
@@ -66,6 +78,9 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> Optional[dict]:
     to avoid redundant yfinance calls for quarterly-changing data.
     Pass use_cache=False to force a fresh fetch (e.g. after an earnings release).
     """
+    if _is_quarantined(ticker):
+        return None
+
     if use_cache:
         try:
             from fundamentals_cache import get_cached, save_to_cache as _save
@@ -164,7 +179,25 @@ def fetch_fundamentals(ticker: str, use_cache: bool = True) -> Optional[dict]:
 
         return raw
 
-    except Exception:
+    except Exception as exc:
+        err_str = str(exc)
+        if "404" in err_str or "Quote not found" in err_str or "No fundamentals data" in err_str:
+            _quarantine(ticker, f"HTTP 404: {err_str[:120]}")
+            err_key = f"404:{ticker}"
+            if err_key not in _SEEN_FA_ERRORS:
+                _SEEN_FA_ERRORS.add(err_key)
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "fetch_fundamentals %s: 404 (quarantined for this run)", ticker
+                )
+        elif "401" in err_str or "Invalid Crumb" in err_str or "unable to access" in err_str.lower():
+            _FA_ERROR_COUNTS["yf_401"] = _FA_ERROR_COUNTS.get("yf_401", 0) + 1
+            if "yf_401" not in _SEEN_FA_ERRORS:
+                _SEEN_FA_ERRORS.add("yf_401")
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "fetch_fundamentals: Yahoo Finance 401 — further 401s suppressed"
+                )
         return None
 
 
@@ -903,6 +936,18 @@ def main():
         time.sleep(0.3)  # Be gentle with yfinance
 
     print(f"\r  Done: {len(results)}/{len(tickers)} tickers with data." + " " * 20)
+
+    # Error summary
+    if _FA_ERROR_COUNTS.get("yf_401", 0):
+        print(f"  [WARN] Yahoo Finance 401 errors: {_FA_ERROR_COUNTS['yf_401']} occurrences (suppressed after first)")
+    quarantined_now = {k: v for k, v in _SEEN_FA_ERRORS if False}.items() if False else {}
+    try:
+        from utils.ticker_quarantine import get_quarantined
+        quarantined_now = get_quarantined()
+        if quarantined_now:
+            print(f"  [INFO] Quarantined tickers (invalid/delisted): {', '.join(sorted(quarantined_now))}")
+    except Exception:
+        pass
 
     if not results:
         print("  No fundamental data retrieved.")

@@ -814,20 +814,29 @@ def generate_daily_top20_ranking(
 # ==============================================================================
 
 def _migrate_daily_rankings_prob_column() -> None:
-    """Add prob_combined column to daily_rankings if not already present (idempotent)."""
+    """Ensure daily_rankings has all required columns with correct types (idempotent)."""
     try:
         from utils.db import get_connection
         conn = get_connection()
         cur  = conn.cursor()
         cur.execute("""
-            SELECT column_name FROM information_schema.columns
+            SELECT column_name, data_type FROM information_schema.columns
             WHERE table_name = 'daily_rankings'
         """)
-        existing = {row["column_name"] for row in cur.fetchall()}
-        if "prob_combined" not in existing:
+        col_info = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
+
+        # Add missing columns
+        if "prob_combined" not in col_info:
             cur.execute("ALTER TABLE daily_rankings ADD COLUMN prob_combined FLOAT")
             conn.commit()
             logger.info("_migrate_daily_rankings_prob_column: added prob_combined column")
+
+        # rank_change must be TEXT (was historically created as INTEGER on some installs)
+        if "rank_change" in col_info and col_info["rank_change"].lower() not in ("text", "character varying"):
+            cur.execute("ALTER TABLE daily_rankings ALTER COLUMN rank_change TYPE TEXT USING rank_change::TEXT")
+            conn.commit()
+            logger.info("_migrate_daily_rankings_prob_column: converted rank_change to TEXT")
+
         conn.close()
     except Exception as exc:
         logger.warning("_migrate_daily_rankings_prob_column: %s", exc)

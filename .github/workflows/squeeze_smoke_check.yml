@@ -5,6 +5,9 @@ on:
     workflows: ["Daily Signal Pipeline (no AI cost)"]
     types: [completed]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   smoke-check:
     # Only run when the daily pipeline succeeded — no point checking broken data

@@ -493,11 +493,58 @@ def run_checker(verbose: bool = False) -> int:
 
     ohlc = _fetch_ohlc(tickers, fetch_start)
 
+    # Identify tickers that returned no data at all — likely delisted
+    _delisted: set = set()
+    for t in tickers:
+        df = ohlc.get(t)
+        if df is None or df.empty:
+            _delisted.add(t)
+            # Also quarantine so other modules skip them
+            try:
+                from utils.ticker_quarantine import quarantine as _q
+                _q(t, "no price data from yfinance (possibly delisted)")
+            except Exception:
+                pass
+
+    if _delisted and verbose:
+        print(f"  [checker] No price data for {sorted(_delisted)} — marking DELISTED")
+
     updated = 0
     for thesis in to_check:
         ticker = thesis["ticker"]
         df     = ohlc.get(ticker)
-        out    = _compute_outcome(thesis, df)
+
+        # If ticker has no data at all treat as delisted rather than silently OPEN
+        if ticker in _delisted:
+            thesis_date = thesis["date"]
+            now = datetime.now()
+            oldest_allowed = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+            if thesis_date < oldest_allowed:
+                # Old thesis, delisted — mark EXPIRED/DELISTED so it stops being re-checked
+                out = {
+                    "thesis_id":   thesis["id"],
+                    "ticker":      ticker,
+                    "thesis_date": thesis_date,
+                    "direction":   (thesis["direction"] or "NEUTRAL").upper(),
+                    "conviction":  thesis["conviction"],
+                    "time_horizon": thesis["time_horizon"],
+                    "target_1":    thesis["target_1"],
+                    "target_2":    thesis["target_2"],
+                    "stop_loss":   thesis["stop_loss"],
+                    "outcome":     "EXPIRED",
+                    "claude_correct": None,
+                    "last_checked":   now.isoformat(),
+                    "created_at":     now.isoformat(),
+                }
+                if verbose:
+                    print(f"    {ticker:<6} {thesis_date}  DELISTED/no-data → EXPIRED")
+            else:
+                # Recent thesis, may just be a temp data gap — keep OPEN
+                if verbose:
+                    print(f"    {ticker:<6} {thesis_date}  no price data (possibly delisted) → OPEN")
+                continue
+        else:
+            out    = _compute_outcome(thesis, df)
 
         # Trade linkage
         was_traded, trade_id = _find_linked_trade(ticker, thesis["date"])

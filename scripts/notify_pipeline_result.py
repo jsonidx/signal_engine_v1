@@ -424,6 +424,16 @@ def build_squeeze_alerts_section(conn) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _read_pipeline_health(status_path: str = "data/pipeline_status.json") -> str:
+    """Read the health field written by run_master.sh."""
+    try:
+        import json as _json
+        data = _json.loads(Path(_ROOT / status_path).read_text())
+        return data.get("health", "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Send pipeline result to Telegram")
     parser.add_argument("--status",       default="success",
@@ -438,11 +448,17 @@ def main() -> None:
                         help="Omit AI thesis section (no AI run)")
     args = parser.parse_args()
 
+    pipeline_health = _read_pipeline_health()
+    # Demote "success" to pipeline health grade when health is worse
+    effective_status = args.status
+    if args.status == "success" and pipeline_health in ("DEGRADED", "FAILED"):
+        effective_status = pipeline_health.lower()
+
     conn = _db_connect()
 
     # ── Build message ─────────────────────────────────────────────────────────
     header = build_header(
-        status=args.status,
+        status=effective_status,
         workflow=args.workflow,
         run_url=args.run_url,
         duration_min=args.duration_min,

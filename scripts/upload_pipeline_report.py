@@ -27,6 +27,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _read_pipeline_health(status_path: str = "data/pipeline_status.json") -> str:
+    """Read the health field written by run_master.sh. Returns SUCCESS/DEGRADED/FAILED."""
+    try:
+        import json as _json
+        data = _json.loads(Path(status_path).read_text())
+        return data.get("health", "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id",    required=True, help="GitHub Actions run ID")
@@ -34,6 +44,17 @@ def main() -> None:
     parser.add_argument("--workflow",  default="Signal Pipeline", help="Workflow display name")
     parser.add_argument("--report",    default="logs/pipeline_report.txt", help="Path to report file")
     args = parser.parse_args()
+
+    # Enrich the CI conclusion with our own health grade.
+    # If CI says "success" but we see DEGRADED/FAILED in the status file, surface it.
+    pipeline_health = _read_pipeline_health()
+    effective_conclusion = args.conclusion
+    if args.conclusion == "success" and pipeline_health in ("DEGRADED", "FAILED"):
+        effective_conclusion = pipeline_health.lower()
+        print(
+            f"[upload_report] CI conclusion={args.conclusion!r} but pipeline health={pipeline_health!r} "
+            f"→ recording as {effective_conclusion!r}"
+        )
 
     report_path = Path(args.report)
     if not report_path.exists():
@@ -68,11 +89,11 @@ def main() -> None:
             INSERT INTO pipeline_reports (run_id, workflow_name, conclusion, content)
             VALUES (%s, %s, %s, %s)
             """,
-            (str(args.run_id), args.workflow, args.conclusion, content),
+            (str(args.run_id), args.workflow, effective_conclusion, content),
         )
         conn.commit()
         conn.close()
-        print(f"[upload_report] Done — run_id={args.run_id}, conclusion={args.conclusion}")
+        print(f"[upload_report] Done — run_id={args.run_id}, conclusion={effective_conclusion} (pipeline_health={pipeline_health})")
     except Exception as exc:
         print(f"[upload_report] Upload failed: {exc}", file=sys.stderr)
         sys.exit(1)

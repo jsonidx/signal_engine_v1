@@ -14,6 +14,10 @@ on:
           - 'true'
           - 'false'
 
+# Opt into Node.js 24 now to avoid the June 2026 forced migration.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
@@ -46,7 +50,7 @@ jobs:
       - name: Run master pipeline
         run: |
           set -o pipefail
-          mkdir -p logs
+          mkdir -p logs data
           SKIP_AI="${{ github.event.inputs.skip_ai || 'true' }}"
           if [ "$SKIP_AI" = "true" ]; then
             echo "Running with --skip-ai (€0.00)"

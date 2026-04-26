@@ -54,6 +54,18 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 try:
+    from utils.ticker_quarantine import quarantine as _quarantine, is_quarantined as _is_quarantined
+    _QUARANTINE_AVAILABLE = True
+except ImportError:
+    _QUARANTINE_AVAILABLE = False
+    def _quarantine(t, r): pass          # type: ignore[misc]
+    def _is_quarantined(t): return False # type: ignore[misc]
+
+# Module-level error deduplication: only log each unique provider error once per run
+_SEEN_PROVIDER_ERRORS: set = set()
+_PROVIDER_ERROR_COUNTS: dict = {}
+
+try:
     from config import OUTPUT_DIR, UNIVERSE_CACHE_TTL_HOURS as _UNIVERSE_TTL
 except ImportError:
     OUTPUT_DIR = "./signals_output"
@@ -181,9 +193,17 @@ def get_stock_data(ticker: str, prefetched_hist: "pd.DataFrame | None" = None) -
             When provided the expensive stock.history() HTTP call is skipped.
             Pass None (default) to fall back to the normal per-ticker fetch.
     """
+    if _is_quarantined(ticker):
+        return None
+
     try:
         stock = yf.Ticker(ticker)
         info = stock.info or {}
+
+        # Detect 404 / delisted via the info dict itself (no quoteType = bad symbol)
+        if not info or info.get("quoteType") is None:
+            _quarantine(ticker, "no quoteType in yfinance info (delisted/invalid)")
+            return None
 
         # Price history — use pre-fetched bulk data when available
         if prefetched_hist is not None and not prefetched_hist.empty and len(prefetched_hist) >= 20:
@@ -231,7 +251,26 @@ def get_stock_data(ticker: str, prefetched_hist: "pd.DataFrame | None" = None) -
             "stock_obj": stock,
         }
 
-    except Exception as e:
+    except Exception as exc:
+        err_str = str(exc)
+        # 404 = symbol not found / delisted — quarantine immediately
+        if "404" in err_str or "Quote not found" in err_str or "No fundamentals data" in err_str:
+            _quarantine(ticker, f"HTTP 404: {err_str[:120]}")
+            err_key = f"404:{ticker}"
+            if err_key not in _SEEN_PROVIDER_ERRORS:
+                _SEEN_PROVIDER_ERRORS.add(err_key)
+                logger.warning("get_stock_data %s: 404 (quarantined for this run): %s", ticker, err_str[:120])
+            return None
+        # 401 / crumb errors — log once, count
+        if "401" in err_str or "Invalid Crumb" in err_str or "unable to access" in err_str.lower():
+            _PROVIDER_ERROR_COUNTS["yf_401"] = _PROVIDER_ERROR_COUNTS.get("yf_401", 0) + 1
+            if "yf_401" not in _SEEN_PROVIDER_ERRORS:
+                _SEEN_PROVIDER_ERRORS.add("yf_401")
+                logger.warning(
+                    "get_stock_data: Yahoo Finance 401/Unauthorized — "
+                    "crumb may be stale. Further 401s will be suppressed."
+                )
+            return None
         return None
 
 
@@ -1215,6 +1254,13 @@ def screen_universe(
         time.sleep(0.3)  # Rate limit
 
     print(f"\r  Scanning complete: {len(results)} tickers analyzed" + " " * 20)
+
+    # Summarise provider errors and quarantined tickers at end of scan
+    if _PROVIDER_ERROR_COUNTS.get("yf_401", 0):
+        print(f"  [WARN] Yahoo Finance 401 errors suppressed: {_PROVIDER_ERROR_COUNTS['yf_401']} occurrences")
+    quarantined = {k: v for k, v in __import__('utils.ticker_quarantine', fromlist=['get_quarantined']).get_quarantined().items()}
+    if quarantined:
+        print(f"  [INFO] Quarantined {len(quarantined)} invalid/delisted ticker(s): {', '.join(sorted(quarantined))}")
 
     df = pd.DataFrame(results)
     if not df.empty:

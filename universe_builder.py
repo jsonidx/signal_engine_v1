@@ -1156,8 +1156,11 @@ def _fetch_earnings_tags(candidates: list, days: int = None) -> dict:
         days = FORCE_EARNINGS_DAYS
 
     tags: dict = {}
+    _seen_errors: set = set()        # deduplicate provider errors within this call
+    _401_count = 0                   # circuit-breaker counter
 
     def _check(ticker: str) -> tuple:
+        nonlocal _401_count
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info or {}
@@ -1181,8 +1184,24 @@ def _fetch_earnings_tags(candidates: list, days: int = None) -> dict:
                             return ticker, dte
             except Exception:
                 pass
-        except Exception:
-            pass
+        except Exception as exc:
+            err_str = str(exc)
+            is_401 = "401" in err_str or "Invalid Crumb" in err_str or "unable to access" in err_str.lower()
+            if is_401:
+                _401_count += 1
+                err_key = "yf_401"
+                if err_key not in _seen_errors:
+                    _seen_errors.add(err_key)
+                    logger.warning(
+                        "Yahoo Finance 401/Unauthorized during earnings check — "
+                        "further 401s suppressed (crumb may be stale). "
+                        "Affected tickers will be treated as UNKNOWN earnings."
+                    )
+            else:
+                err_key = err_str[:80]
+                if err_key not in _seen_errors:
+                    _seen_errors.add(err_key)
+                    logger.debug("_check %s: %s", ticker, exc)
         return ticker, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
@@ -1194,6 +1213,13 @@ def _fetch_earnings_tags(candidates: list, days: int = None) -> dict:
                     tags[ticker] = {"EARNINGS_WINDOW"}
             except Exception:
                 pass
+
+    if _401_count:
+        logger.warning(
+            "_fetch_earnings_tags: %d tickers hit Yahoo 401 — "
+            "their earnings proximity is UNKNOWN (treated as no upcoming earnings).",
+            _401_count,
+        )
 
     return tags
 
@@ -1413,6 +1439,18 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
         from utils.db import get_connection
         conn = get_connection()
         cur = conn.cursor()
+
+        # Detect which optional columns actually exist in the live table so we
+        # never crash on a schema that pre-dates the tier/source/notes columns.
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'user_watchlists'
+        """)
+        existing_cols = {r["column_name"] for r in cur.fetchall()}
+        has_tier   = "tier"   in existing_cols
+        has_source = "source" in existing_cols
+        has_notes  = "notes"  in existing_cols
+
         # Build full list with tiers + force tags
         sync_rows = []
         for t in tier1_set:
@@ -1423,21 +1461,51 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
             tags = sorted(_FORCE_TAGS.get(t.upper(), set()))
             tag_str = ",".join(tags) if tags else None
             sync_rows.append((t.upper(), "AUTO", "universe_builder", tag_str))
-        # Delete rows no longer in the current universe, then upsert
-        cur.execute("DELETE FROM user_watchlists WHERE source = 'universe_builder'")
+
+        # Delete rows no longer in the current universe, then upsert.
+        # Use source column for the DELETE only when it exists.
+        if has_source:
+            cur.execute("DELETE FROM user_watchlists WHERE source = 'universe_builder'")
+        else:
+            cur.execute("DELETE FROM user_watchlists WHERE category = 'equity'")
+
         if sync_rows:
-            cur.executemany(
-                """
-                INSERT INTO user_watchlists (ticker, tier, source, category, notes)
-                VALUES (%s, %s, %s, 'equity', %s)
-                ON CONFLICT (ticker) DO UPDATE
-                  SET tier = EXCLUDED.tier,
-                      source = EXCLUDED.source,
-                      notes = EXCLUDED.notes,
-                      added_at = now()
-                """,
-                sync_rows,
-            )
+            # Build INSERT dynamically based on available columns
+            extra_cols    = []
+            extra_vals    = []
+            update_clauses = []
+            if has_tier:
+                extra_cols.append("tier");    extra_vals.append("%s")
+                update_clauses.append("tier = EXCLUDED.tier")
+            if has_source:
+                extra_cols.append("source");  extra_vals.append("%s")
+                update_clauses.append("source = EXCLUDED.source")
+            if has_notes:
+                extra_cols.append("notes");   extra_vals.append("%s")
+                update_clauses.append("notes = EXCLUDED.notes")
+
+            col_str = ", ".join(["ticker", "category"] + extra_cols)
+            val_str = ", ".join(["%s", "'equity'"] + extra_vals)
+            upd_str = (", ".join(["added_at = now()"] + update_clauses))
+
+            sql = f"""
+                INSERT INTO user_watchlists ({col_str})
+                VALUES ({val_str})
+                ON CONFLICT (ticker) DO UPDATE SET {upd_str}
+            """
+
+            # Trim each row tuple to match the actual number of %s placeholders
+            # tuple: (ticker, tier, source, notes) — keep only the columns present
+            trimmed_rows = []
+            for ticker_val, tier_val, source_val, notes_val in sync_rows:
+                row: list = [ticker_val]
+                if has_tier:   row.append(tier_val)
+                if has_source: row.append(source_val)
+                if has_notes:  row.append(notes_val)
+                trimmed_rows.append(tuple(row))
+
+            cur.executemany(sql, trimmed_rows)
+
         conn.commit()
         conn.close()
         print(f"INFO: Synced {len(sync_rows)} tickers to Supabase user_watchlists")
