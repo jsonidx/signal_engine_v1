@@ -14,7 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Need full history + push access for the commit step
+          # Always use latest main — workflow_run default checkout uses the
+          # triggering workflow's SHA which may predate recent script fixes
+          ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
