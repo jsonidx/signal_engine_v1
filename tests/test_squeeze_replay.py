@@ -309,3 +309,50 @@ class TestReplayHandlesMissingLifecycleState:
         df = replay.run(prices={"CAR": prices})
 
         assert df.iloc[0]["squeeze_state"] == "ARMED"
+
+
+# ── CHUNK-16: replay handles risk fields ──────────────────────────────────────
+
+class TestReplayRiskFieldHandling:
+
+    def test_replay_handles_missing_risk_fields_for_old_rows(self):
+        """Old snapshot rows without risk fields must not crash replay."""
+        old_row = {
+            "date": "2024-01-02",
+            "ticker": "OLD",
+            "final_score": 5.5,
+            "short_pct_float": 0.30,
+            "days_to_cover": 3.5,
+            "computed_dtc_30d": 3.5,
+            "compression_recovery_score": 4.0,
+            "volume_confirmation_flag": True,
+            "squeeze_state": "ARMED",
+            "explanation_summary": "Old row.",
+            "explanation_json": None,
+            # risk_score, risk_level, dilution_risk_flag intentionally absent
+        }
+        prices = _prices([100.0] + [110.0] * 35, start="2024-01-01")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[old_row])
+        df = replay.run(prices={"OLD": prices})
+
+        assert len(df) == 1
+        # Missing risk fields should be None, not crash
+        assert df.iloc[0]["risk_score"] is None
+        assert df.iloc[0]["risk_level"] is None
+        assert df.iloc[0]["dilution_risk_flag"] is None
+
+    def test_replay_includes_risk_fields_when_present(self):
+        """New snapshot rows with risk fields must have them propagated in replay output."""
+        snap = _snap("CAR", signal_date="2024-01-02")
+        snap["risk_score"] = 45.0
+        snap["risk_level"] = "MEDIUM"
+        snap["dilution_risk_flag"] = True
+        prices = _prices([100.0] + [110.0] * 35, start="2024-01-01")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"CAR": prices})
+
+        assert df.iloc[0]["risk_score"] == pytest.approx(45.0)
+        assert df.iloc[0]["risk_level"] == "MEDIUM"
+        assert df.iloc[0]["dilution_risk_flag"] == True  # noqa: E712 — np.True_ vs True

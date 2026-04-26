@@ -162,6 +162,15 @@ class SqueezeScore:
     state_confidence: str = "low"
     state_reasons: List[str] = field(default_factory=list)
     state_warnings: List[str] = field(default_factory=list)
+    # CHUNK-16: risk scoring
+    risk_score: float = 0.0
+    risk_level: str = "LOW"
+    risk_flags: List[str] = field(default_factory=list)
+    risk_warnings: List[str] = field(default_factory=list)
+    risk_components: dict = field(default_factory=dict)
+    dilution_risk_flag: bool = False
+    latest_dilution_filing_date: Optional[str] = None
+    shares_offered_pct_float: Optional[float] = None
     # CHUNK-14: explanation card
     explanation: dict = field(default_factory=dict)
 
@@ -187,6 +196,10 @@ class SqueezeScore:
         # CHUNK-10: flatten lifecycle metadata for CSV/Supabase
         d["state_reasons"] = json.dumps(self.state_reasons) if self.state_reasons else "[]"
         d["state_warnings"] = json.dumps(self.state_warnings) if self.state_warnings else "[]"
+        # CHUNK-16: flatten risk fields for CSV/Supabase
+        d["risk_flags"] = json.dumps(self.risk_flags) if self.risk_flags else "[]"
+        d["risk_warnings"] = json.dumps(self.risk_warnings) if self.risk_warnings else "[]"
+        d["risk_components"] = json.dumps(self.risk_components) if self.risk_components else "{}"
         return d
 
 
@@ -580,6 +593,27 @@ def _load_filing_catalysts(ticker: str, as_of_date: "date | None" = None) -> lis
         return []
 
 
+def _compute_price_extension(data: dict, lookback_days: int = 30) -> float:
+    """
+    Compute how far current price has moved above its recent N-day low.
+
+    Returns (current_price - recent_low) / recent_low, or 0.0 if not computable.
+    Used by CHUNK-16 exhaustion risk component.
+    """
+    try:
+        hist = data.get("history")
+        if hist is None or hist.empty or len(hist) < lookback_days:
+            return 0.0
+        recent_close = hist["Close"].iloc[-lookback_days:]
+        low = float(recent_close.min())
+        current = float(hist["Close"].iloc[-1])
+        if low <= 0:
+            return 0.0
+        return (current - low) / low
+    except Exception:
+        return 0.0
+
+
 # ==============================================================================
 # SECTION 3: SIGNAL SCORING
 # ==============================================================================
@@ -939,27 +973,29 @@ def _expl_driver(
 def _expl_summary(
     ticker: str, final_score: float, squeeze_state: str, positive_drivers: list,
     recent_squeeze: bool = False,
+    risk_level: str = "LOW",
 ) -> str:
     # CHUNK-10: use new lifecycle state values; fall back gracefully for old "completed"/"active"
     _state = squeeze_state.upper() if squeeze_state else ""
+    _risk_suffix = f" [RISK: {risk_level}]" if risk_level in ("HIGH", "EXTREME") else ""
     if _state == "ACTIVE" or squeeze_state == "active":
-        return f"{ticker}: Active squeeze in progress — shorts still trapped."
+        return f"{ticker}: Active squeeze in progress — shorts still trapped.{_risk_suffix}"
     if recent_squeeze or squeeze_state == "completed":
         return f"{ticker}: Squeeze appears completed — score zeroed. Monitor for re-setup."
     if _state == "ARMED":
         quality = "strong" if final_score >= 70 else "moderate"
         if not positive_drivers:
-            return f"{ticker}: Armed squeeze setup — structural preconditions met, catalyst pending."
+            return f"{ticker}: Armed squeeze setup — structural preconditions met, catalyst pending.{_risk_suffix}"
         top = positive_drivers[0]["label"].lower()
-        return f"{ticker}: {quality.capitalize()} armed squeeze setup — {top} is the lead driver."
+        return f"{ticker}: {quality.capitalize()} armed squeeze setup — {top} is the lead driver.{_risk_suffix}"
     quality = "strong" if final_score >= 70 else "moderate" if final_score >= 45 else "weak"
     if not positive_drivers:
-        return f"{ticker}: {quality.capitalize()} squeeze setup with limited positive signals."
+        return f"{ticker}: {quality.capitalize()} squeeze setup with limited positive signals.{_risk_suffix}"
     top = positive_drivers[0]["label"].lower()
     if len(positive_drivers) >= 2:
         second = positive_drivers[1]["label"].lower()
-        return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top} and {second}."
-    return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top}."
+        return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top} and {second}.{_risk_suffix}"
+    return f"{ticker}: {quality.capitalize()} squeeze setup driven by {top}.{_risk_suffix}"
 
 
 def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
@@ -1178,20 +1214,34 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
             "Recent price run appears exhausted; score has been zeroed.", 10.0,
         ))
 
-    # ── 11. Risk warnings (dilution, derivatives) ──────────────────────────────
-    _flag_text = " ".join(sq.flags or []).lower()
-    if any(kw in _flag_text for kw in ("dilut", "424b5", "s-3", "at-the-market", "equity distribution")):
-        warnings.append({
-            "key": "dilution_risk_flag",
-            "label": "Dilution risk",
-            "reason": "Recent SEC filing suggests possible share issuance — may absorb squeeze demand.",
-        })
-    if any(kw in _flag_text for kw in ("derivative", "convertible", "warrant")):
-        warnings.append({
-            "key": "derivative_exposure_flag",
-            "label": "Derivative exposure",
-            "reason": "Potential derivative instruments associated with a large-holder position.",
-        })
+    # ── 11. Risk warnings (CHUNK-16: structured risk layer) ───────────────────
+    # Prefer structured risk_warnings from CHUNK-16 over flag-text matching.
+    if getattr(sq, "risk_warnings", None):
+        for rw in sq.risk_warnings:
+            # Map risk warning text to a structured warning dict
+            _key = "dilution_risk" if "dilution" in rw.lower() or "offering" in rw.lower() else \
+                   "exhaustion_risk" if any(k in rw.lower() for k in ("exhaust", "completed", "covered", "dtc", "extension", "reversal")) else \
+                   "data_quality_risk"
+            warnings.append({
+                "key": _key,
+                "label": _key.replace("_", " ").title(),
+                "reason": rw,
+            })
+    else:
+        # Fallback: flag-text matching (for SqueezeScore objects built without CHUNK-16)
+        _flag_text = " ".join(sq.flags or []).lower()
+        if any(kw in _flag_text for kw in ("dilut", "424b5", "s-3", "at-the-market", "equity distribution")):
+            warnings.append({
+                "key": "dilution_risk_flag",
+                "label": "Dilution risk",
+                "reason": "Recent SEC filing suggests possible share issuance — may absorb squeeze demand.",
+            })
+        if any(kw in _flag_text for kw in ("derivative", "convertible", "warrant")):
+            warnings.append({
+                "key": "derivative_exposure_flag",
+                "label": "Derivative exposure",
+                "reason": "Potential derivative instruments associated with a large-holder position.",
+            })
 
     # ── 12. Data quality notes ─────────────────────────────────────────────────
     if sq.effective_float_confidence == "unknown":
@@ -1249,9 +1299,19 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
     if si_persist >= 7.0:
         tags.append("PERSISTENT_SI")
 
+    # CHUNK-16: risk-level tags
+    _risk_level = getattr(sq, "risk_level", "LOW")
+    if _risk_level == "EXTREME":
+        tags.append("EXTREME_RISK")
+    elif _risk_level == "HIGH":
+        tags.append("HIGH_RISK")
+    if getattr(sq, "dilution_risk_flag", False):
+        tags.append("DILUTION_RISK")
+
     summary = _expl_summary(
         sq.ticker, sq.final_score, sq.squeeze_state, pos_drivers,
         recent_squeeze=sq.recent_squeeze,
+        risk_level=getattr(sq, "risk_level", "LOW"),
     )
 
     return {
@@ -1425,6 +1485,29 @@ def compute_squeeze_score(
     )
     squeeze_state = _lifecycle["state"]   # "NOT_SETUP" | "ARMED" | "ACTIVE"
 
+    # ── CHUNK-16: risk / exhaustion / dilution scoring ────────────────────────
+    from squeeze_risk_analyzer import extract_dilution_info, compute_squeeze_risk_score
+    _dilution_info = extract_dilution_info(
+        filing_catalysts=filing_catalysts,
+        float_shares=float_shares or None,
+    )
+    _price_ext = _compute_price_extension(data)
+    _risk = compute_squeeze_risk_score(
+        squeeze_state=squeeze_state,
+        final_score=final_score,
+        short_pct_float=pos.get("short_pct") or None,
+        computed_dtc_30d=mech.get("computed_dtc_30d") or None,
+        volume_confirmation_flag=mech.get("volume_confirmation_flag"),
+        recent_squeeze_state=raw_squeeze_state,
+        dilution_risk_flag=_dilution_info["dilution_risk_flag"],
+        derivative_exposure_flag=ef_result.get("derivative_exposure_present", False) or None,
+        effective_float_confidence=ef_result.get("effective_float_confidence"),
+        shares_offered_pct_float=_dilution_info["shares_offered_pct_float"],
+        latest_dilution_filing_date=_dilution_info["latest_dilution_filing_date"],
+        si_persistence_count=pos.get("si_persistence_count"),
+        price_extension_pct=_price_ext if _price_ext > 0 else None,
+    )
+
     signal_breakdown = {
         "pct_float_short_score": pos.get("short_pct_score", 0),
         "short_pnl_score": pos.get("short_pnl_score", 0),
@@ -1449,6 +1532,10 @@ def compute_squeeze_score(
         # CHUNK-10 lifecycle state
         "lifecycle_state": squeeze_state,
         "state_confidence": _lifecycle["state_confidence"],
+        # CHUNK-16 risk
+        "risk_score": _risk["risk_score"],
+        "risk_level": _risk["risk_level"],
+        "dilution_risk_flag": float(_dilution_info["dilution_risk_flag"]),
     }
 
     short_pct = pos.get("short_pct", 0)
@@ -1484,6 +1571,18 @@ def compute_squeeze_score(
         state_confidence=_lifecycle["state_confidence"],
         state_reasons=_lifecycle["state_reasons"],
         state_warnings=_lifecycle["state_warnings"],
+        # CHUNK-16 risk scoring
+        risk_score=_risk["risk_score"],
+        risk_level=_risk["risk_level"],
+        risk_flags=_risk["risk_flags"],
+        risk_warnings=_risk["risk_warnings"],
+        risk_components=_risk["risk_components"],
+        dilution_risk_flag=_dilution_info["dilution_risk_flag"],
+        latest_dilution_filing_date=(
+            str(_dilution_info["latest_dilution_filing_date"])
+            if _dilution_info["latest_dilution_filing_date"] else None
+        ),
+        shares_offered_pct_float=_dilution_info["shares_offered_pct_float"],
     )
     # CHUNK-14: build explanation card after all fields are populated
     sq.explanation = build_squeeze_explanation(sq)

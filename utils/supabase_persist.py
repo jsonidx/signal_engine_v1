@@ -474,7 +474,7 @@ CREATE TABLE IF NOT EXISTS squeeze_scores (
 );
 """
 
-# Idempotent migrations: add columns introduced in CHUNK-14 and CHUNK-10.
+# Idempotent migrations: add columns introduced in CHUNK-14, CHUNK-10, and CHUNK-16.
 _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_summary TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_json JSONB;",
@@ -482,6 +482,15 @@ _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_confidence TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_reasons JSONB;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS state_warnings JSONB;",
+    # CHUNK-16: risk scoring columns
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS risk_score REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS risk_level TEXT;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS risk_flags JSONB;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS risk_warnings JSONB;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS risk_components JSONB;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS dilution_risk_flag BOOLEAN;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS latest_dilution_filing_date TEXT;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS shares_offered_pct_float REAL;",
 ]
 
 def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
@@ -548,6 +557,15 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 str(row["state_confidence"]) if row.get("state_confidence") else None,
                 _lifecycle_json(row, "state_reasons"),
                 _lifecycle_json(row, "state_warnings"),
+                # CHUNK-16: risk scoring
+                _f(row, "risk_score"),
+                str(row["risk_level"]) if row.get("risk_level") else None,
+                _lifecycle_json(row, "risk_flags"),
+                _lifecycle_json(row, "risk_warnings"),
+                _lifecycle_json(row, "risk_components"),
+                bool(row["dilution_risk_flag"]) if "dilution_risk_flag" in row and row["dilution_risk_flag"] is not None else None,
+                str(row["latest_dilution_filing_date"]) if row.get("latest_dilution_filing_date") else None,
+                _f(row, "shares_offered_pct_float"),
             ))
         cur.executemany(
             """
@@ -560,8 +578,10 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                  computed_dtc_30d, compression_recovery_score,
                  volume_confirmation_flag, squeeze_state,
                  explanation_summary, explanation_json,
-                 state_confidence, state_reasons, state_warnings)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 state_confidence, state_reasons, state_warnings,
+                 risk_score, risk_level, risk_flags, risk_warnings, risk_components,
+                 dilution_risk_flag, latest_dilution_filing_date, shares_offered_pct_float)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
                 final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
                 recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
@@ -582,7 +602,15 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 explanation_json=EXCLUDED.explanation_json,
                 state_confidence=EXCLUDED.state_confidence,
                 state_reasons=EXCLUDED.state_reasons,
-                state_warnings=EXCLUDED.state_warnings
+                state_warnings=EXCLUDED.state_warnings,
+                risk_score=EXCLUDED.risk_score,
+                risk_level=EXCLUDED.risk_level,
+                risk_flags=EXCLUDED.risk_flags,
+                risk_warnings=EXCLUDED.risk_warnings,
+                risk_components=EXCLUDED.risk_components,
+                dilution_risk_flag=EXCLUDED.dilution_risk_flag,
+                latest_dilution_filing_date=EXCLUDED.latest_dilution_filing_date,
+                shares_offered_pct_float=EXCLUDED.shares_offered_pct_float
             """,
             rows,
         )

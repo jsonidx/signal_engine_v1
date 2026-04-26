@@ -485,3 +485,59 @@ class TestLifecycleStateInSqueezeScore:
                                            si_history=[], filing_catalysts=[])
 
         assert sq.squeeze_state == "NOT_SETUP"
+
+
+# ── CHUNK-16: risk scoring integration ────────────────────────────────────────
+
+class TestRiskFieldsInSqueezeScore:
+
+    def test_squeeze_score_contains_risk_fields(self):
+        """compute_squeeze_score must populate risk_score, risk_level, risk_flags."""
+        from squeeze_screener import compute_squeeze_score
+        from unittest.mock import patch
+
+        data = _flat_data(short_pct_float=0.35)
+        with patch("squeeze_screener._load_filing_catalysts", return_value=[]):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                           si_history=[], filing_catalysts=[])
+
+        assert hasattr(sq, "risk_score")
+        assert hasattr(sq, "risk_level")
+        assert hasattr(sq, "risk_flags")
+        assert hasattr(sq, "risk_warnings")
+        assert sq.risk_level in ("LOW", "MEDIUM", "HIGH", "EXTREME")
+        assert isinstance(sq.risk_score, float)
+
+    def test_final_score_unchanged_by_risk(self):
+        """Adding dilution catalysts must not change final_score."""
+        from squeeze_screener import compute_squeeze_score
+        from unittest.mock import patch
+
+        data = _flat_data(short_pct_float=0.35)
+
+        # Score without dilution
+        with patch("squeeze_screener._load_filing_catalysts", return_value=[]):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq_clean = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                                  si_history=[], filing_catalysts=[])
+
+        # Score with dilution filing
+        dilution_catalyst = [{
+            "ticker": "TEST",
+            "filing_type": "424B5",
+            "dilution_risk_flag": True,
+            "filing_date": "2024-05-15",
+            "shares_offered": 2_000_000,
+            "ownership_accumulation_flag": False,
+            "large_holder_flag": False,
+        }]
+        with patch("squeeze_screener._load_filing_catalysts", return_value=dilution_catalyst):
+            with patch("squeeze_screener._load_si_history", return_value=[]):
+                sq_diluted = compute_squeeze_score("TEST", data, {}, pd.DataFrame(),
+                                                    si_history=[], filing_catalysts=dilution_catalyst)
+
+        # Final score must be identical
+        assert sq_clean.final_score == pytest.approx(sq_diluted.final_score)
+        # But risk_score must differ
+        assert sq_diluted.risk_score > sq_clean.risk_score

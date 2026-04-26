@@ -1270,6 +1270,10 @@ class SqueezeOutcomeReplay:
             "effective_float_score": _extract_from_explanation(
                 snap.get("explanation_json"), "effective_float"
             ),
+            # CHUNK-16: risk fields (gracefully handles old rows that lack them)
+            "risk_score": snap.get("risk_score"),
+            "risk_level": snap.get("risk_level"),
+            "dilution_risk_flag": snap.get("dilution_risk_flag"),
         }
 
         # Forward returns
@@ -1359,6 +1363,12 @@ class SqueezeOutcomeReplay:
             metrics["outcome_label_counts"] = df["outcome_label"].value_counts().to_dict()
         else:
             metrics["outcome_label_counts"] = {}
+
+        # CHUNK-16: optional risk-level breakdown (diagnostic, non-breaking)
+        if "risk_level" in df.columns:
+            metrics["risk_level_counts"] = df["risk_level"].dropna().value_counts().to_dict()
+        else:
+            metrics["risk_level_counts"] = {}
 
         return metrics
 

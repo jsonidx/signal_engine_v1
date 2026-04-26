@@ -393,12 +393,14 @@ class TestOutputPersistence:
         executemany_call = mock_cur.executemany.call_args
         assert executemany_call is not None
 
-        # The rows tuple must have 27 elements:
+        # The rows tuple must have 35 elements:
         # 22 original + explanation_summary + explanation_json (CHUNK-14)
         # + state_confidence + state_reasons + state_warnings (CHUNK-10)
+        # + risk_score + risk_level + risk_flags + risk_warnings + risk_components
+        #   + dilution_risk_flag + latest_dilution_filing_date + shares_offered_pct_float (CHUNK-16)
         rows_arg = executemany_call[0][1]
         assert len(rows_arg) == 1
-        assert len(rows_arg[0]) == 27
+        assert len(rows_arg[0]) == 35
 
         # explanation_summary at index 22 should be a non-empty string
         assert isinstance(rows_arg[0][22], str)
@@ -467,3 +469,47 @@ class TestLifecycleStateInExplanation:
         sq = _make_sq(squeeze_state="NOT_SETUP", final_score=0.0, recent_squeeze=True)
         result = build_squeeze_explanation(sq)
         assert "COMPLETED_SQUEEZE" in result["setup_tags"]
+
+
+# ── CHUNK-16: risk warnings in explanation ────────────────────────────────────
+
+class TestRiskWarningsInExplanation:
+
+    def test_explanation_surfaces_dilution_risk_warning(self):
+        """When sq.risk_warnings contains dilution text, explanation must surface it."""
+        sq = _make_sq(
+            squeeze_state="ARMED",
+            risk_warnings=["Dilution filing detected (424B5/S-3/ATM). Share issuance warning."],
+            risk_flags=["DILUTION_RISK"],
+            risk_level="HIGH",
+            dilution_risk_flag=True,
+        )
+        result = build_squeeze_explanation(sq)
+        warning_keys = [w["key"] for w in result["warning_flags"]]
+        assert any("dilution" in k for k in warning_keys)
+
+    def test_high_risk_tag_present_when_risk_high(self):
+        sq = _make_sq(
+            squeeze_state="ARMED",
+            risk_level="HIGH",
+            risk_warnings=["High risk test."],
+            risk_flags=["COMPLETED_SQUEEZE_RISK"],
+        )
+        result = build_squeeze_explanation(sq)
+        assert "HIGH_RISK" in result["setup_tags"]
+
+    def test_extreme_risk_tag_present(self):
+        sq = _make_sq(squeeze_state="ARMED", risk_level="EXTREME")
+        result = build_squeeze_explanation(sq)
+        assert "EXTREME_RISK" in result["setup_tags"]
+
+    def test_dilution_risk_flag_adds_dilution_tag(self):
+        sq = _make_sq(dilution_risk_flag=True, risk_level="HIGH")
+        result = build_squeeze_explanation(sq)
+        assert "DILUTION_RISK" in result["setup_tags"]
+
+    def test_low_risk_no_risk_tag(self):
+        sq = _make_sq(risk_level="LOW")
+        result = build_squeeze_explanation(sq)
+        assert "HIGH_RISK" not in result["setup_tags"]
+        assert "EXTREME_RISK" not in result["setup_tags"]
