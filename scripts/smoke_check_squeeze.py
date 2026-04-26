@@ -16,7 +16,7 @@ Exit codes:
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,7 +27,7 @@ load_dotenv()
 from utils.db import managed_connection
 
 REPORT_PATH = Path(__file__).resolve().parents[1] / "reports" / "post_fix_first_pipeline_smoke_check.md"
-FIX_COMMIT_DATE = date(2026, 4, 26)
+FIX_COMMIT_DATE = "2026-04-26"  # TEXT column — compare as string
 FIX_COMMIT_SHA = "7caf4e4"
 
 CHUNK_FIELDS = [
@@ -126,7 +126,7 @@ def query_gate_metrics(cur):
     cur.execute("""
         SELECT COUNT(*) AS n FROM squeeze_scores
         WHERE date > %s
-        AND (CURRENT_DATE - date) >= 28
+        AND (CURRENT_DATE - date::date) >= 28
     """, (FIX_COMMIT_DATE,))
     metrics["rows_20d_window_closed"] = cur.fetchone()["n"]
 
