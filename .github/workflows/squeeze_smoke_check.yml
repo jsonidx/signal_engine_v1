@@ -1,0 +1,56 @@
+name: Squeeze Smoke Check
+
+on:
+  workflow_run:
+    workflows: ["Daily Signal Pipeline (no AI cost)"]
+    types: [completed]
+
+jobs:
+  smoke-check:
+    # Only run when the daily pipeline succeeded — no point checking broken data
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history + push access for the commit step
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run smoke check
+        id: smoke
+        run: python scripts/smoke_check_squeeze.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Commit updated report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/post_fix_first_pipeline_smoke_check.md
+          # Only commit if there are actual changes
+          git diff --cached --quiet || git commit -m "Smoke check round $(date +%Y-%m-%d): ${{ steps.smoke.outcome == 'success' && 'PASS/PARTIAL' || 'FAIL' }}"
+
+      - name: Push report commit
+        run: git push
+
+      - name: Notify Telegram on FAIL
+        if: failure()
+        run: |
+          python3 scripts/notify_pipeline_result.py \
+            --status "failure" \
+            --workflow "Squeeze Smoke Check" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "0"
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
