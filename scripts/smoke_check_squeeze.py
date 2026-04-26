@@ -94,7 +94,7 @@ def query_json_fields(cur, run_date):
 def query_gate_metrics(cur):
     metrics = {}
 
-    cur.execute("SELECT COUNT(DISTINCT date) AS n FROM squeeze_scores WHERE date > %s", (FIX_COMMIT_DATE,))
+    cur.execute(f"SELECT COUNT(DISTINCT date) AS n FROM squeeze_scores WHERE date > '{FIX_COMMIT_DATE}'")
     metrics["post_fix_days"] = cur.fetchone()["n"]
 
     cur.execute("SELECT COUNT(*) AS n FROM squeeze_scores WHERE squeeze_state IS NOT NULL")
@@ -123,11 +123,11 @@ def query_gate_metrics(cur):
     metrics["iv_history_tickers_60plus"] = cur.fetchone()["n"]
 
     # 20d forward return windows: oldest post-fix row must be > 20 business days ago
-    cur.execute("""
+    cur.execute(f"""
         SELECT COUNT(*) AS n FROM squeeze_scores
-        WHERE date > %s
+        WHERE date > '{FIX_COMMIT_DATE}'
         AND (CURRENT_DATE - date::date) >= 28
-    """, (FIX_COMMIT_DATE,))
+    """)
     metrics["rows_20d_window_closed"] = cur.fetchone()["n"]
 
     return metrics
