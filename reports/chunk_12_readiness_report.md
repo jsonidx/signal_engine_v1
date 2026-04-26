@@ -1,0 +1,339 @@
+# CHUNK-12 Readiness Report
+
+**Generated:** 2026-04-26  
+**Analyst:** Claude Code (replay-driven, read-only analysis)  
+**Purpose:** Evidence-based gate on whether the codebase is ready for the four-score architecture refactor (CHUNK-12).
+
+---
+
+## 1. Executive Verdict
+
+| | |
+|---|---|
+| **Classification** | **NOT_READY_NEEDS_MORE_DATA** |
+| **Short explanation** | The squeeze engine code (CHUNK-01 through CHUNK-15) is fully implemented and architecturally sound. However, the production database contains zero rows with any CHUNK-added signal fields populated. All 186 saved squeeze_scores rows pre-date the schema migration and have NULL for every field added after the original 18-column schema. Only 5-day forward returns are available (10d/20d/30d windows still open), and the score distribution is compressed well below the ARMED threshold — no ACTIVE or ARMED signals exist in the replay set. |
+| **Recommended next action** | Run the pipeline with the new squeeze_screener code and wait for 30+ calendar days of new-format data before revisiting CHUNK-12. |
+
+---
+
+## 2. Data Coverage
+
+### 2.1 squeeze_scores
+
+| Metric | Value |
+|---|---|
+| Total rows | 186 |
+| Date range | 2026-04-16 → 2026-04-25 (10 calendar days) |
+| Unique tickers | 78 |
+| Schema version | **OLD (18 columns, pre-CHUNK)** |
+| Rows with `squeeze_state` | **0** (NULL for all rows) |
+| Rows with `computed_dtc_30d` | **0** (NULL for all rows) |
+| Rows with `compression_recovery_score` | **0** (NULL for all rows) |
+| Rows with `risk_score` | **0** (NULL for all rows) |
+| Rows with `options_pressure_score` | **0** (NULL for all rows) |
+| Rows with `explanation_json` | **0** (NULL for all rows) |
+| Rows with `si_persistence_score` (via explanation_json) | **0** |
+| Rows with `effective_float_score` (via explanation_json) | **0** |
+| Forward return coverage | 5d: 85/186 rows · 10d/20d/30d: 0 rows |
+
+**Root cause of NULL coverage:** `_SQUEEZE_MIGRATE_DDL` was missing 4 ADD COLUMN statements (`computed_dtc_30d`, `compression_recovery_score`, `volume_confirmation_flag`, `squeeze_state`). Every `save_squeeze_scores()` call since those CHUNKs landed has silently failed on the INSERT (42-column tuple against a 38-column schema). This was discovered during this analysis and fixed as a minimal non-invasive correction (see Section 9). Additionally, `fetch_squeeze_scores_for_replay` contained a `dict(zip(cols, row))` bug that produced column-name→column-name mappings with `RealDictCursor`, also fixed.
+
+**Schema status after fix:** 42 columns now present in production. Future pipeline runs will persist all CHUNK signal fields correctly.
+
+### 2.2 short_interest_history
+
+| Metric | Value |
+|---|---|
+| Total rows | 3 |
+| Unique tickers | 3 (UTHR, COIN, TTWO) |
+| Date range | 2026-04-26 only (single snapshot) |
+| Source | `yfinance_snapshot` — all same day |
+| Distinct periods | 1 |
+
+**Assessment:** Effectively useless for SI persistence validation. A single same-day snapshot across 3 tickers provides no trend signal. The SI persistence scorer (`compute_si_persistence_score`) requires at least 2 distinct FINRA settlement periods to distinguish "rising" from "stable" or "declining" SI. Current coverage is 3 rows / 1 period. Need ≥10 rows per ticker across ≥3 distinct periods for meaningful persistence scoring.
+
+### 2.3 filing_catalysts
+
+| Metric | Value |
+|---|---|
+| Total rows | 43 |
+| Unique tickers | 1 (COIN only) |
+| Rows with `ownership_accumulation_flag` | 0 |
+| Rows with `dilution_risk_flag` | 43 (all of them) |
+| Rows with `large_holder_flag` | 0 |
+
+**Assessment:** Extremely narrow. All 43 rows are COIN dilution filings (S-3, 424B5, F-3 filings). Zero ownership accumulation or large holder signals. Cannot validate effective-float / large-holder signals from this dataset. Cannot test the dilution-risk pathway on multiple tickers.
+
+### 2.4 iv_history
+
+| Metric | Value |
+|---|---|
+| Total rows | 2,196 |
+| Unique tickers | 450 |
+| Date range | 2026-04-01 → 2026-04-26 (18 business days) |
+| Tickers with ≥5 rows | 237 |
+| IV rank computable | 237 tickers |
+
+**Assessment:** This is the healthiest dataset. 237 tickers have enough history for IV rank calculation. However, IV rank is meaningful on a 60+ day window; the current 18-day window gives early-cycle ranks only. Options/IV signals can be evaluated qualitatively but not yet statistically validated.
+
+---
+
+## 3. Replay Results
+
+### 3.1 Overall Outcome Metrics
+
+| Metric | Value | Note |
+|---|---|---|
+| Total signals | 186 | |
+| Unique tickers | 78 | |
+| Date range | 2026-04-16 → 2026-04-25 | |
+| 5d hit rate (>0) | 28.2% | Below coin flip |
+| 5d avg return | −2.27% | Negative |
+| 5d median return | −2.6% | Negative |
+| 10d/20d/30d | N/A | Windows not yet closed |
+| Max score in set | 61.2 | No ARMED signals (threshold 55) |
+| Outcome: none | 175/186 (94.1%) | |
+| Outcome: minor (>5%) | 8/186 (4.3%) | |
+| Outcome: strong (>15%) | 3/186 (1.6%) | |
+
+**Important caveat:** These 186 rows were generated by the *old* pre-CHUNK squeeze screener. They do not include any of the signal improvements (lifecycle state, risk scoring, compression recovery, effective float, options/IV). The negative 5d return is not an indictment of the new signals — it reflects the old screener's output on a period with adverse market conditions.
+
+### 3.2 Score Bucket Metrics (fwd_5d only)
+
+| Score Bucket | Count | 5d fwd n | Median 5d | Hit >0 | Hit >25% |
+|---|---|---|---|---|---|
+| < 50 | 150 | 68 | −2.5% | 27.9% | 0% |
+| 50–60 | 35 | 17 | −3.2% | 29.4% | 0% |
+| 60–70 | 1 | 0 | N/A | N/A | N/A |
+| 70–80 | 0 | — | — | — | — |
+| ≥ 80 | 0 | — | — | — | — |
+
+**Finding:** The old screener never produced a score above 61.2. The new screener has a different score distribution (ARMED threshold is 55, ACTIVE requires structural drivers plus volume). No comparison is possible between old and new scoring regimes. The 28–29% hit rate at 5d is not meaningful signal — effectively noise on a 10-day sample.
+
+### 3.3 Lifecycle State Metrics
+
+| State | Count |
+|---|---|
+| NOT_SETUP / unknown | 186 |
+| ARMED | 0 |
+| ACTIVE | 0 |
+
+All rows have NULL `squeeze_state` because the schema migration had not been applied. No lifecycle state analysis is possible on the existing dataset.
+
+### 3.4 Driver Bucket Metrics
+
+All CHUNK-added driver fields are NULL across all 186 rows:
+
+| Driver | Rows with data | Analysis possible |
+|---|---|---|
+| `computed_dtc_30d` ≥ 5 | 0 | No |
+| `compression_recovery_score` ≥ 6 | 0 | No |
+| `si_persistence_score` ≥ 7 | 0 | No |
+| `effective_float_score` ≥ 6 | 0 | No |
+| `options_pressure_score` ≥ 7 | 0 | No |
+| `risk_level` HIGH/EXTREME | 0 | No |
+| `dilution_risk_flag` | 0 | No |
+| `volume_confirmation_flag` | 0 | No |
+
+**Conclusion:** No driver correlation analysis is possible. The replay data is entirely from the pre-CHUNK schema.
+
+---
+
+## 4. Signal Family Readiness
+
+### Setup Score
+
+**Inputs required:** `short_pct_float`, `computed_dtc_30d`, `si_persistence_score`, `compression_recovery_score`, `effective_float_score`, `large_holder_ownership_pct`
+
+| Field | Implemented in code | Persisted to DB | Replay rows with data | Issues |
+|---|---|---|---|---|
+| `short_pct_float` | ✅ | ✅ (pre-CHUNK) | 186/186 | Only field reliably present |
+| `computed_dtc_30d` | ✅ CHUNK-01/17 | ⚠️ schema fixed, no data yet | 0/186 | Migration bug now fixed |
+| `si_persistence_score` | ✅ CHUNK-02 | ⚠️ in explanation_json only | 0/186 | 3 SI history rows total (insufficient) |
+| `compression_recovery_score` | ✅ CHUNK-04 | ⚠️ schema fixed, no data yet | 0/186 | Migration bug now fixed |
+| `effective_float_score` | ✅ CHUNK-06 | ⚠️ in explanation_json only | 0/186 | SEC data needed per run |
+| `large_holder_ownership_pct` | ✅ CHUNK-07 | ✅ via `filing_catalysts` | Only COIN | 1 ticker's data |
+
+**Readiness:** Code complete. Persistence pipeline fixed. Zero validated data points. Need ≥30 days of new pipeline runs.
+
+### Ignition Score
+
+**Inputs required:** `volume_confirmation_flag`, `options_pressure_score`, `unusual_call_activity_flag`, `squeeze_state == ACTIVE`, price momentum
+
+| Field | Implemented in code | Persisted to DB | Replay rows with data | Issues |
+|---|---|---|---|---|
+| `volume_confirmation_flag` | ✅ CHUNK-05 | ⚠️ schema fixed, no data yet | 0/186 | Migration bug now fixed |
+| `options_pressure_score` | ✅ CHUNK-09 | ✅ schema exists | 0/186 | yfinance options latency risk |
+| `unusual_call_activity_flag` | ✅ CHUNK-09 | ✅ schema exists | 0/186 | yfinance options latency risk |
+| `squeeze_state == ACTIVE` | ✅ CHUNK-10 | ⚠️ schema fixed, no data yet | 0/186 | Migration bug now fixed |
+
+**yfinance options latency concern:** `score_options_activity()` in `catalyst_screener.py` calls `yf.Ticker(ticker).option_chain()` at pipeline runtime. yfinance options data has inconsistent update timing — often stale by hours during GHA runs. This makes `options_pressure_score` unreliable for ACTIVE ignition detection. The `iv_data_confidence` field tracks this but needs empirical validation.
+
+**Readiness:** Code complete. Zero validated ignition events in replay data. Options data reliability unproven.
+
+### Continuation Score
+
+**Inputs required:** `squeeze_state == ACTIVE` persisted across runs, `short_pct_float` still elevated, `computed_dtc_30d` still elevated, `risk_score` separate, `volume_confirmation_flag`
+
+| Field | Status | Issues |
+|---|---|---|
+| Multi-run state tracking | ✅ Alert dedup in CHUNK-15 | `fetch_previous_squeeze_score_for_alert()` implemented |
+| `squeeze_state` persistence | ⚠️ Schema fixed | Need runs to populate |
+| Borrow/lending cost | ❌ Blocked (CHUNK-08) | No vendor decision |
+| Locate availability | ❌ Blocked (CHUNK-08) | Critical for continuation |
+
+**Readiness:** Fundamentally weak without borrow data. The continuation window (shorts staying short vs. covering) is driven by borrow cost — without it, the continuation score would be dominated by the same SI/DTC inputs already in the setup score, producing a near-duplicate signal. **Continuation score architecture should wait for CHUNK-08 vendor decision.**
+
+### Catalyst Score
+
+**Inputs required:** SEC 13G/D ownership accumulation, dilution risk as negative catalyst, options pressure, earnings/news events
+
+| Field | Implemented | Coverage | Issues |
+|---|---|---|---|
+| `dilution_risk_flag` + `shares_offered_pct_float` | ✅ CHUNK-07/16 | COIN only (43 rows) | 1 ticker, all one flag type |
+| `ownership_accumulation_flag` | ✅ parsed | 0 rows | No real data |
+| `large_holder_flag` | ✅ parsed | 0 rows | No real data |
+| Options pressure as catalyst | ✅ CHUNK-09 | 0 validated | yfinance latency risk |
+
+**Dilution placement question:** Risk analyzer places `dilution_risk_flag` in `risk_score` (separate, non-subtractive). Catalyst score could treat it as a negative catalyst. Recommendation: keep it in the risk layer until enough dilution events accumulate to test both treatments. Only COIN data currently exists — insufficient.
+
+**Readiness:** Missing all positive catalyst data. Dilution coverage is single-ticker. Cannot validate.
+
+### Risk Score
+
+**Inputs required:** `risk_score` (0–100), `risk_level` (LOW/MEDIUM/HIGH/EXTREME), `dilution_risk_flag`, `shares_offered_pct_float`, exhaustion signals
+
+| Aspect | Status | Evidence |
+|---|---|---|
+| Risk score computed separately | ✅ CHUNK-16 | Pure function, not subtractive |
+| Persisted to DB | ⚠️ Schema exists, no data yet | Migration bug was blocking saves |
+| Validated against outcomes | ❌ 0 rows with risk data | Cannot test yet |
+| Should it stay separate from final_score? | **YES, per design** | CHUNK-16 deliberately non-subtractive |
+
+**Key design decision (already made):** Risk score is explicitly not subtracted from `final_score`. This is the correct architecture for CHUNK-12 — `risk_score` maps directly to the standalone `risk_score` output in the four-score design. No change needed here; it already matches the target architecture.
+
+**Readiness:** Architecture is correct. Zero empirical validation.
+
+---
+
+## 5. CHUNK-12 Recommendation
+
+### Classification: NOT_READY_NEEDS_MORE_DATA
+
+**Primary reason:** Zero replay rows have any CHUNK-added signal field populated. The replay engine cannot evaluate whether `computed_dtc_30d`, `squeeze_state`, `compression_recovery_score`, `risk_score`, or `options_pressure_score` correlate with forward returns because none of these fields exist in the saved data. All 186 rows are old-format.
+
+**Secondary reasons:**
+- Only 5-day forward returns available; 20d/30d windows (the primary squeeze evaluation horizon) are not yet closed
+- Score distribution is compressed (max 61.2, mean 40.3) and never reached ARMED threshold — no lifecycle states to evaluate
+- `short_interest_history` has 3 rows (1 snapshot, 3 tickers) — SI persistence is unvalidatable
+- `filing_catalysts` is single-ticker (COIN) — effective float and dilution signals unvalidatable
+- Continuation score requires borrow data (CHUNK-08, still blocked)
+- 28.2% 5-day hit rate and −2.27% average return on pre-CHUNK data offer no signal about new architecture quality
+
+**Why not READY_FOR_SKELETON_ONLY:** A skeleton that adds `setup_score`, `ignition_score`, `continuation_score`, `catalyst_score` as separate fields would be meaningless if populated with zero-validated formulas. Adding skeleton fields without data to validate their weights risks freezing a sub-optimal weighting that then becomes the de-facto architecture. The correct sequencing is: generate new-format data → validate individual drivers → propose weights → build skeleton.
+
+**Why not READY_NOW:** No evidence base at all from the new schema. Would be purely speculative.
+
+---
+
+## 6. Proposed Next PR If Proceeding
+
+*Not recommended yet. Included for reference once data thresholds are met.*
+
+If readiness thresholds are met (see Section 7), the skeleton PR would:
+
+1. Add to `SqueezeScore` dataclass (no changes to existing fields):
+   ```python
+   setup_score: float = 0.0
+   ignition_score: float = 0.0
+   continuation_score: float = 0.0
+   catalyst_score: float = 0.0
+   ```
+2. Add corresponding columns to `squeeze_scores` via `_SQUEEZE_MIGRATE_DDL` (4 new REAL columns)
+3. Compute each sub-score as a weighted sum of existing fields already being computed — **no new signals, no new DB calls**
+4. Surface sub-scores in `signal_breakdown` and `explanation_json`
+5. `final_score` remains **unchanged** — sub-scores are additional outputs only
+6. Add sub-score fields to `_build_replay_row()` in `backtest.py`
+7. Do NOT route `daily_rankings` or alert thresholds to sub-scores yet
+
+**Explicit non-goals of the skeleton PR:** Do not change `final_score` weights. Do not change ranking. Do not change alert thresholds. Do not remove any existing field.
+
+---
+
+## 7. Data Needed Before Weight Changes
+
+The following thresholds must be met before any `final_score` weight changes or sub-score routing to rankings:
+
+| Requirement | Threshold | Current | Status |
+|---|---|---|---|
+| squeeze_scores rows (new format) | ≥ 300 | 0 | ❌ |
+| Calendar days of new-format data | ≥ 30 | 0 | ❌ |
+| 20d forward returns available | ≥ 100 rows | 0 | ❌ |
+| 30d forward returns available | ≥ 100 rows | 0 | ❌ |
+| Tickers with ARMED state seen | ≥ 10 distinct | 0 | ❌ |
+| Tickers with ACTIVE state seen | ≥ 5 distinct | 0 | ❌ |
+| short_interest_history rows per ticker | ≥ 3 distinct periods | 0–1 | ❌ |
+| filing_catalysts tickers | ≥ 10 distinct | 1 | ❌ |
+| iv_history tickers with ≥60 rows | ≥ 50 tickers | ~0 | ❌ (only 18 days of data) |
+| Negative-control ticker set documented | at least 10 | none defined | ❌ |
+
+**Soonest realistic gate date:** ~2026-05-26 (30 calendar days after schema fix applied), assuming daily pipeline runs.
+
+---
+
+## 8. Risks
+
+### Overfitting risk
+The existing data (186 rows, 10 days, single market regime) is far too small to tune any weights without guaranteed overfitting. Any threshold change based on current data would be curve-fit to an April 2026 drawdown environment.
+
+### Sparse data risk
+- SI persistence scores will be meaningless until `short_interest_history` has ≥3 distinct FINRA periods per ticker (~2 months of biweekly FINRA data, or daily yfinance snapshots accumulated over time)
+- `effective_float_score` depends on SEC 13G/D filings which arrive sporadically; current single-ticker (COIN) coverage is not representative
+
+### yfinance options latency risk
+`options_pressure_score` is computed at pipeline runtime via `yf.Ticker().option_chain()`. yfinance options data is frequently stale during GHA runs (end-of-day or delayed). This could systematically undercount `options_pressure_score` and `unusual_call_activity_flag` for the ignition signal. The `iv_data_confidence` field tracks this, but empirical validation of accuracy is needed before using options pressure in an ignition score.
+
+### No borrow data
+`continuation_score` without borrow/lending cost data risks being a near-duplicate of `setup_score`. The CHUNK-08 decision (vendor/budget for borrow data) directly gates the quality of continuation scoring. Adding a skeleton continuation score before CHUNK-08 would likely produce a correlation > 0.9 with setup score — architecturally redundant.
+
+### Saved-score coverage gap
+The schema migration bug silently failed all `save_squeeze_scores()` calls that used any CHUNK field in the INSERT. The 186 rows in production are entirely pre-CHUNK data. Any new pipeline run will produce correctly-formatted 42-column rows, but the historical gap from the CHUNK implementation dates to today cannot be backfilled (yfinance point-in-time SI/options data is unavailable).
+
+### Forward-return window gap
+As of 2026-04-26, 10d/20d/30d forward returns for the April 16–25 signals are not yet closed. The 5d window shows negative returns (−2.27% avg) on pre-CHUNK signals during what appears to have been a weak market period (see GOEV delisting, volatility context). These returns should not be treated as representative of the new squeeze engine's alpha.
+
+---
+
+## 9. Commands Run
+
+| Command | Outcome |
+|---|---|
+| `git status --short` | 4 unrelated dirty files (dashboard, pycache) — no action |
+| `git log --oneline -10` | Confirmed CHUNK-15 as HEAD |
+| `python -c "... SELECT column_name FROM information_schema.columns WHERE table_name='squeeze_scores'"` | 18 columns — missing all CHUNK-added fields |
+| `python -c "... _SQUEEZE_MIGRATE_DDL"` | 20 entries — confirmed 4 missing columns |
+| Manual `ALTER TABLE` via `_SQUEEZE_MIGRATE_DDL` | Added 38 columns — still missing 4 CHUNK-01/05/10 columns |
+| **Bug fix 1:** Added 4 missing entries to `_SQUEEZE_MIGRATE_DDL` in `utils/supabase_persist.py` | Non-invasive schema-only fix |
+| Applied migration — schema now 42 columns | ✅ |
+| `python backtest.py --squeeze-replay --start 2026-04-16 --end 2026-04-25` | 186 rows, all column names as values (second bug) |
+| **Bug fix 2:** Changed `dict(zip(cols, row))` → `dict(row)` in `fetch_squeeze_scores_for_replay` | Non-invasive; RealDictCursor fix |
+| `python backtest.py --squeeze-replay --start 2026-04-16 --end 2026-04-25 --output-csv /tmp/squeeze_replay.csv` | 186 signals, 78 tickers, 5d only, all CHUNK fields NULL |
+| `pytest -q tests/test_squeeze_replay.py` | 36 passed |
+| `python -m py_compile backtest.py utils/supabase_persist.py squeeze_screener.py` | ALL OK |
+| Coverage queries: `short_interest_history`, `filing_catalysts`, `iv_history` | As documented in Section 2 |
+
+---
+
+## Appendix: Bug Details
+
+### Bug 1 — Missing migration columns
+**File:** `utils/supabase_persist.py`, `_SQUEEZE_MIGRATE_DDL`  
+**Root cause:** `_SQUEEZE_DDL` (CREATE TABLE) was updated to include `computed_dtc_30d`, `compression_recovery_score`, `volume_confirmation_flag`, `squeeze_state` in the table definition. These 4 columns were never added to `_SQUEEZE_MIGRATE_DDL`. Since the production table already existed with 18 columns, the `CREATE TABLE IF NOT EXISTS` was a no-op, and the ALTER TABLE migrations never ran for these fields. Every subsequent `save_squeeze_scores()` INSERT silently failed on `UndefinedColumn`.  
+**Fix:** Added 4 `ADD COLUMN IF NOT EXISTS` entries at the top of `_SQUEEZE_MIGRATE_DDL`.  
+**Scope:** Schema only. No scoring, no logic, no tests changed.
+
+### Bug 2 — RealDictCursor iteration produces key→key mapping
+**File:** `utils/supabase_persist.py`, `fetch_squeeze_scores_for_replay`  
+**Root cause:** `dict(zip(cols, row))` where `cols` is a list of column names and `row` is a `psycopg2.extras.RealDictRow`. Iterating over a dict-like object yields its *keys* (column names), not values. Result: every field in every returned row had its column name as its value.  
+**Fix:** `dict(row)` — directly convert the RealDictRow to a plain dict.  
+**Scope:** Read-only data fetch function. No scoring affected. 36 replay tests pass.

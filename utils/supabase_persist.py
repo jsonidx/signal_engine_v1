@@ -474,8 +474,17 @@ CREATE TABLE IF NOT EXISTS squeeze_scores (
 );
 """
 
-# Idempotent migrations: add columns introduced in CHUNK-14, CHUNK-10, and CHUNK-16.
+# Idempotent migrations: add columns introduced after the initial 18-column schema.
+# IMPORTANT: computed_dtc_30d / compression_recovery_score / volume_confirmation_flag /
+# squeeze_state are in _SQUEEZE_DDL but were missing from this list — tables created
+# before those CHUNKs landed need them added here.
 _SQUEEZE_MIGRATE_DDL = [
+    # CHUNK-01/03/04/05: early float/squeeze columns absent from original DDL
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS computed_dtc_30d REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS compression_recovery_score REAL;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS volume_confirmation_flag BOOLEAN;",
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS squeeze_state TEXT;",
+    # CHUNK-14: explanation text/JSON
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_summary TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS explanation_json JSONB;",
     # CHUNK-10: lifecycle metadata columns
@@ -998,8 +1007,7 @@ def fetch_squeeze_scores_for_replay(
             """
             params = [_start, _end, limit]
         cur.execute(query, params)
-        cols = [c.name for c in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+        rows = [dict(row) for row in cur.fetchall()]
         conn.close()
         return rows
     except Exception as exc:
