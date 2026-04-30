@@ -53,6 +53,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
 
       - name: Upload report to Supabase
         if: always()
