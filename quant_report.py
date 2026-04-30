@@ -44,7 +44,7 @@ CACHE_TTL_HOURS = 4
 PASS_THRESHOLD = {'min_prob': 0.60, 'min_rr': 2.0}
 REGIME_VIX_MULT = {'VIX<15': 1.0, 'VIX15-25': 0.75, 'VIX25-35': 0.50, 'VIX>35': 0.25}
 
-MARKETAUX_API_KEY: Optional[str] = os.getenv("MARKETAUX_API_KEY")
+EXA_API_KEY: Optional[str] = os.getenv("EXA_API_KEY")
 
 BULLISH_KW = ['beat', 'raised guidance', 'upgrade', 'acquisition', 'buyback',
               'record revenue', 'partnership', 'approval', 'accelerat']
@@ -831,46 +831,30 @@ class NewsScraper:
 
 
 # ==============================================================================
-# 3b. MARKETAUX ENTITY-LINKED NEWS SENTIMENT
+# 3b. EXA NEWS SENTIMENT
 # ==============================================================================
 
-# Simple in-memory cache: {ticker: {"expires": datetime, "result": dict}}
-_MARKETAUX_CACHE: dict = {}
-_MARKETAUX_CACHE_TTL_HOURS = 6
+_EXA_NEWS_CACHE: dict = {}
+_EXA_NEWS_CACHE_TTL_HOURS = 6
 
 
 def fetch_news_sentiment(ticker: str, days_back: int = 7) -> dict:
     """
-    Fetch entity-linked news sentiment for a ticker via Marketaux.
+    Fetch recent news headlines + highlights for a ticker via Exa neural search.
 
-    Marketaux returns per-article entity sentiment scores linked to the specific
-    symbol — far more precise than keyword matching on headlines.
+    Returns article titles, dates, and key excerpts so Claude can assess
+    sentiment and catalysts directly from the source material — no collapsed
+    score that hides the reasoning.
 
-    Falls back to neutral (avg_sentiment=0.0) when:
-      - MARKETAUX_API_KEY is not set
-      - The API call fails (network, rate-limit, non-200)
-      - No articles with entity scores are found for the ticker
-
-    Parameters
-    ----------
-    ticker    : str  — equity symbol (e.g. "AAPL")
-    days_back : int  — look-back window in calendar days (default 7)
+    Falls back to neutral when EXA_API_KEY is not set or the call fails.
 
     Returns
     -------
     dict with keys:
-        ticker          : str
-        articles_found  : int   — number of articles with entity sentiment
-        avg_sentiment   : float — mean entity sentiment, -1.0 … +1.0
-        sentiment_label : str   — "Bullish" | "Neutral" | "Bearish"
-        period_days     : int   — look-back window used
-        source          : str   — "marketaux" | "fallback_neutral"
+        ticker, articles_found, avg_sentiment, sentiment_label, period_days,
+        source, headlines  (list of {title, url, date, highlights})
     """
-    import time as _time
-    import urllib.request as _urllib_request
-
-    # ── In-memory cache check ────────────────────────────────────────────────
-    cached = _MARKETAUX_CACHE.get(ticker)
+    cached = _EXA_NEWS_CACHE.get(ticker)
     if cached and cached["expires"] > datetime.now():
         return cached["result"]
 
@@ -881,80 +865,57 @@ def fetch_news_sentiment(ticker: str, days_back: int = 7) -> dict:
         "sentiment_label": "Neutral",
         "period_days":     days_back,
         "source":          "fallback_neutral",
+        "headlines":       [],
     }
 
-    if not MARKETAUX_API_KEY:
+    if not EXA_API_KEY:
         logging.getLogger(__name__).warning(
-            "MARKETAUX_API_KEY not set — news sentiment unavailable. "
-            "Add MARKETAUX_API_KEY=your_key to .env (free at marketaux.com)."
+            "EXA_API_KEY not set — news sentiment unavailable. Add EXA_API_KEY to .env."
         )
         return _default
-
-    # ── Build request ────────────────────────────────────────────────────────
-    published_after = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M")
-    params = urllib.parse.urlencode({
-        "api_token":       MARKETAUX_API_KEY,
-        "symbols":         ticker,
-        "filter_entities": "true",
-        "language":        "en",
-        "published_after": published_after,
-        "limit":           50,
-    })
-    url = f"https://api.marketaux.com/v1/news/all?{params}"
 
     try:
-        req = _urllib_request.Request(url, headers={"Accept": "application/json"})
-        with _urllib_request.urlopen(req, timeout=8) as resp:
-            if resp.status != 200:
-                logging.getLogger(__name__).warning(
-                    "[%s] Marketaux returned HTTP %s", ticker, resp.status
-                )
-                return _default
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        logging.getLogger(__name__).warning(
-            "[%s] Marketaux request failed: %s", ticker, exc
+        from exa_py import Exa
+        exa = Exa(api_key=EXA_API_KEY)
+
+        response = exa.search_and_contents(
+            f"{ticker} stock news earnings catalyst",
+            type="auto",
+            category="news",
+            num_results=15,
+            highlights=True,
         )
-        return _default
 
-    # ── Extract entity-linked sentiment scores ───────────────────────────────
-    scores = []
-    ticker_upper = ticker.upper()
-    for article in payload.get("data", []):
-        for entity in article.get("entities", []):
-            if entity.get("symbol", "").upper() == ticker_upper:
-                score = entity.get("sentiment_score")
-                if score is not None:
-                    try:
-                        scores.append(float(score))
-                    except (TypeError, ValueError):
-                        pass
-                break  # one entity match per article is enough
-
-    if not scores:
-        result = {**_default, "source": "marketaux"}
-        result["articles_found"] = len(payload.get("data", []))
-    else:
-        avg = round(sum(scores) / len(scores), 4)
-        if avg > 0.20:
-            label = "Bullish"
-        elif avg < -0.20:
-            label = "Bearish"
-        else:
-            label = "Neutral"
+        articles = getattr(response, "results", [])
+        headlines = []
+        for a in articles:
+            pub_date = getattr(a, "published_date", None) or getattr(a, "publishedDate", None) or ""
+            if pub_date:
+                pub_date = pub_date[:10]  # YYYY-MM-DD
+            raw_highlights = getattr(a, "highlights", None) or []
+            headlines.append({
+                "title":      getattr(a, "title", "") or "",
+                "url":        getattr(a, "url", "") or "",
+                "date":       pub_date,
+                "highlights": raw_highlights[:2],  # top 2 excerpts per article
+            })
 
         result = {
             "ticker":          ticker,
-            "articles_found":  len(scores),
-            "avg_sentiment":   avg,
-            "sentiment_label": label,
+            "articles_found":  len(headlines),
+            "avg_sentiment":   0.0,   # Claude assesses from headlines; no collapsed score
+            "sentiment_label": "Neutral",
             "period_days":     days_back,
-            "source":          "marketaux",
+            "source":          "exa",
+            "headlines":       headlines,
         }
 
-    # ── Cache and return ─────────────────────────────────────────────────────
-    _MARKETAUX_CACHE[ticker] = {
-        "expires": datetime.now() + timedelta(hours=_MARKETAUX_CACHE_TTL_HOURS),
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[%s] Exa news fetch failed: %s", ticker, exc)
+        return _default
+
+    _EXA_NEWS_CACHE[ticker] = {
+        "expires": datetime.now() + timedelta(hours=_EXA_NEWS_CACHE_TTL_HOURS),
         "result":  result,
     }
     return result

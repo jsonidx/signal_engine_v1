@@ -15,6 +15,6 @@ export function useSignalsTicker(ticker: string) {
     queryKey: ['signals', 'ticker', ticker],
     queryFn: () => api.signalsTicker(ticker),
     enabled: !!ticker,
-    staleTime: 10 * 60 * 1000,
+    staleTime: 0,
   })
 }

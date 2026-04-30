@@ -2378,30 +2378,28 @@ def _build_prompt(signals: dict) -> str:
     else:
         prompt_parts.append("Dark pool data: unavailable")
 
-    prompt_parts += ["", "## NEWS SENTIMENT (7-day)"]
-    ns_src   = news_sent.get("source", "fallback_neutral")
-    ns_label = news_sent.get("sentiment_label", "Neutral")
-    ns_avg   = news_sent.get("avg_sentiment", 0.0)
-    ns_n     = news_sent.get("articles_found", 0)
-    if ns_src == "marketaux" and ns_n > 0:
-        avg_str = f"{ns_avg:+.3f}" if isinstance(ns_avg, float) else "N/A"
-        prompt_parts += [
-            f"Source: Marketaux (entity-linked NLP sentiment)",
-            f"Articles analysed: {ns_n}  |  Avg entity sentiment: {avg_str}  |  Label: {ns_label}",
-        ]
-        if ns_label == "Bullish":
-            prompt_parts.append(
-                "Note: Positive news flow confirms catalyst thesis — "
-                "add +0.05 qualitative weight to BULL conviction."
-            )
-        elif ns_label == "Bearish":
-            prompt_parts.append(
-                "Note: Negative news flow is a headwind — "
-                "apply -0.05 qualitative discount to BULL conviction; flag in risks."
-            )
+    prompt_parts += ["", "## RECENT NEWS (7-day, Exa neural search)"]
+    ns_src  = news_sent.get("source", "fallback_neutral")
+    ns_n    = news_sent.get("articles_found", 0)
+    headlines = news_sent.get("headlines", [])
+    if ns_src == "exa" and headlines:
+        prompt_parts.append(
+            f"Source: Exa — {ns_n} articles. "
+            "Assess sentiment, catalysts, and risks from the headlines below. "
+            "Adjust conviction and flag any material contra-indicators."
+        )
+        for h in headlines[:12]:
+            date  = h.get("date", "")
+            title = h.get("title", "").strip()
+            hi    = h.get("highlights", [])
+            line  = f"  [{date}] {title}"
+            if hi:
+                excerpt = hi[0].strip()[:200]
+                line += f" — {excerpt}"
+            prompt_parts.append(line)
     else:
         prompt_parts.append(
-            "News sentiment: unavailable (no Marketaux key or no entity-matched articles — neutral assumed)"
+            "News: unavailable (no Exa key or no articles found — assess from other signals only)"
         )
 
     prompt_parts += ["", "## HISTORICAL ANALOG SCORE"]
@@ -3129,7 +3127,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         return None
 
     if raw_output:
-        print("\n--- RAW CLAUDE RESPONSE ---")
+        print("\n--- RAW LLM RESPONSE ---")
         print(raw)
         print("--- END RESPONSE ---\n")
 
@@ -3232,13 +3230,14 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
 
 def analyze_tickers(tickers: List[str], verbose: bool = False,
-                    raw_output: bool = False, use_cache: bool = True) -> List[dict]:
+                    raw_output: bool = False, use_cache: bool = True,
+                    force_ai: bool = False) -> List[dict]:
     """Analyze multiple tickers, returning sorted by conviction."""
     results = []
     for i, ticker in enumerate(tickers, 1):
         print(f"\n[{i}/{len(tickers)}] {ticker}")
         result = analyze_ticker(ticker, verbose=verbose, raw_output=raw_output,
-                                use_cache=use_cache)
+                                use_cache=use_cache, force_ai=force_ai)
         if result:
             results.append(result)
         time.sleep(1)  # Brief pause between API calls
@@ -3411,7 +3410,7 @@ def print_full_report(results: List[dict]) -> None:
     """Print complete AI quant analysis."""
     print()
     print("================================================================")
-    print(f"  AI QUANT ANALYSIS — POWERED BY {AI_MODEL_DEFAULT.upper()} / {AI_MODEL_PREMIUM.upper()}")
+    print(f"  AI QUANT ANALYSIS — POWERED BY {AI_MODEL_DEFAULT.upper()}")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("================================================================")
 
@@ -3643,9 +3642,15 @@ def main():
         print_cache_table()
         return
 
+    llm_label = {
+        "grok":         AI_MODEL_DEFAULT.upper(),
+        "grok-premium": AI_MODEL_PREMIUM.upper(),
+        "claude":       "CLAUDE SONNET 4.6",
+    }.get(args.llm, args.llm.upper())
+
     print()
     print("================================================================")
-    print("  AI QUANT ANALYST — POWERED BY CLAUDE OPUS 4.6")
+    print(f"  AI QUANT ANALYST — POWERED BY {llm_label}")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("================================================================")
     print()
@@ -3909,7 +3914,7 @@ def main():
         tickers = [t.upper() for t in args.tickers]
         print(f"  Analyzing {len(tickers)} tickers...")
         results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw,
-                                  use_cache=use_cache)
+                                  use_cache=use_cache, force_ai=getattr(args, "force_ai", False))
         print_full_report(results)
 
     elif args.tier1_only:
