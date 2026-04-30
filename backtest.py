@@ -1264,9 +1264,7 @@ class SqueezeOutcomeReplay:
             "computed_dtc_30d": snap.get("computed_dtc_30d"),
             "compression_recovery_score": snap.get("compression_recovery_score"),
             "volume_confirmation_flag": snap.get("volume_confirmation_flag"),
-            "si_persistence_score": _extract_from_explanation(
-                snap.get("explanation_json"), "si_persistence"
-            ),
+            "si_persistence_score": snap.get("si_persistence_score"),
             "effective_float_score": _extract_from_explanation(
                 snap.get("explanation_json"), "effective_float"
             ),

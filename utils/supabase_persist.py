@@ -500,6 +500,8 @@ _SQUEEZE_MIGRATE_DDL = [
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS dilution_risk_flag BOOLEAN;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS latest_dilution_filing_date TEXT;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS shares_offered_pct_float REAL;",
+    # SI persistence direct column (was only in signal_breakdown / explanation_json)
+    "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS si_persistence_score REAL;",
     # CHUNK-09: options/IV context columns
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS options_pressure_score REAL;",
     "ALTER TABLE squeeze_scores ADD COLUMN IF NOT EXISTS iv_rank REAL;",
@@ -601,6 +603,7 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 bool(row["unusual_call_activity_flag"]) if "unusual_call_activity_flag" in row and row["unusual_call_activity_flag"] is not None else None,
                 _f(row, "call_put_volume_ratio"),
                 _f(row, "call_put_oi_ratio"),
+                _f(row, "si_persistence_score"),
             ))
         cur.executemany(
             """
@@ -617,8 +620,9 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                  risk_score, risk_level, risk_flags, risk_warnings, risk_components,
                  dilution_risk_flag, latest_dilution_filing_date, shares_offered_pct_float,
                  options_pressure_score, iv_rank, iv_rank_score, iv_data_confidence,
-                 unusual_call_activity_flag, call_put_volume_ratio, call_put_oi_ratio)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 unusual_call_activity_flag, call_put_volume_ratio, call_put_oi_ratio,
+                 si_persistence_score)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
                 final_score=EXCLUDED.final_score, juice_target=EXCLUDED.juice_target,
                 recent_squeeze=EXCLUDED.recent_squeeze, price=EXCLUDED.price,
@@ -654,7 +658,8 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
                 iv_data_confidence=EXCLUDED.iv_data_confidence,
                 unusual_call_activity_flag=EXCLUDED.unusual_call_activity_flag,
                 call_put_volume_ratio=EXCLUDED.call_put_volume_ratio,
-                call_put_oi_ratio=EXCLUDED.call_put_oi_ratio
+                call_put_oi_ratio=EXCLUDED.call_put_oi_ratio,
+                si_persistence_score=EXCLUDED.si_persistence_score
             """,
             rows,
         )

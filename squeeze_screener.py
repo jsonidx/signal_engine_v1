@@ -149,6 +149,7 @@ class SqueezeScore:
     computed_dtc_30d: float = 0.0              # float-adjusted DTC: (SI%×float)/avg_vol_30d
     compression_recovery_score: float = 0.0    # 3-month drawdown + recovery pattern score
     volume_confirmation_flag: bool = False      # True = volume surge confirming squeeze ignition
+    si_persistence_score: float = 5.0          # 0–10 SI persistence signal; 5 = default/no history
     squeeze_state: str = "false"               # "false" | "active" | "completed"
     # CHUNK-06: effective-float fields
     effective_float_estimate: float = 0.0
@@ -1644,6 +1645,7 @@ def compute_squeeze_score(
         computed_dtc_30d=mech.get("computed_dtc_30d", 0.0),
         compression_recovery_score=struct.get("comp_rec_score", 0.0),
         volume_confirmation_flag=mech.get("volume_confirmation_flag", False),
+        si_persistence_score=float(pos.get("si_persistence_score", 5.0)),
         squeeze_state=squeeze_state,
         # CHUNK-06 effective-float fields
         effective_float_estimate=ef_result["effective_float_estimate"],

@@ -34,6 +34,7 @@ CHUNK_FIELDS = [
     "computed_dtc_30d",
     "compression_recovery_score",
     "volume_confirmation_flag",
+    "si_persistence_score",
     "squeeze_state",
     "risk_score",
     "risk_level",
@@ -84,12 +85,9 @@ def query_field_coverage(cur, run_date):
 
 
 def query_json_fields(cur, run_date):
+    # effective_float_score is still JSON-stored; si_persistence_score is now a direct column
     cur.execute("""
         SELECT
-            COUNT(*) FILTER (
-                WHERE explanation_json IS NOT NULL
-                AND explanation_json::text LIKE '%%si_persistence%%'
-            ) AS si_persistence_in_json,
             COUNT(*) FILTER (
                 WHERE explanation_json IS NOT NULL
                 AND explanation_json::text LIKE '%%effective_float%%'
@@ -269,12 +267,10 @@ def build_report(run_dates, latest_date, coverage, json_fields, gate, verdict, v
         tag = " — old-format" if (n == 0 and total > 0) else ""
         lines.append(f"| `{f}` | {n}/{total} | {pct(n, total)}{tag} |")
 
-    # JSON-stored fields
+    # effective_float_score is still JSON-stored (si_persistence_score is now a direct column)
     if json_fields:
-        si = json_fields.get("si_persistence_in_json", 0)
         ef = json_fields.get("effective_float_in_json", 0)
         lines += [
-            f"| `si_persistence_score` (via explanation_json) | {si}/{total} | {pct(si, total)} |",
             f"| `effective_float_score` (via explanation_json) | {ef}/{total} | {pct(ef, total)} |",
         ]
 
