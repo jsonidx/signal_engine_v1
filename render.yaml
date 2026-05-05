@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: signal-engine-bot
+    runtime: python
+    buildCommand: pip install -r requirements-bot.txt
+    startCommand: python3 scripts/telegram_bot.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: jsonidx/signal_engine_v1
+      - key: DATABASE_URL
+        sync: false
