@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements-bot.txt .
+RUN pip install --no-cache-dir -r requirements-bot.txt
+COPY scripts/telegram_bot.py scripts/
+CMD ["python3", "scripts/telegram_bot.py"]
