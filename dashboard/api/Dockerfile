@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
-COPY ../../requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir \
         anthropic \
@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
         passlib
 
 # Copy the full project (signal engine modules + dashboard api)
-COPY ../../ /app/
+COPY . /app/
 
 # The API entrypoint is dashboard/api/main.py
 WORKDIR /app/dashboard/api
