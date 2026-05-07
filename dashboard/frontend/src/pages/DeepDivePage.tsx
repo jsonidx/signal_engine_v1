@@ -422,6 +422,68 @@ function TickerRow({
   )
 }
 
+function BlacklistedRow({
+  t,
+  onUnban,
+}: {
+  t: DeepDiveTicker
+  onUnban: (ticker: string) => Promise<void>
+}) {
+  const navigate = useNavigate()
+  const [pending, setPending] = useState(false)
+
+  const handleUnban = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setPending(true)
+    try {
+      await onUnban(t.ticker)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-4 bg-bg-surface/40 border border-accent-red/10 rounded px-4 py-2.5 opacity-60 hover:opacity-90 transition-opacity group">
+      {/* Ticker + name */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => navigate(`/ticker/${t.ticker}`)}
+        onKeyDown={e => e.key === 'Enter' && navigate(`/ticker/${t.ticker}`)}
+        className="flex items-center gap-3 w-36 flex-shrink-0 cursor-pointer"
+      >
+        <span className="font-mono text-sm font-semibold text-text-secondary group-hover:text-text-primary transition-colors">
+          {t.ticker}
+        </span>
+        {t.direction && (
+          <DirectionBadge direction={t.direction} size="sm" />
+        )}
+      </div>
+
+      {/* Name + sector */}
+      <div className="flex-1 min-w-0">
+        {t.name && (
+          <span className="font-mono text-xs text-text-tertiary truncate block">{t.name}</span>
+        )}
+      </div>
+
+      {/* Last thesis date */}
+      <div className="font-mono text-[10px] text-text-tertiary/60 flex-shrink-0">
+        {t.date ? `last thesis ${t.date}` : 'no thesis'}
+      </div>
+
+      {/* Unban button */}
+      <button
+        onClick={handleUnban}
+        disabled={pending}
+        className="flex-shrink-0 font-mono text-[10px] px-3 py-1 rounded border border-accent-green/30 text-accent-green/60 hover:text-accent-green hover:border-accent-green/60 transition-colors disabled:opacity-40"
+      >
+        {pending ? '…' : '↩ restore'}
+      </button>
+    </div>
+  )
+}
+
 function Section({
   label,
   rows,
@@ -482,7 +544,6 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [sortMode, setSortMode] = useState<SortMode>('direction')
-  const [showBlacklisted, setShowBlacklisted] = useState(false)
   const { data: tickers, isLoading: loadingTickers, isError, error, refetch } = useDeepDiveTickers()
   const { data: openTickers = [] } = useOpenPositionTickers()
   const { data: liveZones = {} } = useDeepDiveLiveZones()
@@ -640,23 +701,14 @@ export function DeepDivePage() {
             />
           )}
 
-          {/* Blacklisted tickers — collapsed by default */}
+          {/* Blacklisted tickers */}
           {blacklistedRows.length > 0 && (
             <div className="space-y-2">
-              <button
-                onClick={() => setShowBlacklisted(v => !v)}
-                className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary/50 hover:text-text-tertiary pt-2 pb-1 border-b border-border-subtle w-full text-left transition-colors"
-              >
-                Blacklisted — {blacklistedRows.length} {showBlacklisted ? '▲ hide' : '▼ show'}
-              </button>
-              {showBlacklisted && blacklistedRows.map(t => (
-                <TickerRow
-                  key={t.ticker}
-                  t={t}
-                  isOpen={openSet.has(t.ticker)}
-                  isBlacklisted={true}
-                  onToggleBlacklist={toggleBlacklist}
-                />
+              <div className="font-mono text-[10px] uppercase tracking-widest text-accent-red/60 pt-2 pb-1 border-b border-accent-red/20">
+                Blacklisted — {blacklistedRows.length} (skipped by AI refresh)
+              </div>
+              {blacklistedRows.map(t => (
+                <BlacklistedRow key={t.ticker} t={t} onUnban={toggleBlacklist} />
               ))}
             </div>
           )}
