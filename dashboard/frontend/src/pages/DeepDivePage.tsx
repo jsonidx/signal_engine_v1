@@ -183,8 +183,18 @@ function cmpRR(a: DeepDiveTicker, b: DeepDiveTicker): number {
   if (rb === null) return -1
   return rb - ra
 }
+function t1Pct(t: DeepDiveTicker): number | null {
+  if (t.target_1 == null) return null
+  const entry = t.entry_low != null && t.entry_high != null
+    ? (t.entry_low + t.entry_high) / 2
+    : t.entry_low ?? t.entry_high
+  if (entry == null || entry === 0) return null
+  return (t.target_1 - entry) / entry
+}
 function cmpT1(a: DeepDiveTicker, b: DeepDiveTicker): number {
-  return (b.target_1 ?? -Infinity) - (a.target_1 ?? -Infinity)
+  const pa = t1Pct(a) ?? -Infinity
+  const pb = t1Pct(b) ?? -Infinity
+  return pb - pa
 }
 const CMP: Record<SortMode, (a: DeepDiveTicker, b: DeepDiveTicker) => number> = {
   direction: cmpDirection, rr: cmpRR, t1: cmpT1,
