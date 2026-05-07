@@ -168,31 +168,35 @@ function BlacklistButton({
   )
 }
 
-function sortByT1(a: DeepDiveTicker, b: DeepDiveTicker) {
-  const ta = a.target_1 ?? -Infinity
-  const tb = b.target_1 ?? -Infinity
-  if (tb !== ta) return tb - ta
-  return (b.conviction ?? 0) - (a.conviction ?? 0)
-}
-
-// Sort analyzed: BULL first, then NEUTRAL, then BEAR; within each group by conviction desc
+// Pure comparators — no tiebreak, so they can be chained
 const DIRECTION_ORDER: Record<string, number> = { BULL: 0, NEUTRAL: 1, BEAR: 2 }
-function sortByBullFirst(a: DeepDiveTicker, b: DeepDiveTicker) {
+function cmpDirection(a: DeepDiveTicker, b: DeepDiveTicker): number {
   const da = DIRECTION_ORDER[a.direction ?? 'NEUTRAL'] ?? 1
   const db = DIRECTION_ORDER[b.direction ?? 'NEUTRAL'] ?? 1
-  if (da !== db) return da - db
-  return (b.conviction ?? 0) - (a.conviction ?? 0)
+  return da - db
 }
-
-// Sort by R:R descending — null R:R goes to bottom, then tiebreak by conviction
-function sortByRR(a: DeepDiveTicker, b: DeepDiveTicker) {
+function cmpRR(a: DeepDiveTicker, b: DeepDiveTicker): number {
   const ra = computeRR(a)
   const rb = computeRR(b)
-  if (ra === null && rb === null) return (b.conviction ?? 0) - (a.conviction ?? 0)
+  if (ra === null && rb === null) return 0
   if (ra === null) return 1
   if (rb === null) return -1
-  if (rb !== ra) return rb - ra
-  return (b.conviction ?? 0) - (a.conviction ?? 0)
+  return rb - ra
+}
+function cmpT1(a: DeepDiveTicker, b: DeepDiveTicker): number {
+  return (b.target_1 ?? -Infinity) - (a.target_1 ?? -Infinity)
+}
+const CMP: Record<SortMode, (a: DeepDiveTicker, b: DeepDiveTicker) => number> = {
+  direction: cmpDirection, rr: cmpRR, t1: cmpT1,
+}
+function buildSorter(modes: SortMode[]) {
+  return (a: DeepDiveTicker, b: DeepDiveTicker): number => {
+    for (const mode of modes) {
+      const r = CMP[mode](a, b)
+      if (r !== 0) return r
+    }
+    return (b.conviction ?? 0) - (a.conviction ?? 0)
+  }
 }
 
 function isInAiEntryZone(t: DeepDiveTicker): boolean {
@@ -550,7 +554,13 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
 
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
-  const [sortMode, setSortMode] = useState<SortMode>('direction')
+  const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
+  const toggleSort = (mode: SortMode) =>
+    setSortModes(prev =>
+      prev.includes(mode)
+        ? prev.filter(m => m !== mode).length ? prev.filter(m => m !== mode) : ['direction']
+        : [...prev, mode]
+    )
   const { data: tickers, isLoading: loadingTickers, isError, error, refetch } = useDeepDiveTickers()
   const { data: openTickers = [] } = useOpenPositionTickers()
   const { data: liveZones = {} } = useDeepDiveLiveZones()
@@ -585,7 +595,7 @@ export function DeepDivePage() {
     const filteredUniverse = filter === 'ALL' ? universe : []
 
     // Sort analyzed section
-    const sorter = sortMode === 'rr' ? sortByRR : sortMode === 't1' ? sortByT1 : sortByBullFirst
+    const sorter = buildSorter(sortModes)
     const sortedAnalyzed = [...filteredAnalyzed].sort(sorter)
 
     // Sort universe: open positions first, then alphabetical
@@ -597,7 +607,7 @@ export function DeepDivePage() {
     })
 
     return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse, blacklistedRows: blacklisted }
-  }, [tickers, filter, sortMode, openSet, liveZones, blacklistSet])
+  }, [tickers, filter, sortModes, openSet, liveZones, blacklistSet])
 
   const totalShown = analyzedRows.length + universeRows.length
 
@@ -635,23 +645,30 @@ export function DeepDivePage() {
         {/* Divider */}
         <div className="w-px h-4 bg-border-subtle mx-1" />
 
-        {/* Sort toggle */}
+        {/* Sort toggle — multi-select, order matters */}
         <div className="flex items-center gap-1">
           <span className="font-mono text-[10px] text-text-tertiary mr-1">sort:</span>
-          {([['direction', 'Direction'], ['rr', 'R:R ↓'], ['t1', 'T1 ↓']] as const).map(([mode, label]) => (
-            <button
-              key={mode}
-              onClick={() => setSortMode(mode)}
-              className={clsx(
-                'font-mono text-xs px-2.5 py-1.5 rounded border transition-colors',
-                sortMode === mode
-                  ? 'bg-bg-elevated text-text-primary border-border-active'
-                  : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
-              )}
-            >
-              {label}
-            </button>
-          ))}
+          {([['direction', 'Direction'], ['rr', 'R:R ↓'], ['t1', 'T1 ↓']] as const).map(([mode, label]) => {
+            const idx = sortModes.indexOf(mode)
+            const active = idx !== -1
+            return (
+              <button
+                key={mode}
+                onClick={() => toggleSort(mode)}
+                className={clsx(
+                  'font-mono text-xs px-2.5 py-1.5 rounded border transition-colors flex items-center gap-1',
+                  active
+                    ? 'bg-bg-elevated text-text-primary border-border-active'
+                    : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+                )}
+              >
+                {label}
+                {active && sortModes.length > 1 && (
+                  <span className="font-mono text-[9px] text-text-tertiary">{idx + 1}</span>
+                )}
+              </button>
+            )
+          })}
         </div>
 
         <span className="font-mono text-[10px] text-text-tertiary ml-1">
