@@ -1,7 +1,8 @@
-name: Refresh Stale Theses (daily, AI-enabled)
+name: Refresh Stale Theses + Hot Entry Alerts (daily)
 
-# Runs every day at 04:30 Berlin time (02:30 UTC) — after the daily --skip-ai pipeline
-# Re-runs AI analysis for any thesis older than 7 days and sends a Telegram diff summary.
+# Runs every day at 04:30 Berlin time (02:30 UTC) — after the daily --skip-ai pipeline.
+# 1. Re-runs AI analysis for theses older than 7 days → Telegram diff
+# 2. Checks all tickers for hot entry (AI zone ∩ live zone) → Telegram alert
 
 on:
   schedule:
@@ -13,7 +14,7 @@ on:
         required: false
         default: '7'
       dry_run:
-        description: 'Dry run (no AI calls, just report)'
+        description: 'Dry run (no AI calls or Telegram sends)'
         required: false
         default: 'false'
         type: choice
@@ -25,7 +26,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  refresh-stale:
+  refresh-and-alert:
     runs-on: ubuntu-latest
 
     steps:
@@ -50,9 +51,21 @@ jobs:
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
 
           CMD="python3 scripts/refresh_stale_and_notify.py --days $DAYS"
-          if [ "$DRY_RUN" = "true" ]; then
-            CMD="$CMD --dry-run"
-          fi
+          if [ "$DRY_RUN" = "true" ]; then CMD="$CMD --dry-run"; fi
+
+          echo "Running: $CMD"
+          $CMD
+
+      - name: Hot entry zone check and notify
+        env:
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          CMD="python3 scripts/notify_hot_entry.py"
+          if [ "$DRY_RUN" = "true" ]; then CMD="$CMD --dry-run"; fi
 
           echo "Running: $CMD"
           $CMD
