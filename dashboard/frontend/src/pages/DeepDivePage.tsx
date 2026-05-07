@@ -102,15 +102,70 @@ function useBlacklist() {
     [blacklistData],
   )
   const toggle = useCallback(async (ticker: string) => {
-    if (blacklistSet.has(ticker)) {
-      await axios.delete(`/api/blacklist/${ticker}`)
-    } else {
-      await axios.post(`/api/blacklist/${ticker}`)
+    try {
+      if (blacklistSet.has(ticker)) {
+        await axios.delete(`/api/blacklist/${ticker}`)
+      } else {
+        await axios.post(`/api/blacklist/${ticker}`)
+      }
+    } catch (err) {
+      console.error(`[blacklist] ${ticker} failed:`, err)
+      throw err
+    } finally {
+      queryClient.invalidateQueries({ queryKey: ['blacklist'] })
+      queryClient.invalidateQueries({ queryKey: ['deepdive'] })
     }
-    queryClient.invalidateQueries({ queryKey: ['blacklist'] })
-    queryClient.invalidateQueries({ queryKey: ['deepdive'] })
   }, [blacklistSet, queryClient])
   return { blacklistSet, toggle }
+}
+
+function BlacklistButton({
+  ticker,
+  isBlacklisted,
+  onToggle,
+  className = '',
+}: {
+  ticker: string
+  isBlacklisted: boolean
+  onToggle: (ticker: string) => Promise<void>
+  className?: string
+}) {
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState(false)
+
+  const handleClick = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setPending(true)
+    setError(false)
+    try {
+      await onToggle(ticker)
+    } catch {
+      setError(true)
+      setTimeout(() => setError(false), 2000)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <button
+      onClick={handleClick}
+      disabled={pending}
+      title={isBlacklisted ? 'Remove from blacklist' : 'Blacklist — skip AI refresh'}
+      className={clsx(
+        'opacity-0 group-hover:opacity-100 transition-opacity font-mono text-[10px] px-2 py-0.5 rounded border flex-shrink-0',
+        pending && 'opacity-50 cursor-wait',
+        error
+          ? 'border-accent-red text-accent-red opacity-100'
+          : isBlacklisted
+            ? 'border-accent-green/40 text-accent-green/70 hover:text-accent-green hover:border-accent-green/70'
+            : 'border-accent-red/30 text-accent-red/60 hover:text-accent-red hover:border-accent-red/60',
+        className,
+      )}
+    >
+      {pending ? '…' : error ? 'err' : isBlacklisted ? 'unban' : '⊘'}
+    </button>
+  )
 }
 
 // Sort analyzed: BULL first, then NEUTRAL, then BEAR; within each group by conviction desc
@@ -240,7 +295,7 @@ function TickerRow({
   t: DeepDiveTicker
   isOpen: boolean
   isBlacklisted: boolean
-  onToggleBlacklist: (ticker: string) => void
+  onToggleBlacklist: (ticker: string) => Promise<void>
 }) {
   const navigate = useNavigate()
 
@@ -282,13 +337,7 @@ function TickerRow({
             <span className="w-1.5 h-1.5 rounded-full bg-text-tertiary/40 inline-block" />
             no analysis — click to run
           </div>
-          <button
-            onClick={e => { e.stopPropagation(); onToggleBlacklist(t.ticker) }}
-            title={isBlacklisted ? 'Remove from blacklist' : 'Blacklist — skip AI refresh'}
-            className="opacity-0 group-hover:opacity-100 transition-opacity font-mono text-[10px] px-2 py-0.5 rounded border border-accent-red/30 text-accent-red/60 hover:text-accent-red hover:border-accent-red/60 flex-shrink-0"
-          >
-            {isBlacklisted ? 'unban' : '⊘'}
-          </button>
+          <BlacklistButton ticker={t.ticker} isBlacklisted={isBlacklisted} onToggle={onToggleBlacklist} />
         </div>
       </div>
     )
@@ -366,13 +415,7 @@ function TickerRow({
               {t.data_quality}
             </div>
           )}
-          <button
-            onClick={e => { e.stopPropagation(); onToggleBlacklist(t.ticker) }}
-            title={isBlacklisted ? 'Remove from blacklist' : 'Blacklist — skip AI refresh'}
-            className="opacity-0 group-hover:opacity-100 transition-opacity font-mono text-[10px] px-2 py-0.5 rounded border border-accent-red/30 text-accent-red/60 hover:text-accent-red hover:border-accent-red/60 mt-1"
-          >
-            {isBlacklisted ? 'unban' : '⊘'}
-          </button>
+          <BlacklistButton ticker={t.ticker} isBlacklisted={isBlacklisted} onToggle={onToggleBlacklist} className="mt-1" />
         </div>
       </div>
     </div>
@@ -391,7 +434,7 @@ function Section({
   rows: DeepDiveTicker[]
   openTickers: Set<string>
   blacklistSet: Set<string>
-  onToggleBlacklist: (ticker: string) => void
+  onToggleBlacklist: (ticker: string) => Promise<void>
   showHeaders?: boolean
 }) {
   if (!rows.length) return null
