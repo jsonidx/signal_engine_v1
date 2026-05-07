@@ -405,14 +405,6 @@ function TickerRow({
           <TradeSetupCells t={t} />
         </div>
 
-        {/* Thesis snippet */}
-        <div className="flex-1 min-w-0">
-          <p className="font-mono text-xs text-text-tertiary leading-relaxed line-clamp-2">
-            {t.thesis_short || 'No thesis available'}
-            {t.thesis_short?.length === 160 ? '…' : ''}
-          </p>
-        </div>
-
         {/* Meta */}
         <div className="text-right flex-shrink-0 space-y-1 w-28">
           {t.current_price != null && (
