@@ -273,12 +273,19 @@ function TradeSetupCells({ t }: { t: DeepDiveTicker }) {
           <div className="font-mono text-[9px] text-text-tertiary">{t.entry_low}–{t.entry_high}</div>
         )}
       </div>
-      {/* T1 */}
+      {/* T1 + P(T1) */}
       <div className="w-20 text-center space-y-0.5">
         {t1p != null ? (
           <>
             <div className={clsx('font-mono text-xs font-semibold', t1p >= 0 ? 'text-accent-green' : 'text-accent-red')}>{fmt(t1p)}</div>
             <div className="font-mono text-[9px] text-text-tertiary">${t.target_1!.toFixed(2)}</div>
+            {t.prob_combined != null && (
+              <div className={clsx('font-mono text-[9px]',
+                t.prob_combined >= 0.65 ? 'text-accent-green'
+                  : t.prob_combined >= 0.45 ? 'text-accent-amber'
+                  : 'text-accent-red'
+              )}>{Math.round(t.prob_combined * 100)}% hit</div>
+            )}
           </>
         ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
       </div>
@@ -424,16 +431,6 @@ function TickerRow({
               <div className="font-mono text-[10px] text-text-tertiary">{t.date}</div>
             )
           })()}
-          {t.prob_combined != null && (
-            <div className={clsx(
-              'font-mono text-[10px] font-semibold',
-              t.prob_combined >= 0.65 ? 'text-accent-green'
-                : t.prob_combined >= 0.45 ? 'text-accent-amber'
-                : 'text-accent-red'
-            )}>
-              P(T1) {Math.round(t.prob_combined * 100)}%
-            </div>
-          )}
           {t.time_horizon && (
             <div className="font-mono text-[10px] text-text-tertiary">{t.time_horizon}</div>
           )}
