@@ -37,7 +37,7 @@ type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_
 interface LiveZoneMap {
   [ticker: string]: { buy_zone_low: number; buy_zone_high: number }
 }
-type SortMode = 'direction' | 'rr'
+type SortMode = 'direction' | 'rr' | 't1'
 
 function fmtDateTime(iso: string | null): { date: string; time: string } | null {
   if (!iso) return null
@@ -166,6 +166,13 @@ function BlacklistButton({
       {pending ? '…' : error ? 'err' : isBlacklisted ? 'unban' : '⊘'}
     </button>
   )
+}
+
+function sortByT1(a: DeepDiveTicker, b: DeepDiveTicker) {
+  const ta = a.target_1 ?? -Infinity
+  const tb = b.target_1 ?? -Infinity
+  if (tb !== ta) return tb - ta
+  return (b.conviction ?? 0) - (a.conviction ?? 0)
 }
 
 // Sort analyzed: BULL first, then NEUTRAL, then BEAR; within each group by conviction desc
@@ -578,7 +585,7 @@ export function DeepDivePage() {
     const filteredUniverse = filter === 'ALL' ? universe : []
 
     // Sort analyzed section
-    const sorter = sortMode === 'rr' ? sortByRR : sortByBullFirst
+    const sorter = sortMode === 'rr' ? sortByRR : sortMode === 't1' ? sortByT1 : sortByBullFirst
     const sortedAnalyzed = [...filteredAnalyzed].sort(sorter)
 
     // Sort universe: open positions first, then alphabetical
@@ -631,7 +638,7 @@ export function DeepDivePage() {
         {/* Sort toggle */}
         <div className="flex items-center gap-1">
           <span className="font-mono text-[10px] text-text-tertiary mr-1">sort:</span>
-          {([['direction', 'Direction'], ['rr', 'R:R ↓']] as const).map(([mode, label]) => (
+          {([['direction', 'Direction'], ['rr', 'R:R ↓'], ['t1', 'T1 ↓']] as const).map(([mode, label]) => (
             <button
               key={mode}
               onClick={() => setSortMode(mode)}
