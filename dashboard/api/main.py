@@ -278,7 +278,7 @@ def _safe_int(v, default=None):
 
 
 def _fetch_current_prices(tickers: list[str], cache_ttl: int = TTL_MEDIUM) -> dict[str, float]:
-    """Fetch latest prices via yfinance with in-memory caching."""
+    """Fetch last-close prices via yfinance (daily bars, no extended hours)."""
     if not tickers:
         return {}
     key = "prices:" + ",".join(sorted(tickers))
@@ -300,6 +300,42 @@ def _fetch_current_prices(tickers: list[str], cache_ttl: int = TTL_MEDIUM) -> di
                     prices[t] = float(series.iloc[-1])
     except Exception as e:
         log.warning("yfinance fetch error: %s", e)
+
+    _cache.set(key, prices, cache_ttl)
+    return prices
+
+
+def _fetch_live_prices(tickers: list[str], cache_ttl: int = 120) -> dict[str, float]:
+    """
+    Fetch the most current price including pre-market and after-hours.
+    Uses 1-minute bars with prepost=True — reflects the active session price.
+    Falls back to an empty dict on error (callers should fall back to close price).
+    """
+    if not tickers:
+        return {}
+    key = "live_prices:" + ",".join(sorted(tickers))
+    hit = _cache.get(key)
+    if hit:
+        return hit
+
+    prices: dict[str, float] = {}
+    try:
+        data = yf.download(
+            tickers, period="1d", interval="1m",
+            prepost=True, auto_adjust=True,
+            progress=False, threads=True,
+        )
+        if isinstance(data.columns, pd.MultiIndex):
+            close = data["Close"]
+        else:
+            close = data[["Close"]].rename(columns={"Close": tickers[0]})
+        for t in tickers:
+            if t in close.columns:
+                series = close[t].dropna()
+                if not series.empty:
+                    prices[t] = round(float(series.iloc[-1]), 2)
+    except Exception as e:
+        log.warning("live price fetch error: %s", e)
 
     _cache.set(key, prices, cache_ttl)
     return prices
@@ -1645,17 +1681,26 @@ async def deepdive_tickers():
                 "stop_loss":              None,
             })
 
-    # Enrich with live prices (yfinance batch, 5-min cache)
+    # Enrich with live prices — try prepost 1-min bars first, fall back to close
     if tickers:
         all_syms = [t["ticker"] for t in tickers]
-        live_prices = _fetch_current_prices(all_syms, cache_ttl=TTL_SHORT)
+        loop = asyncio.get_event_loop()
+        live_prices = await loop.run_in_executor(None, _fetch_live_prices, all_syms)
+        close_prices = _fetch_current_prices(all_syms, cache_ttl=TTL_SHORT) if not live_prices else {}
         for t in tickers:
-            lp = live_prices.get(t["ticker"])
+            sym = t["ticker"]
+            lp = live_prices.get(sym)
             if lp is not None:
                 t["current_price"] = lp
+                t["price_source"] = "live"
+            else:
+                cp = close_prices.get(sym)
+                if cp is not None:
+                    t["current_price"] = cp
+                t["price_source"] = "close"
 
     result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
-    _cache.set(cache_key, result, TTL_SHORT)
+    _cache.set(cache_key, result, 120)  # 2-min cache — contains live prepost prices
     return result
 
 
@@ -1721,14 +1766,8 @@ async def deepdive_live_zones():
 async def deepdive_premarket_prices():
     """
     Latest price including pre-market/after-hours for all analyzed tickers.
-    Uses 1-minute bars with prepost=True so it reflects the current session price
-    before regular-hours open. Short TTL (2 min) — stale data is misleading here.
+    Thin wrapper around _fetch_live_prices — used by the frontend copy-prompt flow.
     """
-    cache_key = "deepdive_premarket_prices"
-    hit = _cache.get(cache_key)
-    if hit is not None:
-        return hit
-
     conn = _db_connect()
     tickers: list[str] = []
     if conn is not None:
@@ -1741,38 +1780,9 @@ async def deepdive_premarket_prices():
         except Exception:
             pass
 
-    if not tickers:
-        out = {"prices": {}, "as_of": datetime.utcnow().isoformat() + "Z"}
-        _cache.set(cache_key, out, 120)
-        return out
-
-    def _fetch():
-        prices: dict[str, float] = {}
-        try:
-            data = yf.download(
-                tickers, period="1d", interval="1m",
-                prepost=True, auto_adjust=True,
-                progress=False, threads=True,
-            )
-            if isinstance(data.columns, pd.MultiIndex):
-                close = data["Close"]
-            else:
-                close = data[["Close"]].rename(columns={"Close": tickers[0]})
-            for t in tickers:
-                if t in close.columns:
-                    series = close[t].dropna()
-                    if not series.empty:
-                        prices[t] = round(float(series.iloc[-1]), 2)
-        except Exception as e:
-            log.warning("premarket price fetch error: %s", e)
-        return prices
-
     loop = asyncio.get_event_loop()
-    prices = await loop.run_in_executor(None, _fetch)
-
-    out = {"prices": prices, "as_of": datetime.utcnow().isoformat() + "Z"}
-    _cache.set(cache_key, out, 120)
-    return out
+    prices = await loop.run_in_executor(None, _fetch_live_prices, tickers) if tickers else {}
+    return {"prices": prices, "as_of": datetime.utcnow().isoformat() + "Z"}
 
 
 @app.get("/api/signals/outcomes")

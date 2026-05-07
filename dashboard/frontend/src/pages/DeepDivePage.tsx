@@ -15,6 +15,7 @@ interface DeepDiveTicker {
   name: string
   sector: string
   current_price: number | null
+  price_source: 'live' | 'close' | null  // live = prepost 1-min bar, close = last daily bar
   date: string | null
   created_at: string | null
   direction: string | null
@@ -31,6 +32,16 @@ interface DeepDiveTicker {
   target_1: number | null
   target_2: number | null
   stop_loss: number | null
+}
+
+/** Returns 'PM', 'AH', or null based on US Eastern time. */
+function priceSessionLabel(): 'PM' | 'AH' | null {
+  const etOffset = -5 // EST; DST handled approximately
+  const utcH = new Date().getUTCHours() + new Date().getUTCMinutes() / 60
+  const etH = ((utcH + etOffset) % 24 + 24) % 24
+  if (etH >= 4 && etH < 9.5)  return 'PM'
+  if (etH >= 16 && etH < 20)  return 'AH'
+  return null
 }
 
 type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR' | 'IN_ENTRY' | 'ZONE_OVERLAP'
@@ -358,8 +369,13 @@ function TickerRow({
             )}
           </div>
           {t.current_price != null && (
-            <span className="font-mono text-xs text-text-secondary flex-shrink-0">
+            <span className="font-mono text-xs text-text-secondary flex-shrink-0 flex items-center gap-1">
               ${t.current_price.toFixed(2)}
+              {t.price_source === 'live' && priceSessionLabel() && (
+                <span className="font-mono text-[9px] text-accent-amber/80 border border-accent-amber/30 rounded px-0.5">
+                  {priceSessionLabel()}
+                </span>
+              )}
             </span>
           )}
           <div className="font-mono text-[10px] text-text-tertiary/60 flex-shrink-0 flex items-center gap-1.5">
@@ -408,8 +424,13 @@ function TickerRow({
         {/* Meta */}
         <div className="text-right flex-shrink-0 space-y-1 w-28">
           {t.current_price != null && (
-            <div className="font-mono text-xs font-semibold text-text-primary">
+            <div className="font-mono text-xs font-semibold text-text-primary flex items-center justify-end gap-1">
               ${t.current_price.toFixed(2)}
+              {t.price_source === 'live' && priceSessionLabel() && (
+                <span className="font-mono text-[9px] text-accent-amber/80 border border-accent-amber/30 rounded px-0.5">
+                  {priceSessionLabel()}
+                </span>
+              )}
             </div>
           )}
           {(() => {
