@@ -1717,6 +1717,64 @@ async def deepdive_live_zones():
     return out
 
 
+@app.get("/api/deepdive/premarket-prices")
+async def deepdive_premarket_prices():
+    """
+    Latest price including pre-market/after-hours for all analyzed tickers.
+    Uses 1-minute bars with prepost=True so it reflects the current session price
+    before regular-hours open. Short TTL (2 min) — stale data is misleading here.
+    """
+    cache_key = "deepdive_premarket_prices"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    conn = _db_connect()
+    tickers: list[str] = []
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT ticker FROM thesis_cache WHERE entry_low IS NOT NULL AND entry_high IS NOT NULL"
+            ).fetchall()
+            conn.close()
+            tickers = [r["ticker"] for r in rows]
+        except Exception:
+            pass
+
+    if not tickers:
+        out = {"prices": {}, "as_of": datetime.utcnow().isoformat() + "Z"}
+        _cache.set(cache_key, out, 120)
+        return out
+
+    def _fetch():
+        prices: dict[str, float] = {}
+        try:
+            data = yf.download(
+                tickers, period="1d", interval="1m",
+                prepost=True, auto_adjust=True,
+                progress=False, threads=True,
+            )
+            if isinstance(data.columns, pd.MultiIndex):
+                close = data["Close"]
+            else:
+                close = data[["Close"]].rename(columns={"Close": tickers[0]})
+            for t in tickers:
+                if t in close.columns:
+                    series = close[t].dropna()
+                    if not series.empty:
+                        prices[t] = round(float(series.iloc[-1]), 2)
+        except Exception as e:
+            log.warning("premarket price fetch error: %s", e)
+        return prices
+
+    loop = asyncio.get_event_loop()
+    prices = await loop.run_in_executor(None, _fetch)
+
+    out = {"prices": prices, "as_of": datetime.utcnow().isoformat() + "Z"}
+    _cache.set(cache_key, out, 120)
+    return out
+
+
 @app.get("/api/signals/outcomes")
 async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
     """

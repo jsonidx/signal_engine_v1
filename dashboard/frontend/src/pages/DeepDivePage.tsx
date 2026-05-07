@@ -576,10 +576,15 @@ function sanitizeThesis(text: string | null | undefined): string {
     .trim()
 }
 
-function buildLLMPrompt(tickers: DeepDiveTicker[], bullOnly = false): string {
+function buildLLMPrompt(
+  tickers: DeepDiveTicker[],
+  bullOnly = false,
+  premarketPrices: Record<string, number> = {},
+): string {
   let analyzed = tickers.filter(t => t.has_thesis && t.direction)
   if (bullOnly) analyzed = analyzed.filter(t => t.direction === 'BULL' && (t.conviction ?? 0) >= 3)
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+  const hasPremarket = Object.keys(premarketPrices).length > 0
 
   const lines: string[] = [
     `You are a quantitative equity analyst. Today is ${today}.`,
@@ -589,6 +594,7 @@ function buildLLMPrompt(tickers: DeepDiveTicker[], bullOnly = false): string {
     `- AI entry zone, T1/T2 targets, stop loss`,
     `- T1 upside %, Risk:Reward, probability of hitting T1`,
     `- Time horizon, signal agreement score (0–100%), sector`,
+    `- Price: ${hasPremarket ? 'live pre-market price fetched at prompt generation time' : 'last close price'}`,
     ``,
     `YOUR TASK:`,
     `1. Identify the TOP 3 best buys for TODAY (intraday / next 1–2 days)`,
@@ -624,13 +630,15 @@ function buildLLMPrompt(tickers: DeepDiveTicker[], bullOnly = false): string {
       return risk > 0 ? (reward / risk).toFixed(1) : null
     })()
 
-    const inEntry = t.current_price != null && t.entry_low != null && t.entry_high != null
-      && t.current_price >= t.entry_low && t.current_price <= t.entry_high
+    const pmPrice   = premarketPrices[t.ticker] ?? null
+    const dispPrice = pmPrice ?? t.current_price
+    const inEntry   = dispPrice != null && t.entry_low != null && t.entry_high != null
+      && dispPrice >= t.entry_low && dispPrice <= t.entry_high
 
     lines.push(``)
     lines.push(`${t.ticker}${t.name ? ` — ${t.name}` : ''}${t.sector ? ` (${t.sector})` : ''}`)
     lines.push(`  Direction:  ${t.direction} | Conviction: ${'●'.repeat(t.conviction ?? 0)}${'○'.repeat(5 - (t.conviction ?? 0))} (${t.conviction}/5)`)
-    lines.push(`  Price:      ${fmt(t.current_price)}${inEntry ? ' ← IN ENTRY ZONE' : ''}`)
+    lines.push(`  Price:      ${fmt(dispPrice)}${pmPrice != null ? ' (pre-market)' : ''}${inEntry ? ' ← IN ENTRY ZONE' : ''}`)
     lines.push(`  Entry zone: ${fmt(t.entry_low)} – ${fmt(t.entry_high)}`)
     lines.push(`  T1:         ${fmt(t.target_1)} (${pct(t.target_1)}) | T2: ${fmt(t.target_2)} (${pct(t.target_2)})`)
     lines.push(`  Stop:       ${fmt(t.stop_loss)} (${pct(t.stop_loss)}) | R:R: ${rr ?? '—'}`)
@@ -651,6 +659,7 @@ export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
   const [copied, setCopied] = useState(false)
+  const [copyFetching, setCopyFetching] = useState(false)
   const [bullOnlyCopy, setBullOnlyCopy] = useState(false)
   const toggleSort = (mode: SortMode) =>
     setSortModes(prev =>
@@ -787,8 +796,18 @@ export function DeepDivePage() {
             BULL conv≥3
           </button>
           <button
-            onClick={() => {
-              const prompt = buildLLMPrompt(tickers ?? [], bullOnlyCopy)
+            disabled={copyFetching}
+            onClick={async () => {
+              setCopyFetching(true)
+              let premarketPrices: Record<string, number> = {}
+              try {
+                const r = await axios.get('/api/deepdive/premarket-prices')
+                premarketPrices = r.data?.prices ?? {}
+              } catch {
+                // silently fall back to close prices
+              }
+              const prompt = buildLLMPrompt(tickers ?? [], bullOnlyCopy, premarketPrices)
+              setCopyFetching(false)
               navigator.clipboard.writeText(prompt).then(() => {
                 setCopied(true)
                 setTimeout(() => setCopied(false), 2000)
@@ -798,10 +817,12 @@ export function DeepDivePage() {
               'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
               copied
                 ? 'border-accent-green/60 text-accent-green'
-                : 'border-border-subtle text-text-tertiary hover:border-border-active hover:text-text-secondary'
+                : copyFetching
+                  ? 'border-border-subtle text-text-tertiary opacity-60 cursor-wait'
+                  : 'border-border-subtle text-text-tertiary hover:border-border-active hover:text-text-secondary'
             )}
           >
-            {copied ? '✓ Copied' : '⎘ Copy LLM Prompt'}
+            {copied ? '✓ Copied' : copyFetching ? '⏳ Fetching…' : '⎘ Copy LLM Prompt'}
           </button>
         </div>
       </div>
