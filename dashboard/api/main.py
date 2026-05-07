@@ -5548,3 +5548,77 @@ async def thesis_live_performance():
     except Exception:
         log.exception("thesis_live_performance error")
         return _no_data("thesis_live_performance failed")
+
+
+# ==============================================================================
+# SECTION 22: BLACKLIST
+# ==============================================================================
+
+@app.get("/api/blacklist")
+async def get_blacklist():
+    """Return all currently blacklisted tickers."""
+    try:
+        conn = _db_connect()
+        if conn is None:
+            return {"blacklist": []}
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, reason, added_at FROM blacklist WHERE expires_at IS NULL OR expires_at > NOW() ORDER BY added_at DESC"
+            )
+            rows = cur.fetchall()
+        conn.close()
+        return {"blacklist": [
+            {"ticker": r["ticker"], "reason": r.get("reason", ""), "added_at": str(r["added_at"])}
+            for r in rows
+        ]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/blacklist/{ticker}")
+async def add_to_blacklist(ticker: str, reason: str = "not_interesting"):
+    """Add a ticker to the blacklist (permanent, no expiry)."""
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    try:
+        conn = _db_connect()
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO blacklist (ticker, reason, added_at, expires_at)
+                VALUES (%s, %s, NOW(), NULL)
+                ON CONFLICT (ticker) DO UPDATE SET reason = EXCLUDED.reason, added_at = NOW(), expires_at = NULL
+                """,
+                (ticker, reason),
+            )
+        conn.commit()
+        conn.close()
+        _cache.invalidate("deepdive_tickers")
+        return {"ok": True, "ticker": ticker}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/blacklist/{ticker}")
+async def remove_from_blacklist(ticker: str):
+    """Remove a ticker from the blacklist."""
+    ticker = ticker.upper().strip()
+    try:
+        conn = _db_connect()
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM blacklist WHERE ticker = %s", (ticker,))
+        conn.commit()
+        conn.close()
+        _cache.invalidate("deepdive_tickers")
+        return {"ok": True, "ticker": ticker}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

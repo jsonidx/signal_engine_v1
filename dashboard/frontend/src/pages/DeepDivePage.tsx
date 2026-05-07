@@ -1,5 +1,5 @@
-import { useState, useMemo } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useState, useMemo, useCallback } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Shell } from '../components/layout/Shell'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
@@ -88,6 +88,29 @@ function useOpenPositionTickers() {
       ) as Promise<string[]>,
     staleTime: 5 * 60 * 1000,
   })
+}
+
+function useBlacklist() {
+  const queryClient = useQueryClient()
+  const { data: blacklistData } = useQuery({
+    queryKey: ['blacklist'],
+    queryFn: () => axios.get('/api/blacklist').then(r => r.data.blacklist as { ticker: string }[]),
+    staleTime: 5 * 60 * 1000,
+  })
+  const blacklistSet = useMemo(
+    () => new Set((blacklistData ?? []).map(b => b.ticker)),
+    [blacklistData],
+  )
+  const toggle = useCallback(async (ticker: string) => {
+    if (blacklistSet.has(ticker)) {
+      await axios.delete(`/api/blacklist/${ticker}`)
+    } else {
+      await axios.post(`/api/blacklist/${ticker}`)
+    }
+    queryClient.invalidateQueries({ queryKey: ['blacklist'] })
+    queryClient.invalidateQueries({ queryKey: ['deepdive'] })
+  }, [blacklistSet, queryClient])
+  return { blacklistSet, toggle }
 }
 
 // Sort analyzed: BULL first, then NEUTRAL, then BEAR; within each group by conviction desc
@@ -208,15 +231,28 @@ function TradeSetupCells({ t }: { t: DeepDiveTicker }) {
   )
 }
 
-function TickerRow({ t, isOpen }: { t: DeepDiveTicker; isOpen: boolean }) {
+function TickerRow({
+  t,
+  isOpen,
+  isBlacklisted,
+  onToggleBlacklist,
+}: {
+  t: DeepDiveTicker
+  isOpen: boolean
+  isBlacklisted: boolean
+  onToggleBlacklist: (ticker: string) => void
+}) {
   const navigate = useNavigate()
 
   if (!t.has_thesis) {
     // Simplified row for unanalyzed universe tickers
     return (
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => navigate(`/ticker/${t.ticker}`)}
-        className="w-full text-left bg-bg-surface/60 border border-border-subtle hover:border-border-active rounded p-3 transition-colors group opacity-70 hover:opacity-100"
+        onKeyDown={e => e.key === 'Enter' && navigate(`/ticker/${t.ticker}`)}
+        className="w-full text-left bg-bg-surface/60 border border-border-subtle hover:border-border-active rounded p-3 transition-colors group opacity-70 hover:opacity-100 cursor-pointer"
       >
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-3 w-44 flex-shrink-0">
@@ -246,15 +282,25 @@ function TickerRow({ t, isOpen }: { t: DeepDiveTicker; isOpen: boolean }) {
             <span className="w-1.5 h-1.5 rounded-full bg-text-tertiary/40 inline-block" />
             no analysis — click to run
           </div>
+          <button
+            onClick={e => { e.stopPropagation(); onToggleBlacklist(t.ticker) }}
+            title={isBlacklisted ? 'Remove from blacklist' : 'Blacklist — skip AI refresh'}
+            className="opacity-0 group-hover:opacity-100 transition-opacity font-mono text-[10px] px-2 py-0.5 rounded border border-accent-red/30 text-accent-red/60 hover:text-accent-red hover:border-accent-red/60 flex-shrink-0"
+          >
+            {isBlacklisted ? 'unban' : '⊘'}
+          </button>
         </div>
-      </button>
+      </div>
     )
   }
 
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => navigate(`/ticker/${t.ticker}`)}
-      className="w-full text-left bg-bg-surface border border-border-subtle hover:border-border-active rounded p-4 transition-colors group"
+      onKeyDown={e => e.key === 'Enter' && navigate(`/ticker/${t.ticker}`)}
+      className="w-full text-left bg-bg-surface border border-border-subtle hover:border-border-active rounded p-4 transition-colors group cursor-pointer"
     >
       <div className="flex items-center gap-4">
         {/* Ticker + badges */}
@@ -320,9 +366,16 @@ function TickerRow({ t, isOpen }: { t: DeepDiveTicker; isOpen: boolean }) {
               {t.data_quality}
             </div>
           )}
+          <button
+            onClick={e => { e.stopPropagation(); onToggleBlacklist(t.ticker) }}
+            title={isBlacklisted ? 'Remove from blacklist' : 'Blacklist — skip AI refresh'}
+            className="opacity-0 group-hover:opacity-100 transition-opacity font-mono text-[10px] px-2 py-0.5 rounded border border-accent-red/30 text-accent-red/60 hover:text-accent-red hover:border-accent-red/60 mt-1"
+          >
+            {isBlacklisted ? 'unban' : '⊘'}
+          </button>
         </div>
       </div>
-    </button>
+    </div>
   )
 }
 
@@ -330,11 +383,15 @@ function Section({
   label,
   rows,
   openTickers,
+  blacklistSet,
+  onToggleBlacklist,
   showHeaders = true,
 }: {
   label: string
   rows: DeepDiveTicker[]
   openTickers: Set<string>
+  blacklistSet: Set<string>
+  onToggleBlacklist: (ticker: string) => void
   showHeaders?: boolean
 }) {
   if (!rows.length) return null
@@ -356,7 +413,13 @@ function Section({
         </div>
       )}
       {rows.map(t => (
-        <TickerRow key={t.ticker} t={t} isOpen={openTickers.has(t.ticker)} />
+        <TickerRow
+          key={t.ticker}
+          t={t}
+          isOpen={openTickers.has(t.ticker)}
+          isBlacklisted={blacklistSet.has(t.ticker)}
+          onToggleBlacklist={onToggleBlacklist}
+        />
       ))}
     </div>
   )
@@ -376,18 +439,24 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [sortMode, setSortMode] = useState<SortMode>('direction')
+  const [showBlacklisted, setShowBlacklisted] = useState(false)
   const { data: tickers, isLoading: loadingTickers, isError, error, refetch } = useDeepDiveTickers()
   const { data: openTickers = [] } = useOpenPositionTickers()
   const { data: liveZones = {} } = useDeepDiveLiveZones()
+  const { blacklistSet, toggle: toggleBlacklist } = useBlacklist()
 
   const openSet = useMemo(() => new Set(openTickers), [openTickers])
 
-  const { analyzedRows, universeRows } = useMemo(() => {
+  const { analyzedRows, universeRows, blacklistedRows } = useMemo(() => {
     const all = tickers ?? []
 
-    // Split into analyzed and unanalyzed
-    const analyzed = all.filter(t => t.has_thesis)
-    const universe = all.filter(t => !t.has_thesis)
+    // Separate blacklisted tickers first
+    const blacklisted = all.filter(t => blacklistSet.has(t.ticker))
+
+    // Split non-blacklisted into analyzed and unanalyzed
+    const active = all.filter(t => !blacklistSet.has(t.ticker))
+    const analyzed = active.filter(t => t.has_thesis)
+    const universe = active.filter(t => !t.has_thesis)
 
     // Apply direction/quality filter to analyzed tickers
     const filteredAnalyzed =
@@ -416,8 +485,8 @@ export function DeepDivePage() {
       return a.ticker.localeCompare(b.ticker)
     })
 
-    return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse }
-  }, [tickers, filter, sortMode, openSet, liveZones])
+    return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse, blacklistedRows: blacklisted }
+  }, [tickers, filter, sortMode, openSet, liveZones, blacklistSet])
 
   const totalShown = analyzedRows.length + universeRows.length
 
@@ -503,14 +572,13 @@ export function DeepDivePage() {
           {/* Analyzed tickers with full thesis data */}
           {analyzedRows.length > 0 && (
             <>
-              {/* Split open positions from watchlist within analyzed */}
               {(() => {
                 const openA = analyzedRows.filter(t => openSet.has(t.ticker))
                 const watchA = analyzedRows.filter(t => !openSet.has(t.ticker))
                 return (
                   <>
-                    <Section label="Open Positions (Analyzed)" rows={openA} openTickers={openSet} />
-                    <Section label="Watchlist (Analyzed)" rows={watchA} openTickers={openSet} />
+                    <Section label="Open Positions (Analyzed)" rows={openA} openTickers={openSet} blacklistSet={blacklistSet} onToggleBlacklist={toggleBlacklist} />
+                    <Section label="Watchlist (Analyzed)" rows={watchA} openTickers={openSet} blacklistSet={blacklistSet} onToggleBlacklist={toggleBlacklist} />
                   </>
                 )
               })()}
@@ -523,8 +591,31 @@ export function DeepDivePage() {
               label="Universe — no AI analysis yet"
               rows={universeRows}
               openTickers={openSet}
+              blacklistSet={blacklistSet}
+              onToggleBlacklist={toggleBlacklist}
               showHeaders={false}
             />
+          )}
+
+          {/* Blacklisted tickers — collapsed by default */}
+          {blacklistedRows.length > 0 && (
+            <div className="space-y-2">
+              <button
+                onClick={() => setShowBlacklisted(v => !v)}
+                className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary/50 hover:text-text-tertiary pt-2 pb-1 border-b border-border-subtle w-full text-left transition-colors"
+              >
+                Blacklisted — {blacklistedRows.length} {showBlacklisted ? '▲ hide' : '▼ show'}
+              </button>
+              {showBlacklisted && blacklistedRows.map(t => (
+                <TickerRow
+                  key={t.ticker}
+                  t={t}
+                  isOpen={openSet.has(t.ticker)}
+                  isBlacklisted={true}
+                  onToggleBlacklist={toggleBlacklist}
+                />
+              ))}
+            </div>
           )}
         </div>
       )}

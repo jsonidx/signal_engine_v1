@@ -178,12 +178,19 @@ step_start
 if [ "$SKIP_AI" = true ]; then
   echo "Step 13: AI synthesis SKIPPED (--skip-ai) — backfilling agreement scores only"
   python3 ai_quant.py --backfill-agreement
-  step_end "Step 13: AI Quant (synthesis skipped; 13a/13b/13c still run)"
+  step_end "Step 13: AI Quant (synthesis skipped; 13a/13b/13c/13d still run)"
 else
   echo "Step 13: AI Quant synthesis (top 20 tickers — sonnet-4-6 + thinking)..."
   python3 ai_quant.py --top-n 20
   step_end "Step 13: AI Quant synthesis"
   echo "Step 13 complete — theses saved to ai_quant_cache.db"
+
+  # ── Step 13d: Refresh stale theses (>7 days old, not in today's top-20) ──────
+  echo ""
+  echo "Step 13d: Refreshing stale theses (older than 7 days)..."
+  step_start
+  python3 refresh_stale_theses.py --days 7 --run
+  step_end "Step 13d: Stale thesis refresh"
 fi
 echo ""
 

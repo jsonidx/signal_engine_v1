@@ -1,0 +1,58 @@
+name: Refresh Stale Theses (daily, AI-enabled)
+
+# Runs every day at 04:30 Berlin time (02:30 UTC) — after the daily --skip-ai pipeline
+# Re-runs AI analysis for any thesis older than 7 days and sends a Telegram diff summary.
+
+on:
+  schedule:
+    - cron: '30 2 * * 1-6'   # 04:30 Berlin (CEST UTC+2), Mon–Sat
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Stale threshold in days'
+        required: false
+        default: '7'
+      dry_run:
+        description: 'Dry run (no AI calls, just report)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  refresh-stale:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh stale theses and notify
+        env:
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          XAI_API_KEY:          ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          CMD="python3 scripts/refresh_stale_and_notify.py --days $DAYS"
+          if [ "$DRY_RUN" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
