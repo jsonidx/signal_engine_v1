@@ -1530,6 +1530,7 @@ async def deepdive_tickers():
                        tc.time_horizon, tc.data_quality, tc.thesis, tc.bull_probability,
                        tc.bear_probability, tc.neutral_probability, tc.created_at,
                        tc.entry_low, tc.entry_high, tc.target_1, tc.target_2, tc.stop_loss,
+                       tc.prob_combined,
                        ss.rank AS equity_rank
                 FROM thesis_cache tc
                 LEFT JOIN (
@@ -1573,6 +1574,7 @@ async def deepdive_tickers():
                     "target_1":               r["target_1"],
                     "target_2":               r["target_2"],
                     "stop_loss":              r["stop_loss"],
+                    "prob_combined":          r["prob_combined"],
                     "equity_rank":            r["equity_rank"],
                 })
         except Exception:

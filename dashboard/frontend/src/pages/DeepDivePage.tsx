@@ -25,6 +25,7 @@ interface DeepDiveTicker {
   thesis_short: string | null
   bull_probability: number | null
   bear_probability: number | null
+  prob_combined: number | null
   entry_low: number | null
   entry_high: number | null
   target_1: number | null
@@ -423,6 +424,16 @@ function TickerRow({
               <div className="font-mono text-[10px] text-text-tertiary">{t.date}</div>
             )
           })()}
+          {t.prob_combined != null && (
+            <div className={clsx(
+              'font-mono text-[10px] font-semibold',
+              t.prob_combined >= 0.65 ? 'text-accent-green'
+                : t.prob_combined >= 0.45 ? 'text-accent-amber'
+                : 'text-accent-red'
+            )}>
+              P(T1) {Math.round(t.prob_combined * 100)}%
+            </div>
+          )}
           {t.time_horizon && (
             <div className="font-mono text-[10px] text-text-tertiary">{t.time_horizon}</div>
           )}
