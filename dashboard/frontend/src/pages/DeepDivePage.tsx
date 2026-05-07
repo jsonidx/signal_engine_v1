@@ -562,9 +562,79 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
   { value: 'ZONE_OVERLAP', label: 'Hot Entry' },
 ]
 
+function buildLLMPrompt(tickers: DeepDiveTicker[]): string {
+  const analyzed = tickers.filter(t => t.has_thesis && t.direction)
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+
+  const lines: string[] = [
+    `You are a quantitative equity analyst. Today is ${today}.`,
+    ``,
+    `Below are ${analyzed.length} tickers from my signal engine with AI-generated theses. Each has:`,
+    `- Direction & conviction (1–5)`,
+    `- AI entry zone, T1/T2 targets, stop loss`,
+    `- T1 upside %, Risk:Reward, probability of hitting T1`,
+    `- Time horizon, signal agreement score (0–100%), sector`,
+    ``,
+    `YOUR TASK:`,
+    `1. Identify the TOP 3 best buys for TODAY (intraday / next 1–2 days)`,
+    `2. Identify the TOP 3 best buys for THIS WEEK (3–5 day hold)`,
+    `3. Flag any tickers to AVOID right now and why`,
+    `4. Give a short overall market read based on what you see across sectors`,
+    ``,
+    `Prioritise: high P(T1) × good R:R × price near entry zone × short time horizon.`,
+    `Penalise: low conviction, wide stop, R:R < 1, NEUTRAL direction.`,
+    ``,
+    `─────────────────────────────────────────────────────`,
+    `TICKER DATA`,
+    `─────────────────────────────────────────────────────`,
+  ]
+
+  for (const t of analyzed) {
+    const entry = t.entry_low != null && t.entry_high != null
+      ? (t.entry_low + t.entry_high) / 2
+      : t.entry_low ?? t.entry_high
+
+    const fmt = (v: number | null, prefix = '$') =>
+      v != null ? `${prefix}${v.toFixed(2)}` : '—'
+
+    const pct = (price: number | null) =>
+      entry && price != null
+        ? `${((price - entry) / entry * 100) >= 0 ? '+' : ''}${((price - entry) / entry * 100).toFixed(1)}%`
+        : '—'
+
+    const rr = (() => {
+      if (!entry || t.target_1 == null || t.stop_loss == null) return null
+      const risk = Math.abs(entry - t.stop_loss)
+      const reward = Math.abs(t.target_1 - entry)
+      return risk > 0 ? (reward / risk).toFixed(1) : null
+    })()
+
+    const inEntry = t.current_price != null && t.entry_low != null && t.entry_high != null
+      && t.current_price >= t.entry_low && t.current_price <= t.entry_high
+
+    lines.push(``)
+    lines.push(`${t.ticker}${t.name ? ` — ${t.name}` : ''}${t.sector ? ` (${t.sector})` : ''}`)
+    lines.push(`  Direction:  ${t.direction} | Conviction: ${'●'.repeat(t.conviction ?? 0)}${'○'.repeat(5 - (t.conviction ?? 0))} (${t.conviction}/5)`)
+    lines.push(`  Price:      ${fmt(t.current_price)}${inEntry ? ' ← IN ENTRY ZONE' : ''}`)
+    lines.push(`  Entry zone: ${fmt(t.entry_low)} – ${fmt(t.entry_high)}`)
+    lines.push(`  T1:         ${fmt(t.target_1)} (${pct(t.target_1)}) | T2: ${fmt(t.target_2)} (${pct(t.target_2)})`)
+    lines.push(`  Stop:       ${fmt(t.stop_loss)} (${pct(t.stop_loss)}) | R:R: ${rr ?? '—'}`)
+    lines.push(`  P(T1):      ${t.prob_combined != null ? `${Math.round(t.prob_combined * 100)}%` : '—'} | Time horizon: ${t.time_horizon ?? '—'}`)
+    lines.push(`  Agreement:  ${t.signal_agreement_score != null ? `${Math.round(t.signal_agreement_score * 100)}%` : '—'} | Data quality: ${t.data_quality ?? '—'}`)
+    if (t.thesis_short) lines.push(`  Thesis:     ${t.thesis_short}`)
+  }
+
+  lines.push(``)
+  lines.push(`─────────────────────────────────────────────────────`)
+  lines.push(`Now give your analysis. Be concise and actionable.`)
+
+  return lines.join('\n')
+}
+
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
+  const [copied, setCopied] = useState(false)
   const toggleSort = (mode: SortMode) =>
     setSortModes(prev =>
       prev.includes(mode)
@@ -684,6 +754,25 @@ export function DeepDivePage() {
         <span className="font-mono text-[10px] text-text-tertiary ml-1">
           {totalShown} ticker{totalShown !== 1 ? 's' : ''}
         </span>
+
+        {/* LLM prompt copy button */}
+        <button
+          onClick={() => {
+            const prompt = buildLLMPrompt(tickers ?? [])
+            navigator.clipboard.writeText(prompt).then(() => {
+              setCopied(true)
+              setTimeout(() => setCopied(false), 2000)
+            })
+          }}
+          className={clsx(
+            'ml-auto font-mono text-xs px-3 py-1.5 rounded border transition-colors flex-shrink-0',
+            copied
+              ? 'border-accent-green/60 text-accent-green'
+              : 'border-border-subtle text-text-tertiary hover:border-border-active hover:text-text-secondary'
+          )}
+        >
+          {copied ? '✓ Copied' : '⎘ Copy LLM Prompt'}
+        </button>
       </div>
 
       {loadingTickers ? (
