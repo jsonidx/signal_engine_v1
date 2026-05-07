@@ -562,14 +562,29 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
   { value: 'ZONE_OVERLAP', label: 'Hot Entry' },
 ]
 
-function buildLLMPrompt(tickers: DeepDiveTicker[]): string {
-  const analyzed = tickers.filter(t => t.has_thesis && t.direction)
+// Strip injected LLM instructions from user-supplied text (prompt injection defense)
+function sanitizeThesis(text: string | null | undefined): string {
+  if (!text) return ''
+  return text
+    .replace(/\bCRITICAL\s*:/gi, '[REDACTED]:')
+    .replace(/\bIMPORTANT\s*:/gi, '[REDACTED]:')
+    .replace(/respond with text only/gi, '[redacted]')
+    .replace(/do not call any tools/gi, '[redacted]')
+    .replace(/your task is to/gi, '[redacted]')
+    .replace(/ignore (previous|prior|all|above) instructions?/gi, '[redacted]')
+    .replace(/disregard (previous|prior|all|above) instructions?/gi, '[redacted]')
+    .trim()
+}
+
+function buildLLMPrompt(tickers: DeepDiveTicker[], bullOnly = false): string {
+  let analyzed = tickers.filter(t => t.has_thesis && t.direction)
+  if (bullOnly) analyzed = analyzed.filter(t => t.direction === 'BULL' && (t.conviction ?? 0) >= 3)
   const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
 
   const lines: string[] = [
     `You are a quantitative equity analyst. Today is ${today}.`,
     ``,
-    `Below are ${analyzed.length} tickers from my signal engine with AI-generated theses. Each has:`,
+    `Below are ${analyzed.length} tickers from my signal engine with AI-generated theses${bullOnly ? ' (BULL direction, conviction ≥ 3 only)' : ''}. Each has:`,
     `- Direction & conviction (1–5)`,
     `- AI entry zone, T1/T2 targets, stop loss`,
     `- T1 upside %, Risk:Reward, probability of hitting T1`,
@@ -621,7 +636,8 @@ function buildLLMPrompt(tickers: DeepDiveTicker[]): string {
     lines.push(`  Stop:       ${fmt(t.stop_loss)} (${pct(t.stop_loss)}) | R:R: ${rr ?? '—'}`)
     lines.push(`  P(T1):      ${t.prob_combined != null ? `${Math.round(t.prob_combined * 100)}%` : '—'} | Time horizon: ${t.time_horizon ?? '—'}`)
     lines.push(`  Agreement:  ${t.signal_agreement_score != null ? `${Math.round(t.signal_agreement_score * 100)}%` : '—'} | Data quality: ${t.data_quality ?? '—'}`)
-    if (t.thesis_short) lines.push(`  Thesis:     ${t.thesis_short}`)
+    const thesisSafe = sanitizeThesis(t.thesis_short)
+    if (thesisSafe) lines.push(`  Thesis:     ${thesisSafe}`)
   }
 
   lines.push(``)
@@ -635,6 +651,7 @@ export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
   const [copied, setCopied] = useState(false)
+  const [bullOnlyCopy, setBullOnlyCopy] = useState(false)
   const toggleSort = (mode: SortMode) =>
     setSortModes(prev =>
       prev.includes(mode)
@@ -755,24 +772,38 @@ export function DeepDivePage() {
           {totalShown} ticker{totalShown !== 1 ? 's' : ''}
         </span>
 
-        {/* LLM prompt copy button */}
-        <button
-          onClick={() => {
-            const prompt = buildLLMPrompt(tickers ?? [])
-            navigator.clipboard.writeText(prompt).then(() => {
-              setCopied(true)
-              setTimeout(() => setCopied(false), 2000)
-            })
-          }}
-          className={clsx(
-            'ml-auto font-mono text-xs px-3 py-1.5 rounded border transition-colors flex-shrink-0',
-            copied
-              ? 'border-accent-green/60 text-accent-green'
-              : 'border-border-subtle text-text-tertiary hover:border-border-active hover:text-text-secondary'
-          )}
-        >
-          {copied ? '✓ Copied' : '⎘ Copy LLM Prompt'}
-        </button>
+        {/* LLM prompt copy controls */}
+        <div className="ml-auto flex items-center gap-1.5 flex-shrink-0">
+          <button
+            onClick={() => setBullOnlyCopy(v => !v)}
+            title="Filter copied prompt to BULL tickers with conviction ≥ 3"
+            className={clsx(
+              'font-mono text-[10px] px-2 py-1.5 rounded border transition-colors',
+              bullOnlyCopy
+                ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+                : 'text-text-tertiary border-border-subtle hover:border-border-active hover:text-text-secondary'
+            )}
+          >
+            BULL conv≥3
+          </button>
+          <button
+            onClick={() => {
+              const prompt = buildLLMPrompt(tickers ?? [], bullOnlyCopy)
+              navigator.clipboard.writeText(prompt).then(() => {
+                setCopied(true)
+                setTimeout(() => setCopied(false), 2000)
+              })
+            }}
+            className={clsx(
+              'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+              copied
+                ? 'border-accent-green/60 text-accent-green'
+                : 'border-border-subtle text-text-tertiary hover:border-border-active hover:text-text-secondary'
+            )}
+          >
+            {copied ? '✓ Copied' : '⎘ Copy LLM Prompt'}
+          </button>
+        </div>
       </div>
 
       {loadingTickers ? (
