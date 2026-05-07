@@ -682,18 +682,7 @@ export function DeepDivePage() {
         <div className="space-y-6">
           {/* Analyzed tickers with full thesis data */}
           {analyzedRows.length > 0 && (
-            <>
-              {(() => {
-                const openA = analyzedRows.filter(t => openSet.has(t.ticker))
-                const watchA = analyzedRows.filter(t => !openSet.has(t.ticker))
-                return (
-                  <>
-                    <Section label="Open Positions (Analyzed)" rows={openA} openTickers={openSet} blacklistSet={blacklistSet} onToggleBlacklist={toggleBlacklist} />
-                    <Section label="Watchlist (Analyzed)" rows={watchA} openTickers={openSet} blacklistSet={blacklistSet} onToggleBlacklist={toggleBlacklist} />
-                  </>
-                )
-              })()}
-            </>
+            <Section label="Watchlist (Analyzed)" rows={analyzedRows} openTickers={openSet} blacklistSet={blacklistSet} onToggleBlacklist={toggleBlacklist} />
           )}
 
           {/* Universe tickers without AI analysis */}
