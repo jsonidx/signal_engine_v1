@@ -175,6 +175,7 @@ class TestFetchIndexConstituents:
 
         assert result == stale_tickers
 
+    @pytest.mark.network
     def test_no_cache_and_network_fail_returns_hardcoded(self):
         """With no cache and no network, must return the hardcoded fallback."""
         with tempfile.TemporaryDirectory() as tmpdir:

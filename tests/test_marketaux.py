@@ -16,6 +16,11 @@ import pytest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
 
+# fetch_news_sentiment was migrated from MarketAux (urllib + MARKETAUX_API_KEY)
+# to Exa (exa_py SDK + EXA_API_KEY). These tests target the old contract and
+# require a live API key to re-validate against the new one.
+pytestmark = pytest.mark.network
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 

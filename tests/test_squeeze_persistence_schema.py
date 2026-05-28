@@ -5,7 +5,7 @@ Post-fix persistence verification for CHUNK-12 readiness gate.
 
 Covers (no live DB):
   1. DDL / migration DDL contains all expected CHUNK-added columns.
-  2. save_squeeze_scores() builds a 42-column payload without crashing (full row).
+  2. save_squeeze_scores() builds a 43-column payload without crashing (full row).
   3. save_squeeze_scores() handles missing optional CHUNK fields gracefully.
   4. fetch_squeeze_scores_for_replay() returns real values with RealDictCursor mocks.
   5. _build_replay_row() surfaces CHUNK-16 and CHUNK-09 fields when present in snap.
@@ -13,10 +13,9 @@ Covers (no live DB):
 
 Design notes
 ------------
-- si_persistence_score, si_persistence_count, effective_float_score are NOT direct
-  DB columns — they live in explanation_json and are extracted by
-  _extract_from_explanation().  Tests for those extraction paths already exist in
-  test_squeeze_replay.py (TestBuildReplayRow.test_extracts_si_persistence_from_explanation).
+- si_persistence_count, effective_float_score are NOT direct DB columns — they
+  live in explanation_json and are extracted by _extract_from_explanation().
+- si_persistence_score was promoted to a direct DB column in CHUNK-15.
 - All tests are pure-function; no live DB or network calls.
 """
 
@@ -192,11 +191,12 @@ class TestDDLAndMigrationCompleteness:
             )
 
     def test_fields_not_direct_columns_are_documented(self):
-        """si_persistence_score, si_persistence_count, effective_float_score are
-        stored in explanation_json, not as direct columns.  Verify they are absent
-        from the DDL (expected design) so callers know to use _extract_from_explanation."""
+        """si_persistence_count and effective_float_score live in explanation_json,
+        not as direct columns.  Verify they are absent from the DDL so callers know
+        to use _extract_from_explanation.  (si_persistence_score was promoted to a
+        direct column in CHUNK-15 and is intentionally excluded from this check.)"""
         schema = self._all_schema_text().lower()
-        indirect_fields = ("si_persistence_score", "si_persistence_count", "effective_float_score")
+        indirect_fields = ("si_persistence_count", "effective_float_score")
         for field in indirect_fields:
             assert field not in schema, (
                 f"'{field}' appeared in DDL/migration but should only live in explanation_json"
@@ -274,14 +274,15 @@ class TestSaveSqueezeScoresPayload:
                 bool(row["unusual_call_activity_flag"]) if "unusual_call_activity_flag" in row and row["unusual_call_activity_flag"] is not None else None,
                 _f(row, "call_put_volume_ratio"),
                 _f(row, "call_put_oi_ratio"),
+                _f(row, "si_persistence_score"),
             ))
         return tuples
 
-    def test_full_new_format_row_produces_42_element_tuple(self):
+    def test_full_new_format_row_produces_43_element_tuple(self):
         df = _make_df([_full_new_format_row()])
         tuples = self._build_tuples(df)
         assert len(tuples) == 1
-        assert len(tuples[0]) == 42, f"Expected 42 elements, got {len(tuples[0])}"
+        assert len(tuples[0]) == 43, f"Expected 43 elements, got {len(tuples[0])}"
 
     def test_full_new_format_row_values_are_correct_types(self):
         df = _make_df([_full_new_format_row()])
@@ -306,9 +307,9 @@ class TestSaveSqueezeScoresPayload:
         tuples = self._build_tuples(df)
         assert len(tuples) == 1
         t = tuples[0]
-        assert len(t) == 42
+        assert len(t) == 43
         # All CHUNK-added positions should be None (not raised)
-        chunk_positions = range(18, 42)
+        chunk_positions = range(18, 43)
         for pos in chunk_positions:
             assert t[pos] is None, f"Position {pos} expected None, got {t[pos]!r}"
 
@@ -333,7 +334,7 @@ class TestSaveSqueezeScoresPayload:
         args = mock_cur.executemany.call_args
         rows_arg = args[0][1]  # second positional = rows list
         assert len(rows_arg) == 1
-        assert len(rows_arg[0]) == 42
+        assert len(rows_arg[0]) == 43
 
     def test_save_squeeze_scores_called_with_old_format_df_does_not_raise(self):
         """save_squeeze_scores() must not raise when fed a pre-CHUNK df."""
@@ -349,7 +350,7 @@ class TestSaveSqueezeScoresPayload:
 
         mock_cur.executemany.assert_called_once()
         rows_arg = mock_cur.executemany.call_args[0][1]
-        assert len(rows_arg[0]) == 42
+        assert len(rows_arg[0]) == 43
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +480,8 @@ class TestReplayRowIncludesChunkFields:
             "iv_rank": 62.0,
             "iv_rank_score": 7.0,
             "unusual_call_activity_flag": False,
+            # CHUNK-15: si_persistence_score is now a direct column
+            "si_persistence_score": 8.0,
         }
 
     def test_chunk_16_fields_in_replay_row(self):
@@ -501,8 +504,9 @@ class TestReplayRowIncludesChunkFields:
         row = replay._build_replay_row(self._snap_full(), None)
         assert row["squeeze_state"] == "ARMED"
 
-    def test_si_persistence_extracted_from_explanation(self):
-        """si_persistence_score lives in explanation_json, not as a direct column."""
+    def test_si_persistence_in_replay_row(self):
+        """si_persistence_score is a direct column (CHUNK-15); effective_float_score
+        is still extracted from explanation_json."""
         replay = SqueezeOutcomeReplay("2026-01-01", "2026-12-31")
         row = replay._build_replay_row(self._snap_full(), None)
         assert row["si_persistence_score"] == pytest.approx(8.0)

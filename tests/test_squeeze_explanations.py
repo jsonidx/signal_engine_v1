@@ -393,16 +393,17 @@ class TestOutputPersistence:
         executemany_call = mock_cur.executemany.call_args
         assert executemany_call is not None
 
-        # The rows tuple must have 42 elements:
+        # The rows tuple must have 43 elements:
         # 22 original + explanation_summary + explanation_json (CHUNK-14)
         # + state_confidence + state_reasons + state_warnings (CHUNK-10)
         # + risk_score + risk_level + risk_flags + risk_warnings + risk_components
         #   + dilution_risk_flag + latest_dilution_filing_date + shares_offered_pct_float (CHUNK-16)
         # + options_pressure_score + iv_rank + iv_rank_score + iv_data_confidence
         #   + unusual_call_activity_flag + call_put_volume_ratio + call_put_oi_ratio (CHUNK-09)
+        # + si_persistence_score (CHUNK-15)
         rows_arg = executemany_call[0][1]
         assert len(rows_arg) == 1
-        assert len(rows_arg[0]) == 42
+        assert len(rows_arg[0]) == 43
 
         # explanation_summary at index 22 should be a non-empty string
         assert isinstance(rows_arg[0][22], str)

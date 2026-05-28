@@ -66,6 +66,7 @@ def _snap(
         "squeeze_state": squeeze_state,
         "explanation_summary": "Setup looks strong.",
         "explanation_json": json.dumps(expl),
+        "si_persistence_score": 7.0,  # direct column since CHUNK-15
     }
 
 
@@ -208,7 +209,9 @@ class TestBuildReplayRow:
         assert row["final_score"] == 9.9
         assert row["short_pct_float"] == 0.75
 
-    def test_extracts_si_persistence_from_explanation(self):
+    def test_si_persistence_and_effective_float_in_replay_row(self):
+        # si_persistence_score: direct column since CHUNK-15
+        # effective_float_score: still extracted from explanation_json
         replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
         snap = _snap()
         row = replay._build_replay_row(snap, None)
