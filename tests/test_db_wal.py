@@ -32,6 +32,7 @@ from utils.db import get_connection, managed_connection, get_local_connection
 # 1. PostgreSQL connection (Supabase)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.database
 def test_pg_connection_returns_dict_rows():
     """get_connection() reaches Supabase; rows behave like dicts."""
     conn = get_connection()
@@ -46,6 +47,7 @@ def test_pg_connection_returns_dict_rows():
 # 2 & 3. managed_connection commit / rollback
 # ---------------------------------------------------------------------------
 
+@pytest.mark.database
 def test_managed_connection_commits():
     """managed_connection() commits on clean exit."""
     with managed_connection() as conn:
@@ -67,6 +69,7 @@ def test_managed_connection_commits():
     assert row["value"] == "ok"
 
 
+@pytest.mark.database
 def test_managed_connection_rollback_on_exception():
     """managed_connection() rolls back when an exception is raised."""
     try:

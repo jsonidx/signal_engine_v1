@@ -175,6 +175,7 @@ class TestComputeMaxPainLiveFetch:
     """
 
     @pytest.mark.integration
+    @pytest.mark.network
     def test_aapl_live_fetch(self):
         try:
             result = compute_max_pain("AAPL")
