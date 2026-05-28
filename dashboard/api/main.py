@@ -1700,7 +1700,7 @@ async def deepdive_tickers():
                 t["price_source"] = "close"
 
     result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
-    _cache.set(cache_key, result, 120)  # 2-min cache — contains live prepost prices
+    _cache.set(cache_key, result, 300)  # 5-min cache — live price fetch takes ~17s for 254 tickers
     return result
 
 

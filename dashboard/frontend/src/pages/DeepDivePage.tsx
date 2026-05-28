@@ -78,7 +78,7 @@ function useDeepDiveTickers() {
     queryKey: ['deepdive', 'tickers'],
     queryFn: () =>
       axios.get('/api/deepdive/tickers').then(r => (r.data?.data ?? []) as DeepDiveTicker[]),
-    staleTime: 0, // always refetch live prices on mount
+    staleTime: 2 * 60 * 1000, // 2-min stale — server caches live prices for 5 min
   })
 }
 

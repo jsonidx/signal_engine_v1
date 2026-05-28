@@ -51,15 +51,26 @@ PAIRS = {
     "JPY": "EURJPY=X",
 }
 
+# Sanity bounds: reject yfinance values outside these ranges (transient glitches)
+RATE_BOUNDS = {
+    "USD": (0.80, 1.60),
+    "GBP": (0.60, 1.00),
+    "CHF": (0.80, 1.20),
+    "SEK": (8.0,  14.0),
+    "JPY": (100.0, 200.0),
+}
+
 # Tickers and their trading currencies
 TICKER_CURRENCY = {
     # EUR-denominated (no conversion)
-    "SAP": "EUR", "AIR.PA": "EUR", "SIE.DE": "EUR", "ALV.DE": "EUR",
+    # Note: "SAP" is the NYSE ADR (USD); "SAP.DE" is the Frankfurt listing (EUR)
+    "SAP.DE": "EUR", "AIR.PA": "EUR", "SIE.DE": "EUR", "ALV.DE": "EUR",
     "BAS.DE": "EUR", "BMW.DE": "EUR", "VOW.DE": "EUR", "DTE.DE": "EUR",
     "MC.PA": "EUR", "OR.PA": "EUR", "SAN.PA": "EUR", "BNP.PA": "EUR",
     "DBK.DE": "EUR", "NOKIA.HE": "EUR",
     # CHF-denominated
-    "NOVN.SW": "CHF", "ROG.SW": "CHF", "NESN.SW": "CHF", "UBS": "CHF",
+    # Note: "UBS" is the NYSE ADR (USD); "UBS.SW" is the Zurich listing (CHF)
+    "NOVN.SW": "CHF", "ROG.SW": "CHF", "NESN.SW": "CHF", "UBS.SW": "CHF",
     # Everything else is USD
 }
 
@@ -111,6 +122,8 @@ def _fetch_yahoo_realtime(currency: str) -> Optional[float]:
         if not pair:
             return None
 
+        lo, hi = RATE_BOUNDS.get(currency, (0.0, 1e9))
+
         # Try intraday first (1-minute interval, last 1 day)
         data = yf.download(pair, period="1d", interval="1m",
                            auto_adjust=True, progress=False)
@@ -120,7 +133,7 @@ def _fetch_yahoo_realtime(currency: str) -> Optional[float]:
                 if isinstance(close, type(data)):
                     close = close.iloc[:, 0]
                 rate = float(close.iloc[-1])
-                if rate > 0:
+                if lo <= rate <= hi:
                     return rate
 
         # Fallback to daily
@@ -131,7 +144,7 @@ def _fetch_yahoo_realtime(currency: str) -> Optional[float]:
                 if isinstance(close, type(data)):
                     close = close.iloc[:, 0]
                 rate = float(close.iloc[-1])
-                if rate > 0:
+                if lo <= rate <= hi:
                     return rate
     except Exception:
         pass
