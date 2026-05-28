@@ -5,6 +5,11 @@ venv/
 # Environment / secrets
 .env
 *.env
+.env.*
+!.env.example
+dashboard/frontend/.env.local
+dashboard/frontend/.env.*.local
+!dashboard/frontend/.env.local.example
 
 # Python
 __pycache__/
@@ -50,6 +55,9 @@ data/finra_cache/
 # Dashboard frontend build artifacts
 dashboard/frontend/node_modules/
 dashboard/frontend/dist/
+# VS Code workspace configuration
+!.vscode/
+!.vscode/*.json
 # Allow frontend config files (overrides *.json rule above)
 !dashboard/frontend/package.json
 !dashboard/frontend/package-lock.json
