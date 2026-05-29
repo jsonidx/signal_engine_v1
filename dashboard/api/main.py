@@ -23,6 +23,7 @@ USAGE:
 """
 
 import asyncio
+import concurrent.futures
 import csv
 import glob
 import json
@@ -171,6 +172,9 @@ class DataCache:
 
 
 _cache = DataCache()
+_deepdive_refresh_running = False  # guard against concurrent background refreshes
+# Module-level executor: avoids ThreadPoolExecutor context-manager shutdown(wait=True) blocking
+_live_price_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="live_prices")
 
 TTL_SHORT  = 300   # 5 min — static outputs (CSVs, ai_quant db)
 TTL_MEDIUM = 900   # 15 min — live prices, portfolio positions
@@ -320,11 +324,21 @@ def _fetch_live_prices(tickers: list[str], cache_ttl: int = 120) -> dict[str, fl
 
     prices: dict[str, float] = {}
     try:
-        data = yf.download(
-            tickers, period="1d", interval="1m",
-            prepost=True, auto_adjust=True,
-            progress=False, threads=True,
-        )
+        def _download():
+            return yf.download(
+                tickers, period="1d", interval="1m",
+                prepost=True, auto_adjust=True,
+                progress=False, threads=True,
+            )
+        future = _live_price_executor.submit(_download)
+        try:
+            data = future.result(timeout=25)
+        except concurrent.futures.TimeoutError:
+            # Do not cancel() — the thread keeps running in the background but we stop waiting.
+            # The executor is module-level so there is no shutdown(wait=True) to block on here.
+            log.warning("live price fetch timed out after 25s for %d tickers", len(tickers))
+            _cache.set(key, prices, cache_ttl)
+            return prices
         if isinstance(data.columns, pd.MultiIndex):
             close = data["Close"]
         else:
@@ -1589,15 +1603,8 @@ async def signals_ticker(ticker: str):
 # SECTION 5b: DEEP DIVE LIST ENDPOINT
 # ==============================================================================
 
-@app.get("/api/deepdive/tickers")
-async def deepdive_tickers():
-    """All universe tickers for the Deep Dive list. Claude-analyzed tickers have has_thesis=True;
-    unanalyzed tickers from the fundamental CSV appear with has_thesis=False."""
-    cache_key = "deepdive_tickers"
-    hit = _cache.get(cache_key)
-    if hit is not None:
-        return hit
-
+async def _build_deepdive_payload() -> dict:
+    """Build the full deepdive payload: DB rows + live price enrichment. ~17-30s on a cache miss."""
     # ── Load fundamental universe for name/sector/price enrichment ──────────────
     fund_map: dict[str, dict] = {}
     fund_files = sorted(glob.glob(str(SIGNALS_DIR / "fundamental_*.csv")))
@@ -1759,8 +1766,44 @@ async def deepdive_tickers():
                     t["current_price"] = cp
                 t["price_source"] = "close"
 
-    result = {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
-    _cache.set(cache_key, result, 300)  # 5-min cache — live price fetch takes ~17s for 254 tickers
+    return {"data_available": bool(tickers), "count": len(tickers), "data": tickers}
+
+
+async def _refresh_deepdive_cache() -> None:
+    """Background task: rebuild deepdive payload and write to both hot and stale caches."""
+    global _deepdive_refresh_running
+    if _deepdive_refresh_running:
+        return
+    _deepdive_refresh_running = True
+    try:
+        result = await _build_deepdive_payload()
+        _cache.set("deepdive_tickers", result, 300)
+        _cache.set("deepdive_tickers:stale", result, 3600)
+    except Exception:
+        log.exception("deepdive background refresh failed")
+    finally:
+        _deepdive_refresh_running = False
+
+
+@app.get("/api/deepdive/tickers")
+async def deepdive_tickers():
+    """All universe tickers for the Deep Dive list. Claude-analyzed tickers have has_thesis=True;
+    unanalyzed tickers from the fundamental CSV appear with has_thesis=False."""
+    # Hot cache hit — return immediately
+    hit = _cache.get("deepdive_tickers")
+    if hit is not None:
+        return hit
+
+    # Stale-while-revalidate: if we have a previous payload, return it now and refresh in background
+    stale = _cache.get("deepdive_tickers:stale")
+    if stale is not None:
+        asyncio.create_task(_refresh_deepdive_cache())
+        return {**stale, "stale": True}
+
+    # First-ever load: build synchronously so both caches get seeded
+    result = await _build_deepdive_payload()
+    _cache.set("deepdive_tickers", result, 300)
+    _cache.set("deepdive_tickers:stale", result, 3600)
     return result
 
 
@@ -6089,6 +6132,7 @@ async def add_to_blacklist(ticker: str, reason: str = "not_interesting"):
         conn.commit()
         conn.close()
         _cache.invalidate("deepdive_tickers")
+        _cache.invalidate("deepdive_tickers:stale")
         return {"ok": True, "ticker": ticker}
     except HTTPException:
         raise
@@ -6109,6 +6153,7 @@ async def remove_from_blacklist(ticker: str):
         conn.commit()
         conn.close()
         _cache.invalidate("deepdive_tickers")
+        _cache.invalidate("deepdive_tickers:stale")
         return {"ok": True, "ticker": ticker}
     except HTTPException:
         raise
