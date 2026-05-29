@@ -758,6 +758,21 @@ export interface HotEntryRow {
   direction:      'BULL' | 'BEAR' | 'NEUTRAL' | null
 }
 
+/** TRD-004: Accumulation/Catalyst Setup Alert — watch/setup signal, NOT a buy. */
+export interface WatchSetupAlert {
+  ticker:               string
+  alert_type:           'catalyst_setup'
+  label:                string
+  reasons:              string[]
+  days_to_earnings:     number | null
+  dark_pool_signal:     'ACCUMULATION' | 'NEUTRAL' | 'DISTRIBUTION'
+  raw_composite:        number
+  composite:            number
+  price:                number
+  thesis_direction:     'BULL' | 'BEAR' | 'NEUTRAL' | 'UNKNOWN'
+  note:                 string
+}
+
 export interface SettingItem {
   key:         string
   label:       string
@@ -1214,6 +1229,9 @@ export const api = {
   hotEntryHistory: (ticker: string, days = 30): Promise<{ data_available: boolean; data: { run_date: string; rank: number; hot_score: number; status: string; rank_change: string }[] }> =>
     client.get('/api/hot-entry/history', { params: { ticker, days } }).then(r => r.data),
 
+  watchSetupAlerts: (): Promise<{ data_available: boolean; run_date: string; count: number; alerts: WatchSetupAlert[] }> =>
+    client.get('/api/watch-setup').then(r => r.data),
+
   thesisBenchmark: (days = 90): Promise<{ data_available: boolean; days: number; summary: BenchmarkModelSummary[]; recent: BenchmarkOutcomeRow[] }> =>
     client.get('/api/thesis/benchmark', { params: { days } }).then(r => r.data),
 
@@ -1225,6 +1243,10 @@ export const api = {
 
   updateSetting: (key: string, value: string): Promise<{ saved: boolean; key: string; value: string }> =>
     client.put(`/api/settings/${key}`, { value }).then(r => r.data),
+
+  // Pattern Watch (TRD-017)
+  patternWatch: (): Promise<PatternWatchResponse> =>
+    client.get('/api/pattern-watch').then(r => r.data),
 
   // Universe
   universeStats: (): Promise<UniverseStats> =>
@@ -1255,4 +1277,30 @@ export interface FavoriteItem {
   symbol: string
   added_at: string
   notes: string
+}
+
+// ─── Pattern Watch (TRD-017) ──────────────────────────────────────────────────
+
+export interface PatternWatchItem {
+  ticker: string
+  matched_pattern: 'SNOW' | 'CRSR' | 'DELL'
+  similarity_pct: number
+  case_probability_pct: number
+  case_upside_pct: number
+  confidence: 'LOW_SAMPLE'
+  sample_size: number
+  flags: string[]
+  reason: string
+  source: string[]
+  current_price: number
+  days_to_earnings: number | null
+  raw_score: number
+}
+
+export interface PatternWatchResponse {
+  data_available: boolean
+  as_of: string
+  count: number
+  method_note: string
+  data: PatternWatchItem[]
 }

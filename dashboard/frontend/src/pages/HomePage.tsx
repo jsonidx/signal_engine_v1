@@ -19,7 +19,232 @@ import {
   usePortfolioSparklines,
   useEquityScreener,
 } from '../hooks/usePortfolio'
-import { api } from '../lib/api'
+import { api, PatternWatchItem } from '../lib/api'
+
+// ─── Watch Setup Panel (TRD-004) — catalyst/accumulation setups, NOT buy signals ─
+
+function WatchSetupPanel() {
+  const navigate = useNavigate()
+
+  const { data, isLoading, refetch, isFetching } = useQuery({
+    queryKey: ['watch-setup'],
+    queryFn: api.watchSetupAlerts,
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const alerts = data?.alerts ?? []
+  if (!isLoading && alerts.length === 0) return null
+
+  const REASON_LABELS: Record<string, string> = {
+    dark_pool_accumulation:    'Dark Pool Accumulation',
+    call_demand_elevated:      'Elevated Call Activity',
+    volume_expansion_confirmed:'Volume Expansion',
+    technical_strength:        'Technical Strength',
+    earnings_approaching:      'Earnings Approaching',
+  }
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border-subtle">
+        <div className="flex items-center gap-2">
+          <Activity size={13} className="text-accent-amber" />
+          <div>
+            <h2 className="font-mono text-xs font-semibold text-text-primary">Catalyst Setup — Watch List</h2>
+            <p className="font-mono text-[10px] text-text-tertiary mt-0.5">
+              {isLoading ? 'Loading…'
+                : `${alerts.length} ticker${alerts.length !== 1 ? 's' : ''} with setup evidence · watch/setup alert, not a buy signal`}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[9px] px-2 py-0.5 rounded bg-accent-amber/10 text-accent-amber border border-accent-amber/30">
+            WATCH / SETUP
+          </span>
+          <button onClick={() => refetch()} disabled={isFetching} className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40">
+            <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+          </button>
+        </div>
+      </div>
+
+      {isLoading ? (
+        <div className="px-4 py-3"><LoadingSkeleton rows={2} /></div>
+      ) : (
+        <div className="divide-y divide-border-subtle">
+          {alerts.map(alert => (
+            <div key={alert.ticker} className="px-4 py-3 flex items-start justify-between gap-4 hover:bg-bg-elevated/30 transition-colors">
+              <div className="flex items-center gap-3 min-w-0">
+                <button
+                  onClick={() => navigate(`/deepdive?ticker=${alert.ticker}`)}
+                  className="font-mono text-sm font-semibold text-accent-blue hover:underline shrink-0"
+                >
+                  {alert.ticker}
+                </button>
+                <div className="flex flex-wrap gap-1 min-w-0">
+                  {alert.reasons.map(r => (
+                    <span key={r} className="font-mono text-[9px] px-1.5 py-0.5 rounded border bg-bg-elevated border-border-subtle text-text-secondary">
+                      {REASON_LABELS[r] ?? r.replace(/_/g, ' ')}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="flex items-center gap-4 shrink-0 font-mono text-xs text-text-secondary">
+                {alert.days_to_earnings != null && (
+                  <span className="text-accent-amber">
+                    Earn {alert.days_to_earnings}d
+                  </span>
+                )}
+                <span className="text-text-tertiary">
+                  Score {alert.raw_composite}
+                </span>
+                <DirectionBadge direction={alert.thesis_direction as 'BULL' | 'BEAR' | 'NEUTRAL'} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Disclaimer */}
+      <div className="px-4 py-2 border-t border-border-subtle bg-bg-elevated/20">
+        <p className="font-mono text-[9px] text-text-tertiary">
+          These are accumulation/catalyst setups worth monitoring before a move.
+          Price is NOT inside the AI entry zone — do not buy without your own analysis.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+// ─── Pattern Watch Panel (TRD-017) ───────────────────────────────────────────
+
+const PATTERN_BADGE: Record<string, string> = {
+  SNOW: 'text-accent-blue border-accent-blue/30 bg-accent-blue/10',
+  CRSR: 'text-accent-amber border-accent-amber/30 bg-accent-amber/10',
+  DELL: 'text-accent-green border-accent-green/30 bg-accent-green/10',
+}
+
+const FLAG_LABEL: Record<string, string> = {
+  earnings_imminent:           'Earn Imminent',
+  earnings_approaching:        'Earn Approaching',
+  call_demand_elevated:        'Elevated Calls',
+  volume_expansion_confirmed:  'Vol Expansion',
+  technical_strength:          'Tech Strength',
+  fresh_catalyst_breakout:     'Catalyst Breakout',
+  dark_pool_accumulation:      'Dark Pool Accum.',
+  high_priority_score:         'High Priority',
+}
+
+function PatternWatchPanel() {
+  const navigate = useNavigate()
+
+  const { data, isLoading, refetch, isFetching } = useQuery({
+    queryKey: ['pattern-watch'],
+    queryFn:  api.patternWatch,
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const items: PatternWatchItem[] = data?.data ?? []
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border-subtle">
+        <div className="flex items-center gap-2">
+          <Brain size={13} className="text-accent-blue" />
+          <div>
+            <h2 className="font-mono text-xs font-semibold text-text-primary">Pattern Watch</h2>
+            <p className="font-mono text-[10px] text-text-tertiary mt-0.5">
+              Setups resembling SNOW / CRSR / DELL case studies
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[9px] px-2 py-0.5 rounded bg-bg-elevated border border-border-subtle text-text-tertiary">
+            case-based · low sample
+          </span>
+          <button
+            onClick={() => refetch()}
+            disabled={isFetching}
+            className="p-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-primary transition-colors disabled:opacity-40"
+          >
+            <RefreshCw size={11} className={isFetching ? 'animate-spin' : ''} />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      {isLoading ? (
+        <div className="px-4 py-3"><LoadingSkeleton rows={2} /></div>
+      ) : items.length === 0 ? (
+        <div className="px-4 py-6 text-center font-mono text-xs text-text-tertiary">
+          No current pattern matches after latest pipeline run.
+        </div>
+      ) : (
+        <div className="divide-y divide-border-subtle">
+          {items.map(item => {
+            const badgeCls = PATTERN_BADGE[item.matched_pattern] ?? 'text-text-secondary border-border-subtle bg-bg-elevated'
+            return (
+              <div key={item.ticker} className="px-4 py-3 hover:bg-bg-elevated/30 transition-colors">
+                <div className="flex items-start justify-between gap-4">
+                  {/* Left: ticker + pattern badge + flags */}
+                  <div className="flex items-center gap-3 min-w-0 flex-wrap">
+                    <button
+                      onClick={() => navigate(`/deepdive?ticker=${item.ticker}`)}
+                      className="font-mono text-sm font-semibold text-accent-blue hover:underline shrink-0"
+                    >
+                      {item.ticker}
+                    </button>
+                    <span className={`font-mono text-[9px] px-1.5 py-0.5 rounded border ${badgeCls} shrink-0`}>
+                      {item.matched_pattern}
+                    </span>
+                    <div className="flex flex-wrap gap-1 min-w-0">
+                      {item.flags.map(f => (
+                        <span
+                          key={f}
+                          className="font-mono text-[9px] px-1.5 py-0.5 rounded border bg-bg-elevated border-border-subtle text-text-secondary"
+                        >
+                          {FLAG_LABEL[f] ?? f.replace(/_/g, ' ')}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Right: upside + probability + similarity */}
+                  <div className="flex items-center gap-4 shrink-0 font-mono text-xs">
+                    <div className="text-right">
+                      <div className="text-accent-green text-[11px]">+{item.case_upside_pct}%</div>
+                      <div className="text-[9px] text-text-tertiary">case upside</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-text-primary text-[11px]">{item.case_probability_pct}%</div>
+                      <div className="text-[9px] text-text-tertiary">case prob</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-text-secondary text-[11px]">{item.similarity_pct}%</div>
+                      <div className="text-[9px] text-text-tertiary">similarity</div>
+                    </div>
+                    {item.days_to_earnings != null && (
+                      <span className="text-accent-amber text-[11px]">Earn {item.days_to_earnings}d</span>
+                    )}
+                  </div>
+                </div>
+
+                <p className="mt-1 font-mono text-[9px] text-text-tertiary">{item.reason}</p>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Disclaimer */}
+      <div className="px-4 py-2 border-t border-border-subtle bg-bg-elevated/20">
+        <p className="font-mono text-[9px] text-text-tertiary">
+          {data?.method_note ?? 'Case-based similarity using SNOW/CRSR/DELL archetypes; low sample size.'}{' '}
+          Not a buy signal — do not act without your own analysis.
+        </p>
+      </div>
+    </div>
+  )
+}
 
 // ─── Hot Entry Panel ──────────────────────────────────────────────────────────
 
@@ -1000,6 +1225,12 @@ export function HomePage() {
 
         {/* Hot Entry — buy today */}
         <HotEntryPanel />
+
+        {/* Catalyst Setup — watch/setup alerts (TRD-004) */}
+        <WatchSetupPanel />
+
+        {/* Pattern Watch — SNOW/CRSR/DELL archetype matching (TRD-017) */}
+        <PatternWatchPanel />
 
         {/* Candidate Pool — full width so Reason column has room */}
         <CandidateSnapshotsTable />

@@ -599,3 +599,366 @@ def test_missing_data_returns_200(endpoint):
     assert "data_available" in body, (
         f"{endpoint} missing 'data_available' key in response"
     )
+
+
+# ==============================================================================
+# TRD-004 — Watch Setup Alert endpoint tests
+# ==============================================================================
+
+class TestWatchSetupEndpoint:
+    """
+    Tests for /api/watch-setup.
+    All DB calls are mocked — no live Supabase required.
+    """
+
+    def _mock_db_rows(self, rows):
+        """Return a mock _PGConn that yields the given rows from execute()."""
+        mock_conn  = MagicMock()
+        mock_cur   = MagicMock()
+        mock_conn.execute.return_value = mock_cur
+        mock_cur.fetchall.return_value = rows
+        return mock_conn
+
+    def test_watch_setup_returns_200_with_no_data(self):
+        """Endpoint returns 200 + data_available:False when DB call fails."""
+        with patch("dashboard.api.main._db_connect", side_effect=Exception("no db")):
+            _cache.invalidate("watch_setup_alerts")
+            resp = client.get("/api/watch-setup")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "data_available" in body
+
+    def test_watch_setup_alert_shape(self):
+        """Alert rows must contain ticker, alert_type, reasons, note."""
+        fake_rows = [
+            {
+                "ticker": "SNOW",
+                "composite": 0.0,
+                "raw_composite": 51.4,
+                "options_score": 4.0,
+                "volume_score": 4.0,
+                "technical_score": 4.0,
+                "dark_pool_score": 1.0,
+                "dark_pool_signal": "NEUTRAL",
+                "earnings_score": 5.0,
+                "post_squeeze_guard": False,
+                "price": 168.5,
+                "days_to_earnings": 2,
+                "thesis_direction": "NEUTRAL",
+                "entry_low": 147.0,
+                "entry_high": 153.0,
+            }
+        ]
+        mock_conn = self._mock_db_rows(fake_rows)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("watch_setup_alerts")
+            resp = client.get("/api/watch-setup")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("data_available") is True
+        assert "alerts" in body
+        if body["alerts"]:
+            alert = body["alerts"][0]
+            assert alert["ticker"] == "SNOW"
+            assert alert["alert_type"] == "catalyst_setup"
+            assert isinstance(alert["reasons"], list)
+            assert "note" in alert
+            # Must NOT be labeled as a buy signal
+            note = alert["note"].lower()
+            assert "buy" not in note or "not" in note or "watch" in note
+
+    def test_watch_setup_skips_hot_entry_zone_tickers(self):
+        """Tickers whose price is inside the entry zone must be excluded."""
+        fake_rows = [
+            {
+                "ticker": "INZONE",
+                "composite": 45.0,
+                "raw_composite": 45.0,
+                "options_score": 4.0,
+                "volume_score": 3.0,
+                "technical_score": 3.0,
+                "dark_pool_score": 1.0,
+                "dark_pool_signal": "NEUTRAL",
+                "earnings_score": 4.0,
+                "post_squeeze_guard": False,
+                "price": 150.0,       # inside entry zone
+                "days_to_earnings": 3,
+                "thesis_direction": "BULL",
+                "entry_low": 148.0,
+                "entry_high": 153.0,  # 150 is inside 148-153 * 1.02
+            }
+        ]
+        mock_conn = self._mock_db_rows(fake_rows)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("watch_setup_alerts")
+            resp = client.get("/api/watch-setup")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        tickers = [a["ticker"] for a in body.get("alerts", [])]
+        assert "INZONE" not in tickers, "Tickers in Hot Entry zone must not appear in watch-setup"
+
+    def test_watch_setup_label_is_not_hot(self):
+        """Label must say 'Catalyst Setup', not 'HOT' or 'Buy'."""
+        fake_rows = [
+            {
+                "ticker": "TESTWS",
+                "composite": 0.0,
+                "raw_composite": 42.0,
+                "options_score": 3.5,
+                "volume_score": 3.0,
+                "technical_score": 3.0,
+                "dark_pool_score": 2.0,
+                "dark_pool_signal": "ACCUMULATION",
+                "earnings_score": 3.0,
+                "post_squeeze_guard": False,
+                "price": 75.0,
+                "days_to_earnings": 8,
+                "thesis_direction": "NEUTRAL",
+                "entry_low": 60.0,
+                "entry_high": 65.0,
+            }
+        ]
+        mock_conn = self._mock_db_rows(fake_rows)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("watch_setup_alerts")
+            resp = client.get("/api/watch-setup")
+
+        body = resp.json()
+        for alert in body.get("alerts", []):
+            assert alert["label"] != "HOT", "Watch setup label must not be 'HOT'"
+            label_lower = alert["label"].lower()
+            assert "buy" not in label_lower, "Watch setup label must not say 'buy'"
+
+
+# ==============================================================================
+# /api/pattern-watch — TRD-017
+# ==============================================================================
+
+class TestPatternWatchEndpoint:
+    """
+    Tests for /api/pattern-watch.
+    All DB calls are mocked — no live Supabase required.
+    """
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _mock_db(self, cs_rows, snap_rows=None):
+        """Return a mock _PGConn whose execute().fetchall() returns the right rows."""
+        mock_conn = MagicMock()
+
+        def _execute(sql, params=None):
+            cur = MagicMock()
+            sql_lower = sql.strip().lower()
+            if "catalyst_scores" in sql_lower:
+                cur.fetchall.return_value = cs_rows
+            elif "candidate_snapshots" in sql_lower:
+                cur.fetchall.return_value = snap_rows or []
+            else:
+                cur.fetchall.return_value = []
+            return cur
+
+        mock_conn.execute.side_effect = _execute
+        return mock_conn
+
+    def _cs(self, ticker, **kwargs):
+        """Minimal catalyst_scores row with sane defaults."""
+        return {
+            "ticker":           ticker,
+            "composite":        kwargs.get("composite", 40.0),
+            "raw_composite":    kwargs.get("raw_composite", kwargs.get("composite", 40.0)),
+            "options_score":    kwargs.get("options_score", 2.0),
+            "volume_score":     kwargs.get("volume_score", 2.0),
+            "technical_score":  kwargs.get("technical_score", 2.0),
+            "dark_pool_score":  kwargs.get("dark_pool_score", 1.0),
+            "dark_pool_signal": kwargs.get("dark_pool_signal", "NEUTRAL"),
+            "earnings_score":   kwargs.get("earnings_score", 1.0),
+            "post_squeeze_guard": kwargs.get("post_squeeze_guard", False),
+            "price":            kwargs.get("price", 100.0),
+            "days_to_earnings": kwargs.get("days_to_earnings", None),
+        }
+
+    def _snap(self, ticker, **kwargs):
+        """Minimal candidate_snapshots row."""
+        return {
+            "ticker":           ticker,
+            "selection_reason": kwargs.get("selection_reason", ""),
+            "priority_score":   kwargs.get("priority_score", 50.0),
+        }
+
+    # ── envelope shape ─────────────────────────────────────────────────────────
+
+    def test_pattern_watch_returns_200_envelope_always(self):
+        """Endpoint always returns 200 with data_available:true, even on DB error."""
+        with patch("dashboard.api.main._db_connect", side_effect=Exception("no db")):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is True
+        assert "count" in body
+        assert "method_note" in body
+        assert isinstance(body["data"], list)
+
+    def test_pattern_watch_empty_dataset_returns_empty_list(self):
+        """Empty catalyst_scores → count:0 and data:[], not a 404."""
+        mock_conn = self._mock_db(cs_rows=[])
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is True
+        assert body["count"] == 0
+        assert body["data"] == []
+
+    # ── SNOW archetype ─────────────────────────────────────────────────────────
+
+    def test_pattern_watch_snow_like_candidate_matches_snow(self):
+        """High earnings + options + technical → matched_pattern == SNOW."""
+        cs = [self._cs(
+            "SNOWTEST",
+            earnings_score=5.0, options_score=4.0, technical_score=4.0,
+            volume_score=3.0, days_to_earnings=3, price=168.5,
+            post_squeeze_guard=False,
+        )]
+        mock_conn = self._mock_db(cs_rows=cs)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        body = resp.json()
+        assert body["data_available"] is True
+        items = body["data"]
+        assert len(items) >= 1
+        item = items[0]
+        assert item["ticker"] == "SNOWTEST"
+        assert item["matched_pattern"] == "SNOW"
+        assert item["similarity_pct"] >= 50
+        assert item["case_upside_pct"] > 0
+        assert item["case_probability_pct"] > 0
+        assert item["confidence"] == "LOW_SAMPLE"
+        assert isinstance(item["flags"], list)
+        assert "earnings_imminent_3d" in item["flags"] or "earnings_imminent" in " ".join(item["flags"])
+
+    # ── CRSR archetype ─────────────────────────────────────────────────────────
+
+    def test_pattern_watch_crsr_like_candidate_matches_crsr(self):
+        """Catalyst breakout in selection_reason + options → matched_pattern == CRSR."""
+        cs = [self._cs(
+            "CRSRTEST",
+            earnings_score=1.0, options_score=3.5, technical_score=3.0,
+            dark_pool_signal="ACCUMULATION",
+        )]
+        snap = [self._snap("CRSRTEST", selection_reason="fresh_catalyst_breakout", priority_score=55.0)]
+        mock_conn = self._mock_db(cs_rows=cs, snap_rows=snap)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        body = resp.json()
+        items = body["data"]
+        assert len(items) >= 1
+        item = next((i for i in items if i["ticker"] == "CRSRTEST"), None)
+        assert item is not None
+        assert item["matched_pattern"] == "CRSR"
+        assert item["similarity_pct"] >= 50
+        assert "fresh_catalyst_breakout" in item["flags"]
+
+    def test_pattern_watch_candidate_snapshot_only_candidate_is_included(self):
+        """Candidate-only catalyst breakouts should not wait for catalyst_scores."""
+        snap = [self._snap(
+            "SNAPONLY",
+            selection_reason="fresh_catalyst_breakout catalyst_price_expansion",
+            priority_score=62.0,
+        )]
+        mock_conn = self._mock_db(cs_rows=[], snap_rows=snap)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        body = resp.json()
+        item = next((i for i in body["data"] if i["ticker"] == "SNAPONLY"), None)
+        assert item is not None
+        assert item["matched_pattern"] == "CRSR"
+        assert item["similarity_pct"] >= 50
+        assert item["source"] == ["candidate_snapshots"]
+
+    # ── DELL archetype ─────────────────────────────────────────────────────────
+
+    def test_pattern_watch_dell_like_candidate_matches_dell(self):
+        """Strong technical + volume + high priority, no earnings → matched_pattern == DELL."""
+        cs = [self._cs(
+            "DELLTEST",
+            earnings_score=1.0, technical_score=5.0, volume_score=4.0,
+        )]
+        snap = [self._snap("DELLTEST", priority_score=70.0)]
+        mock_conn = self._mock_db(cs_rows=cs, snap_rows=snap)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        body = resp.json()
+        items = body["data"]
+        assert len(items) >= 1
+        item = next((i for i in items if i["ticker"] == "DELLTEST"), None)
+        assert item is not None
+        assert item["matched_pattern"] == "DELL"
+        assert item["similarity_pct"] >= 50
+
+    # ── deduplication ──────────────────────────────────────────────────────────
+
+    def test_pattern_watch_deduplication_by_ticker(self):
+        """Same ticker appearing twice in catalyst_scores must appear once in result."""
+        snow_row = self._cs(
+            "DUP",
+            earnings_score=5.0, options_score=4.0, technical_score=4.0, volume_score=3.0,
+            days_to_earnings=2, post_squeeze_guard=False,
+        )
+        mock_conn = self._mock_db(cs_rows=[snow_row, snow_row])
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        body = resp.json()
+        tickers = [i["ticker"] for i in body["data"]]
+        assert tickers.count("DUP") == 1
+
+    # ── required response fields ───────────────────────────────────────────────
+
+    def test_pattern_watch_item_has_all_required_fields(self):
+        """Every returned item must have all required response fields."""
+        required = {
+            "ticker", "matched_pattern", "similarity_pct",
+            "case_probability_pct", "case_upside_pct", "confidence",
+            "sample_size", "flags", "reason", "source",
+            "current_price", "days_to_earnings", "raw_score",
+        }
+        cs = [self._cs(
+            "FIELDCHECK",
+            earnings_score=5.0, options_score=4.0, technical_score=4.0,
+            volume_score=3.0, days_to_earnings=2, post_squeeze_guard=False,
+        )]
+        mock_conn = self._mock_db(cs_rows=cs)
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        items = resp.json()["data"]
+        assert items, "Expected at least one item"
+        missing = required - set(items[0].keys())
+        assert not missing, f"Missing fields: {missing}"
+
+    # ── method_note must be present ────────────────────────────────────────────
+
+    def test_pattern_watch_method_note_present(self):
+        """method_note must be present and mention 'low sample'."""
+        mock_conn = self._mock_db(cs_rows=[])
+        with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+            _cache.invalidate("pattern_watch")
+            resp = client.get("/api/pattern-watch")
+
+        note = resp.json().get("method_note", "")
+        assert note, "method_note must not be empty"
+        assert "sample" in note.lower()

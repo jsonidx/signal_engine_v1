@@ -3046,6 +3046,313 @@ async def hot_entry_history(
         return _no_data("hot_entry_history failed")
 
 
+# ==============================================================================
+# /api/watch-setup  — TRD-004 Accumulation/Catalyst Setup Alert
+# ==============================================================================
+
+@app.get("/api/watch-setup")
+async def watch_setup_alerts():
+    """
+    Returns tickers with accumulation/catalyst setup evidence that are worth
+    watching before a move.  Distinct from Hot Entry (not inside entry zone)
+    and distinct from short squeeze (does not require high short interest).
+
+    Designed to surface cases like SNOW May 2026: strong pre-earnings setup
+    with unusual call activity and improving momentum, but no Hot Entry signal.
+
+    Structured reasons allow the frontend to explain each alert clearly.
+    This is a WATCH/SETUP signal, NOT an immediate buy signal.
+
+    Response shape:
+        {
+          "data_available": true,
+          "run_date": "YYYY-MM-DD",
+          "alerts": [
+            {
+              "ticker": "SNOW",
+              "alert_type": "catalyst_setup",
+              "label": "Catalyst Setup",
+              "reasons": ["earnings_beat_streak_4", "call_demand_elevated", ...],
+              "days_to_earnings": 2,
+              "dark_pool_signal": "NEUTRAL",
+              "pre_earnings_breakout": true,
+              "peb_confidence": "medium",
+              "composite": 51.4,
+              "price": 168.5,
+              "note": "Watch/setup alert — not a buy signal"
+            }
+          ]
+        }
+    """
+    cache_key = "watch_setup_alerts"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        alerts = []
+
+        conn = _db_connect()
+        rows = conn.execute(
+            """
+            SELECT cs.ticker,
+                   cs.composite,
+                   COALESCE(cs.raw_composite, cs.composite) AS raw_composite,
+                   cs.options_score,
+                   cs.volume_score,
+                   cs.technical_score,
+                   cs.dark_pool_score,
+                   cs.dark_pool_signal,
+                   cs.earnings_score,
+                   cs.post_squeeze_guard,
+                   cs.price,
+                   cs.days_to_earnings,
+                   tc.direction AS thesis_direction,
+                   tc.entry_low,
+                   tc.entry_high
+            FROM catalyst_scores cs
+            LEFT JOIN LATERAL (
+                SELECT direction, entry_low, entry_high
+                FROM thesis_cache
+                WHERE ticker = cs.ticker
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) tc ON true
+            WHERE cs.date = %s
+              AND (
+                    cs.options_score >= 3
+                 OR cs.volume_score  >= 3
+                 OR cs.dark_pool_signal = 'ACCUMULATION'
+              )
+              AND cs.earnings_score >= 2
+            ORDER BY COALESCE(cs.raw_composite, cs.composite) DESC
+            LIMIT 20
+            """,
+            (today,),
+        ).fetchall()
+
+        for row in rows:
+            ticker = row["ticker"]
+            reasons = []
+            raw_comp = float(row.get("raw_composite") or row.get("composite") or 0)
+            price = float(row.get("price") or 0)
+            entry_high = float(row.get("entry_high") or 0)
+            entry_low = float(row.get("entry_low") or 0)
+
+            # Skip tickers that are already in a Hot Entry zone
+            if price > 0 and entry_high > 0 and entry_low > 0:
+                if entry_low <= price <= entry_high * 1.02:
+                    continue  # already in Hot Entry range, skip
+
+            if (row.get("dark_pool_signal") or "").upper() == "ACCUMULATION":
+                reasons.append("dark_pool_accumulation")
+            if float(row.get("options_score") or 0) >= 3:
+                reasons.append("call_demand_elevated")
+            if float(row.get("volume_score") or 0) >= 3:
+                reasons.append("volume_expansion_confirmed")
+            if float(row.get("earnings_score") or 0) >= 4:
+                days = row.get("days_to_earnings")
+                reasons.append(f"earnings_imminent_{days}d" if days else "earnings_imminent")
+            elif float(row.get("earnings_score") or 0) >= 2:
+                reasons.append("earnings_approaching")
+            if float(row.get("technical_score") or 0) >= 3:
+                reasons.append("technical_strength")
+
+            if not reasons:
+                continue
+
+            alert = {
+                "ticker": ticker,
+                "alert_type": "catalyst_setup",
+                "label": "Catalyst Setup",
+                "reasons": reasons,
+                "days_to_earnings": row.get("days_to_earnings"),
+                "dark_pool_signal": row.get("dark_pool_signal") or "NEUTRAL",
+                "raw_composite": round(raw_comp, 1),
+                "composite": round(float(row.get("composite") or 0), 1),
+                "price": round(price, 2),
+                "thesis_direction": row.get("thesis_direction") or "UNKNOWN",
+                "note": "Watch/setup alert — not an immediate buy signal",
+            }
+            alerts.append(alert)
+
+        result = {
+            "data_available": True,
+            "run_date": today,
+            "alerts": alerts,
+            "count": len(alerts),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception:
+        log.exception("watch_setup_alerts error")
+        return _no_data("watch_setup_alerts failed")
+
+
+# ==============================================================================
+# /api/pattern-watch  — TRD-017 Pattern Watch (SNOW/CRSR/DELL archetypes)
+# ==============================================================================
+
+@app.get("/api/pattern-watch")
+async def pattern_watch():
+    """
+    Pattern Watch — TRD-017.
+
+    Aggregates current catalyst_scores and candidate_snapshots rows, then scores
+    each ticker against three historical breakout archetypes:
+      - SNOW: pre-earnings catalyst re-rating
+      - CRSR: early catalyst momentum / product-news breakout
+      - DELL: large-cap early momentum continuation
+
+    Probabilities and upside figures are case-based estimates from n=1 examples
+    per archetype.  This is NOT a statistically validated model.
+
+    Returns data_available:true with an empty list when no ticker matches;
+    never returns 404.  Works without AI synthesis.
+    """
+    cache_key = "pattern_watch"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    empty_envelope = {
+        "data_available": True,
+        "as_of": datetime.now().strftime("%Y-%m-%d"),
+        "count": 0,
+        "method_note": "Case-based similarity using SNOW/CRSR/DELL archetypes; low sample size.",
+        "data": [],
+    }
+
+    try:
+        from utils.pattern_watch import score_ticker
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn  = _db_connect()
+
+        cs_rows = conn.execute(
+            """
+            SELECT ticker,
+                   composite,
+                   COALESCE(raw_composite, composite) AS raw_composite,
+                   options_score,
+                   volume_score,
+                   technical_score,
+                   dark_pool_score,
+                   dark_pool_signal,
+                   earnings_score,
+                   post_squeeze_guard,
+                   price,
+                   days_to_earnings
+            FROM   catalyst_scores
+            WHERE  date = %s
+              AND  ticker NOT IN (
+                       SELECT ticker FROM blacklist
+                       WHERE  expires_at IS NULL OR expires_at > NOW()
+                   )
+            ORDER  BY COALESCE(raw_composite, composite) DESC
+            LIMIT  60
+            """,
+            (today,),
+        ).fetchall()
+
+        snap_rows = conn.execute(
+            """
+            SELECT ticker, selection_reason, priority_score
+            FROM   candidate_snapshots
+            WHERE  run_date = (SELECT MAX(run_date) FROM candidate_snapshots)
+              AND  ticker NOT IN (
+                       SELECT ticker FROM blacklist
+                       WHERE  expires_at IS NULL OR expires_at > NOW()
+                   )
+            """
+        ).fetchall()
+        conn.close()
+
+        snap_map = {r["ticker"]: r for r in snap_rows}
+
+        def _snapshot_proxy_cs(snap: dict) -> dict:
+            """
+            Build a conservative catalyst_scores-like row for candidate-only
+            rows so early event candidates are not hidden until catalyst_scores
+            is refreshed.
+            """
+            reason = (snap.get("selection_reason") or "").lower()
+            priority = float(snap.get("priority_score") or 0)
+            has_breakout = any(k in reason for k in (
+                "fresh_catalyst_breakout",
+                "catalyst_price_expansion",
+                "early_momentum_breakout",
+                "breakout",
+            ))
+            has_volume = any(k in reason for k in (
+                "catalyst_price_expansion",
+                "volume",
+                "breakout",
+            ))
+            return {
+                "ticker": snap["ticker"],
+                "composite": priority,
+                "raw_composite": priority,
+                "options_score": 0.0,
+                "volume_score": 3.0 if has_volume else 0.0,
+                "technical_score": 3.0 if has_breakout else 0.0,
+                "dark_pool_score": 0.0,
+                "dark_pool_signal": "ACCUMULATION" if "dark_pool" in reason else "NEUTRAL",
+                "earnings_score": 0.0,
+                "post_squeeze_guard": False,
+                "price": 0.0,
+                "days_to_earnings": None,
+                "_synthetic_from_snapshot": True,
+            }
+
+        def _is_pattern_snapshot(snap: dict) -> bool:
+            reason = (snap.get("selection_reason") or "").lower()
+            return any(k in reason for k in (
+                "fresh_catalyst_breakout",
+                "catalyst_price_expansion",
+                "early_momentum_breakout",
+            ))
+
+        candidates = []
+        seen: set[str] = set()
+        for cs in cs_rows:
+            ticker = cs["ticker"]
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            item = score_ticker(ticker, cs, snap_map.get(ticker))
+            if item:
+                candidates.append(item)
+
+        for snap in snap_rows:
+            ticker = snap["ticker"]
+            if ticker in seen or not _is_pattern_snapshot(snap):
+                continue
+            seen.add(ticker)
+            item = score_ticker(ticker, _snapshot_proxy_cs(snap), snap)
+            if item:
+                candidates.append(item)
+
+        candidates.sort(key=lambda x: x["similarity_pct"], reverse=True)
+
+        result = {
+            "data_available": True,
+            "as_of":          today,
+            "count":          len(candidates),
+            "method_note":    "Case-based similarity using SNOW/CRSR/DELL archetypes; low sample size.",
+            "data":           _json_safe(candidates),
+        }
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    except Exception:
+        log.exception("pattern_watch error")
+        _cache.set(cache_key, empty_envelope, TTL_SHORT)
+        return empty_envelope
+
+
 @app.get("/api/screeners/crypto")
 async def screeners_crypto():
     """
@@ -5048,6 +5355,8 @@ async def usage_summary(
 # ==============================================================================
 
 def _ensure_favorites_table(conn) -> None:
+    from utils.db import ensure_public_table_rls
+
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_favorites (
@@ -5057,6 +5366,7 @@ def _ensure_favorites_table(conn) -> None:
                 notes     TEXT DEFAULT ''
             )
         """)
+    ensure_public_table_rls(conn, "user_favorites")
     conn.commit()
 
 
