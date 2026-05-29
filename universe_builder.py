@@ -79,6 +79,20 @@ except ImportError:
     UNIVERSE_ATR_PCT_MAX = 6.0   # drop if 20-day ATR% > 6 % (excessively volatile)
     UNIVERSE_BETA_MAX    = 2.0   # drop if 60-day rolling beta vs SPY > 2.0
 
+# Early catalyst momentum gate thresholds — configurable from config.py
+try:
+    from config import (
+        FORCE_EARLY_5D_RETURN_MIN,
+        FORCE_EARLY_MIN_DOLLAR_VOL,
+        FORCE_EXPANSION_5D_RETURN_MIN,
+        FORCE_EXPANSION_VOL_RATIO_MIN,
+    )
+except ImportError:
+    FORCE_EARLY_5D_RETURN_MIN     = 0.15
+    FORCE_EARLY_MIN_DOLLAR_VOL    = 10_000_000
+    FORCE_EXPANSION_5D_RETURN_MIN = 0.35
+    FORCE_EXPANSION_VOL_RATIO_MIN = 1.5
+
 # ---------------------------------------------------------------------------
 # Exchange-suffix classification — used in dot-ticker filtering
 # ---------------------------------------------------------------------------
@@ -802,6 +816,86 @@ def _get_persistent_favorites() -> list:
 
 
 # ==============================================================================
+# Force-tag detection — testable logic extracted from _compute_prescreen_scores
+# ==============================================================================
+
+def _detect_force_tags(
+    c: "pd.Series",
+    v: "pd.Series",
+    vol_ratio: float,
+    near_high: float,
+) -> set:
+    """
+    Detect swing-trade force-include tags for a single ticker.
+
+    Tags emitted:
+      VOL_BREAKOUT            — existing gate: vol ratio >= 2.0, 5d return >= 3%
+      VOLATILITY_COMPRESSION  — existing gate: BB squeeze near 52w high
+      EARLY_MOMENTUM_BREAKOUT — NEW: 5d return >= 15%, close > prior 20d high,
+                                20d avg dollar vol >= $10M.
+                                Deep Dive inclusion trigger — not a buy signal.
+      CATALYST_PRICE_EXPANSION — NEW (emergency): 5d return >= 35%, vol ratio >= 1.5.
+                                 Fires before VOL_BREAKOUT (ratio>=2.0) when price
+                                 expansion is extreme.  Deep Dive trigger only.
+
+    All parameters are pre-computed by _compute_prescreen_scores.
+    """
+    tags: set = set()
+
+    if c is None or v is None:
+        return tags
+
+    # ── VOL_BREAKOUT (existing) ────────────────────────────────────────────────
+    if len(v) >= 20 and len(c) >= 6:
+        ret_5d = float(c.iloc[-1] / c.iloc[-6] - 1) if c.iloc[-6] > 0 else 0.0
+        if vol_ratio >= FORCE_VOL_RATIO_MIN and ret_5d >= FORCE_PRICE_5D_MIN:
+            tags.add("VOL_BREAKOUT")
+
+    # ── EARLY_MOMENTUM_BREAKOUT (new) ─────────────────────────────────────────
+    # Requires ALL THREE: 5d return >= 15%, close > prior period high, avg dv >= $10M.
+    # This is a Deep Dive queue trigger, not a buy signal.
+    # len(c) >= 20: need at least 20 bars for the dollar-volume average; the prior-high
+    # window uses c.iloc[-21:-1] which gives up to 19 bars when len=20 — sufficient
+    # to detect a meaningful new recent high.
+    if len(c) >= 20 and len(v) >= 20:
+        ret_5d = float(c.iloc[-1] / c.iloc[-6] - 1) if c.iloc[-6] > 0 else 0.0
+        prior_20d_high = float(c.iloc[-21:-1].max())
+        avg_dv_20d = float((c.iloc[-20:] * v.iloc[-20:]).mean())
+        if (
+            ret_5d >= FORCE_EARLY_5D_RETURN_MIN
+            and float(c.iloc[-1]) > prior_20d_high
+            and avg_dv_20d >= FORCE_EARLY_MIN_DOLLAR_VOL
+        ):
+            tags.add("EARLY_MOMENTUM_BREAKOUT")
+
+    # ── CATALYST_PRICE_EXPANSION (new — emergency) ────────────────────────────
+    # Extreme 5d move + volume expansion: fires before VOL_BREAKOUT when a
+    # catalyst drives a rapid price expansion.  Deep Dive queue trigger only.
+    if len(c) >= 6 and len(v) >= 20:
+        ret_5d = float(c.iloc[-1] / c.iloc[-6] - 1) if c.iloc[-6] > 0 else 0.0
+        if (
+            ret_5d >= FORCE_EXPANSION_5D_RETURN_MIN
+            and vol_ratio >= FORCE_EXPANSION_VOL_RATIO_MIN
+        ):
+            tags.add("CATALYST_PRICE_EXPANSION")
+
+    # ── VOLATILITY_COMPRESSION (existing) ─────────────────────────────────────
+    if len(c) >= 55:
+        try:
+            sma20 = c.rolling(20).mean()
+            std20 = c.rolling(20).std()
+            bb_w  = ((sma20 + 2 * std20 - (sma20 - 2 * std20)) / sma20).dropna()
+            if len(bb_w) >= 50:
+                pct = float((bb_w < bb_w.iloc[-1]).mean() * 100)
+                if pct <= FORCE_BB_PERCENTILE and near_high >= (1 - FORCE_NEAR_HIGH_PCT):
+                    tags.add("VOLATILITY_COMPRESSION")
+        except Exception:
+            pass
+
+    return tags
+
+
+# ==============================================================================
 # Pre-screen scoring — 5-factor composite
 # ==============================================================================
 
@@ -911,28 +1005,9 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
         quality[t] = {"atr_pct": round(atr_pct, 2), "beta": round(beta, 4)}
 
         # ── Swing-trade force-include gate detection ───────────────────────────
-        tags: set = set()
-
-        # VOL_BREAKOUT: unusual volume surge + price confirming upward
-        if v is not None and len(v) >= 20 and len(c) >= 6:
-            vr = vol_ratios.get(t, 1.0)
-            ret_5d = float(c.iloc[-1] / c.iloc[-6] - 1) if c.iloc[-6] > 0 else 0.0
-            if vr >= FORCE_VOL_RATIO_MIN and ret_5d >= FORCE_PRICE_5D_MIN:
-                tags.add("VOL_BREAKOUT")
-
-        # VOLATILITY_COMPRESSION: Bollinger squeeze + near 52w high
-        if len(c) >= 55:
-            try:
-                sma20  = c.rolling(20).mean()
-                std20  = c.rolling(20).std()
-                bb_w   = ((sma20 + 2 * std20 - (sma20 - 2 * std20)) / sma20).dropna()
-                if len(bb_w) >= 50:
-                    pct = float((bb_w < bb_w.iloc[-1]).mean() * 100)
-                    nh  = near_highs.get(t, 0.0)
-                    if pct <= FORCE_BB_PERCENTILE and nh >= (1 - FORCE_NEAR_HIGH_PCT):
-                        tags.add("VOLATILITY_COMPRESSION")
-            except Exception:
-                pass
+        vr   = vol_ratios.get(t, 1.0)
+        nh   = near_highs.get(t, 0.0)
+        tags = _detect_force_tags(c, v, vol_ratio=vr, near_high=nh)
 
         if tags:
             _FORCE_TAGS[t] = tags
@@ -1274,7 +1349,8 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
     # Force-inject protected tickers
     top_set |= protected
 
-    # Force-inject OHLCV-based swing setups (VOL_BREAKOUT, VOLATILITY_COMPRESSION)
+    # Force-inject OHLCV-based swing setups (VOL_BREAKOUT, VOLATILITY_COMPRESSION,
+    # EARLY_MOMENTUM_BREAKOUT, CATALYST_PRICE_EXPANSION)
     ohlcv_forced = force_ohlcv - top_set
     if ohlcv_forced:
         top_set |= ohlcv_forced
@@ -1285,6 +1361,35 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
         for tag, tagged in sorted(tag_summary.items()):
             print(f"  Force-include [{tag}]: {len(tagged)} tickers — {', '.join(sorted(tagged)[:8])}"
                   + (" ..." if len(tagged) > 8 else ""))
+
+    # Populate event-driven Deep Dive queue for early catalyst tags.
+    # These are tickers that fire EARLY_MOMENTUM_BREAKOUT or CATALYST_PRICE_EXPANSION
+    # and may not be in watchlist.txt / resolved_signals.json.
+    _EARLY_CATALYST_TAGS = {"EARLY_MOMENTUM_BREAKOUT", "CATALYST_PRICE_EXPANSION"}
+    try:
+        from utils.event_queue import enqueue as _eq_enqueue
+        _queued_count = 0
+        for t, tags in _FORCE_TAGS.items():
+            early_tags = tags & _EARLY_CATALYST_TAGS
+            if not early_tags:
+                continue
+            c_ser = None
+            v_ser = None
+            # best-effort source fields — populate if available in all_close/volume
+            # (only accessible if called from _compute_prescreen_scores context)
+            tag_str = ",".join(sorted(early_tags))
+            added = _eq_enqueue(
+                ticker=t,
+                reason=tag_str,
+                score=scores.get(t, 0.0),
+                source_fields={"force_tags": tag_str},
+            )
+            if added:
+                _queued_count += 1
+        if _queued_count:
+            print(f"  Event queue: {_queued_count} ticker(s) enqueued for Deep Dive review")
+    except Exception as _eq_exc:
+        logger.debug("Event queue unavailable: %s", _eq_exc)
 
     # Earnings force-include: check "just missed" set for upcoming earnings
     # Only tickers ranked top_n+1 … top_n*2 that aren't already in top_set

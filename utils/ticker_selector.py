@@ -36,6 +36,11 @@ except ImportError:
     AI_QUANT_MIN_AGREEMENT = 0.60
     AI_QUANT_ALWAYS_INCLUDE: List[str] = []
 
+try:
+    from config import EVENT_QUEUE_MAX_AI_SLOTS
+except ImportError:
+    EVENT_QUEUE_MAX_AI_SLOTS = 3
+
 
 # ==============================================================================
 # PRIORITY SCORING
@@ -270,6 +275,8 @@ def select_top_tickers(
     min_agreement: Optional[float] = None,
     always_include: Optional[List[str]] = None,
     force_tickers: Optional[List[str]] = None,
+    event_queue: Optional[List[dict]] = None,
+    event_queue_max_slots: Optional[int] = None,
 ) -> List[dict]:
     """
     Returns ordered list of up to max_tickers dicts for Claude synthesis.
@@ -289,7 +296,15 @@ def select_top_tickers(
       7. Inject always_include tickers (displace lowest non-always if needed)
       8. Take top max_tickers
       9. Generate selection_reason for each
-     10. Print summary table, return list
+     10. Append event_queue tickers (bounded by event_queue_max_slots)
+         that are not already selected, even if absent from resolved_signals
+     11. Print summary table, return list
+
+    event_queue: optional list of event candidate dicts from utils/event_queue.py.
+                 Each must have at least "ticker" and "reason".  Tickers already
+                 in the normal top selection are de-duplicated and not added twice.
+    event_queue_max_slots: max additional AI synthesis slots for event candidates
+                           (default EVENT_QUEUE_MAX_AI_SLOTS = 3).
     """
     if max_tickers is None:
         max_tickers = AI_QUANT_MAX_TICKERS
@@ -460,13 +475,50 @@ def select_top_tickers(
             always_include=s.get("_always_include", False),
         )
 
-    # ── Step 10: Print summary table ──────────────────────────────────────────
-    # total_input = all tickers seen before any filter (skip_claude or agreement)
+    # ── Step 10: Inject event-queue candidates ────────────────────────────────
+    # Event-queue tickers are fresh catalyst breakouts that may not be in
+    # resolved_signals.json.  They are appended after normal selection (bounded
+    # by event_queue_max_slots) so they do not displace normal ranked names.
+    if event_queue:
+        eq_max = (event_queue_max_slots
+                  if event_queue_max_slots is not None
+                  else EVENT_QUEUE_MAX_AI_SLOTS)
+        selected_tickers = {s["ticker"] for s in top}
+        eq_added = 0
+        for eq_entry in event_queue:
+            if eq_added >= eq_max:
+                break
+            eq_ticker = eq_entry.get("ticker", "").upper().strip()
+            if not eq_ticker or eq_ticker in selected_tickers:
+                continue
+            reason_str = eq_entry.get("reason", "fresh_catalyst_breakout")
+            # Pull metadata from resolved_signals if available (falls back gracefully)
+            resolved = resolved_all.get(eq_ticker, {})
+            eq_data  = eq_lookup.get(eq_ticker, {})
+            top.append({
+                "ticker":                  eq_ticker,
+                "priority_score":          float(eq_entry.get("score", 0.0)),
+                "signal_agreement_score":  float(resolved.get("signal_agreement_score", 0) or 0),
+                "pre_resolved_direction":  resolved.get("pre_resolved_direction", "NEUTRAL"),
+                "pre_resolved_confidence": float(resolved.get("pre_resolved_confidence", 0) or 0),
+                "equity_rank":             eq_data.get("equity_rank"),
+                "composite_z":             eq_data.get("composite_z"),
+                "override_flags":          list(resolved.get("override_flags", []) or []),
+                "selection_reason":        f"fresh_catalyst_breakout | {reason_str}",
+                "_event_queue":            True,
+            })
+            selected_tickers.add(eq_ticker)
+            eq_added += 1
+        if eq_added:
+            print(f"Event queue: {eq_added} catalyst candidate(s) added for Deep Dive review")
+
+    # ── Step 11: Print summary table ──────────────────────────────────────────
     _print_selection_table(top, total_input=total_loaded, max_tickers=len(top))
 
     # Strip internal bookkeeping keys before returning
     for s in top:
         s.pop("_always_include", None)
         s.pop("module_votes",    None)
+        s.pop("_event_queue",    None)
 
     return top

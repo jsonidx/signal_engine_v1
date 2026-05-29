@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 # Ensure project root is on path
@@ -576,3 +577,190 @@ def test_always_include_uses_dynamic_not_static(monkeypatch):
     assert result != ["GME", "COIN", "SAP"], (
         "Static config list was returned instead of dynamic DB result"
     )
+class TestEventQueue(unittest.TestCase):
+    """Tests for utils/event_queue.py — insert, cap, de-dup, persistence."""
+
+    def setUp(self):
+        import tempfile, os
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self._path = Path(self._tmp.name)
+
+    def tearDown(self):
+        if self._path.exists():
+            os.unlink(self._path)
+
+    def _queue_path(self):
+        return self._path
+
+    def test_enqueue_adds_entry(self):
+        from utils.event_queue import enqueue, get_queue_for_date
+        added = enqueue("CRSR", "CATALYST_PRICE_EXPANSION", score=0.62,
+                        queue_path=self._path)
+        self.assertTrue(added)
+        q = get_queue_for_date(queue_path=self._path)
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["ticker"], "CRSR")
+        self.assertEqual(q[0]["reason"], "CATALYST_PRICE_EXPANSION")
+
+    def test_deduplication_same_ticker_same_day(self):
+        from utils.event_queue import enqueue, get_queue_for_date
+        enqueue("CRSR", "CATALYST_PRICE_EXPANSION", queue_path=self._path)
+        added_again = enqueue("CRSR", "EARLY_MOMENTUM_BREAKOUT", queue_path=self._path)
+        self.assertFalse(added_again, "Second enqueue for same ticker must return False")
+        q = get_queue_for_date(queue_path=self._path)
+        self.assertEqual(len(q), 1)
+
+    def test_different_tickers_both_added(self):
+        from utils.event_queue import enqueue, get_queue_for_date
+        enqueue("CRSR", "CATALYST_PRICE_EXPANSION", queue_path=self._path)
+        enqueue("MSTR", "EARLY_MOMENTUM_BREAKOUT", queue_path=self._path)
+        q = get_queue_for_date(queue_path=self._path)
+        tickers = {e["ticker"] for e in q}
+        self.assertEqual(tickers, {"CRSR", "MSTR"})
+
+    def test_daily_cap_enforced(self):
+        from utils.event_queue import enqueue, get_queue_for_date
+        cap = 3
+        for i in range(cap + 2):
+            enqueue(f"T{i:02d}", "EARLY_MOMENTUM_BREAKOUT",
+                    queue_path=self._path, daily_cap=cap)
+        q = get_queue_for_date(queue_path=self._path)
+        self.assertEqual(len(q), cap, f"Cap {cap} must be respected; got {len(q)}")
+
+    def test_cap_returns_false_when_full(self):
+        from utils.event_queue import enqueue
+        cap = 2
+        enqueue("T01", "X", queue_path=self._path, daily_cap=cap)
+        enqueue("T02", "X", queue_path=self._path, daily_cap=cap)
+        added = enqueue("T03", "X", queue_path=self._path, daily_cap=cap)
+        self.assertFalse(added)
+
+    def test_clear_stale_entries(self):
+        from utils.event_queue import clear_stale_entries, _load, _save
+        from datetime import datetime, timedelta, timezone
+        old_entry = {
+            "ticker": "OLD",
+            "reason": "X",
+            "score": 0.1,
+            "source_fields": {},
+            "queued_at": (
+                datetime.now(timezone.utc) - timedelta(days=5)
+            ).isoformat(),
+        }
+        _save([old_entry], self._path)
+        removed = clear_stale_entries(keep_days=3, queue_path=self._path)
+        self.assertEqual(removed, 1)
+        remaining = _load(self._path)
+        self.assertEqual(len(remaining), 0)
+
+    def test_get_all_pending_respects_age(self):
+        from utils.event_queue import enqueue, get_all_pending
+        enqueue("CRSR", "CATALYST_PRICE_EXPANSION", queue_path=self._path)
+        result = get_all_pending(max_age_days=1, queue_path=self._path)
+        self.assertEqual(len(result), 1)
+
+
+class TestEventQueueTickerSelectorHandoff(unittest.TestCase):
+    """Event queue tickers appear in select_top_tickers output even without resolved_signals."""
+
+    def setUp(self):
+        import tempfile, os
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self._qpath = Path(self._tmp.name)
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil, os
+        if self._qpath.exists():
+            os.unlink(self._qpath)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_event_ticker_injected_absent_from_resolved(self):
+        """CRSR not in resolved_signals must still appear when passed as event_queue."""
+        from utils.event_queue import enqueue, get_queue_for_date
+
+        enqueue("CRSR", "CATALYST_PRICE_EXPANSION", score=0.62,
+                source_fields={"ret_5d": 0.463}, queue_path=self._qpath)
+
+        resolved = _build_20_ticker_resolved()
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        queue = get_queue_for_date(queue_path=self._qpath)
+
+        result = select_top_tickers(
+            resolved_signals_path=rpath,
+            max_tickers=5,
+            min_agreement=0.0,
+            event_queue=queue,
+            event_queue_max_slots=3,
+        )
+
+        tickers = [r["ticker"] for r in result]
+        self.assertIn("CRSR", tickers)
+
+    def test_event_ticker_not_duplicated(self):
+        """If CRSR is already in resolved_signals and selected, it should not appear twice."""
+        from utils.event_queue import enqueue, get_queue_for_date
+
+        enqueue("T20", "CATALYST_PRICE_EXPANSION", queue_path=self._qpath)
+        resolved = _build_20_ticker_resolved()
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        queue = get_queue_for_date(queue_path=self._qpath)
+
+        result = select_top_tickers(
+            resolved_signals_path=rpath,
+            max_tickers=20,
+            min_agreement=0.0,
+            event_queue=queue,
+            event_queue_max_slots=3,
+        )
+
+        t20_entries = [r for r in result if r["ticker"] == "T20"]
+        self.assertEqual(len(t20_entries), 1, "T20 must appear exactly once")
+
+    def test_event_queue_max_slots_respected(self):
+        """No more than event_queue_max_slots event tickers are added."""
+        from utils.event_queue import enqueue, get_queue_for_date
+
+        # Queue 5 unknown tickers
+        for sym in ["EQ1", "EQ2", "EQ3", "EQ4", "EQ5"]:
+            enqueue(sym, "CATALYST_PRICE_EXPANSION", queue_path=self._qpath, daily_cap=10)
+
+        resolved = _build_20_ticker_resolved()
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        queue = get_queue_for_date(queue_path=self._qpath)
+
+        result = select_top_tickers(
+            resolved_signals_path=rpath,
+            max_tickers=5,
+            min_agreement=0.0,
+            event_queue=queue,
+            event_queue_max_slots=2,
+        )
+
+        event_tickers = [r["ticker"] for r in result if r["ticker"].startswith("EQ")]
+        self.assertLessEqual(len(event_tickers), 2,
+                             f"Max 2 event slots; got {event_tickers}")
+
+    def test_selection_reason_includes_catalyst_tag(self):
+        """Event candidate selection_reason must include the catalyst reason."""
+        from utils.event_queue import enqueue, get_queue_for_date
+
+        enqueue("CRSR", "EARLY_MOMENTUM_BREAKOUT,CATALYST_PRICE_EXPANSION",
+                queue_path=self._qpath)
+
+        resolved = {"AAPL": _make_resolved("AAPL")}
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        queue = get_queue_for_date(queue_path=self._qpath)
+
+        result = select_top_tickers(
+            resolved_signals_path=rpath,
+            max_tickers=5,
+            min_agreement=0.0,
+            event_queue=queue,
+            event_queue_max_slots=2,
+        )
+        crsr = next((r for r in result if r["ticker"] == "CRSR"), None)
+        self.assertIsNotNone(crsr)
+        self.assertIn("EARLY_MOMENTUM_BREAKOUT", crsr["selection_reason"])

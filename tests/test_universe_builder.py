@@ -177,16 +177,17 @@ class TestFetchIndexConstituents:
 
     @pytest.mark.network
     def test_no_cache_and_network_fail_returns_hardcoded(self):
-        """With no cache and no network, must return the hardcoded fallback."""
+        """With no cache and no network, must return the dynamic fallback."""
+        fallback = ["AAPL", "NVDA"]
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
                 patch("universe_builder.requests.get", side_effect=Exception("timeout")),
                 patch("universe_builder._CACHE_DIR", Path(tmpdir)),
+                patch("universe_builder._dynamic_fallback", return_value=fallback),
             ):
                 result = ub.fetch_index_constituents("russell2000")
 
-        assert len(result) > 0
-        assert "NVDA" in result or "AAPL" in result
+        assert result == fallback
 
     def test_raises_on_unknown_index(self):
         """Unknown index name should raise ValueError."""
@@ -850,3 +851,139 @@ class TestTop50HistoryPersistence:
         with patch("universe_builder._TOP50_HIST_PATH", Path("/nonexistent/top50.json")):
             result = ub._load_top50_history()
         assert result == []
+
+
+# ===========================================================================
+# 10. _detect_force_tags — early catalyst momentum gates (TRD-007)
+# ===========================================================================
+
+class TestEarlyMomentumGates:
+    """
+    Tests for EARLY_MOMENTUM_BREAKOUT and CATALYST_PRICE_EXPANSION tags
+    added in TRD-007.  Uses synthetic pd.Series to avoid live yfinance calls.
+    All price/volume data mirrors the CRSR May 2026 postmortem fixture.
+    """
+
+    def _make_crsr_as_of(self, bar_index: int):
+        """
+        Return (close_series, volume_series) as of *bar_index* in the CRSR
+        May 2026 fixture.  Convenience wrapper so tests don't import fixtures.
+        """
+        from tests.fixtures.crsr_may2026 import make_close_series, make_volume_series
+        return make_close_series(bar_index), make_volume_series(bar_index)
+
+    # ── EARLY_MOMENTUM_BREAKOUT ────────────────────────────────────────────────
+
+    def test_may27_fires_early_momentum_breakout(self):
+        """
+        May 27 bar: 5d return ~42.7% >= 15%, close above prior 20d high,
+        avg dollar vol > $10M → must fire EARLY_MOMENTUM_BREAKOUT.
+        (22-bar fixture: MAY27_BAR_INDEX=20 → 21 bars)
+        """
+        c, v = self._make_crsr_as_of(20)   # 21 bars ending May 27 (index 20)
+        tags = ub._detect_force_tags(c, v, vol_ratio=1.65, near_high=0.6)
+        assert "EARLY_MOMENTUM_BREAKOUT" in tags, (
+            f"Expected EARLY_MOMENTUM_BREAKOUT for May 27 bar; got {tags}"
+        )
+
+    def test_may26_fires_early_momentum_breakout(self):
+        """
+        May 26 bar: 5d return ~19.9% >= 15%, close $8.09 > prior period high
+        ($7.70 from May 22), avg dollar vol > $10M → must fire.
+        (22-bar fixture: MAY26_BAR_INDEX=19 → 20 bars)
+        """
+        c, v = self._make_crsr_as_of(19)   # 20 bars ending May 26 (index 19)
+        tags = ub._detect_force_tags(c, v, vol_ratio=1.10, near_high=0.6)
+        assert "EARLY_MOMENTUM_BREAKOUT" in tags, (
+            f"Expected EARLY_MOMENTUM_BREAKOUT for May 26 bar; got {tags}"
+        )
+
+    def test_may22_does_not_fire_early_momentum_breakout(self):
+        """
+        May 22 bar: 5d return ~14.6% < 15% → must NOT fire EARLY_MOMENTUM_BREAKOUT.
+        """
+        c, v = self._make_crsr_as_of(18)   # 19 bars ending May 22
+        tags = ub._detect_force_tags(c, v, vol_ratio=0.86, near_high=0.5)
+        assert "EARLY_MOMENTUM_BREAKOUT" not in tags, (
+            f"May 22 bar must NOT fire EARLY_MOMENTUM_BREAKOUT; got {tags}"
+        )
+
+    def test_insufficient_bars_does_not_fire(self):
+        """Fewer than 20 bars → EARLY_MOMENTUM_BREAKOUT cannot fire (not enough history)."""
+        c = pd.Series([10.0, 12.0, 14.0])    # only 3 bars
+        v = pd.Series([1_000_000.0] * 3)
+        tags = ub._detect_force_tags(c, v, vol_ratio=2.5, near_high=0.9)
+        assert "EARLY_MOMENTUM_BREAKOUT" not in tags
+
+    def test_low_dollar_volume_does_not_fire_early(self):
+        """
+        Even with strong return and new 20d high, EARLY_MOMENTUM_BREAKOUT must
+        not fire if avg dollar volume is below $10M.
+        """
+        import numpy as np
+        # Simulate a cheap penny-stock-like ticker: price $0.50, volume 1M → dv = $500K
+        closes = pd.Series(
+            np.concatenate([np.full(20, 0.45), np.array([0.45, 0.60])])
+        )   # 22 bars; last bar 5d return = 0.60/0.45 - 1 = 33%
+        # Rewind so c.iloc[-6] is 0.45:
+        # c = [0.45]*16 + [0.45, 0.45, 0.45, 0.45, 0.45, 0.60]  — 22 bars
+        closes2 = pd.Series(np.concatenate([np.full(16, 0.45), np.full(5, 0.45), [0.60]]))
+        volumes = pd.Series(np.full(22, 500_000.0))   # avg dv = 0.45 * 500K = $225K < $10M
+        tags = ub._detect_force_tags(closes2, volumes, vol_ratio=3.0, near_high=0.9)
+        assert "EARLY_MOMENTUM_BREAKOUT" not in tags, (
+            f"Low dollar volume must block EARLY_MOMENTUM_BREAKOUT; got {tags}"
+        )
+
+    # ── CATALYST_PRICE_EXPANSION ───────────────────────────────────────────────
+
+    def test_may27_fires_catalyst_price_expansion(self):
+        """
+        May 27 bar: 5d return ~42.7% >= 35%, vol_ratio=1.65 >= 1.5
+        → must fire CATALYST_PRICE_EXPANSION.
+        (22-bar fixture: MAY27_BAR_INDEX=20 → 21 bars)
+        """
+        c, v = self._make_crsr_as_of(20)   # 21 bars ending May 27
+        tags = ub._detect_force_tags(c, v, vol_ratio=1.65, near_high=0.6)
+        assert "CATALYST_PRICE_EXPANSION" in tags, (
+            f"Expected CATALYST_PRICE_EXPANSION for May 27 bar; got {tags}"
+        )
+
+    def test_may22_does_not_fire_catalyst_expansion(self):
+        """May 22 bar: 5d return ~14.6% < 35% → must NOT fire CATALYST_PRICE_EXPANSION."""
+        c, v = self._make_crsr_as_of(18)
+        tags = ub._detect_force_tags(c, v, vol_ratio=0.86, near_high=0.5)
+        assert "CATALYST_PRICE_EXPANSION" not in tags
+
+    def test_high_return_low_volume_does_not_fire_expansion(self):
+        """5d return >= 35% but vol_ratio < 1.5 → CATALYST_PRICE_EXPANSION does NOT fire."""
+        import numpy as np
+        # 22 bars: steady at $10, last bar jumps to $14 (+40% from bar[-6]=$10)
+        closes = pd.Series(np.concatenate([np.full(21, 10.0), [14.0]]))
+        volumes = pd.Series(np.full(22, 1_000_000.0))
+        tags = ub._detect_force_tags(closes, volumes, vol_ratio=1.20, near_high=0.8)
+        assert "CATALYST_PRICE_EXPANSION" not in tags, (
+            f"Low vol_ratio must block CATALYST_PRICE_EXPANSION; got {tags}"
+        )
+
+    # ── VOL_BREAKOUT preservation ──────────────────────────────────────────────
+
+    def test_vol_breakout_still_fires_unchanged(self):
+        """
+        Existing VOL_BREAKOUT gate (ratio >= 2.0, 5d_return >= 3%) must still
+        fire as before — new gates must not interfere with it.
+        """
+        import numpy as np
+        # 22 bars: flat at $10 for 21 bars, then +5% on bar 22
+        # vol_ratio = 2.5 (well above threshold)
+        closes = pd.Series(np.concatenate([np.full(21, 10.0), [10.50]]))
+        volumes = pd.Series(np.full(22, 1_000_000.0))
+        tags = ub._detect_force_tags(closes, volumes, vol_ratio=2.5, near_high=0.8)
+        assert "VOL_BREAKOUT" in tags, f"VOL_BREAKOUT must still fire; got {tags}"
+
+    def test_vol_breakout_needs_both_conditions(self):
+        """VOL_BREAKOUT must NOT fire when vol_ratio >= 2.0 but return < 3%."""
+        import numpy as np
+        closes = pd.Series(np.full(22, 10.0))   # flat price → 5d return = 0%
+        volumes = pd.Series(np.full(22, 1_000_000.0))
+        tags = ub._detect_force_tags(closes, volumes, vol_ratio=3.0, near_high=0.8)
+        assert "VOL_BREAKOUT" not in tags

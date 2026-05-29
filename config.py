@@ -162,6 +162,23 @@ UNIVERSE_CACHE_TTL_HOURS    = 24           # Cache TTL for index constituents (h
 UNIVERSE_ATR_PCT_MAX        = 6.0          # Drop if 20-day ATR% > this (quality gate)
 UNIVERSE_BETA_MAX           = 2.0          # Drop if 60-day beta vs SPY > this
 
+# ── Early catalyst momentum force-include gates ───────────────────────────────
+# These are Deep-Dive queue inclusion triggers, NOT buy signals.
+# EARLY_MOMENTUM_BREAKOUT: catches catalysts before VOL_BREAKOUT (ratio>=2.0) fires
+FORCE_EARLY_5D_RETURN_MIN   = 0.15         # 5d return >= 15%  ┐ all three required
+FORCE_EARLY_MIN_DOLLAR_VOL  = 10_000_000   # 20d avg dv >= $10M┤ for EARLY_MOMENTUM_BREAKOUT
+# close > prior 20d high is also required (checked live in universe_builder)  ┘
+# CATALYST_PRICE_EXPANSION: emergency gate — extreme move + volume expansion
+FORCE_EXPANSION_5D_RETURN_MIN  = 0.35      # 5d return >= 35%  ┐ both required
+FORCE_EXPANSION_VOL_RATIO_MIN  = 1.5       # 5d/20d vol ratio >= 1.5 ┘
+
+# ── Event-driven Deep Dive queue ──────────────────────────────────────────────
+EVENT_QUEUE_DAILY_CAP   = 10    # Max fresh event candidates queued per calendar day
+EVENT_QUEUE_MAX_AI_SLOTS = 3    # Max event-queue tickers injected into AI synthesis per run
+
+# ── Catalyst news enrichment ──────────────────────────────────────────────────
+CATALYST_LOOKBACK_DAYS  = 7     # Headlines older than this are considered stale
+
 # ============================================================
 # REGIME FILTER PARAMETERS
 # ============================================================
