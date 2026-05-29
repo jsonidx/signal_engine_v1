@@ -1,7 +1,7 @@
 # Task: Telegram Approval Requests For Trading Logic
 
 Status: implemented
-Stage: in progress
+Stage: awaiting QA
 Type: feature
 Priority: P1
 Severity: high
@@ -126,3 +126,10 @@ This workflow should support future squeeze-learning tasks such as:
 - score-weight changes
 - taxonomy label rule updates
 - promotion of a calibrated probability model into live scoring
+
+## Tracking Note
+
+Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
+Covers: approval_requests table, save/fetch/update helpers, /approve /reject /pending bot commands, notify_approval_request() notifier.
+Status: implemented and on main, but no live approval workflow has been tested end-to-end in production.
+Action required: confirm at least one approval request has been created, notified, and resolved through Telegram before moving to finished.

@@ -1,7 +1,7 @@
 # Task: Supabase Squeeze Training Dataset
 
 Status: implemented
-Stage: in progress
+Stage: awaiting QA
 Type: feature
 Priority: P0
 Severity: high
@@ -118,3 +118,10 @@ The goal is to make future learning possible, not to promise a 90% classifier im
 - state transition analysis
 
 Design the schema so a future offline trainer can export clean tabular data directly from Supabase.
+
+## Tracking Note
+
+Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
+Covers: squeeze_training_snapshots and squeeze_training_outcomes tables, migration 003, persistence helpers, backfill path.
+Status: implemented and on main, but no formal QA sign-off or first production snapshot observed.
+Action required: confirm migration 003 has been applied to production Supabase and at least one training snapshot has been written by the live pipeline before moving to finished.

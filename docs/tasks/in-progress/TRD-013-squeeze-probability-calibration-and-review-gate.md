@@ -1,7 +1,7 @@
 # Task: Squeeze Probability Calibration And Review Gate
 
 Status: implemented
-Stage: in progress
+Stage: awaiting QA
 Type: research
 Priority: P1
 Severity: high
@@ -109,3 +109,10 @@ Use replayed historical snapshots with closed forward windows to generate labele
 ## Handoff Notes
 
 This task is the guardrail against wishful thinking. The user goal is to learn from successful squeezes and eventually approach very high precision on early setups, but the code should only emit probability claims that are supported by closed-window evidence and adequate sample size.
+
+## Tracking Note
+
+Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
+Covers: scripts/squeeze_calibration.py with --backfill and --create-approval flags, hit-rate breakdown by state/score/SI/DTC buckets.
+Status: implemented and on main, but calibration requires adequate closed-window history to produce meaningful output.
+Action required: run calibration script after sufficient squeeze_training_outcomes rows have accumulated; review probability output before moving to finished.

@@ -1,7 +1,7 @@
 # Task: Squeeze Alert Outcome Taxonomy
 
 Status: implemented
-Stage: in progress
+Stage: awaiting QA
 Type: feature
 Priority: P1
 Severity: high
@@ -108,3 +108,10 @@ This task operationalizes the PM review framework:
 3. false positive
 
 Without these labels persisted in the database, Claude can report on past behavior but cannot cleanly train or recalibrate future squeeze logic from a stable taxonomy.
+
+## Tracking Note
+
+Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
+Covers: compute_taxonomy_label() in backtest.py, EARLY_ENOUGH / LATE_CHASE / FALSE_POSITIVE labels, hit_15pct_10d and hit_25pct_20d binary flags.
+Status: implemented and on main, but taxonomy labels accumulate over time as squeeze outcomes close.
+Action required: verify taxonomy labels are being written correctly to squeeze_training_outcomes in the live pipeline before moving to finished.

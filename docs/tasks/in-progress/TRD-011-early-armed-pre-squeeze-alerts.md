@@ -1,7 +1,7 @@
 # Task: Early Armed Pre-Squeeze Alerts
 
 Status: implemented
-Stage: in progress
+Stage: awaiting QA
 Type: feature
 Priority: P0
 Severity: high
@@ -116,3 +116,10 @@ The current PM takeaway should be preserved in implementation:
 - `EARLY_ARMED` and secondarily `ARMED` are the primary entry-hunting states
 - `ACTIVE_SQUEEZE` is primarily a continuation / chase-risk / management state
 - `DDD` on May 11, 2026 is the cleanest profitable reference case, but still later than the desired first setup detection
+
+## Tracking Note
+
+Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
+Covers: EARLY_ARMED lifecycle state, DDD fixture proof, new EARLY_ARMED_ALERT type, ACTIVE_SQUEEZE chase-risk copy.
+Status: implemented and on main, but no formal QA sign-off recorded.
+Action required: human QA review of EARLY_ARMED trigger thresholds and alert content before moving to finished.
