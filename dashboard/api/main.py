@@ -3094,20 +3094,43 @@ async def watch_setup_alerts():
         alerts = []
 
         conn = _db_connect()
+
+        def _columns(table: str) -> set[str]:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = %s
+                    """,
+                    (table,),
+                ).fetchall()
+                return {r["column_name"] for r in rows}
+            except Exception:
+                return set()
+
+        cs_cols = _columns("catalyst_scores")
+        raw_expr = "COALESCE(cs.raw_composite, cs.composite)" if "raw_composite" in cs_cols else "cs.composite"
+        earnings_select = "cs.earnings_score" if "earnings_score" in cs_cols else "0.0 AS earnings_score"
+        post_guard_select = "cs.post_squeeze_guard" if "post_squeeze_guard" in cs_cols else "FALSE AS post_squeeze_guard"
+        days_select = "cs.days_to_earnings" if "days_to_earnings" in cs_cols else "NULL::integer AS days_to_earnings"
+        earnings_filter = "AND cs.earnings_score >= 2" if "earnings_score" in cs_cols else ""
+
         rows = conn.execute(
-            """
+            f"""
             SELECT cs.ticker,
                    cs.composite,
-                   COALESCE(cs.raw_composite, cs.composite) AS raw_composite,
+                   {raw_expr} AS raw_composite,
                    cs.options_score,
                    cs.volume_score,
                    cs.technical_score,
                    cs.dark_pool_score,
                    cs.dark_pool_signal,
-                   cs.earnings_score,
-                   cs.post_squeeze_guard,
+                   {earnings_select},
+                   {post_guard_select},
                    cs.price,
-                   cs.days_to_earnings,
+                   {days_select},
                    tc.direction AS thesis_direction,
                    tc.entry_low,
                    tc.entry_high
@@ -3125,8 +3148,8 @@ async def watch_setup_alerts():
                  OR cs.volume_score  >= 3
                  OR cs.dark_pool_signal = 'ACCUMULATION'
               )
-              AND cs.earnings_score >= 2
-            ORDER BY COALESCE(cs.raw_composite, cs.composite) DESC
+              {earnings_filter}
+            ORDER BY {raw_expr} DESC
             LIMIT 20
             """,
             (today,),
@@ -3231,27 +3254,48 @@ async def pattern_watch():
         today = datetime.now().strftime("%Y-%m-%d")
         conn  = _db_connect()
 
+        def _columns(table: str) -> set[str]:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = %s
+                    """,
+                    (table,),
+                ).fetchall()
+                return {r["column_name"] for r in rows}
+            except Exception:
+                return set()
+
+        cs_cols = _columns("catalyst_scores")
+        raw_expr = "COALESCE(raw_composite, composite)" if "raw_composite" in cs_cols else "composite"
+        earnings_select = "earnings_score" if "earnings_score" in cs_cols else "0.0 AS earnings_score"
+        post_guard_select = "post_squeeze_guard" if "post_squeeze_guard" in cs_cols else "FALSE AS post_squeeze_guard"
+        days_select = "days_to_earnings" if "days_to_earnings" in cs_cols else "NULL::integer AS days_to_earnings"
+
         cs_rows = conn.execute(
-            """
+            f"""
             SELECT ticker,
                    composite,
-                   COALESCE(raw_composite, composite) AS raw_composite,
+                   {raw_expr} AS raw_composite,
                    options_score,
                    volume_score,
                    technical_score,
                    dark_pool_score,
                    dark_pool_signal,
-                   earnings_score,
-                   post_squeeze_guard,
+                   {earnings_select},
+                   {post_guard_select},
                    price,
-                   days_to_earnings
+                   {days_select}
             FROM   catalyst_scores
             WHERE  date = %s
               AND  ticker NOT IN (
                        SELECT ticker FROM blacklist
                        WHERE  expires_at IS NULL OR expires_at > NOW()
                    )
-            ORDER  BY COALESCE(raw_composite, composite) DESC
+            ORDER  BY {raw_expr} DESC
             LIMIT  60
             """,
             (today,),
