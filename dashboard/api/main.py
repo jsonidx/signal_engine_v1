@@ -3284,12 +3284,14 @@ async def pattern_watch():
                 "fresh_catalyst_breakout",
                 "catalyst_price_expansion",
                 "early_momentum_breakout",
+                "news_catalyst",
                 "breakout",
             ))
             has_volume = any(k in reason for k in (
                 "catalyst_price_expansion",
                 "volume",
                 "breakout",
+                "news_catalyst",
             ))
             return {
                 "ticker": snap["ticker"],
@@ -3313,6 +3315,7 @@ async def pattern_watch():
                 "fresh_catalyst_breakout",
                 "catalyst_price_expansion",
                 "early_momentum_breakout",
+                "news_catalyst",
             ))
 
         candidates = []

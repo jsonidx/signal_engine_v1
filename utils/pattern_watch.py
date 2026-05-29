@@ -92,7 +92,8 @@ def _crsr_score(cs: dict, snap: Optional[dict]) -> tuple[int, list[str]]:
 
     catalyst_kws = [
         "fresh_catalyst_breakout", "catalyst_price_expansion",
-        "early_momentum_breakout", "catalyst", "breakout",
+        "early_momentum_breakout", "news_catalyst",
+        "catalyst", "breakout",
     ]
     has_catalyst = any(kw in selection_reason for kw in catalyst_kws)
 

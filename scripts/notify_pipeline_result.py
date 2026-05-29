@@ -169,7 +169,8 @@ def fetch_catalyst_watch_candidates(conn) -> list[dict]:
                     ON  dr.ticker   = cs.ticker
                     AND dr.run_date = (SELECT MAX(run_date) FROM daily_rankings)
                 WHERE  cs.run_date   = (SELECT MAX(run_date) FROM candidate_snapshots)
-                  AND  cs.selection_reason ILIKE '%fresh_catalyst_breakout%'
+                  AND  (cs.selection_reason ILIKE '%fresh_catalyst_breakout%'
+                        OR cs.selection_reason ILIKE '%NEWS_CATALYST%')
                 ORDER  BY cs.priority_score DESC NULLS LAST
             """)
             snapshot_rows = [dict(r) for r in cur.fetchall()]

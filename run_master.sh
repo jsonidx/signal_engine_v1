@@ -170,6 +170,22 @@ python3 conflict_resolver.py --pre-resolve --output data/resolved_signals.json
 step_end "Step 12: Conflict resolver"
 echo ""
 
+# ── Step 12b: News catalyst scanner (optional, zero AI cost) ─────────────────
+# Controlled by ENABLE_NEWS_CATALYST_SCANNER=true in environment or .env.
+# Fetches free RSS headlines, classifies with keyword rules, queues eligible
+# tickers into event_queue for Pattern Watch and Telegram.  Safe to skip —
+# failure does NOT abort the pipeline.
+if [ "${ENABLE_NEWS_CATALYST_SCANNER:-false}" = "true" ]; then
+  echo "Step 12b: Running news catalyst scanner (ENABLE_NEWS_CATALYST_SCANNER=true)..."
+  step_start
+  python3 utils/news_catalyst_scanner.py --max-tickers 200 --max-headlines-per-ticker 5 --cache-hours 6 || {
+    echo "  Step 12b: news catalyst scanner failed — continuing pipeline" >&2
+    echo "STEP_12B_NEWS_SCANNER: FAILED" >> "$PIPELINE_ERRORS_LOG"
+  }
+  step_end "Step 12b: News catalyst scanner"
+  echo ""
+fi
+
 # ── Step 13: AI Quant synthesis ───────────────────────────
 # Results saved to ai_quant_cache.db — dashboard reads via /api/signals/thesis.
 # Open positions are read dynamically from trade_journal.db at runtime.
