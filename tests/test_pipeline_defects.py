@@ -1029,5 +1029,237 @@ class TestEventQueueIntegration(unittest.TestCase):
         self.assertIn("CATALYST_PRICE_EXPANSION", crsr_entry["selection_reason"])
 
 
+# ==============================================================================
+# TRD-010 — Telegram Catalyst Watch Section Tests
+# ==============================================================================
+
+class TestTelegramCatalystWatchSection(unittest.TestCase):
+    """
+    Tests for build_catalyst_watch_section() and fetch_catalyst_watch_candidates()
+    in scripts/notify_pipeline_result.py.
+
+    All tests use only static data — no live DB or Telegram calls.
+    """
+
+    def _import(self):
+        from scripts.notify_pipeline_result import (
+            build_catalyst_watch_section,
+            fetch_catalyst_watch_candidates,
+        )
+        return build_catalyst_watch_section, fetch_catalyst_watch_candidates
+
+    # ── build_catalyst_watch_section ──────────────────────────────────────────
+
+    def test_empty_candidates_returns_empty_string(self):
+        """No candidates → section is omitted (empty string)."""
+        build_section, _ = self._import()
+        result = build_section([])
+        self.assertEqual(result, "", "Empty candidate list must return empty string")
+
+    def test_queued_not_analyzed_appears_in_section(self):
+        """A ticker queued but without a thesis shows 📋 watch."""
+        build_section, _ = self._import()
+        candidates = [
+            {"ticker": "CRSR", "reason": "CATALYST_PRICE_EXPANSION",
+             "rank": None, "has_thesis": False},
+        ]
+        result = build_section(candidates)
+        self.assertIn("CRSR", result)
+        self.assertIn("CATALYST_PRICE_EXPANSION", result)
+        self.assertIn("📋", result, "Queued-only ticker must show watch icon")
+        self.assertNotIn("✅", result, "No thesis icon for unanalyzed ticker")
+
+    def test_queued_and_analyzed_marked_with_thesis(self):
+        """A ticker that got a thesis this run shows ✅ thesis."""
+        build_section, _ = self._import()
+        candidates = [
+            {"ticker": "MSTR", "reason": "EARLY_MOMENTUM_BREAKOUT",
+             "rank": 3, "has_thesis": True},
+        ]
+        result = build_section(candidates)
+        self.assertIn("MSTR", result)
+        self.assertIn("✅", result, "Analyzed ticker must show thesis icon")
+        self.assertIn("#3", result, "Rank must appear when available")
+
+    def test_section_header_present(self):
+        """Section always contains CATALYST WATCH header."""
+        build_section, _ = self._import()
+        result = build_section([
+            {"ticker": "X", "reason": "EARLY_MOMENTUM_BREAKOUT",
+             "rank": None, "has_thesis": False},
+        ])
+        self.assertIn("CATALYST WATCH", result)
+
+    def test_not_a_buy_signal_disclaimer_present(self):
+        """Section must contain the 'not a buy signal' disclaimer."""
+        build_section, _ = self._import()
+        result = build_section([
+            {"ticker": "X", "reason": "EARLY_MOMENTUM_BREAKOUT",
+             "rank": None, "has_thesis": False},
+        ])
+        self.assertIn("Not a buy signal", result)
+
+    def test_multiple_candidates_deterministic_order(self):
+        """Multiple candidates appear in rank-then-ticker order."""
+        build_section, _ = self._import()
+        candidates = [
+            {"ticker": "ZZZ", "reason": "CATALYST_PRICE_EXPANSION", "rank": 5,  "has_thesis": False},
+            {"ticker": "AAA", "reason": "EARLY_MOMENTUM_BREAKOUT",  "rank": 2,  "has_thesis": True},
+            {"ticker": "MMM", "reason": "CATALYST_PRICE_EXPANSION", "rank": None, "has_thesis": False},
+        ]
+        result = build_section(candidates)
+        # AAA (rank 2) should come before ZZZ (rank 5) which comes before MMM (no rank)
+        pos_aaa = result.index("AAA")
+        pos_zzz = result.index("ZZZ")
+        pos_mmm = result.index("MMM")
+        self.assertLess(pos_aaa, pos_zzz, "Rank #2 must appear before rank #5")
+        self.assertLess(pos_zzz, pos_mmm, "Ranked tickers must appear before unranked")
+
+    def test_section_fits_within_tg_chunk_limit(self):
+        """A section with 10 candidates must fit within TG_LIMIT (4000 chars)."""
+        from scripts.notify_pipeline_result import TG_LIMIT
+        build_section, _ = self._import()
+        candidates = [
+            {"ticker": f"T{i:02d}", "reason": "EARLY_MOMENTUM_BREAKOUT,CATALYST_PRICE_EXPANSION",
+             "rank": i, "has_thesis": i % 2 == 0}
+            for i in range(1, 11)
+        ]
+        result = build_section(candidates)
+        self.assertLessEqual(len(result), TG_LIMIT,
+                             f"Section too long ({len(result)} chars) for TG_LIMIT={TG_LIMIT}")
+
+    def test_no_hot_entry_label_in_section(self):
+        """Catalyst watch section must never contain the words 'Hot Entry'."""
+        build_section, _ = self._import()
+        result = build_section([
+            {"ticker": "CRSR", "reason": "CATALYST_PRICE_EXPANSION",
+             "rank": 1, "has_thesis": True},
+        ])
+        self.assertNotIn("Hot Entry", result,
+                         "Catalyst watch must not use Hot Entry label")
+
+    # ── fetch_catalyst_watch_candidates (mocked DB) ───────────────────────────
+
+    def _make_mock_conn(self, snapshot_rows, thesis_tickers=None):
+        """
+        Build a mock psycopg2 connection whose cursor().fetchall() returns
+        snapshot_rows on the first call and thesis rows on the second.
+        """
+        conn   = MagicMock()
+        cur    = MagicMock()
+        conn.cursor.return_value = cur
+
+        # First fetchall: candidate_snapshots result
+        # Second fetchall: thesis_cache result (which tickers have theses)
+        thesis_rows = [{"ticker": t} for t in (thesis_tickers or [])]
+        cur.fetchall.side_effect = [snapshot_rows, thesis_rows]
+        return conn
+
+    def test_fetch_returns_queued_only_ticker(self):
+        """A snapshot row with fresh_catalyst_breakout and no thesis returns has_thesis=False."""
+        _, fetch = self._import()
+        snapshot = [
+            {
+                "ticker": "CRSR",
+                "selection_reason": "fresh_catalyst_breakout | CATALYST_PRICE_EXPANSION",
+                "priority_score": 0.62,
+                "rank": None,
+            }
+        ]
+        conn = self._make_mock_conn(snapshot, thesis_tickers=[])
+        result = fetch(conn)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ticker"], "CRSR")
+        self.assertEqual(result[0]["reason"], "CATALYST_PRICE_EXPANSION")
+        self.assertFalse(result[0]["has_thesis"])
+
+    def test_fetch_marks_thesis_written(self):
+        """A snapshot row whose ticker appears in thesis_cache shows has_thesis=True."""
+        _, fetch = self._import()
+        snapshot = [
+            {
+                "ticker": "MSTR",
+                "selection_reason": "fresh_catalyst_breakout | EARLY_MOMENTUM_BREAKOUT",
+                "priority_score": 0.55,
+                "rank": 4,
+            }
+        ]
+        conn = self._make_mock_conn(snapshot, thesis_tickers=["MSTR"])
+        result = fetch(conn)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["has_thesis"])
+        self.assertEqual(result[0]["rank"], 4)
+
+    def test_fetch_returns_empty_when_no_snapshot_rows(self):
+        """No fresh_catalyst_breakout rows in candidate_snapshots → empty list."""
+        _, fetch = self._import()
+        conn = self._make_mock_conn([], thesis_tickers=[])
+        result = fetch(conn)
+        self.assertEqual(result, [])
+
+    def test_fetch_fallback_to_event_queue_json(self):
+        """
+        When DB returns no snapshot rows, fetch falls back to event_queue.json
+        via get_all_pending().
+        """
+        _, fetch = self._import()
+        conn = self._make_mock_conn([], thesis_tickers=[])
+
+        eq_entry = {
+            "ticker": "CRSR",
+            "reason": "CATALYST_PRICE_EXPANSION",
+            "score": 0.62,
+            "source_fields": {},
+            "queued_at": "2026-05-29T10:00:00+00:00",
+        }
+        with patch("utils.event_queue.get_all_pending", return_value=[eq_entry]):
+            result = fetch(conn)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ticker"], "CRSR")
+        self.assertEqual(result[0]["reason"], "CATALYST_PRICE_EXPANSION")
+        self.assertIsNone(result[0]["rank"])
+
+    def test_fetch_deduplicates_event_queue_by_ticker(self):
+        """Duplicate ticker entries in event_queue.json are collapsed to one."""
+        _, fetch = self._import()
+        conn = self._make_mock_conn([], thesis_tickers=[])
+
+        eq_entries = [
+            {"ticker": "CRSR", "reason": "EARLY_MOMENTUM_BREAKOUT", "score": 0.5,
+             "source_fields": {}, "queued_at": "2026-05-29T09:00:00+00:00"},
+            {"ticker": "CRSR", "reason": "CATALYST_PRICE_EXPANSION", "score": 0.6,
+             "source_fields": {}, "queued_at": "2026-05-29T10:00:00+00:00"},
+        ]
+        with patch("utils.event_queue.get_all_pending", return_value=eq_entries):
+            result = fetch(conn)
+
+        crsr_entries = [r for r in result if r["ticker"] == "CRSR"]
+        self.assertEqual(len(crsr_entries), 1, "CRSR must appear exactly once")
+
+    def test_full_message_contains_catalyst_section(self):
+        """
+        Integration: when build_catalyst_watch_section returns content, the full
+        Telegram message assembles it between thesis and squeeze sections.
+        """
+        from scripts.notify_pipeline_result import build_catalyst_watch_section
+        candidates = [
+            {"ticker": "CRSR", "reason": "CATALYST_PRICE_EXPANSION",
+             "rank": None, "has_thesis": False},
+        ]
+        section = build_catalyst_watch_section(candidates)
+        self.assertIn("CATALYST WATCH", section)
+        self.assertIn("CRSR", section)
+
+        # Simulate message assembly using filter(None, [...])
+        header   = "header"
+        thesis   = "thesis section"
+        squeeze  = "squeeze section"
+        full     = "\n".join(filter(None, [header, thesis, section, squeeze]))
+        # Verify correct ordering: thesis before catalyst, catalyst before squeeze
+        self.assertLess(full.index("thesis"), full.index("CATALYST WATCH"))
+        self.assertLess(full.index("CATALYST WATCH"), full.index("squeeze"))
+
+
 if __name__ == "__main__":
     unittest.main()

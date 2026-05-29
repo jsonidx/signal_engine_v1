@@ -136,6 +136,112 @@ def _safe_int(v) -> Optional[int]:
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
 
+def fetch_catalyst_watch_candidates(conn) -> list[dict]:
+    """
+    Return event-queue catalyst-watch candidates from the most recent run.
+
+    Sources (priority order):
+      1. candidate_snapshots WHERE selection_reason LIKE '%fresh_catalyst_breakout%'
+         — populated by run_master.sh Step 13a via archive_candidates().
+      2. event_queue.json fallback — used when DB has no fresh snapshot yet.
+
+    Each returned dict has:
+      ticker      : str
+      reason      : str  — catalyst tag(s), e.g. "CATALYST_PRICE_EXPANSION"
+      rank        : int | None  — from daily_rankings if available
+      has_thesis  : bool — whether thesis_cache has an entry for today
+
+    Ordered by priority_score DESC (snapshots) or as-queued (fallback).
+    """
+    today    = date.today().isoformat()
+    rows_out: list[dict] = []
+
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT cs.ticker,
+                       cs.selection_reason,
+                       cs.priority_score,
+                       dr.rank
+                FROM   candidate_snapshots cs
+                LEFT JOIN daily_rankings dr
+                    ON  dr.ticker   = cs.ticker
+                    AND dr.run_date = (SELECT MAX(run_date) FROM daily_rankings)
+                WHERE  cs.run_date   = (SELECT MAX(run_date) FROM candidate_snapshots)
+                  AND  cs.selection_reason ILIKE '%fresh_catalyst_breakout%'
+                ORDER  BY cs.priority_score DESC NULLS LAST
+            """)
+            snapshot_rows = [dict(r) for r in cur.fetchall()]
+
+            if snapshot_rows:
+                # Check which tickers received a thesis today
+                tickers = [r["ticker"] for r in snapshot_rows]
+                cur.execute(
+                    "SELECT ticker FROM thesis_cache WHERE date = %s AND ticker = ANY(%s)",
+                    (today, tickers),
+                )
+                analyzed = {r["ticker"] for r in cur.fetchall()}
+
+                for row in snapshot_rows:
+                    ticker = row["ticker"]
+                    reason = row.get("selection_reason") or ""
+                    # Extract the tag portion after the "fresh_catalyst_breakout | " prefix
+                    tag_str = reason.split("|", 1)[-1].strip() if "|" in reason else reason
+                    rows_out.append({
+                        "ticker":     ticker,
+                        "reason":     tag_str,
+                        "rank":       row.get("rank"),
+                        "has_thesis": ticker in analyzed,
+                    })
+                return rows_out
+        except Exception as exc:
+            print(f"[notify] fetch_catalyst_watch_candidates (DB) failed: {exc}", file=sys.stderr)
+
+    # Fallback: read directly from event_queue.json
+    try:
+        from utils.event_queue import get_all_pending
+        eq_entries = get_all_pending(max_age_days=2)
+        if not eq_entries:
+            return []
+
+        # De-duplicate by ticker (keep first occurrence — highest priority)
+        seen: set = set()
+        deduped = []
+        for entry in eq_entries:
+            t = (entry.get("ticker") or "").upper()
+            if t and t not in seen:
+                seen.add(t)
+                deduped.append(entry)
+
+        # Check which tickers received a thesis today (if DB still available)
+        analyzed: set = set()
+        if conn:
+            try:
+                tickers = [e["ticker"] for e in deduped]
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT ticker FROM thesis_cache WHERE date = %s AND ticker = ANY(%s)",
+                    (today, tickers),
+                )
+                analyzed = {r["ticker"] for r in cur.fetchall()}
+            except Exception:
+                pass
+
+        for entry in deduped:
+            t = entry.get("ticker", "").upper()
+            rows_out.append({
+                "ticker":     t,
+                "reason":     entry.get("reason", ""),
+                "rank":       None,
+                "has_thesis": t in analyzed,
+            })
+    except Exception as exc:
+        print(f"[notify] fetch_catalyst_watch_candidates (fallback) failed: {exc}", file=sys.stderr)
+
+    return rows_out
+
+
 def fetch_top10_rankings(conn) -> list[dict]:
     """Return today's top-10 from daily_rankings (latest run_date)."""
     try:
@@ -344,6 +450,37 @@ def build_thesis_section(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_catalyst_watch_section(candidates: list[dict]) -> str:
+    """
+    Build a compact 'Catalyst Watch' Telegram section.
+
+    Each line: ticker  catalyst_tag(s)  rank  thesis-status
+    Returns empty string when candidates is empty — caller omits the section.
+    These are watch/setup candidates, NOT buy signals.
+    """
+    if not candidates:
+        return ""
+
+    lines = ["\n<b>── CATALYST WATCH ──</b>"]
+    lines.append("<i>Early momentum / catalyst setups queued for Deep Dive.</i>")
+
+    for c in sorted(candidates, key=lambda x: (x.get("rank") or 9999, x["ticker"])):
+        ticker     = c.get("ticker", "?")
+        reason     = c.get("reason", "")
+        rank       = c.get("rank")
+        has_thesis = c.get("has_thesis", False)
+
+        rank_str   = f"#{rank}" if rank is not None else "—"
+        status_str = "✅ thesis" if has_thesis else "📋 watch"
+
+        lines.append(
+            f"• <b>{ticker}</b>  <code>{reason}</code>  {rank_str}  {status_str}"
+        )
+
+    lines.append("<i>Not a buy signal — queued for review only.</i>")
+    return "\n".join(lines)
+
+
 # ── Squeeze lifecycle alerts (CHUNK-15) ──────────────────────────────────────
 
 def _fetch_two_latest_squeeze_dates(conn) -> tuple[str | None, str | None]:
@@ -464,8 +601,9 @@ def main() -> None:
         duration_min=args.duration_min,
     )
 
-    rankings_section = ""
-    thesis_section   = ""
+    rankings_section       = ""
+    thesis_section         = ""
+    catalyst_watch_section = ""
     squeeze_alerts_section = ""
 
     if conn:
@@ -481,6 +619,10 @@ def main() -> None:
         else:
             thesis_section = "\n<i>AI synthesis skipped (--skip-ai run).</i>"
 
+        # Event-queue catalyst-watch candidates
+        catalyst_candidates    = fetch_catalyst_watch_candidates(conn)
+        catalyst_watch_section = build_catalyst_watch_section(catalyst_candidates)
+
         # CHUNK-15: squeeze lifecycle alerts
         squeeze_alerts_section = build_squeeze_alerts_section(conn)
 
@@ -488,9 +630,16 @@ def main() -> None:
     else:
         rankings_section = "\n⚠️ Could not connect to database — no ranking data."
         thesis_section   = ""
+        # Still attempt event_queue.json fallback (no DB needed)
+        try:
+            catalyst_candidates    = fetch_catalyst_watch_candidates(None)
+            catalyst_watch_section = build_catalyst_watch_section(catalyst_candidates)
+        except Exception:
+            catalyst_watch_section = ""
 
     full_message = "\n".join(filter(None, [
-        header, rankings_section, thesis_section, squeeze_alerts_section,
+        header, rankings_section, thesis_section,
+        catalyst_watch_section, squeeze_alerts_section,
     ]))
 
     # ── Send ──────────────────────────────────────────────────────────────────
