@@ -1105,6 +1105,7 @@ const LLM_OPTIONS = [
   { value: 'grok',         label: 'Grok (fast)',    desc: 'xAI Grok — daily driver' },
   { value: 'grok-premium', label: 'Grok Premium',   desc: 'xAI Grok premium — 3× cost' },
   { value: 'claude',       label: 'Claude Sonnet',  desc: 'Anthropic Claude Sonnet' },
+  { value: 'chatgpt',      label: 'ChatGPT o3',     desc: 'OpenAI o3' },
 ] as const
 
 type LLMChoice = typeof LLM_OPTIONS[number]['value']

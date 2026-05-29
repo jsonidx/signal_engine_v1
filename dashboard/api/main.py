@@ -5840,13 +5840,13 @@ SETTINGS_SCHEMA = [
     # ── AI Analysis ───────────────────────────────────────────────────────────
     ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
      "Model used for all standard ai_quant runs",
-     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6"]),
+     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "o3"]),
     ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.20-0309-reasoning",
      "Model used for high-conviction / manual deep-dive re-runs",
-     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "claude-opus-4-7"]),
+     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "claude-opus-4-7", "o3"]),
     ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
      "Retry model if primary call fails",
-     ["grok-4-1-fast-reasoning", "claude-sonnet-4-6"]),
+     ["grok-4-1-fast-reasoning", "claude-sonnet-4-6", "o3"]),
     ("ai_min_conviction_score","Min Conviction Score",     "AI Analysis",   "number",  "13",
      "Minimum composite catalyst score for a ticker to qualify for AI analysis (0–100)"),
     # ── Calibration ───────────────────────────────────────────────────────────
