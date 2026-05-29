@@ -17,6 +17,7 @@ on:
 # Opt into Node.js 24 now to avoid the June 2026 forced migration.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ENABLE_NEWS_CATALYST_SCANNER: "true"
 
 jobs:
   run-pipeline:
