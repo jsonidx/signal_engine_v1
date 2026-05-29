@@ -942,6 +942,27 @@ function buildPrompt(
     lines.push(``)
   }
 
+  // ── Catalyst Screener Events ──
+  const ce = signal.catalyst_events
+  if (ce && Object.keys(ce).length > 0) {
+    lines.push(`## CATALYST SCREENER`)
+    if (ce.composite        != null) lines.push(`Composite Score:    ${ce.composite.toFixed(2)}`)
+    if (ce.technical_score  != null) lines.push(`Technical Score:    ${ce.technical_score.toFixed(2)}`)
+    if (ce.volume_score     != null) lines.push(`Volume Score:       ${ce.volume_score.toFixed(2)}`)
+    if (ce.options_score    != null) lines.push(`Options Score:      ${ce.options_score.toFixed(2)}`)
+    if (ce.earnings_score   != null) lines.push(`Earnings Score:     ${ce.earnings_score.toFixed(2)}`)
+    if (ce.analyst_score    != null) lines.push(`Analyst Score:      ${ce.analyst_score.toFixed(2)}`)
+    if (ce.social_score     != null) lines.push(`Social Score:       ${ce.social_score.toFixed(2)}`)
+    if (ce.dark_pool_score  != null) lines.push(`DP Score:           ${ce.dark_pool_score.toFixed(2)}  ${ce.dark_pool_signal ?? ''}`.trimEnd())
+    if (ce.days_to_earnings != null) lines.push(`Days to Earnings:   ${ce.days_to_earnings}`)
+    if (ce.n_flags          != null) lines.push(`Flag Count:         ${ce.n_flags}`)
+    if (ce.short_pct        != null) lines.push(`Short %:            ${ce.short_pct.toFixed(1)}%`)
+    if (ce.post_squeeze_guard)       lines.push(`Post-Squeeze Guard: YES (squeeze recently fired — catalyst may be exhausted)`)
+    if (ce.selection_reason)         lines.push(`Selection Reason:   ${ce.selection_reason}`)
+    if (ce.priority_score   != null) lines.push(`Priority Score:     ${ce.priority_score.toFixed(3)}`)
+    lines.push(``)
+  }
+
   // ── Earnings ──
   if (earningsData) {
     lines.push(`## EARNINGS`)

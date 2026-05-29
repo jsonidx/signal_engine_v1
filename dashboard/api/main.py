@@ -1502,6 +1502,66 @@ async def signals_ticker(ticker: str):
         result["analyst_count"]  = fund.get("analyst_count")
         result["analyst_rating"] = fund.get("analyst_rating")
 
+        # ── Catalyst screener events ───────────────────────────────────────────
+        try:
+            cs_conn = _db_connect()
+            if cs_conn is not None:
+                cs_cols = _columns("catalyst_scores")
+                earnings_sel  = "earnings_score"  if "earnings_score"  in cs_cols else "0.0 AS earnings_score"
+                days_sel      = "days_to_earnings" if "days_to_earnings" in cs_cols else "NULL::integer AS days_to_earnings"
+                post_guard_sel= "post_squeeze_guard" if "post_squeeze_guard" in cs_cols else "FALSE AS post_squeeze_guard"
+                analyst_sel   = "analyst_score"   if "analyst_score"   in cs_cols else "NULL::real AS analyst_score"
+
+                cs_row = cs_conn.execute(
+                    f"""
+                    SELECT composite, raw_composite, options_score, volume_score,
+                           technical_score, social_score, dark_pool_score,
+                           dark_pool_signal, {earnings_sel}, {days_sel},
+                           {post_guard_sel}, {analyst_sel}, n_flags, short_pct
+                    FROM   catalyst_scores
+                    WHERE  ticker = %s
+                    ORDER  BY date DESC LIMIT 1
+                    """,
+                    (ticker,),
+                ).fetchone()
+
+                snap_row = cs_conn.execute(
+                    """
+                    SELECT selection_reason, priority_score
+                    FROM   candidate_snapshots
+                    WHERE  ticker = %s
+                      AND  run_date = (SELECT MAX(run_date) FROM candidate_snapshots)
+                    LIMIT 1
+                    """,
+                    (ticker,),
+                ).fetchone()
+                cs_conn.close()
+
+                catalyst_events: dict = {}
+                if cs_row:
+                    catalyst_events = {
+                        "composite":        _safe_float(cs_row.get("composite")),
+                        "options_score":    _safe_float(cs_row.get("options_score")),
+                        "volume_score":     _safe_float(cs_row.get("volume_score")),
+                        "technical_score":  _safe_float(cs_row.get("technical_score")),
+                        "social_score":     _safe_float(cs_row.get("social_score")),
+                        "dark_pool_score":  _safe_float(cs_row.get("dark_pool_score")),
+                        "dark_pool_signal": cs_row.get("dark_pool_signal"),
+                        "earnings_score":   _safe_float(cs_row.get("earnings_score")),
+                        "days_to_earnings": cs_row.get("days_to_earnings"),
+                        "analyst_score":    _safe_float(cs_row.get("analyst_score")),
+                        "n_flags":          cs_row.get("n_flags"),
+                        "short_pct":        _safe_float(cs_row.get("short_pct")),
+                        "post_squeeze_guard": bool(cs_row.get("post_squeeze_guard")),
+                    }
+                if snap_row:
+                    catalyst_events["selection_reason"] = snap_row.get("selection_reason")
+                    catalyst_events["priority_score"]   = _safe_float(snap_row.get("priority_score"))
+                result["catalyst_events"] = catalyst_events or None
+        except Exception:
+            log.exception("catalyst_events lookup failed for %s", ticker)
+            result["catalyst_events"] = None
+
         # ── ADV 20d (average daily volume, 20-day) — live yfinance, cached ────
         adv_cache_key = f"adv_20d:{ticker}"
         adv_cached = _cache.get(adv_cache_key)

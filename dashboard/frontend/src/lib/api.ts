@@ -182,6 +182,26 @@ export interface TickerDetail extends TickerSignal {
   analyst_rating?: number | null
   // Volume
   adv_20d?: number | null
+  // Catalyst screener events
+  catalyst_events?: CatalystEvents | null
+}
+
+export interface CatalystEvents {
+  composite?: number | null
+  options_score?: number | null
+  volume_score?: number | null
+  technical_score?: number | null
+  social_score?: number | null
+  dark_pool_score?: number | null
+  dark_pool_signal?: string | null
+  earnings_score?: number | null
+  days_to_earnings?: number | null
+  analyst_score?: number | null
+  n_flags?: number | null
+  short_pct?: number | null
+  post_squeeze_guard?: boolean | null
+  selection_reason?: string | null
+  priority_score?: number | null
 }
 
 export interface ExpectedMove {
