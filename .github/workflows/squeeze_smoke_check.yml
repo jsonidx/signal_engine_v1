@@ -11,9 +11,6 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-permissions:
-  contents: write
-
 jobs:
   smoke-check:
     # Only run when the daily pipeline succeeded — no point checking broken data
