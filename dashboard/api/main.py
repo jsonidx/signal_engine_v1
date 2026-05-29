@@ -4455,8 +4455,8 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
                 est_model = AI_MODEL_DEFAULT
                 est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
         except Exception:
-            est_model = {"grok-premium": "grok-4.20-0309-reasoning", "claude": "claude-sonnet-4-6", "chatgpt": "o3"}.get(llm, "grok-4-1-fast-reasoning")
-            est_cost  = {"grok-premium": 0.027, "claude": 0.012, "chatgpt": 0.015}.get(llm, 0.009)
+            est_model = {"grok-premium": "grok-4.3", "claude": "claude-opus-4-8", "chatgpt": "gpt-5.1"}.get(llm, "grok-4.3")
+            est_cost  = {"grok-premium": 0.027, "claude": 0.015, "chatgpt": 0.020}.get(llm, 0.012)
         return {
             "status": "running", "symbol": sym, "started_at": started, "pid": proc.pid,
             "estimated_model": est_model, "estimated_cost": est_cost, "llm": llm,
@@ -5838,15 +5838,15 @@ async def thesis_benchmark(days: int = 90):
 SETTINGS_SCHEMA = [
     # key, label, group, type, default, description, options (for select)
     # ── AI Analysis ───────────────────────────────────────────────────────────
-    ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
+    ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for all standard ai_quant runs",
-     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "o3"]),
-    ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.20-0309-reasoning",
+     ["grok-4.3", "grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "gpt-5.1", "gpt-5.5", "claude-opus-4-8", "claude-sonnet-4-6"]),
+    ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for high-conviction / manual deep-dive re-runs",
-     ["grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "claude-sonnet-4-6", "claude-opus-4-7", "o3"]),
-    ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4-1-fast-reasoning",
+     ["grok-4.3", "gpt-5.5", "gpt-5.1", "claude-opus-4-8", "claude-sonnet-4-6", "grok-4.20-0309-reasoning"]),
+    ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4.3",
      "Retry model if primary call fails",
-     ["grok-4-1-fast-reasoning", "claude-sonnet-4-6", "o3"]),
+     ["grok-4.3", "gpt-5.1", "claude-sonnet-4-6", "grok-4-1-fast-reasoning"]),
     ("ai_min_conviction_score","Min Conviction Score",     "AI Analysis",   "number",  "13",
      "Minimum composite catalyst score for a ticker to qualify for AI analysis (0–100)"),
     # ── Calibration ───────────────────────────────────────────────────────────

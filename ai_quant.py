@@ -99,9 +99,9 @@ except ImportError:
     _CONFIG_NAV = 50_000
     CRYPTO_ALLOCATION = 0.25
     EQUITY_ALLOCATION = 0.65
-    AI_MODEL_DEFAULT   = "grok-4-1-fast-reasoning"
-    AI_MODEL_PREMIUM   = "grok-4.20-0309-reasoning"
-    AI_MODEL_FALLBACK  = "grok-4-1-fast-reasoning"
+    AI_MODEL_DEFAULT   = "grok-4.3"
+    AI_MODEL_PREMIUM   = "grok-4.3"
+    AI_MODEL_FALLBACK  = "grok-4.3"
     AI_PREMIUM_THRESHOLD = 0.85
 
 try:
@@ -2676,7 +2676,7 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
 
 
 def _call_anthropic(prompt: str, verbose: bool = False,
-                    model: str = "claude-sonnet-4-6") -> Optional[str]:
+                    model: str = "claude-opus-4-8") -> Optional[str]:
     """
     Call Anthropic Claude API (non-streaming).
 
@@ -2729,7 +2729,7 @@ def _notify_openai_credits_exhausted() -> None:
 
 
 def _call_openai(prompt: str, verbose: bool = False,
-                 model: str = "o3") -> Optional[str]:
+                 model: str = "gpt-5.1") -> Optional[str]:
     """
     Call OpenAI ChatGPT API (OpenAI-compatible).
 
@@ -3747,10 +3747,10 @@ def main():
         return
 
     llm_label = {
-        "grok":         AI_MODEL_DEFAULT.upper(),
-        "grok-premium": AI_MODEL_PREMIUM.upper(),
-        "claude":       "CLAUDE SONNET 4.6",
-        "chatgpt":      "CHATGPT O3",
+        "grok":         "GROK 4.3",
+        "grok-premium": "GROK 4.3 (FULL)",
+        "claude":       "CLAUDE OPUS 4.8",
+        "chatgpt":      "GPT-5.1",
     }.get(args.llm, args.llm.upper())
 
     print()

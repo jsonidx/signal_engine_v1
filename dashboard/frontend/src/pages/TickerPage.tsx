@@ -1068,14 +1068,17 @@ function CopyPromptButton({
 
 // ─── Model badge ──────────────────────────────────────────────────────────────
 
-const PREMIUM_MODELS = ['grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning', 'grok-4-0709']
+const PREMIUM_MODELS = ['grok-4.3', 'grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning', 'gpt-5.5', 'gpt-5.1', 'claude-opus-4-8']
 
 function ModelBadge({ model, cost }: { model: string; cost?: number }) {
-  const isPremium = PREMIUM_MODELS.some(m => model.includes('4.20') || model.includes('4-0709'))
+  const isPremium = PREMIUM_MODELS.some(m => model.startsWith(m))
   const shortName = model
     .replace('claude-sonnet-', 'Sonnet-')
     .replace('claude-opus-', 'Opus-')
     .replace('claude-haiku-', 'Haiku-')
+    .replace('gpt-5.5', 'GPT-5.5')
+    .replace('gpt-5.1', 'GPT-5.1')
+    .replace('gpt-', 'GPT-')
     .replace('grok-', 'G-')
     .replace('-reasoning', ' ✦')
     .replace('-non-reasoning', '')
@@ -1102,10 +1105,10 @@ function ModelBadge({ model, cost }: { model: string; cost?: number }) {
 // ─── Analyze button ────────────────────────────────────────────────────────────
 
 const LLM_OPTIONS = [
-  { value: 'grok',         label: 'Grok (fast)',    desc: 'xAI Grok — daily driver' },
-  { value: 'grok-premium', label: 'Grok Premium',   desc: 'xAI Grok premium — 3× cost' },
-  { value: 'claude',       label: 'Claude Sonnet',  desc: 'Anthropic Claude Sonnet' },
-  { value: 'chatgpt',      label: 'ChatGPT o3',     desc: 'OpenAI o3' },
+  { value: 'grok',         label: 'Grok 4.3',       desc: 'xAI Grok 4.3 — daily driver' },
+  { value: 'grok-premium', label: 'Grok 4.3 (full)', desc: 'xAI Grok 4.3 premium — full reasoning' },
+  { value: 'claude',       label: 'Claude Opus 4.8', desc: 'Anthropic Claude Opus 4.8' },
+  { value: 'chatgpt',      label: 'GPT-5.1',         desc: 'OpenAI GPT-5.1' },
 ] as const
 
 type LLMChoice = typeof LLM_OPTIONS[number]['value']
