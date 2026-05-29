@@ -359,3 +359,584 @@ class TestReplayRiskFieldHandling:
         assert df.iloc[0]["risk_score"] == pytest.approx(45.0)
         assert df.iloc[0]["risk_level"] == "MEDIUM"
         assert df.iloc[0]["dilution_risk_flag"] == True  # noqa: E712 — np.True_ vs True
+
+
+# ── TRD-014: compute_taxonomy_label ──────────────────────────────────────────
+
+class TestComputeTaxonomyLabel:
+    """Tests for compute_taxonomy_label() — TRD-014."""
+
+    def test_imports(self):
+        from backtest import compute_taxonomy_label
+        assert callable(compute_taxonomy_label)
+
+    def test_false_positive_when_no_move(self):
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label("ARMED", None, None, None, None, None)
+        assert lbl == "FALSE_POSITIVE"
+
+    def test_false_positive_when_max_return_below_5pct(self):
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label("ARMED", 0.03, 0.04, 0.04, False, False)
+        assert lbl == "FALSE_POSITIVE"
+
+    def test_false_positive_when_negative_return(self):
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label("ARMED", -0.10, -0.12, -0.08, False, False)
+        assert lbl == "FALSE_POSITIVE"
+
+    def test_early_enough_for_early_armed_with_15pct_hit(self):
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "EARLY_ARMED", 0.18, 0.22, 0.18,
+            hit_15pct_10d=True, hit_25pct_20d=False,
+        )
+        assert lbl == "EARLY_ENOUGH"
+
+    def test_early_enough_for_armed_with_25pct_20d_hit(self):
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "ARMED", 0.12, 0.26, 0.26,
+            hit_15pct_10d=False, hit_25pct_20d=True,
+        )
+        assert lbl == "EARLY_ENOUGH"
+
+    def test_late_chase_for_entry_state_no_quick_hit(self):
+        """ARMED state with 20% return but slowly (no 15%/10d or 25%/20d hit)."""
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "ARMED", 0.07, 0.12, 0.20,
+            hit_15pct_10d=False, hit_25pct_20d=False,
+        )
+        assert lbl == "LATE_CHASE"
+
+    def test_late_chase_for_active_state_with_move(self):
+        """ACTIVE state always gets LATE_CHASE (not EARLY_ENOUGH) when there's a move."""
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "ACTIVE", 0.20, 0.30, 0.30,
+            hit_15pct_10d=True, hit_25pct_20d=True,
+        )
+        assert lbl == "LATE_CHASE"
+
+    def test_false_positive_for_active_no_continuation(self):
+        """ACTIVE state with no continuation move → FALSE_POSITIVE."""
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "ACTIVE", 0.02, 0.03, 0.02,
+            hit_15pct_10d=False, hit_25pct_20d=False,
+        )
+        assert lbl == "FALSE_POSITIVE"
+
+    def test_unknown_state_with_move_returns_late_chase(self):
+        """Unknown state with a move → LATE_CHASE (conservative default)."""
+        from backtest import compute_taxonomy_label
+        lbl = compute_taxonomy_label(
+            "UNKNOWN_STATE", 0.25, 0.30, 0.30,
+            hit_15pct_10d=True, hit_25pct_20d=True,
+        )
+        assert lbl == "LATE_CHASE"
+
+
+class TestReplayIncludesTaxonomyFields:
+    """Verify _build_replay_row includes hit flags and taxonomy label (TRD-014)."""
+
+    def _snap(self, squeeze_state="ARMED"):
+        return {
+            "date": "2024-01-02",
+            "ticker": "TSTZ",
+            "final_score": 65.0,
+            "short_pct_float": 0.35,
+            "squeeze_state": squeeze_state,
+            "days_to_cover": 8.0,
+            "computed_dtc_30d": 8.0,
+            "compression_recovery_score": 7.0,
+            "volume_confirmation_flag": False,
+            "explanation_json": None,
+            "si_persistence_score": 7.0,
+        }
+
+    def _prices(self, values, start="2024-01-01"):
+        idx = pd.date_range(start, periods=len(values), freq="B")
+        return pd.Series(values, index=idx, dtype=float)
+
+    def test_hit_15pct_10d_flag_true_when_return_exceeds_15pct(self):
+        from backtest import SqueezeOutcomeReplay
+        # Entry at 100, future bars at 118 → 18% gain → hit_15pct_10d = True
+        prices = self._prices([90.0, 100.0] + [118.0] * 35, "2024-01-01")
+        snap = self._snap("ARMED")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"TSTZ": prices})
+        row = df.iloc[0]
+        assert bool(row["hit_15pct_10d"]) is True
+
+    def test_hit_15pct_10d_flag_false_when_return_below_15pct(self):
+        from backtest import SqueezeOutcomeReplay
+        # Entry at 100, future bars at 108 → 8% gain → hit_15pct_10d = False
+        prices = self._prices([90.0, 100.0] + [108.0] * 35, "2024-01-01")
+        snap = self._snap("ARMED")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"TSTZ": prices})
+        row = df.iloc[0]
+        assert bool(row["hit_15pct_10d"]) is False
+
+    def test_taxonomy_label_early_enough_for_armed_with_large_move(self):
+        from backtest import SqueezeOutcomeReplay
+        # Entry at 100, future at 120 → 20% in 10d → EARLY_ENOUGH (ARMED state)
+        prices = self._prices([90.0, 100.0] + [120.0] * 35, "2024-01-01")
+        snap = self._snap("ARMED")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"TSTZ": prices})
+        assert df.iloc[0]["taxonomy_label"] == "EARLY_ENOUGH"
+
+    def test_taxonomy_label_late_chase_for_active_state(self):
+        from backtest import SqueezeOutcomeReplay
+        # Even with a 20% gain, ACTIVE state → LATE_CHASE
+        prices = self._prices([90.0, 100.0] + [120.0] * 35, "2024-01-01")
+        snap = self._snap("ACTIVE")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"TSTZ": prices})
+        assert df.iloc[0]["taxonomy_label"] == "LATE_CHASE"
+
+    def test_taxonomy_label_false_positive_when_no_move(self):
+        from backtest import SqueezeOutcomeReplay
+        # Flat price → no move → FALSE_POSITIVE
+        prices = self._prices([90.0, 100.0] + [101.0] * 35, "2024-01-01")
+        snap = self._snap("ARMED")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        df = replay.run(prices={"TSTZ": prices})
+        assert df.iloc[0]["taxonomy_label"] == "FALSE_POSITIVE"
+
+    def test_summary_metrics_includes_taxonomy_counts(self):
+        from backtest import SqueezeOutcomeReplay
+        prices = self._prices([90.0, 100.0] + [120.0] * 35, "2024-01-01")
+        snap = self._snap("ARMED")
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap])
+        replay.run(prices={"TSTZ": prices})
+        metrics = replay.summary_metrics()
+        assert "taxonomy_label_counts" in metrics
+        assert "EARLY_ENOUGH" in metrics["taxonomy_label_counts"]
+
+
+# ── Backfill feature completeness (Option A fix) ─────────────────────────────
+
+class TestBackfillSnapshotCoPersistence:
+    """
+    Verify that _persist_training_outcomes() also materialises training snapshot
+    rows using save_squeeze_training_snapshot_backfill(), so the calibration join
+    (outcomes LEFT JOIN snapshots) returns non-NULL feature columns.
+    """
+
+    def _prices(self, values, start="2024-01-01"):
+        idx = pd.date_range(start, periods=len(values), freq="B")
+        return pd.Series(values, index=idx, dtype=float)
+
+    def _snap(self, state="ARMED"):
+        return {
+            "date": "2024-01-02",
+            "ticker": "TSTZ",
+            "final_score": 65.0,
+            "short_pct_float": 0.35,
+            "computed_dtc_30d": 8.0,
+            "compression_recovery_score": 7.0,
+            "si_persistence_score": 7.0,
+            "squeeze_state": state,
+            "volume_confirmation_flag": False,
+            "risk_score": 20.0,
+            "risk_level": "LOW",
+            "dilution_risk_flag": False,
+            "options_pressure_score": 3.0,
+            "iv_rank": 40.0,
+            "unusual_call_activity_flag": False,
+            "explanation_json": None,
+        }
+
+    def test_snapshot_backfill_called_with_correct_feature_fields(self):
+        """
+        When persist_outcomes=True and a 30d window is closed, the replay must
+        call save_squeeze_training_snapshot_backfill() with the feature data
+        sourced from the replay row, before calling save_squeeze_training_outcome().
+        """
+        from unittest.mock import patch, call
+        from backtest import SqueezeOutcomeReplay
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("ARMED")])
+
+        snap_records = []
+        outcome_records = []
+
+        def _cap_snap(rec):
+            snap_records.append(rec)
+
+        def _cap_outcome(rec):
+            outcome_records.append(rec)
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=_cap_snap), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
+                   side_effect=_cap_outcome):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert len(snap_records) == 1, "Snapshot backfill should be called once"
+        assert len(outcome_records) == 1, "Outcome record should be written once"
+
+        snap = snap_records[0]
+        # Join key must match between snapshot and outcome
+        assert snap["signal_date"] == outcome_records[0]["signal_date"]
+        assert snap["ticker"] == outcome_records[0]["ticker"]
+        assert snap["alert_type"] == outcome_records[0]["alert_type"]
+
+        # Feature columns from replay row must be present in the snapshot record
+        assert snap["final_score"] == 65.0
+        assert snap["short_pct_float"] == 0.35
+        assert snap["computed_dtc_30d"] == 8.0
+        assert snap["compression_recovery_score"] == 7.0
+        assert snap["si_persistence_score"] == 7.0
+        assert snap["risk_level"] == "LOW"
+
+    def test_snapshot_backfill_called_before_outcome(self):
+        """
+        Snapshot must be materialised before the outcome (so the join is ready
+        if calibration reads immediately after backfill).
+        """
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        call_order = []
+
+        def _snap_call(rec):
+            call_order.append("snapshot")
+
+        def _outcome_call(rec):
+            call_order.append("outcome")
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("ARMED")])
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=_snap_call), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
+                   side_effect=_outcome_call):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert call_order == ["snapshot", "outcome"], (
+            f"Expected snapshot before outcome, got: {call_order}"
+        )
+
+    def test_snapshot_backfill_not_called_when_persist_false(self):
+        """When persist_outcomes=False, neither snapshot nor outcome should be written."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("ARMED")])
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill") as mock_snap, \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_outcome:
+            replay.run(prices=prices, persist_outcomes=False)
+
+        assert not mock_snap.called
+        assert not mock_outcome.called
+
+    def test_alert_type_equals_squeeze_state_in_both_records(self):
+        """
+        alert_type in both snapshot and outcome must equal the squeeze_state
+        from the source snap — join key consistency.
+        """
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        snap_records = []
+        outcome_records = []
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("EARLY_ARMED")])
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=lambda r: snap_records.append(r)), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
+                   side_effect=lambda r: outcome_records.append(r)):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert snap_records[0]["alert_type"] == "EARLY_ARMED"
+        assert outcome_records[0]["alert_type"] == "EARLY_ARMED"
+        assert snap_records[0]["alert_type"] == outcome_records[0]["alert_type"]
+
+    def test_no_snapshot_backfill_when_30d_window_not_closed(self):
+        """When fwd_30d is None (window not closed), neither call should happen."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        # Only 10 future bars — 30d window not closed
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [110.0] * 10, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("ARMED")])
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill") as mock_snap, \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_outcome:
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert not mock_snap.called
+        assert not mock_outcome.called
+
+    def test_effective_float_score_from_explanation_json_included_in_snapshot(self):
+        """
+        effective_float_score is extracted from explanation_json in _build_replay_row.
+        It must flow into the snapshot backfill record.
+        """
+        import json as _json
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        expl = _json.dumps({
+            "top_positive_drivers": [
+                {"key": "effective_float", "label": "Effective float", "strength": 7.5},
+            ],
+            "top_negative_drivers": [],
+        })
+        snap_with_expl = {**self._snap("ARMED"), "explanation_json": expl}
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[snap_with_expl])
+
+        captured = []
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=lambda r: captured.append(r)), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome"):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert len(captured) == 1
+        # effective_float_score extracted from explanation_json
+        import pytest
+        assert captured[0]["effective_float_score"] == pytest.approx(7.5)
+
+
+# ── Missing/None alert_type skip behavior (data-quality fix) ─────────────────
+
+class TestMissingStateSkipBehavior:
+    """
+    Verify that rows with missing/None/null squeeze_state are skipped during
+    _persist_training_outcomes() and do not produce "None" string alert_type
+    values in the training tables.
+    """
+
+    def _prices(self, values, start="2024-01-01"):
+        idx = pd.date_range(start, periods=len(values), freq="B")
+        return pd.Series(values, index=idx, dtype=float)
+
+    def _snap(self, state, ticker="TSTZ"):
+        return {
+            "date": "2024-01-02",
+            "ticker": ticker,
+            "final_score": 62.0,
+            "short_pct_float": 0.30,
+            "computed_dtc_30d": 8.0,
+            "compression_recovery_score": 7.0,
+            "si_persistence_score": 7.0,
+            "squeeze_state": state,
+            "volume_confirmation_flag": False,
+            "risk_score": 15.0,
+            "risk_level": "LOW",
+            "dilution_risk_flag": False,
+            "options_pressure_score": 2.0,
+            "iv_rank": 30.0,
+            "unusual_call_activity_flag": False,
+            "explanation_json": None,
+        }
+
+    def test_none_state_row_skipped_on_backfill(self):
+        """A row with squeeze_state=None must not call either persistence helper."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap(None)])  # no state
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill") as ms, \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mo:
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert not ms.called, "Snapshot must not be written for None state"
+        assert not mo.called, "Outcome must not be written for None state"
+
+    def test_not_setup_state_row_skipped_on_backfill(self):
+        """A row with squeeze_state='NOT_SETUP' must not be persisted."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("NOT_SETUP")])
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill") as ms, \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mo:
+            replay.run(prices=prices, persist_outcomes=True)
+
+        assert not ms.called
+        assert not mo.called
+
+    def test_valid_state_still_persisted_alongside_invalid(self):
+        """Valid rows must still be persisted even when mixed with None-state rows."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        prices = {
+            "TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01"),
+            "OLD": self._prices([50.0, 60.0] + [65.0] * 40, "2024-01-01"),
+        }
+        snaps = [
+            self._snap("ARMED", ticker="TSTZ"),
+            {**self._snap(None, ticker="OLD")},  # no state
+        ]
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=snaps)
+
+        snap_records = []
+        outcome_records = []
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=lambda r: snap_records.append(r)), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
+                   side_effect=lambda r: outcome_records.append(r)):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        # Only the ARMED row should have been persisted
+        assert len(snap_records) == 1
+        assert len(outcome_records) == 1
+        assert snap_records[0]["ticker"] == "TSTZ"
+        assert snap_records[0]["alert_type"] == "ARMED"
+
+    def test_no_none_string_alert_type_in_persisted_records(self):
+        """The persisted alert_type must never be the string 'None'."""
+        from unittest.mock import patch
+        from backtest import SqueezeOutcomeReplay
+
+        # Simulate a pre-CHUNK-10 replay row where squeeze_state=None
+        prices = {"TSTZ": self._prices([90.0, 100.0] + [120.0] * 40, "2024-01-01")}
+        replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
+        replay.load_snapshots(rows=[self._snap("ARMED")])  # valid row
+
+        persisted_types = []
+
+        def _capture_snap(rec):
+            persisted_types.append(rec.get("alert_type"))
+
+        def _capture_outcome(rec):
+            persisted_types.append(rec.get("alert_type"))
+
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill",
+                   side_effect=_capture_snap), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
+                   side_effect=_capture_outcome):
+            replay.run(prices=prices, persist_outcomes=True)
+
+        for at in persisted_types:
+            assert at != "None", f'alert_type must not be string "None", got {at!r}'
+            assert at is not None, "alert_type must not be Python None in persisted record"
+
+
+class TestCalibrationNoBogusNoneBucket:
+    """
+    Verify that compute_metrics() in squeeze_calibration.py does not create
+    a bogus 'NONE' or 'UNKNOWN' bucket from rows with missing alert_type.
+    """
+
+    def test_none_alert_type_rows_excluded_from_metrics(self):
+        """Rows with alert_type=None must not appear in compute_metrics output."""
+        from scripts.squeeze_calibration import compute_metrics
+
+        rows = [
+            {"alert_type": "ARMED", "taxonomy_label": "EARLY_ENOUGH",
+             "hit_15pct_10d": True, "hit_25pct_20d": True,
+             "fwd_10d": 0.20, "fwd_20d": 0.25, "max_fwd_return": 0.25},
+            {"alert_type": None, "taxonomy_label": "FALSE_POSITIVE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.02, "fwd_20d": 0.02, "max_fwd_return": 0.02},
+        ]
+        metrics = compute_metrics(rows)
+        assert "ARMED" in metrics
+        assert "NONE" not in metrics
+        assert None not in metrics
+
+    def test_string_none_alert_type_excluded_from_metrics(self):
+        """Rows with alert_type='None' (string) must not produce a 'NONE' bucket."""
+        from scripts.squeeze_calibration import compute_metrics
+
+        rows = [
+            {"alert_type": "ARMED", "taxonomy_label": "LATE_CHASE",
+             "hit_15pct_10d": False, "hit_25pct_20d": True,
+             "fwd_10d": 0.10, "fwd_20d": 0.26, "max_fwd_return": 0.26},
+            {"alert_type": "None", "taxonomy_label": "FALSE_POSITIVE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.01, "fwd_20d": 0.01, "max_fwd_return": 0.01},
+        ]
+        metrics = compute_metrics(rows)
+        assert "ARMED" in metrics
+        assert "NONE" not in metrics
+        assert "None" not in metrics
+
+    def test_not_setup_rows_excluded_from_metrics(self):
+        """NOT_SETUP alert_type must not appear in calibration metrics."""
+        from scripts.squeeze_calibration import compute_metrics
+
+        rows = [
+            {"alert_type": "EARLY_ARMED", "taxonomy_label": "EARLY_ENOUGH",
+             "hit_15pct_10d": True, "hit_25pct_20d": True,
+             "fwd_10d": 0.18, "fwd_20d": 0.22, "max_fwd_return": 0.22},
+            {"alert_type": "NOT_SETUP", "taxonomy_label": "FALSE_POSITIVE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.0, "fwd_20d": 0.0, "max_fwd_return": 0.0},
+        ]
+        metrics = compute_metrics(rows)
+        assert "EARLY_ARMED" in metrics
+        assert "NOT_SETUP" not in metrics
+
+    def test_unknown_bucket_excluded_from_metrics(self):
+        """'UNKNOWN' alert_type must not appear in calibration metrics output."""
+        from scripts.squeeze_calibration import compute_metrics
+
+        rows = [
+            {"alert_type": "UNKNOWN", "taxonomy_label": "FALSE_POSITIVE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.0, "fwd_20d": 0.0, "max_fwd_return": 0.0},
+        ]
+        metrics = compute_metrics(rows)
+        assert "UNKNOWN" not in metrics
+        assert len(metrics) == 0  # all rows were excluded
+
+    def test_valid_states_still_present_after_filtering(self):
+        """After filtering, valid labeled states must remain in metrics."""
+        from scripts.squeeze_calibration import compute_metrics
+
+        rows = [
+            {"alert_type": "EARLY_ARMED", "taxonomy_label": "EARLY_ENOUGH",
+             "hit_15pct_10d": True, "hit_25pct_20d": True,
+             "fwd_10d": 0.20, "fwd_20d": 0.28, "max_fwd_return": 0.28},
+            {"alert_type": "ARMED", "taxonomy_label": "LATE_CHASE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.08, "fwd_20d": 0.10, "max_fwd_return": 0.10},
+            {"alert_type": "ACTIVE", "taxonomy_label": "LATE_CHASE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.05, "fwd_20d": 0.07, "max_fwd_return": 0.07},
+            {"alert_type": None, "taxonomy_label": "FALSE_POSITIVE",
+             "hit_15pct_10d": False, "hit_25pct_20d": False,
+             "fwd_10d": 0.0, "fwd_20d": 0.0, "max_fwd_return": 0.0},
+        ]
+        metrics = compute_metrics(rows)
+        assert set(metrics.keys()) == {"EARLY_ARMED", "ARMED", "ACTIVE"}
+        assert metrics["EARLY_ARMED"]["n"] == 1
+        assert metrics["ARMED"]["n"] == 1
+        assert metrics["ACTIVE"]["n"] == 1

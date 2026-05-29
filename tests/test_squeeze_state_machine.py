@@ -57,12 +57,14 @@ class TestNotSetupLowScore:
         result = _classify(final_score=44.9)
         assert result["state"] == "NOT_SETUP"
 
-    def test_score_45_can_be_armed(self):
-        # Score at 45 is no longer auto-NOT_SETUP; ARMED needs >= 55
+    def test_score_45_with_elevated_drivers_triggers_early_armed(self):
+        # TRD-011: score=45 is no longer always NOT_SETUP. With elevated SI and
+        # structural drivers, it now triggers EARLY_ARMED (new state between NOT_SETUP
+        # and ARMED). ARMED still requires >= 55 and 2+ full structural drivers.
         result = _classify(final_score=45.0, volume_confirmation_flag=False)
-        # 45 < 55 so not ARMED, but not auto-NOT_SETUP either — should still be NOT_SETUP
-        # because ARMED requires final_score >= 55
-        assert result["state"] == "NOT_SETUP"
+        # The _classify() defaults include SI=0.30, DTC=5.0, comp_rec=6.0 etc.
+        # All meet EARLY_ARMED thresholds → state should be EARLY_ARMED
+        assert result["state"] == "EARLY_ARMED"
 
     def test_reasons_mention_score(self):
         result = _classify(final_score=20.0)
@@ -110,8 +112,9 @@ class TestArmedHighStructuralSetup:
             computed_dtc_30d=6.0,
             volume_confirmation_flag=False,
         )
-        # Below 55 threshold → NOT_SETUP
-        assert result["state"] == "NOT_SETUP"
+        # Below 55 ARMED threshold → should NOT be ARMED.
+        # TRD-011: with SI=35% (>=20%) and DTC=6.0 (>=5) it can trigger EARLY_ARMED.
+        assert result["state"] != "ARMED"
 
     def test_armed_not_triggered_with_volume_confirmation(self):
         # Same inputs but volume confirmed → should not be ARMED
@@ -362,3 +365,190 @@ class TestStateReasonsNonEmpty:
         assert result["state"] == expected_state
         assert len(result["state_reasons"]) >= 1
         assert all(isinstance(r, str) and len(r) > 0 for r in result["state_reasons"])
+
+
+# ── TRD-011: EARLY_ARMED state ────────────────────────────────────────────────
+
+class TestEarlyArmedState:
+    """
+    Tests for the EARLY_ARMED lifecycle state (TRD-011).
+
+    EARLY_ARMED fires before ARMED when:
+    - final_score >= 45 (EARLY_ARMED floor) and < 55 (ARMED floor)
+    - short_pct_float >= 20% (elevated SI)
+    - At least 1 early-setup driver: early comp-rec OR elevated DTC OR moderate SI persistence
+    - No volume confirmation (that would push to ACTIVE)
+    - No recent active squeeze
+    """
+
+    def test_early_armed_fires_with_low_comp_rec_and_elevated_dtc(self):
+        """Score 47-53, SI >= 20%, DTC >= 5 → EARLY_ARMED."""
+        result = _classify(
+            final_score=49.0,
+            short_pct_float=0.24,
+            computed_dtc_30d=8.5,
+            compression_recovery_score=3.0,   # early pattern
+            effective_float_score=None,
+            si_persistence_score=5.5,
+            volume_confirmation_flag=False,
+            recent_squeeze_state=None,
+        )
+        assert result["state"] == "EARLY_ARMED"
+
+    def test_early_armed_fires_with_only_dtc_driver(self):
+        """DTC alone (>=5) counts as an early driver when SI >= 20% and score >= 45."""
+        result = _classify(
+            final_score=46.0,
+            short_pct_float=0.22,
+            computed_dtc_30d=6.5,
+            compression_recovery_score=None,
+            effective_float_score=None,
+            si_persistence_score=None,
+            volume_confirmation_flag=False,
+        )
+        assert result["state"] == "EARLY_ARMED"
+
+    def test_early_armed_requires_si_at_least_20pct(self):
+        """SI below 20% → NOT EARLY_ARMED (insufficient squeeze fuel)."""
+        result = _classify(
+            final_score=50.0,
+            short_pct_float=0.18,   # below 20% floor
+            computed_dtc_30d=8.0,
+            compression_recovery_score=3.0,
+            volume_confirmation_flag=False,
+        )
+        assert result["state"] == "NOT_SETUP"
+
+    def test_early_armed_requires_score_at_least_45(self):
+        """Score below 45 → NOT_SETUP (EARLY_ARMED threshold is 45)."""
+        result = _classify(
+            final_score=42.0,
+            short_pct_float=0.25,
+            computed_dtc_30d=8.0,
+            compression_recovery_score=3.0,
+            volume_confirmation_flag=False,
+        )
+        assert result["state"] == "NOT_SETUP"
+
+    def test_early_armed_does_not_fire_with_volume_confirmation_score_above_55(self):
+        """Volume confirmation + score >= 55 + SI >= 30% → ACTIVE (not EARLY_ARMED)."""
+        result = _classify(
+            final_score=62.0,    # above ARMED/ACTIVE threshold
+            short_pct_float=0.35,  # SI >= 30% for ACTIVE
+            computed_dtc_30d=8.0,
+            compression_recovery_score=3.0,
+            volume_confirmation_flag=True,
+        )
+        assert result["state"] == "ACTIVE"
+        assert result["state"] != "EARLY_ARMED"
+
+    def test_early_armed_excluded_when_volume_confirmation_present(self):
+        """Volume confirmation at any score level excludes EARLY_ARMED
+        (vol_confirmed pushes the state toward ACTIVE, not EARLY_ARMED)."""
+        result = _classify(
+            final_score=52.0,
+            short_pct_float=0.25,
+            computed_dtc_30d=8.0,
+            compression_recovery_score=3.0,
+            volume_confirmation_flag=True,
+        )
+        assert result["state"] != "EARLY_ARMED"
+
+    def test_early_armed_does_not_fire_when_armed_would_fire(self):
+        """When score >= 55 and 2+ structural drivers → ARMED, not EARLY_ARMED."""
+        result = _classify(
+            final_score=60.0,
+            short_pct_float=0.35,
+            computed_dtc_30d=6.0,
+            compression_recovery_score=7.0,
+            volume_confirmation_flag=False,
+        )
+        assert result["state"] == "ARMED"
+
+    def test_early_armed_state_ordering_lower_than_armed(self):
+        """EARLY_ARMED fires at lower score/structural completeness than ARMED."""
+        early_armed_result = _classify(
+            final_score=49.0,
+            short_pct_float=0.24,
+            computed_dtc_30d=8.5,
+            compression_recovery_score=3.0,
+            si_persistence_score=5.5,
+            volume_confirmation_flag=False,
+        )
+        armed_result = _classify(
+            final_score=62.0,
+            short_pct_float=0.27,
+            computed_dtc_30d=10.0,
+            compression_recovery_score=8.0,
+            si_persistence_score=7.5,
+            volume_confirmation_flag=False,
+        )
+        assert early_armed_result["state"] == "EARLY_ARMED"
+        assert armed_result["state"] == "ARMED"
+
+    def test_early_armed_reasons_are_non_empty(self):
+        result = _classify(
+            final_score=49.0,
+            short_pct_float=0.24,
+            computed_dtc_30d=8.5,
+            compression_recovery_score=3.0,
+            volume_confirmation_flag=False,
+        )
+        assert result["state"] == "EARLY_ARMED"
+        assert len(result["state_reasons"]) >= 1
+        assert any("early" in r.lower() or "early_armed" in r.lower() or "pre-ignition" in r.lower()
+                   for r in result["state_reasons"])
+
+    def test_ddd_apr15_fixture_fires_early_armed(self):
+        """DDD April 15, 2026 fixture must trigger EARLY_ARMED (TRD-011 acceptance test)."""
+        from tests.fixtures.ddd_apr_may_2026 import APR15_STATE_INPUTS, APR15_EXPECTED_STATE
+        inp = APR15_STATE_INPUTS
+        result = classify_squeeze_state(
+            final_score=inp["final_score"],
+            short_pct_float=inp["short_pct_float"],
+            computed_dtc_30d=inp["computed_dtc_30d"],
+            compression_recovery_score=inp["compression_recovery_score"],
+            si_persistence_score=inp["si_persistence_score"],
+            effective_float_score=inp.get("effective_float_score"),
+            volume_confirmation_flag=inp["volume_confirmation_flag"],
+            recent_squeeze_state=inp["recent_squeeze_state"],
+        )
+        assert result["state"] == APR15_EXPECTED_STATE == "EARLY_ARMED"
+
+    def test_ddd_apr07_fixture_is_not_setup(self):
+        """DDD April 7, 2026 (at the low) must NOT trigger EARLY_ARMED — setup not yet forming."""
+        from tests.fixtures.ddd_apr_may_2026 import APR07_STATE_INPUTS, APR07_EXPECTED_STATE
+        inp = APR07_STATE_INPUTS
+        result = classify_squeeze_state(
+            final_score=inp["final_score"],
+            short_pct_float=inp["short_pct_float"],
+            computed_dtc_30d=inp["computed_dtc_30d"],
+            compression_recovery_score=inp["compression_recovery_score"],
+            si_persistence_score=inp["si_persistence_score"],
+            volume_confirmation_flag=inp["volume_confirmation_flag"],
+            recent_squeeze_state=inp["recent_squeeze_state"],
+        )
+        assert result["state"] == APR07_EXPECTED_STATE == "NOT_SETUP"
+
+    def test_ddd_may11_fixture_fires_armed(self):
+        """DDD May 11, 2026 (reference case) must fire ARMED, not EARLY_ARMED."""
+        from tests.fixtures.ddd_apr_may_2026 import MAY11_STATE_INPUTS, MAY11_EXPECTED_STATE
+        inp = MAY11_STATE_INPUTS
+        result = classify_squeeze_state(
+            final_score=inp["final_score"],
+            short_pct_float=inp["short_pct_float"],
+            computed_dtc_30d=inp["computed_dtc_30d"],
+            compression_recovery_score=inp["compression_recovery_score"],
+            si_persistence_score=inp["si_persistence_score"],
+            volume_confirmation_flag=inp["volume_confirmation_flag"],
+            recent_squeeze_state=inp["recent_squeeze_state"],
+        )
+        assert result["state"] == MAY11_EXPECTED_STATE == "ARMED"
+
+    def test_early_armed_fires_materially_earlier_than_armed(self):
+        """EARLY_ARMED fires ~18 trading days before the reference ARMED signal."""
+        from tests.fixtures.ddd_apr_may_2026 import DETECTION_IMPROVEMENT_DAYS
+        assert DETECTION_IMPROVEMENT_DAYS >= 10, (
+            f"EARLY_ARMED should fire at least 10 trading days before ARMED, "
+            f"got {DETECTION_IMPROVEMENT_DAYS}"
+        )

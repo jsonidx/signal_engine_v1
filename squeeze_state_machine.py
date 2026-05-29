@@ -1,25 +1,35 @@
 """
-squeeze_state_machine.py — 3-state squeeze lifecycle classifier (CHUNK-10)
+squeeze_state_machine.py — 4-state squeeze lifecycle classifier (CHUNK-10 + TRD-011)
 
 Conservative, deterministic lifecycle labeling for squeeze setups.
 
 STATES
 ──────
-    NOT_SETUP   Setup quality is weak or structural preconditions are absent.
-    ARMED       Structural squeeze preconditions met; ignition not yet confirmed.
-    ACTIVE      Squeeze mechanics appear live (recent price run with trapped shorts,
-                or volume-confirmed ignition alongside structural pressure).
+    NOT_SETUP    Setup quality is weak or structural preconditions are absent.
+    EARLY_ARMED  Early pre-squeeze setup forming — DDD-style coiled spring pattern.
+                 Entry-hunting state; fire early, accept lower hit rate.
+                 Alert semantics: "Early setup / watch / entry hunting — may have
+                 lower hit rate than ARMED; not yet confirmed."
+    ARMED        Structural squeeze preconditions fully met; ignition not yet confirmed.
+                 Primary entry-hunting state. Alert semantics: "Setup confirmed /
+                 pre-breakout watch — strong structural preconditions present."
+    ACTIVE       Squeeze mechanics appear live (recent price run with trapped shorts,
+                 or volume-confirmed ignition alongside structural pressure).
+                 Alert semantics: "Move in progress / chase risk HIGH — this is a
+                 continuation signal, not a fresh-entry alert."
 
 DESIGN PRINCIPLES
 ─────────────────
 • Pure function — no I/O, no DB calls.
 • All inputs are optional/nullable; missing data degrades confidence, never crashes.
 • `recent_squeeze_state = "completed"` maps to NOT_SETUP with an explicit warning.
+• EARLY_ARMED fires before ARMED: lower score floor, relaxed structural thresholds.
+• ARMED and ACTIVE semantics are preserved from the original 3-state design.
+• ACTIVE is NOT the primary fresh-entry alert; its copy and labels must reflect
+  chase risk. Use EARLY_ARMED / ARMED for entry-hunting.
 • Thresholds are conservative and manually chosen; use replay (CHUNK-11) to
   validate before changing them.
 • EXHAUSTION_RISK intentionally excluded — deferred to CHUNK-16.
-• Full six-state lifecycle deferred; validation must confirm ARMED/ACTIVE
-  separation before adding more states.
 
 PUBLIC API
 ──────────
@@ -36,22 +46,27 @@ from typing import Optional
 # ── Thresholds (single source of truth — do not duplicate in other modules) ───
 
 _SCORE_MIN_ARMED = 55.0          # final_score floor for ARMED or ACTIVE
+_SCORE_MIN_EARLY_ARMED = 45.0    # final_score floor for EARLY_ARMED
 _SCORE_MIN_SETUP = 45.0          # final_score below this → always NOT_SETUP
 _SCORE_HIGH_OVERRIDE = 75.0      # override low-SI NOT_SETUP when score is very high
 
 _SI_MIN_SETUP = 0.15             # short_pct_float below this → NOT_SETUP (unless high score)
-_SI_MIN_STRUCTURAL = 0.30        # structural driver threshold
+_SI_MIN_STRUCTURAL = 0.30        # structural driver threshold (ARMED / ACTIVE)
+_SI_MIN_EARLY_ARMED = 0.20       # minimum SI for EARLY_ARMED (lower than ARMED)
 _SI_MIN_ACTIVE = 0.30            # minimum SI for volume-confirmed ACTIVE
 
 _DTC_STRUCTURAL = 5.0            # computed_dtc_30d structural driver threshold
-_COMP_REC_STRUCTURAL = 6.0       # compression_recovery_score structural driver threshold
+_COMP_REC_STRUCTURAL = 6.0       # compression_recovery_score threshold for ARMED
+_COMP_REC_EARLY_ARMED = 3.0      # early compression-recovery pattern threshold
 _EF_STRUCTURAL = 6.0             # effective_float_score structural driver threshold
 _SI_PERSIST_STRUCTURAL = 7.0     # si_persistence_score structural driver threshold
+_SI_PERSIST_EARLY_ARMED = 5.0    # relaxed SI persistence for EARLY_ARMED
 
 _COMPLETED_SI_FLOOR = 0.20       # recent completed squeeze + SI below this → NOT_SETUP
 
 _STRUCTURAL_MIN_ARMED = 2        # minimum structural drivers for ARMED
 _STRUCTURAL_MIN_ACTIVE_VOL = 1   # minimum structural drivers for volume-confirmed ACTIVE
+_EARLY_ARMED_MIN_DRIVERS = 1     # minimum early-setup drivers for EARLY_ARMED
 
 
 def classify_squeeze_state(
@@ -180,6 +195,51 @@ def classify_squeeze_state(
         confidence = _confidence_armed(n_struct, known_count)
         return _result("ARMED", confidence, reasons, warnings)
 
+    # ── EARLY_ARMED: pre-ignition setup forming — DDD-style coiled spring ─────
+    #
+    # Lower thresholds than ARMED: fires when the setup is starting to form but
+    # has not yet met full structural confirmation. This is the primary entry-
+    # hunting alert — it favors catching the setup early even at the cost of a
+    # lower hit rate than ARMED.
+    #
+    # Requirements:
+    #   - score >= 45 (setup threshold) and < 55 (ARMED floor — otherwise ARMED would fire)
+    #   - SI >= 20% (elevated but below full ARMED structural threshold)
+    #   - At least 1 early-setup driver: early comp-rec OR elevated DTC OR moderate SI persistence
+    #   - No volume confirmation (would push to ACTIVE)
+    #   - No recent active squeeze
+    #   - No completed squeeze with SI below the reset floor
+    early_armed_drivers: list[str] = []
+    if comp_rec is not None and comp_rec >= _COMP_REC_EARLY_ARMED:
+        early_armed_drivers.append(f"Early compression-recovery pattern ({comp_rec:.1f} ≥ {_COMP_REC_EARLY_ARMED:.0f})")
+    if dtc is not None and dtc >= _DTC_STRUCTURAL:
+        early_armed_drivers.append(f"Elevated DTC {dtc:.1f} ≥ {_DTC_STRUCTURAL:.0f}")
+    if si_persist is not None and si_persist >= _SI_PERSIST_EARLY_ARMED:
+        early_armed_drivers.append(f"SI persistence score {si_persist:.1f} ≥ {_SI_PERSIST_EARLY_ARMED:.0f}")
+    if ef is not None and ef >= _EF_STRUCTURAL:
+        early_armed_drivers.append(f"Effective float score {ef:.1f} ≥ {_EF_STRUCTURAL:.0f}")
+
+    n_early = len(early_armed_drivers)
+
+    if (
+        final_score >= _SCORE_MIN_EARLY_ARMED
+        and si is not None and si >= _SI_MIN_EARLY_ARMED
+        and n_early >= _EARLY_ARMED_MIN_DRIVERS
+        and not vol_confirmed
+        and rss != "active"
+        and not (completed_squeeze and (si is None or si < _COMPLETED_SI_FLOOR))
+    ):
+        reasons.append(
+            f"Early squeeze setup forming — {n_early} pre-ignition driver(s) present. "
+            f"EARLY_ARMED: entry-hunting / watch state. "
+            f"Lower confirmation than ARMED; accept that hit rate may be lower."
+        )
+        reasons.extend(early_armed_drivers)
+        if completed_squeeze:
+            reasons.append("Note: recent squeeze completed; may be a re-accumulation phase.")
+        confidence = _confidence_early_armed(n_early, known_count)
+        return _result("EARLY_ARMED", confidence, reasons, warnings)
+
     # ── Fallthrough: NOT_SETUP ────────────────────────────────────────────────
     if final_score >= _SCORE_MIN_ARMED and n_struct < _STRUCTURAL_MIN_ARMED:
         reasons.append(
@@ -195,6 +255,14 @@ def classify_squeeze_state(
 
 
 # ── Confidence helpers ────────────────────────────────────────────────────────
+
+def _confidence_early_armed(n_early: int, known_count: int) -> str:
+    if known_count <= 1:
+        return "low"
+    if n_early >= 2 and known_count >= 3:
+        return "medium"
+    return "low"
+
 
 def _confidence_active(
     n_struct: int,

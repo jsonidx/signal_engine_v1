@@ -1,12 +1,38 @@
 # Task: CRSR May 2026 Postmortem Fixture
 
 Status: done
+Stage: done
+Type: research
+Priority: P1
+Severity: medium
 Owner: Claude Code
+Reviewer: Human
+Product Area: data-pipeline
+Category: research
 Risk: trading-logic
+Effort: S
+Target Release: completed
+Due Date: completed
+Dependencies: TRD-006, TRD-007, TRD-008
+Blocked By: none
+Links: tests/fixtures/
+Success Metric: the CRSR late-routing failure mode is reproducible in a static fixture and regression test.
+
+## Problem Statement
+
+The team needed a stable fixture for a late-routed catalyst breakout so future routing changes could be validated against a real failure mode.
+
+## User Impact
+
+Without a regression fixture, the pipeline could continue to route similar catalyst names too late without a reliable test signal.
 
 ## Objective
 
 Create a reproducible CRSR May 2026 fixture that captures the failure mode: a ticker was in the Russell universe and had a fresh catalyst plus early momentum, but was not routed into Deep Dive until the move was already mature.
+
+## Proposed Solution
+
+Capture the relevant CRSR bars and catalyst context in static fixtures, then assert the intended early-routing behavior in tests.
 
 ## Scope
 

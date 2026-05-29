@@ -8,7 +8,16 @@ Commands:
   /analyze TSLA     — fresh signals + AI thesis for one ticker
   /analyze TSLA NVDA AMD  — deep dive for multiple tickers
   /status           — show last GitHub Actions run result
+  /approve <id>     — approve a pending trading-logic change (TRD-015)
+  /reject <id>      — reject a pending trading-logic change (TRD-015)
+  /pending          — list all pending approval requests (TRD-015)
   /help             — list commands
+
+Approval workflow (TRD-015):
+  When the calibration script or other automation proposes a trading-logic change,
+  it persists an approval_request in Supabase and optionally sends a Telegram
+  notification. The human can then approve or reject it via /approve or /reject.
+  Changes are NEVER auto-applied without explicit approval.
 
 Run:
   python3 scripts/telegram_bot.py
@@ -271,8 +280,63 @@ HELP_TEXT = (
     "/analyze TSLA — deep dive: fresh signals + AI thesis for one ticker\n"
     "/analyze TSLA NVDA AMD — deep dive for multiple tickers\n"
     "/status — last pipeline run result\n"
+    "/pending — list pending approval requests\n"
+    "/approve &lt;id&gt; — approve a pending trading-logic change\n"
+    "/reject &lt;id&gt; — reject a pending trading-logic change\n"
     "/help — show this message"
 )
+
+
+# ── Approval helpers ──────────────────────────────────────────────────────────
+
+def _fetch_pending_requests() -> list:
+    """Fetch pending approval requests from Supabase. Returns [] on failure."""
+    try:
+        from utils.supabase_persist import fetch_pending_approval_requests
+        return fetch_pending_approval_requests()
+    except Exception as exc:
+        log.warning("_fetch_pending_requests failed: %s", exc)
+        return []
+
+
+def _approve_request(request_id: str) -> bool:
+    """Approve a request. Returns True on success."""
+    try:
+        from utils.supabase_persist import update_approval_request_status
+        return update_approval_request_status(request_id, "APPROVED", approved_by="telegram")
+    except Exception as exc:
+        log.warning("_approve_request failed: %s", exc)
+        return False
+
+
+def _reject_request(request_id: str) -> bool:
+    """Reject a request. Returns True on success."""
+    try:
+        from utils.supabase_persist import update_approval_request_status
+        return update_approval_request_status(request_id, "REJECTED", approved_by="telegram")
+    except Exception as exc:
+        log.warning("_reject_request failed: %s", exc)
+        return False
+
+
+def _format_approval_request(req: dict) -> str:
+    """Format a single approval request for Telegram display."""
+    rid    = req.get("request_id", "?")
+    title  = req.get("title", "—")
+    cat    = req.get("category", "?")
+    risk   = req.get("risk_level", "?")
+    status = req.get("status", "?")
+    summ   = (req.get("summary") or "")[:200]
+    created = str(req.get("created_at", ""))[:16].replace("T", " ")
+    lines = [
+        f"<b>{rid}</b> [{status}]",
+        f"<b>{title}</b>",
+        f"Category: {cat}  |  Risk: {risk}  |  Created: {created}",
+    ]
+    if summ:
+        lines.append(f"<i>{summ}</i>")
+    lines.append(f"/approve {rid}  |  /reject {rid}")
+    return "\n".join(lines)
 
 
 def handle_command(text: str, chat_id: str) -> None:
@@ -332,6 +396,59 @@ def handle_command(text: str, chat_id: str) -> None:
             )
         except Exception as exc:
             tg_send(f"❌ Could not fetch status: {exc}", chat_id)
+
+    elif lower.startswith("/pending"):
+        reqs = _fetch_pending_requests()
+        if not reqs:
+            tg_send("✅ No pending approval requests.", chat_id)
+            return
+        lines = [f"📋 <b>Pending approval requests ({len(reqs)})</b>\n"]
+        for req in reqs[:5]:  # cap at 5 to avoid giant messages
+            lines.append(_format_approval_request(req))
+            lines.append("")
+        if len(reqs) > 5:
+            lines.append(f"… and {len(reqs) - 5} more. Check Supabase for full list.")
+        tg_send("\n".join(lines), chat_id)
+
+    elif lower.startswith("/approve"):
+        parts = text.split()
+        if len(parts) < 2:
+            tg_send("Usage: /approve &lt;request_id&gt;", chat_id)
+            return
+        request_id = parts[1].strip()
+        ok = _approve_request(request_id)
+        if ok:
+            tg_send(
+                f"✅ <b>APPROVED</b>: <code>{request_id}</code>\n"
+                f"Recorded in Supabase. The approved change must still be applied manually.",
+                chat_id,
+            )
+        else:
+            tg_send(
+                f"❌ Failed to approve <code>{request_id}</code>.\n"
+                f"Check that the ID is correct and the request is still PENDING.",
+                chat_id,
+            )
+
+    elif lower.startswith("/reject"):
+        parts = text.split()
+        if len(parts) < 2:
+            tg_send("Usage: /reject &lt;request_id&gt;", chat_id)
+            return
+        request_id = parts[1].strip()
+        ok = _reject_request(request_id)
+        if ok:
+            tg_send(
+                f"❌ <b>REJECTED</b>: <code>{request_id}</code>\n"
+                f"Recorded in Supabase. This change will not be applied.",
+                chat_id,
+            )
+        else:
+            tg_send(
+                f"❌ Failed to reject <code>{request_id}</code>.\n"
+                f"Check that the ID is correct and the request is still PENDING.",
+                chat_id,
+            )
 
     else:
         tg_send(f"Unknown command. Type /help for the list.", chat_id)

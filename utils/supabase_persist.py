@@ -36,6 +36,12 @@ def _today() -> str:
     return date.today().isoformat()
 
 
+def _ensure_table_security(conn, *tables: str) -> None:
+    from utils.db import ensure_public_table_rls
+
+    ensure_public_table_rls(conn, *tables)
+
+
 # ==============================================================================
 # 1. REGIME SNAPSHOTS
 # ==============================================================================
@@ -75,6 +81,7 @@ def save_regime_snapshot(regime_data: dict) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_REGIME_DDL)
+        _ensure_table_security(conn, "regime_snapshots")
         cur.execute(
             """
             INSERT INTO regime_snapshots
@@ -141,6 +148,7 @@ def save_dark_pool_snapshot(results: list[dict], run_date: str | None = None) ->
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_DARK_POOL_DDL)
+        _ensure_table_security(conn, "dark_pool_snapshots")
         rows = [
             (
                 run_date,
@@ -221,6 +229,7 @@ def save_screener_signals(signals_df: Any, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_SCREENER_DDL)
+        _ensure_table_security(conn, "screener_signals")
 
         rows = []
         for _, row in signals_df.iterrows():
@@ -316,6 +325,7 @@ def save_backtest_runs(results_df: Any, factor_ic: dict | None = None,
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_BACKTEST_DDL)
+        _ensure_table_security(conn, "backtest_runs")
 
         rows = []
         for _, row in results_df.iterrows():
@@ -371,6 +381,8 @@ CREATE TABLE IF NOT EXISTS catalyst_scores (
     date              TEXT    NOT NULL,
     ticker            TEXT    NOT NULL,
     composite         REAL,
+    raw_composite     REAL,
+    post_squeeze_guard BOOLEAN,
     squeeze_score     REAL,
     volume_score      REAL,
     vol_compress      REAL,
@@ -380,6 +392,8 @@ CREATE TABLE IF NOT EXISTS catalyst_scores (
     polymarket_score  REAL,
     dark_pool_score   REAL,
     dark_pool_signal  TEXT,
+    earnings_score    REAL,
+    days_to_earnings  INTEGER,
     n_flags           INTEGER,
     price             REAL,
     short_pct         REAL,
@@ -387,8 +401,24 @@ CREATE TABLE IF NOT EXISTS catalyst_scores (
 );
 """
 
+# Migration DDL: add new columns to existing tables without recreating them.
+# Safe to run repeatedly — ADD COLUMN IF NOT EXISTS is idempotent on Postgres.
+_CATALYST_MIGRATE_DDL = """
+ALTER TABLE catalyst_scores
+    ADD COLUMN IF NOT EXISTS raw_composite      REAL,
+    ADD COLUMN IF NOT EXISTS post_squeeze_guard BOOLEAN,
+    ADD COLUMN IF NOT EXISTS earnings_score     REAL,
+    ADD COLUMN IF NOT EXISTS days_to_earnings   INTEGER;
+"""
+
+
 def save_catalyst_scores(df: Any, run_date: str | None = None) -> None:
-    """Upsert catalyst screener per-ticker scores into catalyst_scores."""
+    """Upsert catalyst screener per-ticker scores into catalyst_scores.
+
+    raw_composite preserves the pre-post-squeeze-guard value so that rows
+    zeroed by the guard do not silently lose nonzero component evidence
+    (TRD-003 regression fix).
+    """
     try:
         import pandas as pd
         if df is None or (hasattr(df, "empty") and df.empty):
@@ -397,38 +427,65 @@ def save_catalyst_scores(df: Any, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_CATALYST_DDL)
+        _ensure_table_security(conn, "catalyst_scores")
+        # Idempotent migration for existing tables
+        try:
+            cur.execute(_CATALYST_MIGRATE_DDL)
+        except Exception:
+            pass
 
         def _f(row, col):
             v = row.get(col)
             return float(v) if v is not None and pd.notna(v) else None
+
+        def _b(row, col):
+            v = row.get(col)
+            return bool(v) if v is not None and pd.notna(v) else None
 
         rows = []
         for _, row in df.iterrows():
             ticker = str(row.get("ticker", "")).strip().upper()
             if not ticker:
                 continue
+            composite = _f(row, "composite")
+            # raw_composite falls back to composite when not present (pre-TRD-003 rows)
+            raw_composite = _f(row, "raw_composite")
+            if raw_composite is None:
+                raw_composite = composite
+            dte = row.get("days_to_earnings")
+            days_to_earnings_val = int(dte) if dte is not None and pd.notna(dte) else None
             rows.append((
                 run_date, ticker,
-                _f(row, "composite"), _f(row, "squeeze_score"), _f(row, "volume_score"),
+                composite, raw_composite, _b(row, "post_squeeze_guard"),
+                _f(row, "squeeze_score"), _f(row, "volume_score"),
                 _f(row, "vol_compress"), _f(row, "options_score"), _f(row, "technical_score"),
                 _f(row, "social_score"), _f(row, "polymarket_score"), _f(row, "dark_pool_score"),
                 str(row.get("dark_pool_signal") or ""),
+                _f(row, "earnings_score"), days_to_earnings_val,
                 int(row["n_flags"]) if "n_flags" in row and pd.notna(row["n_flags"]) else None,
                 _f(row, "price"), _f(row, "short_pct"),
             ))
         cur.executemany(
             """
             INSERT INTO catalyst_scores
-                (date, ticker, composite, squeeze_score, volume_score, vol_compress,
+                (date, ticker, composite, raw_composite, post_squeeze_guard,
+                 squeeze_score, volume_score, vol_compress,
                  options_score, technical_score, social_score, polymarket_score,
-                 dark_pool_score, dark_pool_signal, n_flags, price, short_pct)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 dark_pool_score, dark_pool_signal,
+                 earnings_score, days_to_earnings,
+                 n_flags, price, short_pct)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (date, ticker) DO UPDATE SET
-                composite=EXCLUDED.composite, squeeze_score=EXCLUDED.squeeze_score,
+                composite=EXCLUDED.composite,
+                raw_composite=EXCLUDED.raw_composite,
+                post_squeeze_guard=EXCLUDED.post_squeeze_guard,
+                squeeze_score=EXCLUDED.squeeze_score,
                 volume_score=EXCLUDED.volume_score, vol_compress=EXCLUDED.vol_compress,
                 options_score=EXCLUDED.options_score, technical_score=EXCLUDED.technical_score,
                 social_score=EXCLUDED.social_score, polymarket_score=EXCLUDED.polymarket_score,
                 dark_pool_score=EXCLUDED.dark_pool_score, dark_pool_signal=EXCLUDED.dark_pool_signal,
+                earnings_score=EXCLUDED.earnings_score,
+                days_to_earnings=EXCLUDED.days_to_earnings,
                 n_flags=EXCLUDED.n_flags, price=EXCLUDED.price, short_pct=EXCLUDED.short_pct
             """,
             rows,
@@ -533,6 +590,7 @@ def save_squeeze_scores(df: Any, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_SQUEEZE_DDL)
+        _ensure_table_security(conn, "squeeze_scores")
         # Idempotent migration for tables created before CHUNK-14
         for stmt in _SQUEEZE_MIGRATE_DDL:
             try:
@@ -715,6 +773,7 @@ def save_short_interest_history(records: list[dict]) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_SI_HISTORY_DDL)
+        _ensure_table_security(conn, "short_interest_history")
 
         def _v(rec, key):
             v = rec.get(key)
@@ -796,6 +855,7 @@ def fetch_short_interest_history(
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_SI_HISTORY_DDL)
+        _ensure_table_security(conn, "short_interest_history")
         cur.execute(
             """
             SELECT ticker, publication_date, settlement_date, snapshot_date,
@@ -904,6 +964,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
     ON filing_catalysts (ticker, filing_date, filing_type,
                          COALESCE(accession_number, ''));
 """)
+        _ensure_table_security(conn, "filing_catalysts")
 
         today = _date.today().isoformat()
         rows = []
@@ -1143,6 +1204,7 @@ def save_red_flag_scores(df: Any, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_RED_FLAG_DDL)
+        _ensure_table_security(conn, "red_flag_scores")
 
         def _f(row, col):
             v = row.get(col)
@@ -1226,6 +1288,7 @@ def save_fundamental_scores(df: Any, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_FUNDAMENTAL_SCORES_DDL)
+        _ensure_table_security(conn, "fundamental_scores")
 
         def _f(row, col):
             v = row.get(col)
@@ -1308,6 +1371,7 @@ def save_catalyst_history(history: dict, run_date: str | None = None) -> None:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(_CATALYST_HISTORY_DDL)
+        _ensure_table_security(conn, "catalyst_history")
         rows = []
         for ticker, entries in history.items():
             t = ticker.strip().upper()
@@ -1427,6 +1491,647 @@ def fetch_latest_iv_rank(
 # ==============================================================================
 # 11. SQUEEZE ALERT HELPERS  (CHUNK-15)
 # ==============================================================================
+
+
+# ==============================================================================
+# TRD-012: SQUEEZE TRAINING DATASET
+# ==============================================================================
+# Two tables: squeeze_training_snapshots (point-in-time features at signal time)
+# and squeeze_training_outcomes (forward returns + taxonomy labels, filled after
+# the forward window closes).
+#
+# Design: these tables are ML-ready exports. squeeze_scores is the source of
+# truth for pipeline history; these tables extract a clean tabular view for
+# model training and calibration. The key difference from squeeze_scores is:
+#   - signal-time features are explicit columns (not buried in explanation_json)
+#   - outcomes include binary hit flags and taxonomy labels
+#   - one row per (signal_date, ticker, alert_type) — not just (date, ticker)
+# ==============================================================================
+
+_SQUEEZE_TRAINING_SNAPSHOTS_DDL = """
+CREATE TABLE IF NOT EXISTS squeeze_training_snapshots (
+    id                          BIGSERIAL PRIMARY KEY,
+    signal_date                 DATE        NOT NULL,
+    ticker                      TEXT        NOT NULL,
+    alert_type                  TEXT,
+    final_score                 REAL,
+    short_pct_float             REAL,
+    computed_dtc_30d            REAL,
+    compression_recovery_score  REAL,
+    volume_confirmation_flag    BOOLEAN,
+    si_persistence_score        REAL,
+    effective_float_score       REAL,
+    effective_short_float_ratio REAL,
+    large_holder_ownership_pct  REAL,
+    options_pressure_score      REAL,
+    iv_rank                     REAL,
+    unusual_call_activity_flag  BOOLEAN,
+    risk_score                  REAL,
+    risk_level                  TEXT,
+    dilution_risk_flag          BOOLEAN,
+    explanation_tags            JSONB,
+    explanation_summary         TEXT,
+    created_at                  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (signal_date, ticker, alert_type)
+);
+"""
+
+_SQUEEZE_TRAINING_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS squeeze_training_outcomes (
+    id              BIGSERIAL PRIMARY KEY,
+    signal_date     DATE    NOT NULL,
+    ticker          TEXT    NOT NULL,
+    alert_type      TEXT,
+    fwd_5d          REAL,
+    fwd_10d         REAL,
+    fwd_20d         REAL,
+    fwd_30d         REAL,
+    max_fwd_return  REAL,
+    hit_15pct_10d   BOOLEAN,
+    hit_25pct_20d   BOOLEAN,
+    outcome_label   TEXT,
+    taxonomy_label  TEXT,
+    labeled_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (signal_date, ticker, alert_type)
+);
+"""
+
+
+def _norm_alert_type(val) -> "str | None":
+    """
+    Normalize an alert_type value to a clean string or None.
+
+    Guards against str(None) → "None" (the common coercion bug):
+    - Python None          → SQL NULL (return None)
+    - "None" / "none"      → SQL NULL (return None)
+    - "null" / "NULL"      → SQL NULL (return None)
+    - "" / whitespace-only → SQL NULL (return None)
+    - pandas/numpy NaN     → SQL NULL (return None)
+    - any other value      → str(val).strip()
+
+    Used consistently in all three training-table persistence helpers so
+    unlabeled historical rows cannot pollute calibration buckets with a
+    bogus "None" string grouping key.
+    """
+    if val is None:
+        return None
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s or s.lower() in ("none", "null", "nan"):
+        return None
+    return s
+
+
+def save_squeeze_training_snapshot(record: dict) -> None:
+    """
+    Upsert one point-in-time training snapshot into squeeze_training_snapshots.
+
+    All fields are sourced at signal time (no lookahead). Caller is responsible
+    for providing only information known on signal_date.
+
+    record must contain at minimum: signal_date, ticker, alert_type.
+    Rows with a missing / unknown alert_type are silently skipped to prevent
+    "None" string pollution in calibration grouping keys.
+    """
+    if not record:
+        return
+    _at = _norm_alert_type(record.get("alert_type"))
+    if _at is None:
+        logger.debug("save_squeeze_training_snapshot: skipping row with no alert_type (%s)", record.get("ticker"))
+        return
+    try:
+        import json as _json
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SQUEEZE_TRAINING_SNAPSHOTS_DDL)
+        _ensure_table_security(conn, "squeeze_training_snapshots")
+
+        def _f(key):
+            v = record.get(key)
+            return float(v) if v is not None else None
+
+        def _b(key):
+            v = record.get(key)
+            return bool(v) if v is not None else None
+
+        tags = record.get("explanation_tags")
+        tags_json = _json.dumps(tags) if isinstance(tags, (dict, list)) else (tags if isinstance(tags, str) else None)
+
+        cur.execute(
+            """
+            INSERT INTO squeeze_training_snapshots
+                (signal_date, ticker, alert_type,
+                 final_score, short_pct_float, computed_dtc_30d,
+                 compression_recovery_score, volume_confirmation_flag,
+                 si_persistence_score, effective_float_score,
+                 effective_short_float_ratio, large_holder_ownership_pct,
+                 options_pressure_score, iv_rank, unusual_call_activity_flag,
+                 risk_score, risk_level, dilution_risk_flag,
+                 explanation_tags, explanation_summary)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (signal_date, ticker, alert_type) DO UPDATE SET
+                final_score                 = EXCLUDED.final_score,
+                short_pct_float             = EXCLUDED.short_pct_float,
+                computed_dtc_30d            = EXCLUDED.computed_dtc_30d,
+                compression_recovery_score  = EXCLUDED.compression_recovery_score,
+                volume_confirmation_flag    = EXCLUDED.volume_confirmation_flag,
+                si_persistence_score        = EXCLUDED.si_persistence_score,
+                effective_float_score       = EXCLUDED.effective_float_score,
+                effective_short_float_ratio = EXCLUDED.effective_short_float_ratio,
+                large_holder_ownership_pct  = EXCLUDED.large_holder_ownership_pct,
+                options_pressure_score      = EXCLUDED.options_pressure_score,
+                iv_rank                     = EXCLUDED.iv_rank,
+                unusual_call_activity_flag  = EXCLUDED.unusual_call_activity_flag,
+                risk_score                  = EXCLUDED.risk_score,
+                risk_level                  = EXCLUDED.risk_level,
+                dilution_risk_flag          = EXCLUDED.dilution_risk_flag,
+                explanation_tags            = EXCLUDED.explanation_tags,
+                explanation_summary         = EXCLUDED.explanation_summary
+            """,
+            (
+                str(record.get("signal_date", "")),
+                str(record.get("ticker", "")).strip().upper(),
+                _at,
+                _f("final_score"), _f("short_pct_float"), _f("computed_dtc_30d"),
+                _f("compression_recovery_score"), _b("volume_confirmation_flag"),
+                _f("si_persistence_score"), _f("effective_float_score"),
+                _f("effective_short_float_ratio"), _f("large_holder_ownership_pct"),
+                _f("options_pressure_score"), _f("iv_rank"), _b("unusual_call_activity_flag"),
+                _f("risk_score"),
+                str(record.get("risk_level", "")) or None,
+                _b("dilution_risk_flag"),
+                tags_json,
+                str(record.get("explanation_summary", "")) or None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("save_squeeze_training_snapshot failed (non-fatal): %s", exc)
+
+
+def save_squeeze_training_snapshot_backfill(record: dict) -> None:
+    """
+    Insert a training snapshot row from historical replay/backfill data.
+
+    Identical to save_squeeze_training_snapshot() except this uses
+    ON CONFLICT DO NOTHING — so if a richer live-pipeline snapshot already
+    exists for this (signal_date, ticker, alert_type), it is preserved intact.
+
+    Use this when materializing historical feature rows from squeeze_scores
+    replay data (backfill path). Do NOT use for live pipeline writes — those
+    should use save_squeeze_training_snapshot() which keeps the row fresh.
+
+    Sourced from: squeeze_scores fields available in _build_replay_row().
+    Point-in-time safe: all fields come from data already saved at signal time.
+    """
+    if not record:
+        return
+    _at = _norm_alert_type(record.get("alert_type"))
+    if _at is None:
+        logger.debug("save_squeeze_training_snapshot_backfill: skipping row with no alert_type (%s)", record.get("ticker"))
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SQUEEZE_TRAINING_SNAPSHOTS_DDL)
+        _ensure_table_security(conn, "squeeze_training_snapshots")
+
+        def _f(key):
+            v = record.get(key)
+            return float(v) if v is not None else None
+
+        def _b(key):
+            v = record.get(key)
+            return bool(v) if v is not None else None
+
+        cur.execute(
+            """
+            INSERT INTO squeeze_training_snapshots
+                (signal_date, ticker, alert_type,
+                 final_score, short_pct_float, computed_dtc_30d,
+                 compression_recovery_score, volume_confirmation_flag,
+                 si_persistence_score, effective_float_score,
+                 effective_short_float_ratio, large_holder_ownership_pct,
+                 options_pressure_score, iv_rank, unusual_call_activity_flag,
+                 risk_score, risk_level, dilution_risk_flag,
+                 explanation_tags, explanation_summary)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (signal_date, ticker, alert_type) DO NOTHING
+            """,
+            (
+                str(record.get("signal_date", "")),
+                str(record.get("ticker", "")).strip().upper(),
+                _at,
+                _f("final_score"), _f("short_pct_float"), _f("computed_dtc_30d"),
+                _f("compression_recovery_score"), _b("volume_confirmation_flag"),
+                _f("si_persistence_score"), _f("effective_float_score"),
+                _f("effective_short_float_ratio"), _f("large_holder_ownership_pct"),
+                _f("options_pressure_score"), _f("iv_rank"), _b("unusual_call_activity_flag"),
+                _f("risk_score"),
+                str(record.get("risk_level", "")) or None,
+                _b("dilution_risk_flag"),
+                None,   # explanation_tags: not available in replay rows; live pipeline sets this
+                None,   # explanation_summary: same
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("save_squeeze_training_snapshot_backfill failed (non-fatal): %s", exc)
+
+
+def save_squeeze_training_outcome(record: dict) -> None:
+    """
+    Upsert a labeled outcome row into squeeze_training_outcomes.
+
+    Only call after the relevant forward window has closed (point-in-time safety).
+
+    record must contain at minimum: signal_date, ticker, alert_type.
+    Forward return fields and labels are optional (stored as NULL when missing).
+    """
+    if not record:
+        return
+    _at = _norm_alert_type(record.get("alert_type"))
+    if _at is None:
+        logger.debug("save_squeeze_training_outcome: skipping row with no alert_type (%s)", record.get("ticker"))
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SQUEEZE_TRAINING_OUTCOMES_DDL)
+        _ensure_table_security(conn, "squeeze_training_outcomes")
+
+        def _f(key):
+            v = record.get(key)
+            return float(v) if v is not None else None
+
+        def _b(key):
+            v = record.get(key)
+            return bool(v) if v is not None else None
+
+        cur.execute(
+            """
+            INSERT INTO squeeze_training_outcomes
+                (signal_date, ticker, alert_type,
+                 fwd_5d, fwd_10d, fwd_20d, fwd_30d, max_fwd_return,
+                 hit_15pct_10d, hit_25pct_20d,
+                 outcome_label, taxonomy_label)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (signal_date, ticker, alert_type) DO UPDATE SET
+                fwd_5d          = EXCLUDED.fwd_5d,
+                fwd_10d         = EXCLUDED.fwd_10d,
+                fwd_20d         = EXCLUDED.fwd_20d,
+                fwd_30d         = EXCLUDED.fwd_30d,
+                max_fwd_return  = EXCLUDED.max_fwd_return,
+                hit_15pct_10d   = EXCLUDED.hit_15pct_10d,
+                hit_25pct_20d   = EXCLUDED.hit_25pct_20d,
+                outcome_label   = EXCLUDED.outcome_label,
+                taxonomy_label  = EXCLUDED.taxonomy_label,
+                labeled_at      = NOW()
+            """,
+            (
+                str(record.get("signal_date", "")),
+                str(record.get("ticker", "")).strip().upper(),
+                _at,
+                _f("fwd_5d"), _f("fwd_10d"), _f("fwd_20d"), _f("fwd_30d"),
+                _f("max_fwd_return"),
+                _b("hit_15pct_10d"), _b("hit_25pct_20d"),
+                str(record.get("outcome_label", "")) or None,
+                str(record.get("taxonomy_label", "")) or None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("save_squeeze_training_outcome failed (non-fatal): %s", exc)
+
+
+def fetch_squeeze_training_outcomes(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    alert_types: "list[str] | None" = None,
+    tickers: "list[str] | None" = None,
+) -> "list[dict]":
+    """
+    Fetch labeled training outcomes for calibration and reporting.
+
+    Returns list of dicts joining snapshots + outcomes. Only returns rows where
+    outcomes have been labeled (taxonomy_label IS NOT NULL).
+    """
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        wheres = ["o.taxonomy_label IS NOT NULL"]
+        params: list = []
+        if start_date:
+            wheres.append("o.signal_date >= %s")
+            params.append(start_date)
+        if end_date:
+            wheres.append("o.signal_date <= %s")
+            params.append(end_date)
+        if alert_types:
+            wheres.append("o.alert_type = ANY(%s)")
+            params.append(alert_types)
+        if tickers:
+            wheres.append("o.ticker = ANY(%s)")
+            params.append([t.upper() for t in tickers])
+        where_clause = " AND ".join(wheres)
+        cur.execute(
+            f"""
+            SELECT
+                o.signal_date, o.ticker, o.alert_type,
+                o.fwd_5d, o.fwd_10d, o.fwd_20d, o.fwd_30d, o.max_fwd_return,
+                o.hit_15pct_10d, o.hit_25pct_20d,
+                o.outcome_label, o.taxonomy_label,
+                s.final_score, s.short_pct_float, s.computed_dtc_30d,
+                s.compression_recovery_score, s.si_persistence_score,
+                s.risk_level, s.dilution_risk_flag
+            FROM   squeeze_training_outcomes o
+            LEFT JOIN squeeze_training_snapshots s
+                   ON s.signal_date = o.signal_date
+                  AND s.ticker      = o.ticker
+                  AND s.alert_type  = o.alert_type
+            WHERE  {where_clause}
+            ORDER  BY o.signal_date ASC, o.ticker ASC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("fetch_squeeze_training_outcomes failed: %s", exc)
+        return []
+
+
+# ==============================================================================
+# TRD-015: APPROVAL REQUESTS
+# ==============================================================================
+
+_APPROVAL_REQUESTS_DDL = """
+CREATE TABLE IF NOT EXISTS approval_requests (
+    request_id          TEXT        NOT NULL PRIMARY KEY,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    category            TEXT        NOT NULL,
+    risk_level          TEXT        NOT NULL DEFAULT 'LOW',
+    title               TEXT        NOT NULL,
+    summary             TEXT,
+    evidence_ref        TEXT,
+    proposed_change_json JSONB,
+    status              TEXT        NOT NULL DEFAULT 'PENDING',
+    approved_by         TEXT,
+    approved_at         TIMESTAMPTZ,
+    expires_at          TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+_VALID_APPROVAL_STATUSES = frozenset({"PENDING", "APPROVED", "REJECTED", "EXPIRED", "APPLIED"})
+
+
+def save_approval_request(record: dict) -> str:
+    """
+    Persist a new approval request in Supabase.
+
+    record must contain: request_id, category, title.
+    Optional: risk_level, summary, evidence_ref, proposed_change_json, expires_at.
+
+    Returns request_id on success, empty string on failure.
+    """
+    if not record:
+        return ""
+    try:
+        import json as _json
+        import uuid as _uuid
+
+        request_id = str(record.get("request_id") or _uuid.uuid4())
+        category   = str(record.get("category", "UNCLASSIFIED"))
+        risk_level = str(record.get("risk_level", "LOW")).upper()
+        title      = str(record.get("title", ""))
+        summary    = str(record.get("summary", "")) or None
+        evidence_ref = str(record.get("evidence_ref", "")) or None
+        pch = record.get("proposed_change_json")
+        pch_json = _json.dumps(pch) if isinstance(pch, (dict, list)) else (pch if isinstance(pch, str) else None)
+        expires_at = record.get("expires_at")
+
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_APPROVAL_REQUESTS_DDL)
+        _ensure_table_security(conn, "approval_requests")
+        cur.execute(
+            """
+            INSERT INTO approval_requests
+                (request_id, category, risk_level, title, summary,
+                 evidence_ref, proposed_change_json, status, expires_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,'PENDING',%s)
+            ON CONFLICT (request_id) DO NOTHING
+            """,
+            (request_id, category, risk_level, title, summary,
+             evidence_ref, pch_json, expires_at),
+        )
+        conn.commit()
+        conn.close()
+        logger.info("save_approval_request: created %s (%s)", request_id, title)
+        return request_id
+    except Exception as exc:
+        logger.warning("save_approval_request failed: %s", exc)
+        return ""
+
+
+def update_approval_request_status(
+    request_id: str,
+    new_status: str,
+    approved_by: "str | None" = None,
+) -> bool:
+    """
+    Transition an approval request to a new status.
+
+    Transition guards (conservative, auditable):
+    - APPROVED / REJECTED transitions are only allowed when the current status
+      is exactly 'PENDING' AND the request is not expired. Attempting to
+      approve/reject an already-decided (APPROVED, REJECTED, APPLIED) or
+      expired request returns False without modifying the row.
+    - APPLIED transitions are only allowed from APPROVED.
+    - EXPIRED can be set from PENDING only.
+    - The guard is enforced at both Python level (fast pre-check via fetch)
+      and SQL level (WHERE status = 'PENDING' / 'APPROVED' as appropriate).
+
+    Returns True only when exactly one row was updated.
+    Returns False on any of: invalid status, wrong current state, expired,
+      not found, or DB error.
+    """
+    new_status = new_status.upper()
+    if new_status not in _VALID_APPROVAL_STATUSES:
+        logger.warning("update_approval_request_status: invalid status %r", new_status)
+        return False
+
+    # ── Python-level pre-check (fast, avoids a silent no-op in the DB) ────────
+    if new_status in ("APPROVED", "REJECTED", "EXPIRED", "APPLIED"):
+        current = fetch_approval_request(request_id)
+        if current is None:
+            logger.warning(
+                "update_approval_request_status: request %r not found", request_id
+            )
+            return False
+        cur_status = (current.get("status") or "").upper()
+
+        # APPROVED / REJECTED require current status = PENDING
+        if new_status in ("APPROVED", "REJECTED"):
+            if cur_status != "PENDING":
+                logger.warning(
+                    "update_approval_request_status: %s is already %s — "
+                    "transition to %s rejected (only PENDING can be approved/rejected)",
+                    request_id, cur_status, new_status,
+                )
+                return False
+            # Expiry check
+            expires_at = current.get("expires_at")
+            if expires_at is not None:
+                try:
+                    from datetime import timezone as _tz
+                    _now = datetime.now(_tz.utc)
+                    if isinstance(expires_at, str):
+                        _exp = datetime.fromisoformat(
+                            expires_at.replace("Z", "+00:00")
+                        )
+                    else:
+                        _exp = expires_at
+                    if _exp.tzinfo is None:
+                        _exp = _exp.replace(tzinfo=_tz.utc)
+                    if _exp < _now:
+                        logger.warning(
+                            "update_approval_request_status: %s is expired — "
+                            "transition to %s rejected",
+                            request_id, new_status,
+                        )
+                        return False
+                except Exception:
+                    pass  # unparseable expiry — allow and let SQL guard handle it
+
+        # APPLIED requires current status = APPROVED
+        elif new_status == "APPLIED":
+            if cur_status != "APPROVED":
+                logger.warning(
+                    "update_approval_request_status: %s is %s — "
+                    "APPLIED transition requires APPROVED",
+                    request_id, cur_status,
+                )
+                return False
+
+        # EXPIRED requires current status = PENDING
+        elif new_status == "EXPIRED":
+            if cur_status != "PENDING":
+                logger.warning(
+                    "update_approval_request_status: %s is %s — "
+                    "EXPIRED transition only allowed from PENDING",
+                    request_id, cur_status,
+                )
+                return False
+
+    # ── SQL update with status guard (belt-and-suspenders) ────────────────────
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_APPROVAL_REQUESTS_DDL)
+        if new_status in ("APPROVED", "REJECTED"):
+            # Belt-and-suspenders: WHERE also guards status=PENDING and expiry
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET    status = %s, approved_by = %s,
+                       approved_at = NOW(), updated_at = NOW()
+                WHERE  request_id = %s
+                  AND  status = 'PENDING'
+                  AND  (expires_at IS NULL OR expires_at > NOW())
+                """,
+                (new_status, approved_by, request_id),
+            )
+        elif new_status == "APPLIED":
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET    status = %s, updated_at = NOW()
+                WHERE  request_id = %s
+                  AND  status = 'APPROVED'
+                """,
+                (new_status, request_id),
+            )
+        elif new_status == "EXPIRED":
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET    status = %s, updated_at = NOW()
+                WHERE  request_id = %s
+                  AND  status = 'PENDING'
+                """,
+                (new_status, request_id),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE approval_requests
+                SET    status = %s, updated_at = NOW()
+                WHERE  request_id = %s
+                """,
+                (new_status, request_id),
+            )
+        rows_updated = cur.rowcount
+        conn.commit()
+        conn.close()
+        logger.info(
+            "update_approval_request_status: %s → %s (rows=%d)",
+            request_id, new_status, rows_updated,
+        )
+        return rows_updated > 0
+    except Exception as exc:
+        logger.warning("update_approval_request_status failed: %s", exc)
+        return False
+
+
+def fetch_approval_request(request_id: str) -> "dict | None":
+    """Fetch a single approval request by request_id."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_APPROVAL_REQUESTS_DDL)
+        cur.execute(
+            "SELECT * FROM approval_requests WHERE request_id = %s",
+            (request_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as exc:
+        logger.warning("fetch_approval_request failed: %s", exc)
+        return None
+
+
+def fetch_pending_approval_requests() -> "list[dict]":
+    """Fetch all PENDING approval requests ordered by created_at DESC."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_APPROVAL_REQUESTS_DDL)
+        cur.execute(
+            """
+            SELECT * FROM approval_requests
+            WHERE  status = 'PENDING'
+            ORDER  BY created_at DESC
+            """,
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("fetch_pending_approval_requests failed: %s", exc)
+        return []
+
 
 def fetch_previous_squeeze_score_for_alert(
     ticker: str,

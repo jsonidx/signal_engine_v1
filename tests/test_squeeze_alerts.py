@@ -27,6 +27,7 @@ from squeeze_alerts import (
     build_squeeze_alerts,
     format_alert_message,
     format_alerts_section,
+    EARLY_ARMED_ALERT,
     SQUEEZE_ARMED,
     ACTIVE_SQUEEZE,
     SQUEEZE_RISK_HIGH,
@@ -471,3 +472,134 @@ class TestNotifyIntegration:
 
         result = build_squeeze_alerts_section(mock_conn)
         assert isinstance(result, str)
+
+
+# ── TRD-011: EARLY_ARMED_ALERT tests ────────────────────────────────────────
+
+class TestEarlyArmedAlert:
+    """Tests for the EARLY_ARMED_ALERT alert type (TRD-011)."""
+
+    def test_early_armed_alert_fires_on_not_setup_to_early_armed(self):
+        """NOT_SETUP → EARLY_ARMED transition must fire EARLY_ARMED_ALERT."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=49.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        assert EARLY_ARMED_ALERT in _alert_types(alerts)
+
+    def test_early_armed_alert_does_not_repeat(self):
+        """EARLY_ARMED → EARLY_ARMED (unchanged) must NOT fire again."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=49.0)
+        prev = _row(squeeze_state="EARLY_ARMED")
+        alerts = build_squeeze_alerts(curr, prev)
+        assert EARLY_ARMED_ALERT not in _alert_types(alerts)
+
+    def test_early_armed_alert_fires_with_no_previous(self):
+        """First time seeing EARLY_ARMED with score above floor → alert fires."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=48.0)
+        alerts = build_squeeze_alerts(curr, previous_row=None, min_early_armed_score=45.0)
+        assert EARLY_ARMED_ALERT in _alert_types(alerts)
+
+    def test_early_armed_alert_below_min_score_no_alert(self):
+        """Score below min_early_armed_score → no alert."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=42.0)
+        alerts = build_squeeze_alerts(curr, previous_row=None, min_early_armed_score=45.0)
+        assert EARLY_ARMED_ALERT not in _alert_types(alerts)
+
+    def test_early_armed_alert_not_fired_when_armed(self):
+        """When state is ARMED, only SQUEEZE_ARMED fires (not EARLY_ARMED_ALERT)."""
+        curr = _row(squeeze_state="ARMED", final_score=62.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        assert SQUEEZE_ARMED in _alert_types(alerts)
+        assert EARLY_ARMED_ALERT not in _alert_types(alerts)
+
+    def test_early_armed_alert_not_fired_when_active(self):
+        """When state is ACTIVE, only ACTIVE_SQUEEZE fires (not EARLY_ARMED_ALERT)."""
+        curr = _row(squeeze_state="ACTIVE", final_score=65.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        assert ACTIVE_SQUEEZE in _alert_types(alerts)
+        assert EARLY_ARMED_ALERT not in _alert_types(alerts)
+
+    def test_early_armed_alert_has_medium_severity(self):
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=49.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        a = next(a for a in alerts if a["alert_type"] == EARLY_ARMED_ALERT)
+        assert a["severity"] == "MEDIUM"
+
+    def test_early_armed_alert_message_contains_watch_language(self):
+        """EARLY_ARMED_ALERT message must convey 'watch' / 'entry-hunting' semantics."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=49.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        a = next(a for a in alerts if a["alert_type"] == EARLY_ARMED_ALERT)
+        msg = format_alert_message(a)
+        assert any(kw in msg.lower() for kw in ("watch", "entry", "early", "hunt"))
+
+    def test_active_squeeze_alert_message_contains_chase_language(self):
+        """ACTIVE_SQUEEZE message must clearly state chase risk / not fresh-entry."""
+        curr = _row(squeeze_state="ACTIVE", final_score=65.0)
+        prev = _row(squeeze_state="ARMED")
+        alerts = build_squeeze_alerts(curr, prev)
+        a = next(a for a in alerts if a["alert_type"] == ACTIVE_SQUEEZE)
+        msg = format_alert_message(a)
+        assert any(kw in msg.lower() for kw in ("chase", "continuation", "move", "progress"))
+
+    def test_early_armed_alert_not_fired_when_downgrading_from_armed(self):
+        """ARMED → EARLY_ARMED downgrade should NOT fire EARLY_ARMED_ALERT
+        (only fires on upward transitions from lower states)."""
+        curr = _row(squeeze_state="EARLY_ARMED", final_score=49.0)
+        prev = _row(squeeze_state="ARMED")
+        alerts = build_squeeze_alerts(curr, prev)
+        assert EARLY_ARMED_ALERT not in _alert_types(alerts)
+
+    def test_ddd_fixture_alert_transition(self):
+        """DDD April 15 row (EARLY_ARMED) fires alert vs NOT_SETUP previous row."""
+        from tests.fixtures.ddd_apr_may_2026 import APR15_SQUEEZE_ROW, APR15_PREVIOUS_ROW
+        alerts = build_squeeze_alerts(APR15_SQUEEZE_ROW, APR15_PREVIOUS_ROW)
+        assert EARLY_ARMED_ALERT in _alert_types(alerts)
+        # Must NOT fire SQUEEZE_ARMED (that's for the higher ARMED state)
+        assert SQUEEZE_ARMED not in _alert_types(alerts)
+
+    def test_squeeze_armed_alert_message_contains_prebreakout_language(self):
+        """SQUEEZE_ARMED message must convey structural / pre-breakout entry-watch semantics."""
+        curr = _row(squeeze_state="ARMED", final_score=62.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        a = next(a for a in alerts if a["alert_type"] == SQUEEZE_ARMED)
+        msg = format_alert_message(a)
+        assert any(kw in msg.lower() for kw in ("armed", "pre-breakout", "structural", "setup", "entry watch"))
+
+    def test_squeeze_armed_alert_not_confused_with_active(self):
+        """SQUEEZE_ARMED message must NOT contain 'chase' or 'continuation' language."""
+        curr = _row(squeeze_state="ARMED", final_score=62.0)
+        prev = _row(squeeze_state="NOT_SETUP")
+        alerts = build_squeeze_alerts(curr, prev)
+        a = next(a for a in alerts if a["alert_type"] == SQUEEZE_ARMED)
+        msg = format_alert_message(a)
+        assert "chase risk" not in msg.lower(), "ARMED alert must not read like ACTIVE_SQUEEZE"
+
+    def test_state_hierarchy_message_ordering(self):
+        """EARLY_ARMED, ARMED, ACTIVE messages all have distinct context lines."""
+        def _msg_for(state, prev_state="NOT_SETUP"):
+            curr = _row(squeeze_state=state, final_score=65.0)
+            prev = _row(squeeze_state=prev_state)
+            alerts = build_squeeze_alerts(curr, prev)
+            if not alerts:
+                return ""
+            return format_alert_message(alerts[0])
+
+        early_msg  = _msg_for("EARLY_ARMED")
+        armed_msg  = _msg_for("ARMED")
+        active_msg = _msg_for("ACTIVE", prev_state="ARMED")
+
+        # All three must produce messages
+        assert early_msg,  "EARLY_ARMED should produce a message"
+        assert armed_msg,  "ARMED should produce a message"
+        assert active_msg, "ACTIVE should produce a message"
+
+        # Each state must include its characteristic keyword
+        assert any(kw in early_msg.lower()  for kw in ("watch", "entry", "early", "hunt"))
+        assert any(kw in armed_msg.lower()  for kw in ("armed", "pre-breakout", "structural", "setup"))
+        assert any(kw in active_msg.lower() for kw in ("chase", "continuation", "move", "progress"))

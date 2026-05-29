@@ -26,6 +26,7 @@
 --   blacklist           — ticker exclusions with reason + optional TTL
 --   ticker_metadata     — IPO/delist dates, sector; eliminates per-ticker yf calls
 --   fundamentals        — quarterly fundamental data cache (30-day TTL)
+--   catalyst_scores     — per-ticker screener scores incl. earnings_score, raw_composite
 -- =============================================================================
 
 
@@ -305,6 +306,41 @@ CREATE INDEX IF NOT EXISTS idx_fundamentals_fetched_at
     ON fundamentals (fetched_at);
 
 
+-- ---------------------------------------------------------------------------
+-- 12. Pipeline Output Tables
+-- ---------------------------------------------------------------------------
+-- These tables are auto-created by utils/supabase_persist.py on first write,
+-- but are listed here so a fresh Supabase install has them immediately and the
+-- /api/watch-setup endpoint does not fail on missing columns.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS catalyst_scores (
+    date               TEXT    NOT NULL,
+    ticker             TEXT    NOT NULL,
+    composite          REAL,
+    raw_composite      REAL,
+    post_squeeze_guard BOOLEAN,
+    squeeze_score      REAL,
+    volume_score       REAL,
+    vol_compress       REAL,
+    options_score      REAL,
+    technical_score    REAL,
+    social_score       REAL,
+    polymarket_score   REAL,
+    dark_pool_score    REAL,
+    dark_pool_signal   TEXT,
+    earnings_score     REAL,
+    days_to_earnings   INTEGER,
+    n_flags            INTEGER,
+    price              REAL,
+    short_pct          REAL,
+    PRIMARY KEY (date, ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalyst_scores_date
+    ON catalyst_scores (date DESC);
+
+
 -- =============================================================================
 -- ROW LEVEL SECURITY (RLS)
 -- =============================================================================
@@ -329,6 +365,7 @@ ALTER TABLE equity_positions   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE weekly_returns     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE portfolio_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_watchlists    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_favorites     ENABLE ROW LEVEL SECURITY;
 
 -- Global shared cache tables
 ALTER TABLE thesis_cache       ENABLE ROW LEVEL SECURITY;
@@ -340,6 +377,7 @@ ALTER TABLE thesis_outcomes    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE blacklist          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ticker_metadata    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE fundamentals       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE catalyst_scores    ENABLE ROW LEVEL SECURITY;
 
 -- Policies: authenticated users can access all tables
 -- (replace USING (true) with USING (auth.uid() = user_id) in Phase 5 for user tables)
@@ -349,10 +387,10 @@ DECLARE
 BEGIN
     FOREACH tbl IN ARRAY ARRAY[
         'trades','trade_returns','snapshots','equity_positions',
-        'weekly_returns','portfolio_settings','user_watchlists',
+        'weekly_returns','portfolio_settings','user_watchlists','user_favorites',
         'thesis_cache','transcript_cache','iv_history',
         'resolution_cache','strategy_config','thesis_outcomes',
-        'blacklist','ticker_metadata','fundamentals'
+        'blacklist','ticker_metadata','fundamentals','catalyst_scores'
     ] LOOP
         EXECUTE format(
             'DROP POLICY IF EXISTS "authenticated_full_access" ON %I;
@@ -372,3 +410,97 @@ ALTER TABLE equity_positions   ADD COLUMN IF NOT EXISTS user_id UUID;
 ALTER TABLE weekly_returns     ADD COLUMN IF NOT EXISTS user_id UUID;
 ALTER TABLE portfolio_settings ADD COLUMN IF NOT EXISTS user_id UUID;
 ALTER TABLE user_watchlists    ADD COLUMN IF NOT EXISTS user_id UUID;
+ALTER TABLE user_favorites     ADD COLUMN IF NOT EXISTS user_id UUID;
+
+-- =============================================================================
+-- TRD-012: squeeze training dataset (signal-time features + labeled outcomes)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS squeeze_training_snapshots (
+    id                          BIGSERIAL PRIMARY KEY,
+    signal_date                 DATE        NOT NULL,
+    ticker                      TEXT        NOT NULL,
+    alert_type                  TEXT,
+    final_score                 REAL,
+    short_pct_float             REAL,
+    computed_dtc_30d            REAL,
+    compression_recovery_score  REAL,
+    volume_confirmation_flag    BOOLEAN,
+    si_persistence_score        REAL,
+    effective_float_score       REAL,
+    effective_short_float_ratio REAL,
+    large_holder_ownership_pct  REAL,
+    options_pressure_score      REAL,
+    iv_rank                     REAL,
+    unusual_call_activity_flag  BOOLEAN,
+    risk_score                  REAL,
+    risk_level                  TEXT,
+    dilution_risk_flag          BOOLEAN,
+    explanation_tags            JSONB,
+    explanation_summary         TEXT,
+    created_at                  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (signal_date, ticker, alert_type)
+);
+
+CREATE TABLE IF NOT EXISTS squeeze_training_outcomes (
+    id              BIGSERIAL PRIMARY KEY,
+    signal_date     DATE    NOT NULL,
+    ticker          TEXT    NOT NULL,
+    alert_type      TEXT,
+    fwd_5d          REAL,
+    fwd_10d         REAL,
+    fwd_20d         REAL,
+    fwd_30d         REAL,
+    max_fwd_return  REAL,
+    hit_15pct_10d   BOOLEAN,
+    hit_25pct_20d   BOOLEAN,
+    outcome_label   TEXT,
+    taxonomy_label  TEXT,
+    labeled_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (signal_date, ticker, alert_type)
+);
+
+ALTER TABLE squeeze_training_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE squeeze_training_outcomes  ENABLE ROW LEVEL SECURITY;
+
+DO $$
+DECLARE tbl TEXT;
+BEGIN
+    FOREACH tbl IN ARRAY ARRAY['squeeze_training_snapshots','squeeze_training_outcomes'] LOOP
+        EXECUTE format(
+            'DROP POLICY IF EXISTS "authenticated_full_access" ON %I;
+             CREATE POLICY "authenticated_full_access" ON %I
+                 FOR ALL TO authenticated USING (true) WITH CHECK (true);',
+            tbl, tbl
+        );
+    END LOOP;
+END $$;
+
+-- =============================================================================
+-- TRD-015: approval_requests (human-approval gate for trading-logic changes)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    request_id           TEXT        NOT NULL PRIMARY KEY,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    category             TEXT        NOT NULL,
+    risk_level           TEXT        NOT NULL DEFAULT 'LOW',
+    title                TEXT        NOT NULL,
+    summary              TEXT,
+    evidence_ref         TEXT,
+    proposed_change_json JSONB,
+    status               TEXT        NOT NULL DEFAULT 'PENDING',
+    approved_by          TEXT,
+    approved_at          TIMESTAMPTZ,
+    expires_at           TIMESTAMPTZ,
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE approval_requests ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    DROP POLICY IF EXISTS "authenticated_full_access" ON approval_requests;
+    CREATE POLICY "authenticated_full_access" ON approval_requests
+        FOR ALL TO authenticated USING (true) WITH CHECK (true);
+END $$;

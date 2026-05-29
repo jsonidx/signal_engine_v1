@@ -1,12 +1,38 @@
 # Task: Event-Driven Deep Dive Candidate Queue
 
 Status: done
+Stage: done
+Type: feature
+Priority: P1
+Severity: high
 Owner: Claude Code
+Reviewer: Human
+Product Area: data-pipeline
+Category: automation
 Risk: trading-logic
+Effort: M
+Target Release: completed
+Due Date: completed
+Dependencies: none
+Blocked By: none
+Links: none
+Success Metric: fresh catalyst candidates can be queued into Deep Dive without first appearing in the traditional watchlist path.
+
+## Problem Statement
+
+Fresh event-driven setups could be missed because the Deep Dive pipeline depended too heavily on pre-existing watchlist and ranking entry points.
+
+## User Impact
+
+Users received late or incomplete coverage on new catalyst names that should have been routed into deeper analysis earlier.
 
 ## Objective
 
 Add a bounded event-driven candidate queue so fresh catalyst breakouts can be routed into Deep Dive thesis generation even when the ticker is not already present in `watchlist.txt`, `resolved_signals.json`, or `daily_rankings`.
+
+## Proposed Solution
+
+Introduce a capped, auditable event queue and wire it into candidate selection for downstream AI thesis generation.
 
 ## Scope
 

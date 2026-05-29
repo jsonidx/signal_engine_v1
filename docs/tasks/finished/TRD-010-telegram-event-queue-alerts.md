@@ -1,12 +1,38 @@
 # Task: Telegram Event Queue Alerts
 
 Status: done
+Stage: done
+Type: feature
+Priority: P2
+Severity: medium
 Owner: Claude Code
+Reviewer: Human
+Product Area: alerts
+Category: automation
 Risk: api
+Effort: S
+Target Release: completed
+Due Date: completed
+Dependencies: TRD-006
+Blocked By: none
+Links: none
+Success Metric: Telegram pipeline summaries can show event-queue catalyst candidates with correct watch semantics.
+
+## Problem Statement
+
+Event-queue candidates were being generated, but the Telegram delivery layer did not surface them clearly in pipeline summaries.
+
+## User Impact
+
+Users could miss fresh catalyst-watch names even when the backend had already identified them.
 
 ## Objective
 
 Extend Telegram pipeline notifications so event-queue tickers found during the workflow are surfaced explicitly as catalyst/watch candidates, even when they are not yet Hot Entry names.
+
+## Proposed Solution
+
+Add a compact event-queue section to Telegram summaries using existing structured reasons and pipeline outputs.
 
 ## Scope
 

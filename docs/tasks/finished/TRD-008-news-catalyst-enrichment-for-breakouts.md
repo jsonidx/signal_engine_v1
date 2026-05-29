@@ -1,12 +1,38 @@
 # Task: News Catalyst Enrichment For Breakouts
 
 Status: done
+Stage: done
+Type: feature
+Priority: P1
+Severity: medium
 Owner: Claude Code
+Reviewer: Human
+Product Area: data-pipeline
+Category: automation
 Risk: trading-logic
+Effort: M
+Target Release: completed
+Due Date: completed
+Dependencies: none
+Blocked By: none
+Links: none
+Success Metric: structured fresh-news catalyst evidence can influence breakout and Deep Dive routing earlier.
+
+## Problem Statement
+
+Breakout detection needed better structured catalyst inputs from news and related narrative shifts.
+
+## User Impact
+
+Without catalyst enrichment, users could see price action without enough context to prioritize fresh fundamental or narrative drivers.
 
 ## Objective
 
 Enrich breakout detection with structured fresh-catalyst evidence from company news, press releases, and optionally social/news velocity, so narrative changes can trigger Deep Dive review earlier.
+
+## Proposed Solution
+
+Layer structured catalyst tagging from news, press, and sentiment inputs into breakout candidate scoring and metadata.
 
 ## Scope
 

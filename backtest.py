@@ -1096,6 +1096,65 @@ def classify_squeeze_outcome(max_fwd_return: Optional[float]) -> str:
     return "none"
 
 
+def compute_taxonomy_label(
+    squeeze_state: Optional[str],
+    fwd_10d: Optional[float],
+    fwd_20d: Optional[float],
+    max_fwd_return: Optional[float],
+    hit_15pct_10d: Optional[bool],
+    hit_25pct_20d: Optional[bool],
+) -> str:
+    """
+    Assign an alert-outcome taxonomy label for PM review and ML training.
+
+    Labels (TRD-014):
+        EARLY_ENOUGH    — entry-state alert (EARLY_ARMED/ARMED) that preceded a
+                          qualifying move (>=15% in 10d or >=25% in 20d).
+        LATE_CHASE      — alert fired after the move was underway (ACTIVE state),
+                          or entry-state alert that failed to capture a timely move.
+        FALSE_POSITIVE  — no meaningful move occurred after the alert (<5% max
+                          forward return across all windows).
+
+    Semantics:
+        • EARLY_ENOUGH only applies to entry states (EARLY_ARMED, ARMED).
+        • ACTIVE is a continuation / chase state by design; its default label is
+          LATE_CHASE unless no move occurred at all (FALSE_POSITIVE).
+        • Labels are only valid after the relevant forward window has closed.
+        • Never hardcodes a success rate — labels describe timing quality, not
+          whether the alert system is "good" or "bad".
+
+    Point-in-time safety:
+        Only inputs known at or after the close of the forward window are used.
+        The signal_date features (SI, DTC, etc.) are stored separately in
+        squeeze_training_snapshots and must NOT be passed here.
+    """
+    _state = (squeeze_state or "").upper()
+    _is_entry_state = _state in ("EARLY_ARMED", "ARMED")
+    _is_chase_state = _state == "ACTIVE"
+
+    _max = max_fwd_return
+    if _max is None or (_max != _max):  # NaN guard
+        _max = None
+
+    # False positive: no meaningful move across any tracked window
+    if _max is None or _max < 0.05:
+        return "FALSE_POSITIVE"
+
+    # Chase state: move happened but entry was already underway
+    if _is_chase_state:
+        return "LATE_CHASE"
+
+    # Entry state: reward early-enough detection
+    if _is_entry_state:
+        if hit_15pct_10d or hit_25pct_20d:
+            return "EARLY_ENOUGH"
+        # Move happened but too slowly or target not reached quickly
+        return "LATE_CHASE"
+
+    # Unknown state: fall back to LATE_CHASE when there was a move
+    return "LATE_CHASE"
+
+
 def _extract_from_explanation(explanation_json_str: Optional[str], field_key: str) -> Optional[float]:
     """
     Extract a numeric score from explanation_json by matching driver key names.
@@ -1298,16 +1357,40 @@ class SqueezeOutcomeReplay:
             v = row.get(f"fwd_{w}d")
             row[f"hit_{w}d"] = bool(v > 0) if v is not None else None
 
+        # TRD-014: binary success labels for ML training
+        fwd_10d = row.get("fwd_10d")
+        fwd_20d = row.get("fwd_20d")
+        row["hit_15pct_10d"] = bool(fwd_10d >= 0.15) if fwd_10d is not None else None
+        row["hit_25pct_20d"] = bool(fwd_20d >= 0.25) if fwd_20d is not None else None
+
+        # TRD-014: taxonomy label (EARLY_ENOUGH | LATE_CHASE | FALSE_POSITIVE)
+        row["taxonomy_label"] = compute_taxonomy_label(
+            squeeze_state=row.get("squeeze_state"),
+            fwd_10d=fwd_10d,
+            fwd_20d=fwd_20d,
+            max_fwd_return=max_fwd,
+            hit_15pct_10d=row["hit_15pct_10d"],
+            hit_25pct_20d=row["hit_25pct_20d"],
+        )
+
         return row
 
-    def run(self, prices: Optional[Dict[str, pd.Series]] = None) -> pd.DataFrame:
+    def run(
+        self,
+        prices: Optional[Dict[str, pd.Series]] = None,
+        persist_outcomes: bool = False,
+    ) -> pd.DataFrame:
         """
         Run the full replay.
 
         Parameters
         ----------
-        prices : optional pre-loaded price dict {ticker: pd.Series}.
-                 If None, fetches from yfinance (requires network).
+        prices          : optional pre-loaded price dict {ticker: pd.Series}.
+                          If None, fetches from yfinance (requires network).
+        persist_outcomes: when True, persist labeled outcomes for rows whose
+                          30-day forward window is closed (fwd_30d is not None)
+                          into squeeze_training_outcomes via Supabase. Defaults
+                          to False to preserve test compatibility.
 
         Returns a DataFrame with one row per signal snapshot.
         """
@@ -1332,7 +1415,126 @@ class SqueezeOutcomeReplay:
             rows.append(self._build_replay_row(snap, self._prices.get(ticker)))
 
         self._results = pd.DataFrame(rows)
+
+        if persist_outcomes:
+            self._persist_training_outcomes()
+
         return self._results
+
+    def _persist_training_outcomes(self) -> int:
+        """
+        Persist labeled outcomes to squeeze_training_outcomes for rows whose
+        30-day forward window is fully closed (fwd_30d is not None).
+
+        Only closed windows are written — this preserves point-in-time safety
+        and avoids mislabeling signals whose outcome is not yet determined.
+
+        Returns the count of rows persisted (0 if none, non-fatal on error).
+        """
+        df = self._results
+        if df.empty:
+            return 0
+
+        # Only rows with a closed 30-day window
+        if "fwd_30d" not in df.columns:
+            return 0
+
+        closed = df[df["fwd_30d"].notna()]
+        if closed.empty:
+            logger.info("_persist_training_outcomes: no closed 30d windows yet")
+            return 0
+
+        # States that carry meaningful learning signal for the training dataset.
+        # Pre-CHUNK-10 rows have squeeze_state=None and must not enter the training
+        # tables as alert_type="None" (string), which would create bogus calibration
+        # buckets. NOT_SETUP is also excluded — no signal of interest.
+        _MEANINGFUL_STATES = frozenset({"EARLY_ARMED", "ARMED", "ACTIVE"})
+
+        try:
+            from utils.supabase_persist import (
+                save_squeeze_training_outcome,
+                save_squeeze_training_snapshot_backfill,
+            )
+            count = 0
+            skipped = 0
+            for _, row in closed.iterrows():
+                signal_date = row.get("signal_date")
+                ticker = row.get("ticker")
+                raw_state = row.get("squeeze_state")
+
+                # Normalize and gate: skip rows whose state is missing, "None",
+                # NaN, "NOT_SETUP", or any other non-meaningful value.
+                if raw_state is None:
+                    skipped += 1
+                    continue
+                import pandas as _pd
+                try:
+                    if _pd.isna(raw_state):
+                        skipped += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                alert_type = str(raw_state).strip().upper()
+                if not alert_type or alert_type in ("NONE", "NULL", "NAN", "NOT_SETUP", "UNKNOWN"):
+                    skipped += 1
+                    continue
+                if alert_type not in _MEANINGFUL_STATES:
+                    # Future-proof: allow new states added after this code was written,
+                    # but log so we know they exist.
+                    logger.debug(
+                        "_persist_training_outcomes: state %r is not in known training states "
+                        "(%s) — including anyway",
+                        alert_type, ", ".join(sorted(_MEANINGFUL_STATES)),
+                    )
+
+                # Materialize a training snapshot from replay feature data if one
+                # doesn't exist yet (ON CONFLICT DO NOTHING — live-pipeline rows win).
+                # This ensures fetch_squeeze_training_outcomes() returns non-NULL
+                # feature columns for historically backfilled rows.
+                save_squeeze_training_snapshot_backfill({
+                    "signal_date": signal_date,
+                    "ticker": ticker,
+                    "alert_type": alert_type,
+                    "final_score": row.get("final_score"),
+                    "short_pct_float": row.get("short_pct_float"),
+                    "computed_dtc_30d": row.get("computed_dtc_30d"),
+                    "compression_recovery_score": row.get("compression_recovery_score"),
+                    "volume_confirmation_flag": row.get("volume_confirmation_flag"),
+                    "si_persistence_score": row.get("si_persistence_score"),
+                    "effective_float_score": row.get("effective_float_score"),
+                    "options_pressure_score": row.get("options_pressure_score"),
+                    "iv_rank": row.get("iv_rank"),
+                    "unusual_call_activity_flag": row.get("unusual_call_activity_flag"),
+                    "risk_score": row.get("risk_score"),
+                    "risk_level": row.get("risk_level"),
+                    "dilution_risk_flag": row.get("dilution_risk_flag"),
+                })
+
+                save_squeeze_training_outcome({
+                    "signal_date": signal_date,
+                    "ticker": ticker,
+                    "alert_type": alert_type,
+                    "fwd_5d": row.get("fwd_5d"),
+                    "fwd_10d": row.get("fwd_10d"),
+                    "fwd_20d": row.get("fwd_20d"),
+                    "fwd_30d": row.get("fwd_30d"),
+                    "max_fwd_return": row.get("max_fwd_return"),
+                    "hit_15pct_10d": row.get("hit_15pct_10d"),
+                    "hit_25pct_20d": row.get("hit_25pct_20d"),
+                    "outcome_label": row.get("outcome_label"),
+                    "taxonomy_label": row.get("taxonomy_label"),
+                })
+                count += 1
+            if skipped:
+                logger.info(
+                    "_persist_training_outcomes: skipped %d row(s) with no meaningful state",
+                    skipped,
+                )
+            logger.info("_persist_training_outcomes: persisted %d outcome row(s) with snapshots", count)
+            return count
+        except Exception as exc:
+            logger.warning("_persist_training_outcomes failed (non-fatal): %s", exc)
+            return 0
 
     def summary_metrics(self) -> dict:
         """
@@ -1366,6 +1568,20 @@ class SqueezeOutcomeReplay:
             metrics["outcome_label_counts"] = df["outcome_label"].value_counts().to_dict()
         else:
             metrics["outcome_label_counts"] = {}
+
+        # TRD-014: taxonomy label counts by state type
+        if "taxonomy_label" in df.columns:
+            metrics["taxonomy_label_counts"] = df["taxonomy_label"].dropna().value_counts().to_dict()
+        else:
+            metrics["taxonomy_label_counts"] = {}
+
+        # TRD-014: ML hit flag rates
+        for flag in ("hit_15pct_10d", "hit_25pct_20d"):
+            if flag in df.columns:
+                s = df[flag].dropna()
+                metrics[flag + "_rate"] = float(s.mean()) if not s.empty else None
+            else:
+                metrics[flag + "_rate"] = None
 
         # CHUNK-16: optional risk-level breakdown (diagnostic, non-breaking)
         if "risk_level" in df.columns:

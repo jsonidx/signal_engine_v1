@@ -1,4 +1,4 @@
-.PHONY: setup setup-python setup-frontend test test-backend test-frontend build-frontend verify verify-full pipeline-skip-ai dashboard clean-pyc
+.PHONY: setup setup-python setup-frontend test test-backend test-frontend build-frontend verify verify-full pipeline-skip-ai dashboard clean-pyc sync-tasks check-tasks
 
 PYTHON ?= python3
 PIP ?= pip
@@ -39,3 +39,9 @@ dashboard:
 clean-pyc:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	find . -type f -name '*.pyc' -delete
+
+sync-tasks:
+	$(PYTHON) scripts/sync_task_status.py
+
+check-tasks:
+	$(PYTHON) scripts/sync_task_status.py --check

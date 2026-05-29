@@ -1,12 +1,38 @@
 # Task: Early Catalyst Momentum Gates
 
 Status: done
+Stage: done
+Type: feature
+Priority: P1
+Severity: high
 Owner: Claude Code
+Reviewer: Human
+Product Area: data-pipeline
+Category: growth
 Risk: trading-logic
+Effort: M
+Target Release: completed
+Due Date: completed
+Dependencies: none
+Blocked By: none
+Links: none
+Success Metric: strong catalyst moves can be force-included before the stricter `VOL_BREAKOUT` path would have admitted them.
+
+## Problem Statement
+
+The existing inclusion rules were too late for some strong catalyst breakouts because they required a stricter volume confirmation pattern.
+
+## User Impact
+
+Users could miss or see delayed Deep Dive routing on some of the strongest early momentum names.
 
 ## Objective
 
 Add earlier price/volume force-include rules that catch catalyst breakouts before the existing strict `VOL_BREAKOUT` gate fires.
+
+## Proposed Solution
+
+Add configurable early momentum gates that preserve liquidity discipline while broadening earlier candidate detection.
 
 ## Scope
 

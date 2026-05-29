@@ -1,6 +1,6 @@
 # Post-Fix Pipeline Smoke Check — Round 5
 
-**Generated:** 2026-05-29 10:16 UTC  
+**Generated:** 2026-05-29 10:07 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
@@ -58,7 +58,7 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 | Check | Result |
 |---|---|
 | `py_compile` (supabase_persist, backtest, squeeze_screener) | ✅ OK |
-| `pytest` (persistence schema + replay + screener) | ❌ no output |
+| `pytest` (persistence schema + replay + screener) | ✅ ============================= 105 passed in 6.35s ============================== |
 
 ---
 

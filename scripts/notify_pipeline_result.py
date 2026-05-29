@@ -647,5 +647,43 @@ def main() -> None:
     print(f"[notify] Telegram notification sent ({len(full_message)} chars).")
 
 
+
+# ==============================================================================
+# TRD-015: Approval request notification helper
+# ==============================================================================
+
+def notify_approval_request(
+    request_id: str,
+    title: str,
+    category: str,
+    risk_level: str,
+    summary: str,
+    evidence_ref: str = "",
+) -> None:
+    """
+    Send a Telegram notification for a new pending approval request.
+
+    Call this after save_approval_request() to ensure the human is notified.
+    Does NOT auto-apply any change — only informs and provides the approve/reject
+    command syntax.
+    """
+    risk_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk_level.upper(), "⚪")
+    short_summary = summary[:300] + "…" if len(summary) > 300 else summary
+    msg = (
+        f"📋 <b>New approval request</b> [{risk_level}] {risk_icon}\n"
+        f"<b>ID:</b> <code>{request_id}</code>\n"
+        f"<b>Category:</b> {category}\n"
+        f"<b>Title:</b> {title}\n\n"
+        f"<i>{short_summary}</i>\n"
+    )
+    if evidence_ref:
+        msg += f"\n<b>Evidence:</b> {evidence_ref}\n"
+    msg += (
+        f"\n<b>To approve:</b> <code>/approve {request_id}</code>\n"
+        f"<b>To reject:</b> <code>/reject {request_id}</code>"
+    )
+    tg_send(msg)
+
+
 if __name__ == "__main__":
     main()

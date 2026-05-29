@@ -984,11 +984,15 @@ def _expl_summary(
     recent_squeeze: bool = False,
     risk_level: str = "LOW",
 ) -> str:
-    # CHUNK-10: use new lifecycle state values; fall back gracefully for old "completed"/"active"
+    # CHUNK-10 + TRD-011: use lifecycle state values; fall back gracefully for old values
     _state = squeeze_state.upper() if squeeze_state else ""
     _risk_suffix = f" [RISK: {risk_level}]" if risk_level in ("HIGH", "EXTREME") else ""
     if _state == "ACTIVE" or squeeze_state == "active":
-        return f"{ticker}: Active squeeze in progress — shorts still trapped.{_risk_suffix}"
+        # Explicit chase-risk framing — ACTIVE is NOT the primary fresh-entry state
+        return (
+            f"{ticker}: Move in progress — chase risk elevated, shorts still trapped. "
+            f"ACTIVE_SQUEEZE is a continuation signal, not a fresh-entry alert.{_risk_suffix}"
+        )
     if recent_squeeze or squeeze_state == "completed":
         return f"{ticker}: Squeeze appears completed — score zeroed. Monitor for re-setup."
     if _state == "ARMED":
@@ -997,6 +1001,19 @@ def _expl_summary(
             return f"{ticker}: Armed squeeze setup — structural preconditions met, catalyst pending.{_risk_suffix}"
         top = positive_drivers[0]["label"].lower()
         return f"{ticker}: {quality.capitalize()} armed squeeze setup — {top} is the lead driver.{_risk_suffix}"
+    if _state == "EARLY_ARMED":
+        # TRD-011: explicit early-setup framing — lower hit rate than ARMED
+        if not positive_drivers:
+            return (
+                f"{ticker}: Early squeeze setup forming — watch / entry-hunting state. "
+                f"SI and mechanics starting to align; compression-recovery pattern early-stage. "
+                f"Lower hit rate than ARMED; not yet structurally confirmed.{_risk_suffix}"
+            )
+        top = positive_drivers[0]["label"].lower()
+        return (
+            f"{ticker}: Early squeeze setup forming — {top} visible. "
+            f"Watch / entry-hunting state; lower hit rate than ARMED.{_risk_suffix}"
+        )
     quality = "strong" if final_score >= 70 else "moderate" if final_score >= 45 else "weak"
     if not positive_drivers:
         return f"{ticker}: {quality.capitalize()} squeeze setup with limited positive signals.{_risk_suffix}"
@@ -1329,12 +1346,18 @@ def build_squeeze_explanation(sq: "SqueezeScore") -> dict:
     pos_drivers = pos_drivers[:5]
     neg_drivers = neg_drivers[:5]
 
-    # ── 15. Setup tags (CHUNK-10: lifecycle state drives primary tag) ──────────
+    # ── 15. Setup tags (CHUNK-10 + TRD-011: lifecycle state drives primary tag) ─
     _sq_state_tag = sq.squeeze_state.upper() if sq.squeeze_state else ""
     if _sq_state_tag == "ACTIVE" or sq.squeeze_state == "active":
+        # Chase-risk state — tag explicitly marks it as continuation not fresh-entry
         tags.append("ACTIVE_SQUEEZE")
+        tags.append("CHASE_RISK")
     elif _sq_state_tag == "ARMED":
         tags.append("ARMED")
+    elif _sq_state_tag == "EARLY_ARMED":
+        # TRD-011: earliest entry-hunting tag
+        tags.append("EARLY_ARMED")
+        tags.append("ENTRY_HUNTING")
     elif sq.recent_squeeze or sq.squeeze_state == "completed":
         tags.append("COMPLETED_SQUEEZE")
 
@@ -1798,6 +1821,50 @@ def run_screener(
             save_short_interest_history(si_snapshots)
         except Exception as _exc:
             logger.debug("SI snapshot persistence failed (non-fatal): %s", _exc)
+
+    # ── Persist training snapshots for meaningful squeeze states (TRD-012) ───
+    # Only persist EARLY_ARMED / ARMED / ACTIVE — NOT_SETUP rows carry no signal.
+    # Uses point-in-time-safe data already computed above; no recomputation.
+    _training_states = frozenset({"EARLY_ARMED", "ARMED", "ACTIVE"})
+    _training_snaps: list[dict] = []
+    _today_str = datetime.now().strftime("%Y-%m-%d")
+    for sq in results:
+        if (sq.squeeze_state or "").upper() not in _training_states:
+            continue
+        expl = sq.explanation or {}
+        _training_snaps.append({
+            "signal_date": _today_str,
+            "ticker": sq.ticker,
+            "alert_type": sq.squeeze_state,
+            "final_score": sq.final_score,
+            "short_pct_float": sq.short_pct_float,
+            "computed_dtc_30d": sq.computed_dtc_30d,
+            "compression_recovery_score": sq.compression_recovery_score,
+            "volume_confirmation_flag": sq.volume_confirmation_flag,
+            "si_persistence_score": sq.si_persistence_score,
+            "effective_float_score": sq.effective_float_score,
+            "effective_short_float_ratio": sq.effective_short_float_ratio,
+            "large_holder_ownership_pct": sq.large_holder_ownership_pct,
+            "options_pressure_score": sq.options_pressure_score,
+            "iv_rank": sq.iv_rank,
+            "unusual_call_activity_flag": sq.unusual_call_activity_flag,
+            "risk_score": sq.risk_score,
+            "risk_level": sq.risk_level,
+            "dilution_risk_flag": sq.dilution_risk_flag,
+            "explanation_tags": expl.get("setup_tags"),
+            "explanation_summary": expl.get("summary"),
+        })
+    if _training_snaps:
+        try:
+            from utils.supabase_persist import save_squeeze_training_snapshot
+            for _ts in _training_snaps:
+                save_squeeze_training_snapshot(_ts)
+            logger.info(
+                "Training snapshots persisted: %d row(s) for %s",
+                len(_training_snaps), _today_str,
+            )
+        except Exception as _exc:
+            logger.debug("Training snapshot persistence failed (non-fatal): %s", _exc)
 
     # Sort by chosen key descending
     if sort_by == "ev":
