@@ -1764,6 +1764,18 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
         else:
             _generate_resolved_signals_file(wl, resolved_signals_path, verbose=args.verbose)
         equity_path = _find_latest_equity_signals_file()
+
+        # Load event-queue catalyst candidates (fresh breakouts not in resolved_signals)
+        _event_queue: list = []
+        try:
+            from utils.event_queue import get_all_pending, clear_stale_entries
+            clear_stale_entries(keep_days=3)
+            _event_queue = get_all_pending(max_age_days=2)
+            if _event_queue:
+                print(f"  Event queue: {len(_event_queue)} catalyst candidate(s) available for Deep Dive")
+        except Exception as _eq_exc:
+            logger.debug("Event queue unavailable: %s", _eq_exc)
+
         selected = select_top_tickers(
             resolved_signals_path=resolved_signals_path,
             equity_signals_path=equity_path,
@@ -1771,6 +1783,7 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
             min_agreement=min_agreement,
             always_include=always_include,
             force_tickers=None,
+            event_queue=_event_queue or None,
         )
         ticker_list = [s["ticker"] for s in selected]
 

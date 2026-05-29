@@ -755,7 +755,13 @@ def score_technical_setup(data: dict) -> dict:
         score += 1
         flags.append(f"Early recovery: {pct_from_low:.0%} off 52-week low")
 
-    return {"score": score, "max": 7, "flags": flags}
+    # 1-month momentum (22 trading days) — used by pre_earnings_breakout detector
+    try:
+        momentum_1m_pct = float(close.iloc[-1] / close.iloc[-22] - 1) * 100
+    except Exception:
+        momentum_1m_pct = 0.0
+
+    return {"score": score, "max": 7, "flags": flags, "momentum_1m_pct": momentum_1m_pct}
 
 
 # ==============================================================================
@@ -841,6 +847,247 @@ def score_earnings_catalyst(data: dict) -> dict:
         flags.append(f"Earnings passed {abs(days_to_earnings)}d ago")
 
     return {"score": score, "max": 5, "flags": flags, "days_to_earnings": days_to_earnings}
+
+
+def _derive_earnings_beat_stats(data: dict) -> dict:
+    """
+    Return earnings beat streak and average surprise for pre-earnings scoring.
+
+    yfinance does not expose stable ``earningsBeatStreak`` or
+    ``earningsSurpriseAvgPct`` keys in ``Ticker.info``.  Use those keys when a
+    fixture/vendor provides them, otherwise derive the values from
+    ``Ticker.earnings_history``.
+    """
+    info = data.get("info") or {}
+    beat_streak = info.get("earningsBeatStreak")
+    surprise_avg = info.get("earningsSurpriseAvgPct")
+    if beat_streak is not None or surprise_avg is not None:
+        return {
+            "earnings_beat_streak": int(beat_streak or 0),
+            "earnings_surprise_avg_pct": float(surprise_avg or 0.0),
+        }
+
+    stock_obj = data.get("stock_obj")
+    if stock_obj is None:
+        return {"earnings_beat_streak": 0, "earnings_surprise_avg_pct": 0.0}
+
+    try:
+        hist = stock_obj.earnings_history
+    except Exception:
+        return {"earnings_beat_streak": 0, "earnings_surprise_avg_pct": 0.0}
+
+    if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
+        return {"earnings_beat_streak": 0, "earnings_surprise_avg_pct": 0.0}
+
+    try:
+        df = hist.copy()
+        # Keep newest first for streak calculation. yfinance usually indexes by date.
+        try:
+            df = df.sort_index(ascending=False)
+        except Exception:
+            pass
+        df = df.head(8)
+
+        surprise_col = next(
+            (c for c in df.columns if "surprise" in str(c).lower()),
+            None,
+        )
+        estimate_col = next(
+            (c for c in df.columns if "estimate" in str(c).lower()),
+            None,
+        )
+        actual_col = next(
+            (
+                c for c in df.columns
+                if "actual" in str(c).lower() or "reported" in str(c).lower()
+            ),
+            None,
+        )
+
+        surprises: list[float] = []
+        if surprise_col is not None:
+            for val in df[surprise_col].dropna().tolist():
+                try:
+                    v = float(str(val).replace("%", "").strip())
+                    # Some yfinance versions return fractions, some percentages.
+                    surprises.append(v * 100 if abs(v) <= 1 else v)
+                except Exception:
+                    continue
+        elif estimate_col is not None and actual_col is not None:
+            for _, row in df.iterrows():
+                try:
+                    est = float(row[estimate_col])
+                    act = float(row[actual_col])
+                    if est:
+                        surprises.append((act - est) / abs(est) * 100)
+                except Exception:
+                    continue
+
+        beat_streak = 0
+        for surprise in surprises:
+            if surprise > 0:
+                beat_streak += 1
+            else:
+                break
+
+        recent = surprises[:4] if surprises else []
+        avg = float(np.mean(recent)) if recent else 0.0
+        return {
+            "earnings_beat_streak": beat_streak,
+            "earnings_surprise_avg_pct": avg,
+        }
+    except Exception:
+        return {"earnings_beat_streak": 0, "earnings_surprise_avg_pct": 0.0}
+
+
+def score_pre_earnings_breakout(inputs: dict) -> dict:
+    """
+    Detect high-quality pre-earnings re-rating setups independent of short interest.
+
+    Unlike a short squeeze, this setup requires earnings proximity plus multiple
+    independent confirming signals: serial beats, improving relative strength,
+    volume/price confirmation, and elevated call demand.  High short interest is
+    NOT required — this is the key difference from squeeze detection.
+
+    Motivating case: SNOW May 2026 — serial earnings beats + strong momentum +
+    unusual call activity, but the engine treated earnings purely as risk.
+
+    Parameters (from `inputs` dict):
+        days_to_earnings        int or None
+        earnings_beat_streak    int   — consecutive quarters with EPS beat
+        earnings_surprise_avg_pct float — average beat magnitude %
+        momentum_1m_pct         float — 1-month price momentum %
+        volume_score            float — from score_volume_breakout (0–5)
+        options_score           float — from score_options_activity (0–5)
+        dark_pool_signal        str   — "ACCUMULATION" | "NEUTRAL" | "DISTRIBUTION"
+        short_pct_float         float — used only to confirm this is NOT a squeeze
+
+    Returns dict with keys:
+        score                   int   (0–5)
+        max                     int   (5)
+        flags                   list[str]
+        pre_earnings_breakout   bool
+        confidence              str   "low" | "medium" | "high"
+        requires_high_short_interest bool  (always False — for docs/tests)
+    """
+    score = 0
+    flags: List[str] = []
+    conditions_met: List[str] = []
+
+    days_to_e           = inputs.get("days_to_earnings")
+    beat_streak         = int(inputs.get("earnings_beat_streak") or 0)
+    surprise_avg        = float(inputs.get("earnings_surprise_avg_pct") or 0.0)
+    momentum_1m         = float(inputs.get("momentum_1m_pct") or 0.0)
+    volume_sc           = float(inputs.get("volume_score") or 0.0)
+    options_sc          = float(inputs.get("options_score") or 0.0)
+    dp_signal           = str(inputs.get("dark_pool_signal") or "NEUTRAL").upper()
+    short_pct           = float(inputs.get("short_pct_float") or 0.0)
+
+    # Gate 1: must be in the pre-earnings window (≤30 days)
+    if days_to_e is None or days_to_e < 0 or days_to_e > 30:
+        return {
+            "score": 0, "max": 5, "flags": flags,
+            "pre_earnings_breakout": False,
+            "confidence": "none",
+            "requires_high_short_interest": False,
+        }
+
+    # Gate 2: serial earnings beat history is required (hard gate).
+    # Momentum or volume alone is not sufficient — we need evidence that
+    # THIS company has a pattern of beating estimates.
+    if beat_streak < 2:
+        return {
+            "score": 0, "max": 5, "flags": flags,
+            "pre_earnings_breakout": False,
+            "confidence": "none",
+            "requires_high_short_interest": False,
+        }
+
+    # Gate 3: price momentum must be non-negative.
+    # Negative momentum contradicts the re-rating thesis — if the market is
+    # selling ahead of earnings, the setup is not set up.
+    if momentum_1m < 0:
+        flags.append(
+            f"PRE-EARNINGS SETUP BLOCKED: 1m momentum {momentum_1m:.1f}% < 0 "
+            f"— market is not confirming the re-rating thesis"
+        )
+        return {
+            "score": 0, "max": 5, "flags": flags,
+            "pre_earnings_breakout": False,
+            "confidence": "none",
+            "requires_high_short_interest": False,
+        }
+
+    # Condition 1: serial earnings beats (≥2 consecutive)
+    if beat_streak >= 3:
+        score += 2
+        conditions_met.append(f"earnings_beat_streak_{beat_streak}")
+        flags.append(
+            f"PRE-EARNINGS SETUP: {beat_streak} consecutive EPS beats "
+            f"(avg +{surprise_avg:.1f}%) → re-rating probability elevated"
+        )
+    elif beat_streak >= 2:
+        score += 1
+        conditions_met.append(f"earnings_beat_streak_{beat_streak}")
+        flags.append(f"Pre-earnings: {beat_streak} consecutive EPS beats (avg +{surprise_avg:.1f}%)")
+
+    # Condition 2: improving relative strength / positive momentum
+    if momentum_1m >= 8.0:
+        score += 1
+        conditions_met.append("momentum_1m_above_threshold")
+        flags.append(f"Strong 1m momentum +{momentum_1m:.1f}% ahead of earnings")
+    elif momentum_1m >= 4.0:
+        score += 1
+        conditions_met.append("momentum_1m_above_threshold")
+        flags.append(f"Positive 1m momentum +{momentum_1m:.1f}% ahead of earnings")
+
+    # Condition 3: volume expansion
+    if volume_sc >= 3.0:
+        score += 1
+        conditions_met.append("volume_expansion_confirmed")
+        flags.append("Volume expansion ahead of earnings — accumulation pattern")
+
+    # Condition 4: elevated call demand (options)
+    if options_sc >= 3.0:
+        score += 1
+        conditions_met.append("call_demand_elevated")
+        flags.append("Elevated call activity — smart money positioning ahead of catalyst")
+    elif dp_signal == "ACCUMULATION":
+        score += 1
+        conditions_met.append("dark_pool_accumulation")
+        flags.append("Dark-pool ACCUMULATION signal ahead of earnings")
+
+    # Confidence tier
+    n = len(conditions_met)
+    if n >= 4:
+        confidence = "high"
+    elif n >= 3:
+        confidence = "medium"
+    elif n >= 2:
+        confidence = "low"
+    else:
+        confidence = "none"
+        score = 0  # require at least 2 conditions
+
+    pre_breakout = score >= 3
+
+    if pre_breakout:
+        flags.insert(
+            0,
+            f"PRE-EARNINGS BREAKOUT SETUP (confidence={confidence}) — "
+            f"{n} signals align; watch for catalyst, NOT automatic buy. "
+            f"Short interest: {short_pct:.1f}% (squeeze not required).",
+        )
+
+    return {
+        "score": min(score, 5),
+        "max": 5,
+        "flags": flags,
+        "pre_earnings_breakout": pre_breakout,
+        "confidence": confidence,
+        "conditions_met": conditions_met,
+        "requires_high_short_interest": False,
+    }
 
 
 def score_analyst_momentum(data: dict) -> dict:
@@ -1175,6 +1422,22 @@ def screen_universe(
             except Exception:
                 pass
 
+        # Pre-earnings breakout detector (TRD-001): runs after all sub-scores so it
+        # can reuse volume, options, and dark_pool results.  Does NOT require high
+        # short interest — intentionally independent of squeeze mechanics.
+        _earnings_stats = _derive_earnings_beat_stats(data)
+        _peb_inputs = {
+            "days_to_earnings": earnings.get("days_to_earnings"),
+            "earnings_beat_streak": _earnings_stats["earnings_beat_streak"],
+            "earnings_surprise_avg_pct": _earnings_stats["earnings_surprise_avg_pct"],
+            "momentum_1m_pct": technical.get("momentum_1m_pct", 0.0),
+            "volume_score": volume["score"],
+            "options_score": options["score"],
+            "dark_pool_signal": dark_pool.get("signal", "NEUTRAL"),
+            "short_pct_float": data.get("short_pct_float", 0.0),
+        }
+        pre_earnings_breakout_result = score_pre_earnings_breakout(_peb_inputs)
+
         # Composite score
         max_possible = (squeeze["max"] + volume["max"] + vol_squeeze["max"] +
                         options["max"] + technical["max"] + social["max"] +
@@ -1205,13 +1468,17 @@ def screen_universe(
         all_flags = (squeeze["flags"] + volume["flags"] + vol_squeeze["flags"] +
                      options["flags"] + technical["flags"] + social["flags"] +
                      polymarket["flags"] + dark_pool["flags"] +
-                     earnings["flags"] + analyst["flags"])
+                     earnings["flags"] + analyst["flags"] +
+                     pre_earnings_breakout_result["flags"])
         if all_boost_flag:
             all_flags.insert(0, all_boost_flag)
 
         # Cross-module post-squeeze guard (mirrors squeeze_screener.py logic).
         # Zeroes the composite score when a squeeze has already fired — the
         # setup is spent; entries before the price resets are low-probability.
+        # raw_composite preserves the pre-guard value for persistence so that
+        # nonzero component evidence is never silently lost (TRD-003).
+        raw_composite = round(composite, 1)
         _recent_sq = False
         if _SQUEEZE_GUARD_AVAILABLE:
             try:
@@ -1246,7 +1513,10 @@ def screen_universe(
             "days_to_earnings": earnings.get("days_to_earnings"),
             "upgrades_7d": analyst.get("upgrades_7d", 0),
             "post_squeeze_guard": bool(_recent_sq),
+            "raw_composite": raw_composite,
             "composite": round(composite, 1),
+            "pre_earnings_breakout": pre_earnings_breakout_result["pre_earnings_breakout"],
+            "peb_confidence": pre_earnings_breakout_result["confidence"],
             "flags": all_flags,
             "n_flags": len(all_flags),
         })

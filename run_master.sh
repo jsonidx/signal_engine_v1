@@ -203,15 +203,19 @@ python3 -c "
 from utils.ticker_selector import select_top_tickers
 from utils.candidate_archive import archive_candidates
 from ai_quant import _get_open_positions
+from utils.event_queue import get_all_pending, clear_stale_entries
 import sys, traceback
 try:
     open_pos = _get_open_positions()
+    clear_stale_entries(keep_days=3)
+    event_queue = get_all_pending(max_age_days=2)
     candidates = select_top_tickers(
         resolved_signals_path='data/resolved_signals.json',
         equity_signals_path=None,
         max_tickers=50,
         min_agreement=0.0,
         always_include=open_pos,
+        event_queue=event_queue or None,
     )
     n = archive_candidates(candidates, open_positions=open_pos)
     print(f'  Archived {n} candidates to candidate_snapshots')
@@ -231,15 +235,18 @@ python3 -c "
 from utils.ticker_selector import select_top_tickers
 from utils.trade_selector_4w import run_daily_top20_pipeline
 from ai_quant import _get_open_positions
+from utils.event_queue import get_all_pending
 import sys, traceback
 try:
     open_pos = _get_open_positions()
+    event_queue = get_all_pending(max_age_days=2)
     candidates = select_top_tickers(
         resolved_signals_path='data/resolved_signals.json',
         equity_signals_path=None,
         max_tickers=50,
         min_agreement=0.0,
         always_include=open_pos,
+        event_queue=event_queue or None,
     )
     top20 = run_daily_top20_pipeline(candidates, open_positions=open_pos)
     print(f'  Top-20 ranking complete ({len(top20)} names)')
@@ -287,15 +294,18 @@ python3 -c "
 from utils.iv_calculator import collect_and_store_iv
 from utils.ticker_selector import select_top_tickers
 from ai_quant import _get_open_positions
+from utils.event_queue import get_all_pending
 import config
 
 open_positions = _get_open_positions()
+event_queue = get_all_pending(max_age_days=2)
 
 selected = select_top_tickers(
     resolved_signals_path='data/resolved_signals.json',
     equity_signals_path=None,
     max_tickers=config.AI_QUANT_MAX_TICKERS,
-    always_include=open_positions
+    always_include=open_positions,
+    event_queue=event_queue or None,
 )
 tickers = list({s['ticker'] for s in selected} | set(open_positions))
 results = collect_and_store_iv(tickers)
