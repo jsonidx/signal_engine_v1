@@ -1090,36 +1090,121 @@ def score_pre_earnings_breakout(inputs: dict) -> dict:
     }
 
 
+def _is_numeric(val) -> bool:
+    """Return True if val can be converted to float."""
+    try:
+        float(val)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _classify_analyst_row(row) -> str:
+    """
+    Classify one analyst row as its primary event type.
+
+    Rating-change classification (upgrade/downgrade) wins over target changes
+    so a single row is never counted twice.  Pure target moves (Action=main/reit
+    with a numeric PT change) are only classified as target_raise/target_cut
+    when the row does not also carry a rating change.
+
+    yfinance upgrades_downgrades columns used:
+      Action            — "upgrade", "downgrade", "main", "reit", "init", …
+      ToGrade           — textual rating (e.g. "Buy", "Outperform")
+      priceTargetAction — "Raises", "Lowers", "Maintains", "Announces", …
+      currentPriceTarget / priorPriceTarget — numeric PT values (fallback)
+
+    Returns: "upgrade" | "downgrade" | "target_raise" | "target_cut" | "neutral"
+    """
+    action = str(row.get("Action", "")).lower()
+    grade = str(row.get("ToGrade", "")).lower()
+
+    _upgrade_actions = {"upgrade", "init", "reiterated", "raised"}
+    _downgrade_actions = {"downgrade", "lowered"}
+
+    if action in _upgrade_actions or any(
+        k in grade for k in ("buy", "outperform", "overweight", "strong buy")
+    ):
+        return "upgrade"
+    if action in _downgrade_actions or any(
+        k in grade for k in ("sell", "underperform", "underweight")
+    ):
+        return "downgrade"
+
+    # Pure target change — only reached when rating action is neutral
+    pt_action = str(row.get("priceTargetAction", "")).strip().lower()
+    current_pt = row.get("currentPriceTarget")
+    prior_pt = row.get("priorPriceTarget")
+    numeric_raise = (
+        _is_numeric(current_pt)
+        and _is_numeric(prior_pt)
+        and float(current_pt) > float(prior_pt)
+    )
+    numeric_cut = (
+        _is_numeric(current_pt)
+        and _is_numeric(prior_pt)
+        and float(current_pt) < float(prior_pt)
+    )
+
+    if pt_action == "raises" or numeric_raise:
+        return "target_raise"
+    if pt_action == "lowers" or numeric_cut:
+        return "target_cut"
+    return "neutral"
+
+
 def score_analyst_momentum(data: dict) -> dict:
     """
-    Analyst upgrade clustering score.
+    Analyst upgrade clustering and price-target change score.
 
     Multiple upgrades or price-target raises in the same week signal
     institutional consensus forming — often a precursor to a gap-up.
     The AMD pattern (Apr 2026): 3 upgrades + PT raises in 7 days → +5%.
 
     Data source: yfinance stock.upgrades_downgrades (free, no API key)
+    Columns used: Action, ToGrade, priceTargetAction, currentPriceTarget,
+                  priorPriceTarget (TRD-019).
 
     Scoring (max=6):
-      3+ upgrades in 7 days          → +3  (strong clustering)
-      2 upgrades in 7 days           → +2  (clustering detected)
-      1 upgrade in 7 days            → +1  (single upgrade)
-      Bonus: upgrade within earnings → +2  (upgrade × earnings proximity)
-      Downgrade in 7 days penalty    → -1 per downgrade (floor 0)
+      Rating upgrades in 7 days:
+        3+  → +3  (strong clustering)
+        2   → +2  (clustering detected)
+        1   → +1  (single upgrade)
+      Pure target raises in 7 days (no double-count with upgrades):
+        2+  → +2
+        1   → +1
+      30d momentum bonus (no 7d upgrades):    +1
+      Downgrade penalty:                       -1 per downgrade (floor 0)
+      Pure target cut penalty:                 -1 per cut (floor 0)
+
+    Output flags:
+      target_raise_flag   — True if ≥1 pure PT raise in 7d
+      target_cut_flag     — True if ≥1 pure PT cut in 7d
+      target_raises_7d    — count of pure PT raises in 7d
+      target_cuts_7d      — count of pure PT cuts in 7d
     """
     score = 0
     flags = []
     upgrades_7d = 0
     downgrades_7d = 0
+    target_raises_7d = 0
+    target_cuts_7d = 0
+
+    _neutral_result = {
+        "score": 0, "max": 6, "flags": [],
+        "upgrades_7d": 0,
+        "target_raises_7d": 0, "target_cuts_7d": 0,
+        "target_raise_flag": False, "target_cut_flag": False,
+    }
 
     try:
         stock_obj = data.get("stock_obj")
         if stock_obj is None:
-            return {"score": 0, "max": 6, "flags": [], "upgrades_7d": 0}
+            return _neutral_result
 
         upg_df = stock_obj.upgrades_downgrades
         if upg_df is None or (hasattr(upg_df, "empty") and upg_df.empty):
-            return {"score": 0, "max": 6, "flags": [], "upgrades_7d": 0}
+            return _neutral_result
 
         # Normalise index to datetime
         if not isinstance(upg_df.index, pd.DatetimeIndex):
@@ -1131,26 +1216,24 @@ def score_analyst_momentum(data: dict) -> dict:
         recent_7d  = upg_df[upg_df.index >= cutoff_7d]
         recent_30d = upg_df[upg_df.index >= cutoff_30d]
 
-        upgrade_actions   = {"upgrade", "init", "reiterated", "raised"}
-        downgrade_actions = {"downgrade", "lowered"}
+        # Classify each row exactly once to avoid double-counting
+        for _, row in recent_7d.iterrows():
+            event_type = _classify_analyst_row(row)
+            if event_type == "upgrade":
+                upgrades_7d += 1
+            elif event_type == "downgrade":
+                downgrades_7d += 1
+            elif event_type == "target_raise":
+                target_raises_7d += 1
+            elif event_type == "target_cut":
+                target_cuts_7d += 1
 
-        def is_upgrade(row):
-            action = str(row.get("Action", "")).lower()
-            grade  = str(row.get("ToGrade", "")).lower()
-            return (action in upgrade_actions or
-                    any(k in grade for k in ("buy", "outperform", "overweight", "strong buy")))
+        upgrades_30d = sum(
+            1 for _, r in recent_30d.iterrows()
+            if _classify_analyst_row(r) == "upgrade"
+        )
 
-        def is_downgrade(row):
-            action = str(row.get("Action", "")).lower()
-            grade  = str(row.get("ToGrade", "")).lower()
-            return (action in downgrade_actions or
-                    any(k in grade for k in ("sell", "underperform", "underweight")))
-
-        upgrades_7d   = sum(1 for _, r in recent_7d.iterrows()  if is_upgrade(r))
-        downgrades_7d = sum(1 for _, r in recent_7d.iterrows()  if is_downgrade(r))
-        upgrades_30d  = sum(1 for _, r in recent_30d.iterrows() if is_upgrade(r))
-
-        # Base clustering score
+        # Base upgrade clustering score (behavior unchanged from pre-TRD-019)
         if upgrades_7d >= 3:
             score += 3
             flags.append(f"ANALYST CLUSTER: {upgrades_7d} upgrades/raises in 7 days")
@@ -1166,16 +1249,41 @@ def score_analyst_momentum(data: dict) -> dict:
             score += 1
             flags.append(f"Strong analyst momentum: {upgrades_30d} upgrades in 30 days")
 
+        # Pure price-target raises (bullish, not already counted as upgrades)
+        if target_raises_7d >= 2:
+            score += 2
+            flags.append(
+                f"PT RAISED: {target_raises_7d} price-target raises in 7 days (bullish)"
+            )
+        elif target_raises_7d == 1:
+            score += 1
+            flags.append("Price-target raise in last 7 days (bullish)")
+
         # Downgrade penalty
         if downgrades_7d > 0:
-            penalty = min(downgrades_7d, score)  # don't go below 0 from here
+            penalty = min(downgrades_7d, score)
             score = max(0, score - penalty)
             flags.append(f"⚠️  {downgrades_7d} downgrade(s) in 7 days")
+
+        # Pure target cut penalty
+        if target_cuts_7d > 0:
+            penalty = min(target_cuts_7d, score)
+            score = max(0, score - penalty)
+            flags.append(f"⚠️  {target_cuts_7d} price-target cut(s) in 7 days (bearish)")
 
     except Exception as exc:
         flags.append(f"[analyst data unavailable: {exc}]")
 
-    return {"score": min(score, 6), "max": 6, "flags": flags, "upgrades_7d": upgrades_7d}
+    return {
+        "score": min(score, 6),
+        "max": 6,
+        "flags": flags,
+        "upgrades_7d": upgrades_7d,
+        "target_raises_7d": target_raises_7d,
+        "target_cuts_7d": target_cuts_7d,
+        "target_raise_flag": target_raises_7d > 0,
+        "target_cut_flag": target_cuts_7d > 0,
+    }
 
 
 # ==============================================================================
@@ -1512,6 +1620,10 @@ def screen_universe(
             "analyst_score": analyst["score"],
             "days_to_earnings": earnings.get("days_to_earnings"),
             "upgrades_7d": analyst.get("upgrades_7d", 0),
+            "target_raises_7d": analyst.get("target_raises_7d", 0),
+            "target_cuts_7d": analyst.get("target_cuts_7d", 0),
+            "target_raise_flag": analyst.get("target_raise_flag", False),
+            "target_cut_flag": analyst.get("target_cut_flag", False),
             "post_squeeze_guard": bool(_recent_sq),
             "raw_composite": raw_composite,
             "composite": round(composite, 1),
