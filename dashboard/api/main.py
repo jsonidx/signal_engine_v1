@@ -4402,7 +4402,7 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
     Returns immediately. Poll /analyze/status to see when the job completes.
     """
     sym = symbol.upper()
-    llm = req.llm if req.llm in ("grok", "grok-premium", "claude") else "grok"
+    llm = req.llm if req.llm in ("grok", "grok-premium", "claude", "chatgpt") else "grok"
 
     # If already running for the same LLM, return current status
     job = _analysis_jobs.get(sym)
@@ -4423,7 +4423,7 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
         import os as _os
         sub_env = dict(_os.environ)
         # Ensure API keys are forwarded to the subprocess
-        for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY"):
+        for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
             val = _os.environ.get(key)
             if val:
                 sub_env[key] = val
@@ -4448,12 +4448,15 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
             elif llm == "grok-premium":
                 est_model = AI_MODEL_PREMIUM
                 est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
+            elif llm == "chatgpt":
+                est_model = "o3"
+                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
             else:
                 est_model = AI_MODEL_DEFAULT
                 est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
         except Exception:
-            est_model = {"grok-premium": "grok-4.20-0309-reasoning", "claude": "claude-sonnet-4-6"}.get(llm, "grok-4-1-fast-reasoning")
-            est_cost  = {"grok-premium": 0.027, "claude": 0.012}.get(llm, 0.009)
+            est_model = {"grok-premium": "grok-4.20-0309-reasoning", "claude": "claude-sonnet-4-6", "chatgpt": "o3"}.get(llm, "grok-4-1-fast-reasoning")
+            est_cost  = {"grok-premium": 0.027, "claude": 0.012, "chatgpt": 0.015}.get(llm, 0.009)
         return {
             "status": "running", "symbol": sym, "started_at": started, "pid": proc.pid,
             "estimated_model": est_model, "estimated_cost": est_cost, "llm": llm,

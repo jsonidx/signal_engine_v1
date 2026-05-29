@@ -2575,6 +2575,35 @@ def _grok_stream(client, model: str, prompt: str) -> str:
     return full_text
 
 
+def _send_telegram_alert(msg: str) -> None:
+    """Send a Telegram message using env-configured bot."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id   = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
+        return
+    try:
+        import urllib.request, urllib.parse
+        url  = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception:
+        pass
+
+
+def _notify_xai_credits_exhausted() -> None:
+    _send_telegram_alert(
+        "⚠️ xAI API credits exhausted — Grok analysis is blocked.\n"
+        "Top up at https://console.x.ai to resume."
+    )
+
+
+def _notify_anthropic_credits_exhausted() -> None:
+    _send_telegram_alert(
+        "⚠️ Anthropic API credits exhausted — Claude analysis is blocked.\n"
+        "Top up at https://console.anthropic.com to resume."
+    )
+
+
 def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False) -> Optional[str]:
     """
     Call xAI Grok with streaming (OpenAI-compatible API).
@@ -2620,6 +2649,9 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
                     print("  ERROR: Invalid XAI_API_KEY.")
                 elif "429" in err or "rate" in err.lower():
                     print("  ERROR: Grok API rate limit hit. Wait and retry.")
+                elif "403" in err or "spending limit" in err.lower() or "used all available credits" in err.lower():
+                    print(f"  ERROR: xAI credits exhausted: {e2}")
+                    _notify_xai_credits_exhausted()
                 else:
                     print(f"  ERROR: Grok fallback also failed: {e2}")
                 return None
@@ -2629,6 +2661,9 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
                 print("  ERROR: Invalid XAI_API_KEY.")
             elif "429" in err or "rate" in err.lower():
                 print("  ERROR: Grok API rate limit hit. Wait and retry.")
+            elif "403" in err or "spending limit" in err.lower() or "used all available credits" in err.lower():
+                print(f"  ERROR: xAI credits exhausted: {e}")
+                _notify_xai_credits_exhausted()
             else:
                 print(f"  ERROR: Unexpected error calling Grok: {e}")
             return None
@@ -2678,8 +2713,65 @@ def _call_anthropic(prompt: str, verbose: bool = False,
             print("  ERROR: Invalid ANTHROPIC_API_KEY.")
         elif "429" in err or "rate" in err.lower():
             print("  ERROR: Anthropic API rate limit hit. Wait and retry.")
+        elif "402" in err or "credit balance" in err.lower() or "billing" in err.lower():
+            print(f"  ERROR: Anthropic credits exhausted: {e}")
+            _notify_anthropic_credits_exhausted()
         else:
             print(f"  ERROR: Anthropic API call failed: {e}")
+        return None
+
+
+def _notify_openai_credits_exhausted() -> None:
+    _send_telegram_alert(
+        "⚠️ OpenAI API credits exhausted — ChatGPT analysis is blocked.\n"
+        "Top up at https://platform.openai.com/settings/organization/billing to resume."
+    )
+
+
+def _call_openai(prompt: str, verbose: bool = False,
+                 model: str = "o3") -> Optional[str]:
+    """
+    Call OpenAI ChatGPT API (OpenAI-compatible).
+
+    Returns the response text, or None on failure.
+    Token usage is stored in module-level _last_call_usage after each call.
+    """
+    if not _OPENAI_AVAILABLE:
+        print("ERROR: openai package not installed. Run: pip install openai")
+        return None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("  ERROR: OPENAI_API_KEY environment variable not set.")
+        return None
+
+    if verbose:
+        print(f"  Calling OpenAI API ({model})...", flush=True)
+
+    try:
+        client = _OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+        )
+        text = response.choices[0].message.content if response.choices else ""
+        _last_call_usage["input_tokens"]  = response.usage.prompt_tokens     if response.usage else 0
+        _last_call_usage["output_tokens"] = response.usage.completion_tokens if response.usage else 0
+        _last_call_usage["model"]         = model
+        return text.strip() if text else None
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "authentication" in err.lower() or "invalid_api_key" in err.lower():
+            print("  ERROR: Invalid OPENAI_API_KEY.")
+        elif "429" in err or "rate" in err.lower():
+            print("  ERROR: OpenAI API rate limit hit. Wait and retry.")
+        elif "402" in err or "insufficient_quota" in err.lower() or "billing" in err.lower():
+            print(f"  ERROR: OpenAI credits exhausted: {e}")
+            _notify_openai_credits_exhausted()
+        else:
+            print(f"  ERROR: OpenAI API call failed: {e}")
         return None
 
 
@@ -3125,14 +3217,13 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
     # Route to the selected LLM backend
     if llm == "claude":
-        # Anthropic Claude (claude-sonnet-4-6)
         raw = _call_anthropic(prompt, verbose=verbose)
+    elif llm == "chatgpt":
+        raw = _call_openai(prompt, verbose=verbose)
     elif llm == "grok-premium":
-        # Force xAI Grok premium model regardless of agreement score
         raw = _call_claude(prompt, verbose=verbose, use_thinking=True)
     else:
         # Default: xAI Grok — upgrade to premium for highest-conviction setups
-        # Use prob_combined as primary signal; fall back to agreement score
         _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
         use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
         raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
@@ -3244,13 +3335,13 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
 def analyze_tickers(tickers: List[str], verbose: bool = False,
                     raw_output: bool = False, use_cache: bool = True,
-                    force_ai: bool = False) -> List[dict]:
+                    force_ai: bool = False, llm: str = "grok") -> List[dict]:
     """Analyze multiple tickers, returning sorted by conviction."""
     results = []
     for i, ticker in enumerate(tickers, 1):
         print(f"\n[{i}/{len(tickers)}] {ticker}")
         result = analyze_ticker(ticker, verbose=verbose, raw_output=raw_output,
-                                use_cache=use_cache, force_ai=force_ai)
+                                use_cache=use_cache, force_ai=force_ai, llm=llm)
         if result:
             results.append(result)
         time.sleep(1)  # Brief pause between API calls
@@ -3596,7 +3687,7 @@ def main():
     )
     parser.add_argument(
         "--llm", type=str, default="grok",
-        choices=["grok", "grok-premium", "claude"],
+        choices=["grok", "grok-premium", "claude", "chatgpt"],
         help="LLM backend: grok (default xAI fast), grok-premium (forced premium Grok), claude (Anthropic Claude Sonnet)",
     )
     parser.add_argument(
@@ -3659,6 +3750,7 @@ def main():
         "grok":         AI_MODEL_DEFAULT.upper(),
         "grok-premium": AI_MODEL_PREMIUM.upper(),
         "claude":       "CLAUDE SONNET 4.6",
+        "chatgpt":      "CHATGPT O3",
     }.get(args.llm, args.llm.upper())
 
     print()
@@ -3927,7 +4019,8 @@ def main():
         tickers = [t.upper() for t in args.tickers]
         print(f"  Analyzing {len(tickers)} tickers...")
         results = analyze_tickers(tickers, verbose=args.verbose, raw_output=args.raw,
-                                  use_cache=use_cache, force_ai=getattr(args, "force_ai", False))
+                                  use_cache=use_cache, force_ai=getattr(args, "force_ai", False),
+                                  llm=args.llm)
         print_full_report(results)
 
     elif args.tier1_only:
