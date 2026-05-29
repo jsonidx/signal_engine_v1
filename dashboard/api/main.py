@@ -4402,7 +4402,9 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
     Returns immediately. Poll /analyze/status to see when the job completes.
     """
     sym = symbol.upper()
-    llm = req.llm if req.llm in ("grok", "grok-premium", "claude", "chatgpt") else "grok"
+    _VALID_LLMS = ("grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
+                   "grok", "grok-premium", "claude", "chatgpt")
+    llm = req.llm if req.llm in _VALID_LLMS else "grok-4.3"
 
     # If already running for the same LLM, return current status
     job = _analysis_jobs.get(sym)
@@ -5840,13 +5842,13 @@ SETTINGS_SCHEMA = [
     # ── AI Analysis ───────────────────────────────────────────────────────────
     ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for all standard ai_quant runs",
-     ["grok-4.3", "grok-4-1-fast-reasoning", "grok-4.20-0309-reasoning", "gpt-5.1", "gpt-5.5", "claude-opus-4-8", "claude-sonnet-4-6"]),
+     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for high-conviction / manual deep-dive re-runs",
-     ["grok-4.3", "gpt-5.5", "gpt-5.1", "claude-opus-4-8", "claude-sonnet-4-6", "grok-4.20-0309-reasoning"]),
+     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4.3",
      "Retry model if primary call fails",
-     ["grok-4.3", "gpt-5.1", "claude-sonnet-4-6", "grok-4-1-fast-reasoning"]),
+     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_min_conviction_score","Min Conviction Score",     "AI Analysis",   "number",  "13",
      "Minimum composite catalyst score for a ticker to qualify for AI analysis (0–100)"),
     # ── Calibration ───────────────────────────────────────────────────────────

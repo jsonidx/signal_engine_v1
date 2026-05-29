@@ -1105,10 +1105,12 @@ function ModelBadge({ model, cost }: { model: string; cost?: number }) {
 // ─── Analyze button ────────────────────────────────────────────────────────────
 
 const LLM_OPTIONS = [
-  { value: 'grok',         label: 'Grok 4.3',       desc: 'xAI Grok 4.3 — daily driver' },
-  { value: 'grok-premium', label: 'Grok 4.3 (full)', desc: 'xAI Grok 4.3 premium — full reasoning' },
-  { value: 'claude',       label: 'Claude Opus 4.8', desc: 'Anthropic Claude Opus 4.8' },
-  { value: 'chatgpt',      label: 'GPT-5.1',         desc: 'OpenAI GPT-5.1' },
+  { value: 'grok-4.3',         label: 'Grok 4.3',        desc: 'xAI Grok 4.3' },
+  { value: 'gpt-5.1',          label: 'GPT-5.1',          desc: 'OpenAI GPT-5.1' },
+  { value: 'gpt-5.5',          label: 'GPT-5.5',          desc: 'OpenAI GPT-5.5' },
+  { value: 'gpt-5.5-pro',      label: 'GPT-5.5 Pro',      desc: 'OpenAI GPT-5.5 Pro' },
+  { value: 'claude-sonnet-4-6',label: 'Claude Sonnet 4.6',desc: 'Anthropic Claude Sonnet 4.6' },
+  { value: 'claude-opus-4-8',  label: 'Claude Opus 4.8',  desc: 'Anthropic Claude Opus 4.8' },
 ] as const
 
 type LLMChoice = typeof LLM_OPTIONS[number]['value']

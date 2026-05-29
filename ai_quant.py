@@ -2729,7 +2729,7 @@ def _notify_openai_credits_exhausted() -> None:
 
 
 def _call_openai(prompt: str, verbose: bool = False,
-                 model: str = "gpt-5.1") -> Optional[str]:
+                 model: str = "gpt-5.5") -> Optional[str]:
     """
     Call OpenAI ChatGPT API (OpenAI-compatible).
 
@@ -3215,18 +3215,25 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print(prompt)
         print("--- END PROMPT ---\n")
 
-    # Route to the selected LLM backend
-    if llm == "claude":
-        raw = _call_anthropic(prompt, verbose=verbose)
-    elif llm == "chatgpt":
-        raw = _call_openai(prompt, verbose=verbose)
-    elif llm == "grok-premium":
-        raw = _call_claude(prompt, verbose=verbose, use_thinking=True)
+    # Route to the selected LLM backend by model-ID prefix
+    if llm.startswith("claude-"):
+        raw = _call_anthropic(prompt, verbose=verbose, model=llm)
+    elif llm.startswith("gpt-"):
+        raw = _call_openai(prompt, verbose=verbose, model=llm)
+    elif llm.startswith("grok-"):
+        raw = _call_claude(prompt, verbose=verbose, use_thinking=False)
     else:
-        # Default: xAI Grok — upgrade to premium for highest-conviction setups
-        _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
-        use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
-        raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
+        # Legacy aliases + default
+        if llm == "claude":
+            raw = _call_anthropic(prompt, verbose=verbose)
+        elif llm == "chatgpt":
+            raw = _call_openai(prompt, verbose=verbose)
+        elif llm == "grok-premium":
+            raw = _call_claude(prompt, verbose=verbose, use_thinking=True)
+        else:
+            _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
+            use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
+            raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking)
     if raw is None:
         return None
 
@@ -3687,7 +3694,8 @@ def main():
     )
     parser.add_argument(
         "--llm", type=str, default="grok",
-        choices=["grok", "grok-premium", "claude", "chatgpt"],
+        choices=["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
+                 "grok", "grok-premium", "claude", "chatgpt"],
         help="LLM backend: grok (default xAI fast), grok-premium (forced premium Grok), claude (Anthropic Claude Sonnet)",
     )
     parser.add_argument(
@@ -3747,10 +3755,16 @@ def main():
         return
 
     llm_label = {
-        "grok":         "GROK 4.3",
-        "grok-premium": "GROK 4.3 (FULL)",
-        "claude":       "CLAUDE OPUS 4.8",
-        "chatgpt":      "GPT-5.1",
+        "grok":             "GROK 4.3",
+        "grok-premium":     "GROK 4.3 (FULL)",
+        "claude":           "CLAUDE OPUS 4.8",
+        "chatgpt":          "GPT-5.5",
+        "grok-4.3":         "GROK 4.3",
+        "gpt-5.1":          "GPT-5.1",
+        "gpt-5.5":          "GPT-5.5",
+        "gpt-5.5-pro":      "GPT-5.5 PRO",
+        "claude-sonnet-4-6":"CLAUDE SONNET 4.6",
+        "claude-opus-4-8":  "CLAUDE OPUS 4.8",
     }.get(args.llm, args.llm.upper())
 
     print()
