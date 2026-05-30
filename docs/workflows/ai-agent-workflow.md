@@ -20,14 +20,35 @@ The human owns final approval for trading logic, deployment, secrets, and produc
    - `docs/tasks/finished/` for `done` or `completed` tasks
    - Run `python3 scripts/sync_task_status.py` after status changes to move files automatically
 2. Classify risk.
-3. Assign implementation to Claude Code if code changes or refactoring are needed.
-4. Assign Codex to verify, review, test, and document findings.
-5. If Codex finds issues that require code changes, Codex must immediately write a Claude Code fix prompt in the task file or linked handoff doc before stopping.
-6. Claude Code uses that prompt to implement the fixes, then hands the branch back to Codex for another QA pass.
-7. Run `make verify` before merge.
-8. After QA succeeds and the task is complete, Codex must immediately write a paste-ready Claude Code shipping prompt that covers commit, push, and PR/update steps, then set `Status: done` or `Status: completed` and run `python3 scripts/sync_task_status.py`.
-9. Run `make verify-full` for live DB or integration changes.
-10. Require human approval for `trading-logic` risk.
+3. If the ticket is intended for Claude Code implementation, Codex must write a paste-ready Claude implementation prompt in the task file `## Handoff Notes` when the ticket is created or assigned.
+4. Assign implementation to Claude Code if code changes or refactoring are needed.
+5. Assign Codex to verify, review, test, and document findings.
+6. If Codex finds issues that require code changes, Codex must immediately write a Claude Code fix prompt in the task file or linked handoff doc before stopping.
+7. Claude Code uses that prompt to implement the fixes, then hands the branch back to Codex for another QA pass.
+8. Run `make verify` before merge.
+9. After QA succeeds and the task is complete, Codex must immediately write a paste-ready Claude Code shipping prompt that covers commit, push, and PR/update steps, then set `Status: done` or `Status: completed` and run `python3 scripts/sync_task_status.py`.
+10. Run `make verify-full` for live DB or integration changes.
+11. Require human approval for `trading-logic` risk.
+
+## Ticket Creation Handoff Rule
+
+When Codex creates or assigns a new implementation ticket for Claude Code, Codex must not stop at the spec alone. Codex must immediately produce a Claude Code implementation prompt that is ready to paste into Claude in the same update.
+
+The prompt should include:
+
+- the task title and desired outcome
+- the exact implementation scope, with file paths when known
+- explicit non-goals and boundaries
+- required tests or verification commands
+- any risk constraints such as `trading-logic`, API behavior freeze, or no-refactor limits
+- if more than one ticket is covered, a short summary of each ticket and the combined objective
+
+Preferred locations:
+
+1. `## Handoff Notes` in the new task under `docs/tasks/`
+2. a linked file under `.ai/prompts/` when the handoff is large or reused
+
+The intent is immediate execution: task spec first, Claude-ready implementation prompt second, in the same Codex cycle.
 
 ## Refactoring Rule
 
@@ -44,6 +65,7 @@ The prompt should include:
 - explicit scope boundaries and non-goals
 - required tests or verification commands
 - any risk constraints such as `trading-logic` or API behavior freeze
+- if more than one ticket is covered, a short summary of each ticket and how the fixes are grouped
 
 Preferred locations:
 
@@ -65,6 +87,7 @@ The shipping prompt should include:
 - the recommended commit message
 - the branch and remote if known
 - explicit instructions to commit, push, and update or open the PR without making extra code changes
+- if more than one ticket is covered, a short summary of the tickets included in the shipment
 
 Preferred locations:
 

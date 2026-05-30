@@ -1137,7 +1137,8 @@ class TestOutcomePersistenceCallPath:
         replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
         replay.load_snapshots(rows=[self._snap()])
 
-        with patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill"), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
             replay.run(prices=prices, persist_outcomes=True)
         assert mock_save.called
 
@@ -1150,7 +1151,8 @@ class TestOutcomePersistenceCallPath:
         replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
         replay.load_snapshots(rows=[self._snap()])
 
-        with patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill"), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
             replay.run(prices=prices, persist_outcomes=False)
         assert not mock_save.called
 
@@ -1164,7 +1166,8 @@ class TestOutcomePersistenceCallPath:
         replay = SqueezeOutcomeReplay("2024-01-01", "2024-12-31")
         replay.load_snapshots(rows=[self._snap()])
 
-        with patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill"), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome") as mock_save:
             replay.run(prices=prices, persist_outcomes=True)
         assert not mock_save.called
 
@@ -1182,7 +1185,8 @@ class TestOutcomePersistenceCallPath:
         def _capture(record):
             saved_records.append(record)
 
-        with patch("utils.supabase_persist.save_squeeze_training_outcome",
+        with patch("utils.supabase_persist.save_squeeze_training_snapshot_backfill"), \
+             patch("utils.supabase_persist.save_squeeze_training_outcome",
                    side_effect=_capture):
             replay.run(prices=prices, persist_outcomes=True)
 

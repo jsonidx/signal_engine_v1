@@ -1,7 +1,7 @@
 # Task: Pattern Watch Dashboard Section
 
-Status: implemented
-Stage: finished
+Status: done
+Stage: done
 Type: feature
 Priority: P1
 Severity: medium

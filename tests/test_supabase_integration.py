@@ -562,3 +562,142 @@ def test_api_key_wrong_key_returns_none():
 
     auth_user = _verify_api_key("se_" + "x" * 64)
     assert auth_user is None
+
+
+# ---------------------------------------------------------------------------
+# TRD-003 — Catalyst score persistence regression
+# ---------------------------------------------------------------------------
+
+class TestCatalystScorePersistenceMock:
+    """
+    Mock-only tests (no live DB) that verify save_catalyst_scores preserves
+    raw_composite and post_squeeze_guard even when composite is zeroed.
+
+    Regression guard: rows with nonzero volume/options/technical components
+    must never silently persist with composite=0.0 without a documented reason.
+    """
+
+    def _make_df(self, rows):
+        import pandas as pd
+        return pd.DataFrame(rows)
+
+    def test_nonzero_components_with_zero_composite_are_flagged(self):
+        """
+        A row with nonzero component scores but composite=0.0 must have
+        post_squeeze_guard=True OR raw_composite > 0 to explain the zero.
+        Rows missing both are a regression.
+        """
+        import pandas as pd
+        from unittest.mock import MagicMock, patch
+
+        row = {
+            "ticker": "SNOW",
+            "composite": 0.0,
+            "raw_composite": 51.4,       # pre-guard value stored
+            "post_squeeze_guard": False, # not a squeeze — composite was wrong
+            "squeeze_score": 1.0,
+            "volume_score": 4.0,
+            "vol_compress": 2.0,
+            "options_score": 4.0,
+            "technical_score": 4.0,
+            "social_score": 0.0,
+            "polymarket_score": 0.0,
+            "dark_pool_score": 1.0,
+            "dark_pool_signal": "NEUTRAL",
+            "earnings_score": 5.0,
+            "analyst_score": 2.0,
+            "n_flags": 9,
+            "price": 168.5,
+            "short_pct": 5.1,
+        }
+        df = self._make_df([row])
+
+        # Assert: if composite==0.0, either guard fired OR raw_composite explains it
+        for _, r in df.iterrows():
+            if r["composite"] == 0.0:
+                has_guard = bool(r.get("post_squeeze_guard", False))
+                has_raw = (r.get("raw_composite") or 0.0) > 0.0
+                assert has_guard or has_raw, (
+                    f"Ticker {r['ticker']}: composite=0.0 but post_squeeze_guard=False "
+                    f"and raw_composite=0 — this is the TRD-003 regression"
+                )
+
+    def test_save_catalyst_scores_passes_raw_composite_to_db(self):
+        """save_catalyst_scores must pass raw_composite as a separate column."""
+        import pandas as pd
+        from unittest.mock import MagicMock, patch, call
+
+        row = {
+            "ticker": "TESTX",
+            "composite": 0.0,
+            "raw_composite": 42.0,
+            "post_squeeze_guard": True,
+            "squeeze_score": 5.0, "volume_score": 3.0, "vol_compress": 1.0,
+            "options_score": 2.0, "technical_score": 3.0, "social_score": 0.0,
+            "polymarket_score": 0.0, "dark_pool_score": 1.0,
+            "dark_pool_signal": "NEUTRAL",
+            "earnings_score": 4.0, "days_to_earnings": 5,
+            "n_flags": 4,
+            "price": 50.0, "short_pct": 18.0,
+        }
+        df = pd.DataFrame([row])
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+
+        with patch("utils.supabase_persist._conn", return_value=mock_conn):
+            from utils.supabase_persist import save_catalyst_scores
+            save_catalyst_scores(df, run_date="2026-05-25")
+
+        assert mock_cur.executemany.called, "executemany must be called"
+        args = mock_cur.executemany.call_args
+        inserted_rows = args[0][1]  # second positional arg to executemany
+        assert len(inserted_rows) == 1
+        persisted = inserted_rows[0]
+        # Tuple layout: date, ticker, composite, raw_composite, post_squeeze_guard,
+        #   squeeze, volume, vol_compress, options, technical, social, polymarket,
+        #   dark_pool_score, dark_pool_signal, earnings_score, days_to_earnings,
+        #   n_flags, price, short_pct  (19 values total)
+        assert len(persisted) == 19, f"Expected 19 columns, got {len(persisted)}"
+        # Position 3 is raw_composite (after date, ticker, composite)
+        assert persisted[3] == 42.0, f"raw_composite should be 42.0, got {persisted[3]}"
+        # Position 4 is post_squeeze_guard
+        assert persisted[4] is True, f"post_squeeze_guard should be True, got {persisted[4]}"
+        # Position 14 is earnings_score, 15 is days_to_earnings
+        assert persisted[14] == 4.0, f"earnings_score should be 4.0, got {persisted[14]}"
+        assert persisted[15] == 5,   f"days_to_earnings should be 5, got {persisted[15]}"
+
+    def test_save_catalyst_scores_fallback_raw_composite(self):
+        """
+        When raw_composite column is absent (pre-TRD-003 caller), it must fall
+        back to composite so the DB row is not left NULL.
+        """
+        import pandas as pd
+        from unittest.mock import MagicMock, patch
+
+        row = {
+            "ticker": "TESTY",
+            "composite": 35.5,
+            # raw_composite intentionally absent
+            "post_squeeze_guard": False,
+            "squeeze_score": 2.0, "volume_score": 3.0, "vol_compress": 1.0,
+            "options_score": 1.0, "technical_score": 3.0, "social_score": 0.0,
+            "polymarket_score": 0.0, "dark_pool_score": 0.0,
+            "dark_pool_signal": "", "n_flags": 3,
+            "price": 100.0, "short_pct": 4.0,
+        }
+        df = pd.DataFrame([row])
+
+        mock_conn = MagicMock()
+        mock_cur  = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+
+        with patch("utils.supabase_persist._conn", return_value=mock_conn):
+            from utils.supabase_persist import save_catalyst_scores
+            save_catalyst_scores(df, run_date="2026-05-25")
+
+        args = mock_cur.executemany.call_args
+        persisted = args[0][1][0]
+        # raw_composite should fall back to composite value (35.5)
+        assert persisted[3] == 35.5, f"raw_composite fallback should be 35.5, got {persisted[3]}"

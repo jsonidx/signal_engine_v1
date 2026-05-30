@@ -1,7 +1,7 @@
 # Task: Telegram Approval Requests For Trading Logic
 
-Status: implemented
-Stage: awaiting QA
+Status: done
+Stage: done
 Type: feature
 Priority: P1
 Severity: high
@@ -127,9 +127,79 @@ This workflow should support future squeeze-learning tasks such as:
 - taxonomy label rule updates
 - promotion of a calibrated probability model into live scoring
 
+Paste-ready Codex QA prompt:
+
+```text
+Codex QA for TRD-012, TRD-013, TRD-014, and TRD-015.
+
+Ticket summary:
+- TRD-012: verify the live Supabase training dataset path is working end-to-end.
+- TRD-013: verify the calibration workflow can run on real labeled data and produce a report.
+- TRD-014: verify taxonomy labels are persisted correctly in live training outcomes.
+- TRD-015: verify the Telegram approval-request workflow works end-to-end with auditable DB state transitions.
+
+Combined objective:
+Use repo-local tests plus live environment checks to determine whether these four tickets are truly ready to move from `qa` to `done`. Do not mark any ticket done unless its external acceptance evidence is present.
+
+Exact scope:
+- `docs/tasks/in-progress/TRD-012-supabase-squeeze-training-dataset.md`
+- `docs/tasks/in-progress/TRD-013-squeeze-probability-calibration-and-review-gate.md`
+- `docs/tasks/in-progress/TRD-014-squeeze-alert-outcome-taxonomy.md`
+- `docs/tasks/in-progress/TRD-015-telegram-approval-requests-for-trading-logic.md`
+- `migrations/003_squeeze_training_and_approvals.sql`
+- `utils/supabase_persist.py`
+- `backtest.py`
+- `scripts/squeeze_calibration.py`
+- `scripts/telegram_bot.py`
+- `scripts/notify_pipeline_result.py`
+- related tests under `tests/test_squeeze_persistence_schema.py`, `tests/test_squeeze_replay.py`, and `tests/test_telegram_notifications.py`
+
+Required verification:
+1. Run local automated coverage:
+   `pytest tests/test_squeeze_state_machine.py tests/test_squeeze_alerts.py tests/test_squeeze_replay.py tests/test_squeeze_persistence_schema.py tests/test_telegram_notifications.py -q`
+2. TRD-012:
+   - Confirm migration `003_squeeze_training_and_approvals.sql` is applied in the live Supabase environment.
+   - Confirm at least one live `squeeze_training_snapshots` row exists from the pipeline.
+   - Confirm at least one related `squeeze_training_outcomes` row exists or clearly document that forward windows are not yet closed.
+3. TRD-013:
+   - Run `python3 scripts/squeeze_calibration.py` against real labeled data if available.
+   - Confirm a real calibration report is written under `reports/`.
+   - If sample size is insufficient, leave the ticket in `qa` and record the exact blocker.
+4. TRD-014:
+   - Query live `squeeze_training_outcomes` rows and verify taxonomy labels are being written as expected.
+   - Confirm labels are reproducible from the code rules, not manual edits.
+5. TRD-015:
+   - Create a real or controlled test `approval_requests` row.
+   - Verify notification formatting.
+   - Verify `/pending`, `/approve <id>`, and `/reject <id>` or equivalent handler flow updates DB state correctly.
+   - Confirm auditable status transitions in Supabase.
+
+Non-goals:
+- Do not change trading logic, thresholds, schema, or Telegram bot behavior while doing QA.
+- Do not mark a ticket done from unit tests alone when its acceptance criteria require live DB or Telegram evidence.
+- Do not refactor implementation code.
+
+Risk constraints:
+- Treat TRD-013 and TRD-014 as `trading-logic`-adjacent verification work; do not alter scoring behavior.
+- Treat TRD-015 as approval-gate infrastructure; verify that rejected or non-pending requests cannot bypass the guard.
+
+Required output:
+- For each ticket, explicitly state `done` or `remain in qa`.
+- Cite the exact evidence used.
+- If blocked, state the missing evidence in one sentence.
+- If QA passes, update `Status:` to `done`, `Stage:` to `done`, add the verification summary in the ticket, and run `python3 scripts/sync_task_status.py`.
+```
+
 ## Tracking Note
 
 Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
 Covers: approval_requests table, save/fetch/update helpers, /approve /reject /pending bot commands, notify_approval_request() notifier.
 Status: implemented and on main, but no live approval workflow has been tested end-to-end in production.
 Action required: confirm at least one approval request has been created, notified, and resolved through Telegram before moving to finished.
+
+## QA Verification Summary
+
+- 2026-05-30: local coverage passed via `pytest tests/test_squeeze_state_machine.py tests/test_squeeze_alerts.py tests/test_squeeze_replay.py tests/test_squeeze_persistence_schema.py tests/test_telegram_notifications.py -q` with `282 passed in 5.11s`.
+- 2026-05-30: created controlled live Supabase requests `qa-trd015-ad505633-a` and `qa-trd015-ad505633-r`, exercised `scripts.telegram_bot.handle_command()` for `/pending`, `/approve <id>`, and `/reject <id>`, and verified DB transitions to `APPROVED` and `REJECTED` with `approved_by='telegram'`, non-null `approved_at`, and updated audit timestamps.
+- 2026-05-30: verified duplicate-state guard by attempting `/reject qa-trd015-ad505633-a` after approval; the handler returned the expected failure message and the row stayed `APPROVED`.
+- 2026-05-30: verified live Telegram delivery for notifier path with controlled request `qa-trd015-19b12e30-live`; `scripts.notify_pipeline_result.tg_send()` returned `True`, the approval-request message included `/approve qa-trd015-19b12e30-live` and `/reject qa-trd015-19b12e30-live`, and the QA row was then cleaned up to `REJECTED` in Supabase.

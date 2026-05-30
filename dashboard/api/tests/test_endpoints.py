@@ -166,6 +166,39 @@ def _make_conflict_log(path: Path):
 
 
 # ==============================================================================
+# SHARED MOCK HELPERS
+# ==============================================================================
+
+def _db_conn_raises():
+    """Patch target that makes _db_connect() raise (simulates DB unavailable)."""
+    return patch("dashboard.api.main._db_connect", side_effect=Exception("db unavailable"))
+
+
+def _make_db_conn(*, fetchone=None, fetchall=None):
+    """
+    Build a mock _PGConn that satisfies both calling patterns used by endpoints:
+      - conn.execute(sql).fetchone()   / .fetchall()   (direct execute)
+      - with conn.cursor() as cur:     (context manager, used by option_candidates)
+    """
+    if fetchall is None:
+        fetchall = []
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = fetchone
+    mock_cur.fetchall.return_value = fetchall
+
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=mock_cur)
+    ctx.__exit__ = MagicMock(return_value=False)
+
+    conn = MagicMock()
+    conn.execute.return_value = mock_cur
+    conn.cursor.return_value = ctx
+    conn.close.return_value = None
+    conn.__bool__ = lambda self: True
+    return conn
+
+
+# ==============================================================================
 # FIXTURES
 # ==============================================================================
 
@@ -286,12 +319,11 @@ def test_portfolio_summary_with_db(tmp_data):
 
 
 def test_portfolio_summary_missing_db():
-    """Must return 200 with data_available=False, never 404 or 500."""
-    with patch("dashboard.api.main.PAPER_TRADES_DB", Path("/nonexistent/paper_trades.db")):
+    """Must return 200 with data_available=False when DB is unavailable."""
+    with _db_conn_raises():
         resp = client.get("/api/portfolio/summary")
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["data_available"] is False
+    assert resp.json()["data_available"] is False
 
 
 # ==============================================================================
@@ -317,7 +349,8 @@ def test_portfolio_history_returns_list(tmp_data):
 
 
 def test_portfolio_history_missing_db():
-    with patch("dashboard.api.main.PAPER_TRADES_DB", Path("/nope/paper_trades.db")):
+    """Must return 200 with data_available=False when DB is unavailable."""
+    with _db_conn_raises():
         resp = client.get("/api/portfolio/history")
     assert resp.status_code == 200
     assert resp.json()["data_available"] is False
@@ -373,26 +406,48 @@ def test_signals_dates(tmp_data):
 # ==============================================================================
 
 def test_signals_heatmap_normalised(tmp_data):
-    with patch.multiple(
-        "dashboard.api.main",
-        AI_QUANT_DB=tmp_data / "ai_quant_cache.db",
-        SIGNALS_DIR=tmp_data / "signals_output",
-        DATA_DIR=tmp_data / "data",
+    """All module scores in each heatmap row must be normalised to [-1, +1]."""
+    # The heatmap reads tickers from the signals CSV (still uses SIGNALS_DIR),
+    # then enriches via _db_connect() (Supabase). Mock _db_connect to return the
+    # test AAPL thesis row so the test is deterministic.
+    signals_json = json.dumps({
+        "options_flow": {"heat_score": 72.5, "iv_rank": 45.0},
+        "squeeze":      {"short_squeeze_score": 20},
+        "fundamentals": {"fundamental_score_pct": 66.0},
+    })
+    aapl_row = {
+        "ticker": "AAPL", "direction": "BULL", "conviction": 4,
+        "signal_agreement_score": 0.78, "signals_json": signals_json,
+    }
+    mock_conn = _make_db_conn(fetchall=[aapl_row])
+
+    with (
+        patch("dashboard.api.main.SIGNALS_DIR", tmp_data / "signals_output"),
+        patch("dashboard.api.main.DATA_DIR",    tmp_data / "data"),
+        patch("dashboard.api.main._db_connect", return_value=mock_conn),
     ):
         resp = client.get("/api/signals/heatmap")
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["data_available"] is True
     assert body["count"] >= 1
+    # Response schema: module scores are flat top-level fields (not nested in "modules")
+    MODULE_FIELDS = ["signal_engine", "squeeze", "options", "dark_pool", "fundamentals"]
     for row in body["data"]:
-        for module, score in row["modules"].items():
+        for field in MODULE_FIELDS:
+            score = row[field]
             assert -1.0 <= score <= 1.0, (
-                f"module={module} score={score} out of [-1,1] for {row['ticker']}"
+                f"{field}={score} out of [-1,1] for {row['ticker']}"
             )
 
 
 def test_signals_heatmap_missing_db():
-    with patch("dashboard.api.main.AI_QUANT_DB", Path("/nope/ai_quant_cache.db")):
+    """Returns data_available=False when both signals CSV and DB are unavailable."""
+    with (
+        patch("dashboard.api.main.SIGNALS_DIR", Path("/nope/signals_output")),
+        _db_conn_raises(),
+    ):
         resp = client.get("/api/signals/heatmap")
     assert resp.status_code == 200
     assert resp.json()["data_available"] is False
@@ -402,19 +457,44 @@ def test_signals_heatmap_missing_db():
 # SIGNALS TICKER
 # ==============================================================================
 
-def test_signals_ticker_found(tmp_data):
-    with patch.multiple(
-        "dashboard.api.main",
-        AI_QUANT_DB=tmp_data / "ai_quant_cache.db",
-    ):
+def test_signals_ticker_found():
+    """With a valid thesis row in the DB, the ticker endpoint returns full data."""
+    signals_json = json.dumps({
+        "options_flow": {"heat_score": 72.5, "iv_rank": 45.0, "pc_ratio": 0.82,
+                         "expected_move_pct": 3.1, "days_to_exp": 7},
+        "fundamentals": {"fundamental_score_pct": 66.0},
+        "squeeze":      {"short_squeeze_score": 20},
+        "volume_profile": {"poc": 176.5, "vwap_20d": 174.0},
+    })
+    thesis_row = {
+        "ticker": "AAPL", "date": "2026-03-22", "direction": "BULL",
+        "conviction": 4, "time_horizon": "2-4 weeks",
+        "entry_low": 172.0, "entry_high": 178.0, "stop_loss": 165.0,
+        "target_1": 190.0, "target_2": 205.0,
+        "thesis": "Strong momentum with options confirmation.",
+        "data_quality": "HIGH", "signal_agreement_score": 0.78,
+        "bull_probability": 0.65, "bear_probability": 0.20, "neutral_probability": 0.15,
+        "catalysts_json": '["Strong earnings revision"]',
+        "risks_json": '["Macro headwinds"]',
+        "signals_json": signals_json,
+        "created_at": "2026-03-22T10:00:00",
+        "key_invalidation": None, "primary_scenario": None, "bear_scenario": None,
+        "prob_combined": None, "prob_technical": None, "prob_options": None,
+        "prob_catalyst": None, "prob_news": None,
+        "model_used": None, "cost_usd": None, "position_size_pct": 5.0,
+        "expected_moves_json": None,
+    }
+    mock_conn = _make_db_conn(fetchone=thesis_row)
+    with patch("dashboard.api.main._db_connect", return_value=mock_conn):
         resp = client.get("/api/signals/ticker/AAPL")
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["data_available"] is True
     assert body["ticker"] == "AAPL"
-    assert "ai_thesis" in body
-    assert "entry_zone" in body
-    assert "options_heat" in body
+    assert "ai_thesis"   in body   # backward-compat nested dict
+    assert "entry_zone"  in body   # backward-compat nested dict
+    assert "options_heat" in body  # backward-compat nested dict
 
 
 def test_signals_ticker_not_found(tmp_data):
@@ -442,16 +522,20 @@ def test_screeners_catalysts_missing_csv():
     assert resp.json()["data_available"] is False
 
 
-def test_screeners_options_from_cache(tmp_data):
-    with patch.multiple(
-        "dashboard.api.main",
-        AI_QUANT_DB=tmp_data / "ai_quant_cache.db",
-    ):
+def test_screeners_options_from_cache():
+    """Options screener returns tickers that exceed the heat threshold."""
+    signals_json = json.dumps({
+        "options_flow": {"heat_score": 72.5, "iv_rank": 45.0, "pc_ratio": 0.82,
+                         "expected_move_pct": 3.1, "days_to_exp": 7},
+    })
+    aapl_row = {"ticker": "AAPL", "date": "2026-03-22", "signals_json": signals_json}
+    mock_conn = _make_db_conn(fetchall=[aapl_row])
+    with patch("dashboard.api.main._db_connect", return_value=mock_conn):
         resp = client.get("/api/screeners/options?min_heat=50")
     assert resp.status_code == 200
     body = resp.json()
     assert body["data_available"] is True
-    # AAPL has heat_score=72.5 so should appear
+    # AAPL has heat_score=72.5 > min_heat=50, must appear
     tickers = [r["ticker"] for r in body["data"]]
     assert "AAPL" in tickers
 
@@ -546,9 +630,13 @@ def test_backtest_from_csv(tmp_data):
 
 
 def test_backtest_missing_files():
-    with patch("dashboard.api.main.SIGNALS_DIR", Path("/nope")):
-        with patch("dashboard.api.main.DATA_DIR", Path("/nope")):
-            resp = client.get("/api/backtest/results")
+    """Returns data_available=False when neither DB nor CSV files have backtest data."""
+    with (
+        patch("dashboard.api.main.SIGNALS_DIR", Path("/nope")),
+        patch("dashboard.api.main.DATA_DIR",    Path("/nope")),
+        _db_conn_raises(),
+    ):
+        resp = client.get("/api/backtest/results")
     assert resp.status_code == 200
     assert resp.json()["data_available"] is False
 
@@ -962,3 +1050,312 @@ class TestPatternWatchEndpoint:
         note = resp.json().get("method_note", "")
         assert note, "method_note must not be empty"
         assert "sample" in note.lower()
+
+
+# ==============================================================================
+# TRD-022: /api/ticker/{symbol}/option-candidates
+# ==============================================================================
+
+def _make_mock_db_conn(thesis_row: dict | None):
+    """
+    Build a minimal mock _PGConn that returns *thesis_row* from a cursor fetchone.
+    The cursor is used as a context manager (with conn.cursor() as cur:).
+    """
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = thesis_row
+
+    # cursor() used as a context manager
+    ctx_mgr = MagicMock()
+    ctx_mgr.__enter__ = MagicMock(return_value=mock_cur)
+    ctx_mgr.__exit__ = MagicMock(return_value=False)
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = ctx_mgr
+    mock_conn.close.return_value = None
+    return mock_conn
+
+
+def _make_suppressed_result(ticker: str = "AAPL", reason: str = "No thesis context") -> dict:
+    """Return a CandidateResult-like dict for a suppressed response."""
+    from utils.option_candidates import CandidateResult
+    return CandidateResult(
+        ticker=ticker,
+        generated_at="2026-05-29T12:00:00",
+        suppressed=True,
+        suppression_reason=reason,
+    )
+
+
+def _make_candidate_result(ticker: str = "AAPL") -> dict:
+    """Return a CandidateResult-like object with one mock candidate."""
+    from utils.option_candidates import CandidateResult, OptionCandidate
+    from datetime import date, timedelta
+    expiry = (date.today() + timedelta(days=21)).strftime("%Y-%m-%d")
+    candidate = OptionCandidate(
+        ticker=ticker,
+        expiry=expiry,
+        strike=150.0,
+        right="C",
+        dte=21,
+        bid=2.0,
+        ask=2.20,
+        mid=2.10,
+        spread_pct=9.5,
+        delta=0.40,
+        implied_vol=0.35,
+        open_interest=500,
+        volume=100,
+        breakeven=152.10,
+        score=68.0,
+        rationale="bullish long call — Δ+0.40, IV 35%, 21d DTE",
+        strategy_preset="long_call",
+        source="yfinance",
+    )
+    return CandidateResult(
+        ticker=ticker,
+        generated_at="2026-05-29T12:00:00",
+        suppressed=False,
+        candidates=[candidate],
+        rejection_reasons=["C 155.0 2026-06-20: OI 10 < 50 minimum"],
+        underlying_price=148.0,
+        chain_source="yfinance",
+    )
+
+
+class TestOptionCandidatesEndpoint:
+    """Tests for GET /api/ticker/{symbol}/option-candidates  (TRD-022)."""
+
+    def setup_method(self):
+        _cache._store.clear()
+
+    def test_returns_200_always(self):
+        """Endpoint must return 200 even when no data is available."""
+        with (
+            patch("dashboard.api.main._db_connect", side_effect=Exception("no db")),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result("AAPL", "No thesis context available")),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+        assert resp.status_code == 200
+
+    def test_response_shape_suppressed(self):
+        """Suppressed response must have all required fields."""
+        with (
+            patch("dashboard.api.main._db_connect", side_effect=Exception("no db")),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result()),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        required = {
+            "ticker", "generated_at", "suppressed", "suppression_reason",
+            "candidates", "rejection_reasons", "underlying_price",
+            "chain_source", "chain_error",
+        }
+        missing = required - set(body.keys())
+        assert not missing, f"Missing fields: {missing}"
+
+    def test_suppressed_when_no_db(self):
+        """When DB is unavailable, no thesis → suppressed=True."""
+        with (
+            patch("dashboard.api.main._db_connect", side_effect=Exception("no db")),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result()),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        assert body["suppressed"] is True
+        assert body["candidates"] == []
+
+    def test_suppressed_when_no_thesis_row(self):
+        """When thesis_cache has no row for this ticker, suppressed=True."""
+        mock_conn = _make_mock_db_conn(thesis_row=None)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result("AAPL", "No thesis context available for this ticker")),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        assert body["suppressed"] is True
+        assert body["candidates"] == []
+        assert body["suppression_reason"] is not None
+
+    def test_returns_candidates_when_thesis_found(self):
+        """With a valid thesis, the engine result is serialized correctly."""
+        thesis_row = {
+            "ticker": "AAPL", "direction": "BULL", "conviction": 4,
+            "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
+            "target_2": 175.0, "stop_loss": 140.0, "time_horizon": "2-4 weeks",
+            "signals_json": None, "current_price": 148.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        engine_result = _make_candidate_result("AAPL")
+
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates", return_value=engine_result),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        assert resp.status_code == 200
+        assert body["suppressed"] is False
+        assert len(body["candidates"]) == 1
+        c = body["candidates"][0]
+        assert c["right"]  == "C"
+        assert c["strike"] == 150.0
+        assert c["delta"]  == pytest.approx(0.40)
+        assert c["source"] == "yfinance"
+
+    def test_candidate_fields_complete(self):
+        """Each candidate must include all execution-relevant fields."""
+        thesis_row = {
+            "ticker": "AAPL", "direction": "BULL", "conviction": 3,
+            "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
+            "target_2": None, "stop_loss": 140.0, "time_horizon": None,
+            "signals_json": None, "current_price": 148.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_candidate_result("AAPL")),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        c = resp.json()["candidates"][0]
+        required_fields = {
+            "ticker", "expiry", "strike", "right", "dte",
+            "bid", "ask", "mid", "spread_pct", "delta",
+            "implied_vol", "open_interest", "volume",
+            "breakeven", "score", "rationale", "strategy_preset", "source",
+        }
+        missing = required_fields - set(c.keys())
+        assert not missing, f"Candidate missing fields: {missing}"
+
+    def test_implied_vol_serialized_as_percentage(self):
+        """implied_vol must be returned as a percentage (e.g. 35.0 not 0.35)."""
+        thesis_row = {
+            "ticker": "AAPL", "direction": "BULL", "conviction": 3,
+            "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
+            "target_2": None, "stop_loss": 140.0, "time_horizon": None,
+            "signals_json": None, "current_price": 148.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_candidate_result("AAPL")),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        c = resp.json()["candidates"][0]
+        # Candidate has implied_vol=0.35; serializer multiplies by 100 → 35.0
+        assert c["implied_vol"] == pytest.approx(35.0)
+        assert c["implied_vol"] > 1.0, "implied_vol must be percentage not decimal"
+
+    def test_rejection_reasons_included(self):
+        """rejection_reasons must be a list (even when empty)."""
+        mock_conn = _make_mock_db_conn(thesis_row=None)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result()),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        assert isinstance(body["rejection_reasons"], list)
+
+    def test_ticker_normalized_to_uppercase(self):
+        """Lowercase symbol in URL must be normalized to uppercase in response."""
+        mock_conn = _make_mock_db_conn(thesis_row=None)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result("AAPL")),
+        ):
+            resp = client.get("/api/ticker/aapl/option-candidates")
+
+        assert resp.status_code == 200
+        assert resp.json()["ticker"] == "AAPL"
+
+    def test_cache_hit_avoids_second_db_call(self):
+        """A cached response must be returned on a second identical request."""
+        thesis_row = {
+            "ticker": "MSFT", "direction": "BULL", "conviction": 3,
+            "entry_low": 400.0, "entry_high": 410.0, "target_1": 430.0,
+            "target_2": None, "stop_loss": 390.0, "time_horizon": None,
+            "signals_json": None, "current_price": 405.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn) as db_mock,
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_candidate_result("MSFT")),
+        ):
+            _cache.invalidate("option_candidates:MSFT")
+            client.get("/api/ticker/MSFT/option-candidates")
+            client.get("/api/ticker/MSFT/option-candidates")
+            # DB should only be hit once (second request served from cache)
+            assert db_mock.call_count == 1
+
+    def test_thesis_direction_and_conviction_in_response(self):
+        """The response must include thesis_direction and thesis_conviction."""
+        thesis_row = {
+            "ticker": "AAPL", "direction": "BEAR", "conviction": 2,
+            "entry_low": 145.0, "entry_high": 150.0, "target_1": 130.0,
+            "target_2": None, "stop_loss": 155.0, "time_horizon": None,
+            "signals_json": None, "current_price": 148.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_suppressed_result("AAPL", "NEUTRAL direction")),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        body = resp.json()
+        assert body["thesis_direction"] == "BEAR"
+        assert body["thesis_conviction"] == 2
+
+    def test_thesis_date_and_agreement_extracted_from_row(self):
+        """thesis_date and signal_agreement must be populated from the DB row for persistence.
+        thesis_id is always None — thesis_cache has composite PK (ticker, date), no surrogate id."""
+        thesis_row = {
+            "date": "2026-05-29",
+            "ticker": "AAPL", "direction": "BULL", "conviction": 3,
+            "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
+            "target_2": None, "stop_loss": 140.0, "time_horizon": "2-4 weeks",
+            "signal_agreement_score": 0.75,
+            "signals_json": None,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        persisted: dict = {}
+
+        def _capture_persist(result, thesis_id=None, thesis_context=None):
+            persisted["thesis_id"] = thesis_id
+            persisted["thesis_date"] = (thesis_context or {}).get("thesis_date")
+            persisted["signal_agreement"] = (thesis_context or {}).get("signal_agreement")
+
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates",
+                  return_value=_make_candidate_result("AAPL")),
+            patch("utils.supabase_persist.save_option_candidate_snapshot",
+                  side_effect=_capture_persist),
+        ):
+            resp = client.get("/api/ticker/AAPL/option-candidates")
+
+        assert resp.status_code == 200
+        # Give fire-and-forget executor a moment to run
+        import time; time.sleep(0.05)
+        assert persisted.get("thesis_id") is None, "thesis_id must be None (no surrogate id column)"
+        assert persisted.get("thesis_date") == "2026-05-29", "thesis_date must be set"
+        assert persisted.get("signal_agreement") == pytest.approx(0.75)

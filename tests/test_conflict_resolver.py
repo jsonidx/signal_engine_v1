@@ -444,3 +444,107 @@ class TestLogging:
         content = csv_files[0].read_text()
         assert "timestamp" in content  # header row
         assert "GME" in content
+
+
+# ==============================================================================
+# TRD-001 — Pre-Earnings Breakout: conflict resolver integration
+# ==============================================================================
+
+class TestPreEarningsBreakoutConflictResolver:
+    """
+    The conflict resolver must NOT automatically force BULL when a pre-earnings
+    breakout flag fires.  The detector is advisory (adds a context flag) and must
+    leave the existing pre-earnings-hold override semantics intact.
+    """
+
+    def _signals_with_earnings(self, days_to_earn: int, is_catalyst: bool = True) -> dict:
+        """Signals dict that will trigger pre_earnings_hold or earnings_is_thesis."""
+        sigs = {
+            "ticker": "SNOW",
+            "signal_engine":  {"composite_z": 0.8},
+            "fundamentals":   {"fundamental_score_pct": 65.0},
+            "squeeze":        {"squeeze_score_100": 11.5, "recent_squeeze": False},
+            "options_flow":   {"heat_score": 70.0, "pc_ratio": 0.55},
+            "sec":            {"score": 0, "flags": []},
+            "technical":      {"momentum_1m_pct": 9.0},
+            "market_regime":  {"regime": "RISK_ON"},
+            "catalyst":       {"is_earnings_catalyst": is_catalyst},
+        }
+        return sigs
+
+    def test_pre_earnings_hold_still_fires_for_non_catalyst(self):
+        """
+        When earnings are within 5 days and the setup is NOT flagged as a
+        catalyst thesis, pre_earnings_hold override must still fire.
+        This ensures the new detector does not weaken the override.
+        """
+        sigs = self._signals_with_earnings(days_to_earn=3, is_catalyst=False)
+
+        with patch.object(cr, "_get_days_to_earnings", return_value=3), \
+             patch.object(cr, "_is_earnings_catalyst", return_value=False):
+            result = cr.resolve(sigs, "RISK_ON")
+
+        override_flags = result.get("override_flags", [])
+        pre_hold_fired = any("pre_earnings_hold" in f for f in override_flags)
+        assert pre_hold_fired, (
+            "pre_earnings_hold must still fire even when pre_earnings_breakout logic is present"
+        )
+
+    def test_pre_earnings_breakout_context_flag_does_not_override_direction(self):
+        """
+        A context flag about pre-earnings breakout setup must not change
+        the pre-resolved direction produced by the weighted vote.
+        """
+        sigs = {
+            "ticker": "TESTPEB",
+            "signal_engine":  {"composite_z": 0.5},
+            "fundamentals":   {"fundamental_score_pct": 50.0},
+            "squeeze":        {"squeeze_score_100": 11.5, "recent_squeeze": False},
+            "options_flow":   {"heat_score": 60.0, "pc_ratio": 0.6},
+            "sec":            {"score": 0, "flags": []},
+            "technical":      {"momentum_1m_pct": 3.0},
+            "market_regime":  {"regime": "RISK_ON"},
+        }
+        import yfinance as yf
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"longBusinessSummary": "", "regularMarketPrice": 50.0}
+        mock_ticker.history.return_value = MagicMock(empty=False)
+        with patch.object(cr, "_get_days_to_earnings", return_value=30), \
+             patch.object(yf, "Ticker", return_value=mock_ticker):
+            result = cr.resolve(sigs, "RISK_ON")
+
+        # Direction must come from the module vote, not any pre-earnings shortcut
+        assert result["pre_resolved_direction"] in ("BULL", "BEAR", "NEUTRAL")
+        # No "override: pre_earnings_hold" must fire with 30 days out
+        override_flags = result.get("override_flags", [])
+        assert not any("pre_earnings_hold" in f for f in override_flags), (
+            "pre_earnings_hold must not fire with 30 days to earnings"
+        )
+
+    def test_pre_earnings_breakout_result_is_watch_not_buy(self):
+        """
+        Document: pre_earnings_breakout is a WATCH/SETUP signal, not a buy.
+        score_pre_earnings_breakout must never set skip_claude=False or
+        force a direction by itself — it only produces advisory flags.
+        """
+        from catalyst_screener import score_pre_earnings_breakout
+        result = score_pre_earnings_breakout({
+            "days_to_earnings": 5,
+            "earnings_beat_streak": 4,
+            "earnings_surprise_avg_pct": 8.5,
+            "momentum_1m_pct": 9.2,
+            "volume_score": 4.0,
+            "options_score": 4.0,
+            "dark_pool_signal": "NEUTRAL",
+            "short_pct_float": 5.1,
+        })
+        # Detector must NOT produce a buy/direction field
+        assert "direction" not in result, "Detector must not set direction"
+        assert "skip_claude" not in result, "Detector must not set skip_claude"
+        # Must produce flags, not a hard override
+        assert isinstance(result["flags"], list)
+        if result["pre_earnings_breakout"]:
+            flag_text = " ".join(result["flags"]).lower()
+            assert "watch" in flag_text or "setup" in flag_text or "catalyst" in flag_text, (
+                "Pre-earnings breakout flag must describe a watch/setup, not a buy"
+            )

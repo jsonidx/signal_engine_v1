@@ -1,7 +1,7 @@
 # Task: Low-Cost News Catalyst Scanner
 
-Status: implemented
-Stage: finished
+Status: done
+Stage: done
 Type: feature
 Priority: P1
 Severity: medium

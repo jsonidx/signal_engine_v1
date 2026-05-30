@@ -9,6 +9,7 @@ Primary responsibilities:
 - Add or update tests for behavioral changes.
 - Run local verification and summarize failures.
 - Review Claude Code changes as a QA engineer.
+- When QA finds implementation issues, write a Claude-ready fix prompt immediately.
 - Protect trading logic from unbenchmarked changes.
 - Keep generated artifacts, secrets, and local caches out of git.
 - Maintain repeatable workflows through scripts, Make targets, and CI.

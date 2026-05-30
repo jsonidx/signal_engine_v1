@@ -59,6 +59,47 @@ def _make_ishares_csv(tickers: list, sectors: dict = None, n_metadata_rows: int 
     return "\n".join(lines)
 
 
+def _make_ishares_workbook(tickers: list, sectors: dict = None) -> str:
+    rows = []
+    for t in tickers:
+        sec = (sectors or {}).get(t, "Technology")
+        rows.append(
+            f"""
+<ss:Row>
+  <ss:Cell><ss:Data ss:Type="String">{t}</ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String">{t} Inc</ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String">{sec}</ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String">Equity</ss:Data></ss:Cell>
+</ss:Row>""".strip()
+        )
+    rows.append(
+        """
+<ss:Row>
+  <ss:Cell><ss:Data ss:Type="String">-</ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String">CASH USD</ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String"></ss:Data></ss:Cell>
+  <ss:Cell><ss:Data ss:Type="String">Cash</ss:Data></ss:Cell>
+</ss:Row>""".strip()
+    )
+    body = "\n".join(rows)
+    return f"""<?xml version="1.0"?>
+<ss:Workbook xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  <ss:Worksheet ss:Name="Holdings">
+    <ss:Table>
+      <ss:Row><ss:Cell><ss:Data ss:Type="String">Fund Holdings as of 2026-05-28</ss:Data></ss:Cell></ss:Row>
+      <ss:Row><ss:Cell><ss:Data ss:Type="String"></ss:Data></ss:Cell></ss:Row>
+      <ss:Row>
+        <ss:Cell><ss:Data ss:Type="String">Ticker</ss:Data></ss:Cell>
+        <ss:Cell><ss:Data ss:Type="String">Name</ss:Data></ss:Cell>
+        <ss:Cell><ss:Data ss:Type="String">Sector</ss:Data></ss:Cell>
+        <ss:Cell><ss:Data ss:Type="String">Asset Class</ss:Data></ss:Cell>
+      </ss:Row>
+      {body}
+    </ss:Table>
+  </ss:Worksheet>
+</ss:Workbook>"""
+
+
 def _make_price_df(tickers: list, n_bars: int = 200, price: float = 10.0,
                    volume: float = 1_000_000.0) -> pd.DataFrame:
     """
@@ -209,6 +250,25 @@ class TestFetchIndexConstituents:
             ):
                 ub.fetch_index_constituents("sp500")
 
+        assert ub._SECTOR_MAP.get("AAPL") == "Technology"
+        assert ub._SECTOR_MAP.get("XOM") == "Energy"
+
+    def test_parses_current_workbook_export(self):
+        """Current BlackRock workbook export should parse like the legacy CSV."""
+        sectors = {"AAPL": "Technology", "XOM": "Energy"}
+        workbook = _make_ishares_workbook(list(sectors.keys()), sectors=sectors)
+        mock_resp = MagicMock()
+        mock_resp.text = workbook
+        mock_resp.raise_for_status = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("universe_builder.requests.get", return_value=mock_resp),
+                patch("universe_builder._CACHE_DIR", Path(tmpdir)),
+            ):
+                result = ub.fetch_index_constituents("sp500")
+
+        assert set(result) == set(sectors)
         assert ub._SECTOR_MAP.get("AAPL") == "Technology"
         assert ub._SECTOR_MAP.get("XOM") == "Energy"
 

@@ -1,7 +1,7 @@
 # Task: Squeeze Alert Outcome Taxonomy
 
-Status: implemented
-Stage: awaiting QA
+Status: qa
+Stage: qa
 Type: feature
 Priority: P1
 Severity: high
@@ -109,9 +109,87 @@ This task operationalizes the PM review framework:
 
 Without these labels persisted in the database, Claude can report on past behavior but cannot cleanly train or recalibrate future squeeze logic from a stable taxonomy.
 
+Paste-ready Codex QA prompt:
+
+```text
+Codex QA for TRD-012, TRD-013, TRD-014, and TRD-015.
+
+Ticket summary:
+- TRD-012: verify the live Supabase training dataset path is working end-to-end.
+- TRD-013: verify the calibration workflow can run on real labeled data and produce a report.
+- TRD-014: verify taxonomy labels are persisted correctly in live training outcomes.
+- TRD-015: verify the Telegram approval-request workflow works end-to-end with auditable DB state transitions.
+
+Combined objective:
+Use repo-local tests plus live environment checks to determine whether these four tickets are truly ready to move from `qa` to `done`. Do not mark any ticket done unless its external acceptance evidence is present.
+
+Exact scope:
+- `docs/tasks/in-progress/TRD-012-supabase-squeeze-training-dataset.md`
+- `docs/tasks/in-progress/TRD-013-squeeze-probability-calibration-and-review-gate.md`
+- `docs/tasks/in-progress/TRD-014-squeeze-alert-outcome-taxonomy.md`
+- `docs/tasks/in-progress/TRD-015-telegram-approval-requests-for-trading-logic.md`
+- `migrations/003_squeeze_training_and_approvals.sql`
+- `utils/supabase_persist.py`
+- `backtest.py`
+- `scripts/squeeze_calibration.py`
+- `scripts/telegram_bot.py`
+- `scripts/notify_pipeline_result.py`
+- related tests under `tests/test_squeeze_persistence_schema.py`, `tests/test_squeeze_replay.py`, and `tests/test_telegram_notifications.py`
+
+Required verification:
+1. Run local automated coverage:
+   `pytest tests/test_squeeze_state_machine.py tests/test_squeeze_alerts.py tests/test_squeeze_replay.py tests/test_squeeze_persistence_schema.py tests/test_telegram_notifications.py -q`
+2. TRD-012:
+   - Confirm migration `003_squeeze_training_and_approvals.sql` is applied in the live Supabase environment.
+   - Confirm at least one live `squeeze_training_snapshots` row exists from the pipeline.
+   - Confirm at least one related `squeeze_training_outcomes` row exists or clearly document that forward windows are not yet closed.
+3. TRD-013:
+   - Run `python3 scripts/squeeze_calibration.py` against real labeled data if available.
+   - Confirm a real calibration report is written under `reports/`.
+   - If sample size is insufficient, leave the ticket in `qa` and record the exact blocker.
+4. TRD-014:
+   - Query live `squeeze_training_outcomes` rows and verify taxonomy labels are being written as expected.
+   - Confirm labels are reproducible from the code rules, not manual edits.
+5. TRD-015:
+   - Create a real or controlled test `approval_requests` row.
+   - Verify notification formatting.
+   - Verify `/pending`, `/approve <id>`, and `/reject <id>` or equivalent handler flow updates DB state correctly.
+   - Confirm auditable status transitions in Supabase.
+
+Non-goals:
+- Do not change trading logic, thresholds, schema, or Telegram bot behavior while doing QA.
+- Do not mark a ticket done from unit tests alone when its acceptance criteria require live DB or Telegram evidence.
+- Do not refactor implementation code.
+
+Risk constraints:
+- Treat TRD-013 and TRD-014 as `trading-logic`-adjacent verification work; do not alter scoring behavior.
+- Treat TRD-015 as approval-gate infrastructure; verify that rejected or non-pending requests cannot bypass the guard.
+
+Required output:
+- For each ticket, explicitly state `done` or `remain in qa`.
+- Cite the exact evidence used.
+- If blocked, state the missing evidence in one sentence.
+- If QA passes, update `Status:` to `done`, `Stage:` to `done`, add the verification summary in the ticket, and run `python3 scripts/sync_task_status.py`.
+```
+
 ## Tracking Note
 
 Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
 Covers: compute_taxonomy_label() in backtest.py, EARLY_ENOUGH / LATE_CHASE / FALSE_POSITIVE labels, hit_15pct_10d and hit_25pct_20d binary flags.
 Status: implemented and on main, but taxonomy labels accumulate over time as squeeze outcomes close.
 Action required: verify taxonomy labels are being written correctly to squeeze_training_outcomes in the live pipeline before moving to finished.
+
+## QA Verification Summary (2026-05-30) — REMAIN IN QA
+
+**Taxonomy rule code confirmed:**
+- `compute_taxonomy_label()` at `backtest.py:1099–1155` defines explicit reproducible rules:
+  - `EARLY_ENOUGH`: entry state (EARLY_ARMED/ARMED) + hit_15pct_10d OR hit_25pct_20d
+  - `LATE_CHASE`: ACTIVE state with any move ≥5%; or entry state with move below threshold
+  - `FALSE_POSITIVE`: max_fwd_return < 5% across all windows
+- Called in `_persist_training_outcomes()` at backtest.py:1513–1526. Labels derive from code rules, not manual edits.
+- `squeeze_training_snapshots` has 5 real rows (signal_date=2026-05-30) confirming the write path is live and correctly captures ACTIVE and EARLY_ARMED states.
+
+**Live evidence:**
+- `squeeze_training_outcomes`: 0 rows — time-blocked, not implementation-blocked.
+- 24 trading bars available after 2026-04-26 as of 2026-05-29 close; 30 needed for fwd_30d.
+- Blocker: first labeled outcome rows with taxonomy_label require ~2026-06-05. Leave in qa until `squeeze_training_outcomes` has at least 1 live row with a non-null `taxonomy_label` matching the code rules above.

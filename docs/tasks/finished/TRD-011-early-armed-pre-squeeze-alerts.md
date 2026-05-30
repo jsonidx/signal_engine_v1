@@ -1,7 +1,7 @@
 # Task: Early Armed Pre-Squeeze Alerts
 
-Status: implemented
-Stage: awaiting QA
+Status: done
+Stage: done
 Type: feature
 Priority: P0
 Severity: high
@@ -121,5 +121,9 @@ The current PM takeaway should be preserved in implementation:
 
 Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
 Covers: EARLY_ARMED lifecycle state, DDD fixture proof, new EARLY_ARMED_ALERT type, ACTIVE_SQUEEZE chase-risk copy.
-Status: implemented and on main, but no formal QA sign-off recorded.
-Action required: human QA review of EARLY_ARMED trigger thresholds and alert content before moving to finished.
+Status: QA passed on 2026-05-30 based on local acceptance evidence.
+Verification evidence:
+- `pytest tests/test_squeeze_state_machine.py tests/test_squeeze_alerts.py tests/test_squeeze_replay.py tests/test_squeeze_persistence_schema.py tests/test_telegram_notifications.py -q` → 282 passed
+- DDD fixture acceptance remains covered in `tests/test_squeeze_state_machine.py` (`test_ddd_apr15_fixture_fires_early_armed`, `test_ddd_may11_fixture_fires_armed`)
+- Alert semantics remain covered in `tests/test_squeeze_alerts.py` (`test_early_armed_alert_message_contains_watch_language`, `test_active_squeeze_alert_message_contains_chase_language`)
+Decision: moved to `done` and eligible for `docs/tasks/finished/`.

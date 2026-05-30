@@ -1,7 +1,7 @@
 # Task: Squeeze Probability Calibration And Review Gate
 
-Status: implemented
-Stage: awaiting QA
+Status: qa
+Stage: qa
 Type: research
 Priority: P1
 Severity: high
@@ -110,9 +110,85 @@ Use replayed historical snapshots with closed forward windows to generate labele
 
 This task is the guardrail against wishful thinking. The user goal is to learn from successful squeezes and eventually approach very high precision on early setups, but the code should only emit probability claims that are supported by closed-window evidence and adequate sample size.
 
+Paste-ready Codex QA prompt:
+
+```text
+Codex QA for TRD-012, TRD-013, TRD-014, and TRD-015.
+
+Ticket summary:
+- TRD-012: verify the live Supabase training dataset path is working end-to-end.
+- TRD-013: verify the calibration workflow can run on real labeled data and produce a report.
+- TRD-014: verify taxonomy labels are persisted correctly in live training outcomes.
+- TRD-015: verify the Telegram approval-request workflow works end-to-end with auditable DB state transitions.
+
+Combined objective:
+Use repo-local tests plus live environment checks to determine whether these four tickets are truly ready to move from `qa` to `done`. Do not mark any ticket done unless its external acceptance evidence is present.
+
+Exact scope:
+- `docs/tasks/in-progress/TRD-012-supabase-squeeze-training-dataset.md`
+- `docs/tasks/in-progress/TRD-013-squeeze-probability-calibration-and-review-gate.md`
+- `docs/tasks/in-progress/TRD-014-squeeze-alert-outcome-taxonomy.md`
+- `docs/tasks/in-progress/TRD-015-telegram-approval-requests-for-trading-logic.md`
+- `migrations/003_squeeze_training_and_approvals.sql`
+- `utils/supabase_persist.py`
+- `backtest.py`
+- `scripts/squeeze_calibration.py`
+- `scripts/telegram_bot.py`
+- `scripts/notify_pipeline_result.py`
+- related tests under `tests/test_squeeze_persistence_schema.py`, `tests/test_squeeze_replay.py`, and `tests/test_telegram_notifications.py`
+
+Required verification:
+1. Run local automated coverage:
+   `pytest tests/test_squeeze_state_machine.py tests/test_squeeze_alerts.py tests/test_squeeze_replay.py tests/test_squeeze_persistence_schema.py tests/test_telegram_notifications.py -q`
+2. TRD-012:
+   - Confirm migration `003_squeeze_training_and_approvals.sql` is applied in the live Supabase environment.
+   - Confirm at least one live `squeeze_training_snapshots` row exists from the pipeline.
+   - Confirm at least one related `squeeze_training_outcomes` row exists or clearly document that forward windows are not yet closed.
+3. TRD-013:
+   - Run `python3 scripts/squeeze_calibration.py` against real labeled data if available.
+   - Confirm a real calibration report is written under `reports/`.
+   - If sample size is insufficient, leave the ticket in `qa` and record the exact blocker.
+4. TRD-014:
+   - Query live `squeeze_training_outcomes` rows and verify taxonomy labels are being written as expected.
+   - Confirm labels are reproducible from the code rules, not manual edits.
+5. TRD-015:
+   - Create a real or controlled test `approval_requests` row.
+   - Verify notification formatting.
+   - Verify `/pending`, `/approve <id>`, and `/reject <id>` or equivalent handler flow updates DB state correctly.
+   - Confirm auditable status transitions in Supabase.
+
+Non-goals:
+- Do not change trading logic, thresholds, schema, or Telegram bot behavior while doing QA.
+- Do not mark a ticket done from unit tests alone when its acceptance criteria require live DB or Telegram evidence.
+- Do not refactor implementation code.
+
+Risk constraints:
+- Treat TRD-013 and TRD-014 as `trading-logic`-adjacent verification work; do not alter scoring behavior.
+- Treat TRD-015 as approval-gate infrastructure; verify that rejected or non-pending requests cannot bypass the guard.
+
+Required output:
+- For each ticket, explicitly state `done` or `remain in qa`.
+- Cite the exact evidence used.
+- If blocked, state the missing evidence in one sentence.
+- If QA passes, update `Status:` to `done`, `Stage:` to `done`, add the verification summary in the ticket, and run `python3 scripts/sync_task_status.py`.
+```
+
 ## Tracking Note
 
 Code shipped in commit **c8f3481** ("Add EARLY_ARMED squeeze training, calibration, and approval workflows", 2026-05-29).
 Covers: scripts/squeeze_calibration.py with --backfill and --create-approval flags, hit-rate breakdown by state/score/SI/DTC buckets.
 Status: implemented and on main, but calibration requires adequate closed-window history to produce meaningful output.
 Action required: run calibration script after sufficient squeeze_training_outcomes rows have accumulated; review probability output before moving to finished.
+
+## QA Verification Summary (2026-05-30) — REMAIN IN QA
+
+**Calibration script run:**
+- `python3 scripts/squeeze_calibration.py --backfill` executed cleanly.
+- Loaded 653 squeeze_scores snapshots, skipped 38 (NOT_SETUP state), persisted 0 outcomes.
+- `squeeze_training_outcomes` fetched 0 labeled rows → empty-data report written to `reports/squeeze_calibration_2026-05-30.md`.
+- The empty-data fallback path executes correctly (no crash, explicit message in report).
+- The calibration script code is complete: score/SI/DTC bucketing, state breakdown, entry vs chase comparison, report writing all verified against the code.
+
+**DB state:** All 3 migration-003 tables exist and are reachable. `squeeze_training_outcomes` has 0 rows.
+
+**Blocker:** yfinance confirms 24 trading bars available after 2026-04-26 as of last close (2026-05-29); 30 are needed for fwd_30d. First outcomes computable ~2026-06-05. Sample size of 10+ per state requires further accumulation after that. Leave in qa until `squeeze_training_outcomes` has rows and `python3 scripts/squeeze_calibration.py` produces a non-empty-data report.

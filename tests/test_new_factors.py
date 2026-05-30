@@ -524,3 +524,368 @@ class TestConfigWeights:
             assert EQUITY_FACTORS[key]["weight"] > 0.0, (
                 f"{key} has zero/negative weight"
             )
+
+
+# ==============================================================================
+# TRD-001 — Pre-Earnings Breakout Detector
+# ==============================================================================
+
+class TestPreEarningsBreakoutDetector:
+    """
+    Unit tests for catalyst_screener.score_pre_earnings_breakout.
+
+    All inputs are static dicts — no live yfinance, Supabase, or SEC calls.
+    """
+
+    def _call(self, **kwargs):
+        from catalyst_screener import score_pre_earnings_breakout
+        return score_pre_earnings_breakout(kwargs)
+
+    # ── Bullish case (SNOW-like) ──────────────────────────────────────────────
+
+    def test_snow_like_setup_fires(self):
+        """SNOW-like inputs (beat streak ≥3, momentum ≥5%, volume+options ≥3) must fire."""
+        result = self._call(
+            days_to_earnings=2,
+            earnings_beat_streak=4,
+            earnings_surprise_avg_pct=8.5,
+            momentum_1m_pct=9.2,
+            volume_score=4.0,
+            options_score=4.0,
+            dark_pool_signal="NEUTRAL",
+            short_pct_float=5.1,
+        )
+        assert result["pre_earnings_breakout"] is True
+        assert result["confidence"] in ("medium", "high")
+        assert result["requires_high_short_interest"] is False
+
+    def test_high_confidence_all_conditions(self):
+        """Four conditions met → high confidence."""
+        result = self._call(
+            days_to_earnings=5,
+            earnings_beat_streak=5,
+            earnings_surprise_avg_pct=12.0,
+            momentum_1m_pct=10.0,
+            volume_score=4.0,
+            options_score=4.0,
+            dark_pool_signal="ACCUMULATION",
+            short_pct_float=4.0,
+        )
+        assert result["pre_earnings_breakout"] is True
+        assert result["confidence"] == "high"
+
+    # ── Neutral case ─────────────────────────────────────────────────────────
+
+    def test_only_one_condition_does_not_fire(self):
+        """Single condition (beat streak only, weak momentum, no volume/options) → no flag."""
+        result = self._call(
+            days_to_earnings=10,
+            earnings_beat_streak=3,
+            earnings_surprise_avg_pct=5.0,
+            momentum_1m_pct=1.0,    # below threshold
+            volume_score=1.0,       # below threshold
+            options_score=1.0,      # below threshold
+            dark_pool_signal="NEUTRAL",
+            short_pct_float=6.0,
+        )
+        assert result["pre_earnings_breakout"] is False
+
+    def test_no_earnings_window_does_not_fire(self):
+        """Outside earnings window (days_to_earnings=None or >30) → no flag."""
+        result_none = self._call(
+            days_to_earnings=None,
+            earnings_beat_streak=5,
+            earnings_surprise_avg_pct=15.0,
+            momentum_1m_pct=12.0,
+            volume_score=5.0,
+            options_score=5.0,
+            dark_pool_signal="ACCUMULATION",
+            short_pct_float=5.0,
+        )
+        assert result_none["pre_earnings_breakout"] is False
+
+        result_far = self._call(
+            days_to_earnings=45,
+            earnings_beat_streak=5,
+            earnings_surprise_avg_pct=15.0,
+            momentum_1m_pct=12.0,
+            volume_score=5.0,
+            options_score=5.0,
+            dark_pool_signal="ACCUMULATION",
+            short_pct_float=5.0,
+        )
+        assert result_far["pre_earnings_breakout"] is False
+
+    # ── False-positive guard ──────────────────────────────────────────────────
+
+    def test_no_beat_streak_does_not_fire(self):
+        """Even with strong momentum/volume/options, zero beat streak → no flag."""
+        result = self._call(
+            days_to_earnings=3,
+            earnings_beat_streak=0,  # no history
+            earnings_surprise_avg_pct=0.0,
+            momentum_1m_pct=12.0,
+            volume_score=5.0,
+            options_score=5.0,
+            dark_pool_signal="ACCUMULATION",
+            short_pct_float=5.0,
+        )
+        assert result["pre_earnings_breakout"] is False, (
+            "Beat streak is required — momentum alone is not enough"
+        )
+
+    def test_negative_momentum_does_not_fire(self):
+        """Beat streak + negative momentum → no flag (price says market disagrees)."""
+        result = self._call(
+            days_to_earnings=5,
+            earnings_beat_streak=4,
+            earnings_surprise_avg_pct=8.0,
+            momentum_1m_pct=-3.0,   # negative
+            volume_score=4.0,
+            options_score=4.0,
+            dark_pool_signal="NEUTRAL",
+            short_pct_float=5.0,
+        )
+        assert result["pre_earnings_breakout"] is False, (
+            "Negative momentum contradicts re-rating thesis"
+        )
+
+    # ── Squeeze independence ──────────────────────────────────────────────────
+
+    def test_does_not_require_high_short_interest(self):
+        """Detector must work regardless of short interest level."""
+        for si in (1.0, 5.0, 10.0, 30.0, 50.0):
+            result = self._call(
+                days_to_earnings=7,
+                earnings_beat_streak=3,
+                earnings_surprise_avg_pct=6.0,
+                momentum_1m_pct=6.0,
+                volume_score=3.5,
+                options_score=3.5,
+                dark_pool_signal="NEUTRAL",
+                short_pct_float=si,
+            )
+            assert result["requires_high_short_interest"] is False, (
+                f"requires_high_short_interest must always be False (SI={si})"
+            )
+
+    def test_score_max_field_always_5(self):
+        """score_pre_earnings_breakout always returns max=5."""
+        result = self._call(
+            days_to_earnings=5,
+            earnings_beat_streak=3,
+            earnings_surprise_avg_pct=6.0,
+            momentum_1m_pct=6.0,
+            volume_score=3.0,
+            options_score=3.0,
+            dark_pool_signal="NEUTRAL",
+            short_pct_float=5.0,
+        )
+        assert result["max"] == 5
+
+    def test_derive_earnings_beat_stats_from_yfinance_history(self):
+        """Beat stats should be derived from earnings_history when info keys are absent."""
+        from catalyst_screener import _derive_earnings_beat_stats
+
+        mock_stock = MagicMock()
+        mock_stock.earnings_history = pd.DataFrame(
+            {"Surprise(%)": [0.10, 0.08, -0.02]},
+            index=pd.to_datetime(["2026-05-01", "2026-02-01", "2025-11-01"]),
+        )
+
+        result = _derive_earnings_beat_stats({"info": {}, "stock_obj": mock_stock})
+
+        assert result["earnings_beat_streak"] == 2
+        assert result["earnings_surprise_avg_pct"] == pytest.approx((10 + 8 - 2) / 3)
+
+    def test_derive_earnings_beat_stats_preserves_explicit_info_keys(self):
+        """Fixture/vendor info keys should remain supported."""
+        from catalyst_screener import _derive_earnings_beat_stats
+
+        result = _derive_earnings_beat_stats({
+            "info": {"earningsBeatStreak": 4, "earningsSurpriseAvgPct": 18.7},
+            "stock_obj": None,
+        })
+
+        assert result == {
+            "earnings_beat_streak": 4,
+            "earnings_surprise_avg_pct": 18.7,
+        }
+
+
+# ==============================================================================
+# TRD-001 hardening — _derive_earnings_beat_stats parser
+# ==============================================================================
+
+class TestDeriveEarningsBeatStats:
+    """
+    Unit tests for catalyst_screener._derive_earnings_beat_stats.
+    All inputs are static dicts/DataFrames — no live yfinance calls.
+    """
+
+    def _call(self, data: dict):
+        from catalyst_screener import _derive_earnings_beat_stats
+        return _derive_earnings_beat_stats(data)
+
+    # ── Direct info-key path ──────────────────────────────────────────────────
+
+    def test_info_keys_take_priority(self):
+        """When info has earningsBeatStreak, use it without touching stock_obj."""
+        result = self._call({
+            "info": {"earningsBeatStreak": 4, "earningsSurpriseAvgPct": 8.5},
+            "stock_obj": None,
+        })
+        assert result["earnings_beat_streak"] == 4
+        assert result["earnings_surprise_avg_pct"] == 8.5
+
+    def test_info_key_partial_uses_default_for_missing(self):
+        """Only one info key present → other defaults to 0."""
+        result = self._call({"info": {"earningsBeatStreak": 3}, "stock_obj": None})
+        assert result["earnings_beat_streak"] == 3
+        assert result["earnings_surprise_avg_pct"] == 0.0
+
+    # ── earnings_history path ─────────────────────────────────────────────────
+
+    def test_surprise_col_detected(self):
+        """Columns with 'surprise' in name are used directly.
+
+        yfinance indexes earnings_history by date ascending; the code
+        sorts descending so the newest quarter ends up first.  Construct
+        the fixture with ascending dates so the intended newest value
+        (first beat) becomes first after the descending sort.
+        """
+        import pandas as pd
+
+        # Ascending-date order (oldest→newest): -0.02, 0.05, 0.12, 0.08
+        # After sort_index descending (newest first): 0.08, 0.12, 0.05, -0.02
+        # Values ≤1 → ×100: [8, 12, 5, -2]
+        # Beat streak: 3 (8, 12, 5 are beats; -2 breaks)
+        dates = pd.date_range("2025-06-01", periods=4, freq="QE")
+        hist = pd.DataFrame(
+            {"epsSurprisePct": [-0.02, 0.05, 0.12, 0.08]},
+            index=dates,
+        )
+        mock_obj = type("T", (), {"earnings_history": hist})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        assert result["earnings_beat_streak"] == 3
+        assert result["earnings_surprise_avg_pct"] > 0
+
+    def test_estimate_actual_cols_fallback(self):
+        """When no 'surprise' col, derive from estimate + actual."""
+        import pandas as pd
+
+        # All quarters beat: actual > estimate
+        dates = pd.date_range("2025-06-01", periods=4, freq="QE")
+        hist = pd.DataFrame({
+            "epsEstimate": [1.0, 1.2, 0.9, 1.1],
+            "epsActual":   [1.1, 1.3, 1.0, 1.2],  # all beat
+        }, index=dates)
+        mock_obj = type("T", (), {"earnings_history": hist})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        assert result["earnings_beat_streak"] >= 1
+
+    def test_non_dataframe_hist_returns_zeros(self):
+        """If earnings_history is a dict or string, return safe zeros."""
+        mock_obj = type("T", (), {"earnings_history": {"bad": "data"}})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        assert result["earnings_beat_streak"] == 0
+        assert result["earnings_surprise_avg_pct"] == 0.0
+
+    def test_empty_dataframe_returns_zeros(self):
+        """Empty DataFrame → zeros."""
+        import pandas as pd
+        mock_obj = type("T", (), {"earnings_history": pd.DataFrame()})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        assert result["earnings_beat_streak"] == 0
+
+    def test_no_stock_obj_returns_zeros(self):
+        """No stock_obj and no info keys → zeros (not exception)."""
+        result = self._call({"info": {}, "stock_obj": None})
+        assert result["earnings_beat_streak"] == 0
+        assert result["earnings_surprise_avg_pct"] == 0.0
+
+    def test_exception_in_earnings_history_returns_zeros(self):
+        """If earnings_history raises → return zeros safely."""
+        class BadObj:
+            @property
+            def earnings_history(self):
+                raise RuntimeError("yfinance broken")
+        result = self._call({"info": {}, "stock_obj": BadObj()})
+        assert result["earnings_beat_streak"] == 0
+
+    def test_all_misses_streak_is_zero(self):
+        """All negative surprises → beat streak = 0."""
+        import pandas as pd
+        dates = pd.date_range("2025-06-01", periods=4, freq="QE")
+        hist = pd.DataFrame(
+            {"epsSurprisePct": [-0.05, -0.10, -0.02, -0.08]},
+            index=dates,
+        )
+        mock_obj = type("T", (), {"earnings_history": hist})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        assert result["earnings_beat_streak"] == 0
+
+    def test_percentage_surprises_not_multiplied(self):
+        """Values >1 in surprise col are treated as percentage already.
+
+        Construct with ascending dates so after descending sort newest=8.0:
+        ascending: [3.0, -2.0, 5.0, 8.0] → descending: [8.0, 5.0, -2.0, 3.0]
+        Beats: 8 then 5; -2 breaks → streak = 2.
+        """
+        import pandas as pd
+        dates = pd.date_range("2025-06-01", periods=4, freq="QE")
+        hist = pd.DataFrame(
+            {"epsSurprisePct": [3.0, -2.0, 5.0, 8.0]},
+            index=dates,
+        )
+        mock_obj = type("T", (), {"earnings_history": hist})()
+        result = self._call({"info": {}, "stock_obj": mock_obj})
+        # Values >1 → no ×100; newest first after sort: [8, 5, -2, 3]
+        # Streak: 8 (beat), 5 (beat), -2 (miss) → 2
+        assert result["earnings_beat_streak"] == 2
+
+
+# ==============================================================================
+# TRD-001 hardening — momentum_1m_pct from score_technical_setup
+# ==============================================================================
+
+class TestTechnicalSetupMomentum:
+    """Verify score_technical_setup now returns momentum_1m_pct."""
+
+    def test_momentum_key_present(self):
+        """score_technical_setup must return momentum_1m_pct for sufficient history."""
+        import numpy as np
+        import pandas as pd
+        from catalyst_screener import score_technical_setup
+
+        n = 60
+        prices = pd.Series(
+            100.0 * np.exp(np.cumsum(np.random.default_rng(42).normal(0.001, 0.01, n))),
+            index=pd.date_range("2026-01-01", periods=n, freq="B"),
+            name="Close",
+        )
+        hist = pd.DataFrame({"Close": prices, "Volume": 1e6})
+        data = {"history": hist}
+        result = score_technical_setup(data)
+        assert "momentum_1m_pct" in result, (
+            "score_technical_setup must return momentum_1m_pct for pre-earnings detector"
+        )
+        assert isinstance(result["momentum_1m_pct"], float)
+
+    def test_momentum_matches_22day_return(self):
+        """momentum_1m_pct should equal (close[-1]/close[-22] - 1) * 100."""
+        import numpy as np
+        import pandas as pd
+        from catalyst_screener import score_technical_setup
+
+        n = 60
+        prices = pd.Series(
+            100.0 * np.exp(np.cumsum(np.random.default_rng(7).normal(0.002, 0.01, n))),
+            index=pd.date_range("2026-01-01", periods=n, freq="B"),
+            name="Close",
+        )
+        hist = pd.DataFrame({"Close": prices, "Volume": 1e6})
+        data = {"history": hist}
+        result = score_technical_setup(data)
+        expected = (prices.iloc[-1] / prices.iloc[-22] - 1) * 100
+        assert abs(result["momentum_1m_pct"] - expected) < 1e-6
