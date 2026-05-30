@@ -1,6 +1,6 @@
-# Post-Fix Pipeline Smoke Check — Round 5
+# Post-Fix Pipeline Smoke Check — Round 6
 
-**Generated:** 2026-05-29 10:07 UTC  
+**Generated:** 2026-05-30 05:17 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
@@ -58,7 +58,7 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 | Check | Result |
 |---|---|
 | `py_compile` (supabase_persist, backtest, squeeze_screener) | ✅ OK |
-| `pytest` (persistence schema + replay + screener) | ✅ ============================= 105 passed in 6.35s ============================== |
+| `pytest` (persistence schema + replay + screener) | ❌ no output |
 
 ---
 
@@ -69,7 +69,7 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 | Calendar days of post-fix squeeze_scores | ≥ 30 | **23** | ❌ |
 | New-format rows total | ≥ 500 | **461** | ❌ |
 | Rows with ARMED or ACTIVE state | ≥ 50 | **32** | ❌ |
-| 20-day forward return windows closed | ≥ 100 rows | **100** | ✅ |
+| 20-day forward return windows closed | ≥ 100 rows | **120** | ✅ |
 | Rows with non-null `risk_score` | ≥ 100 | **461** | ✅ |
 | Rows with non-null `options_pressure_score` | ≥ 20 | **461** | ✅ |
 | `short_interest_history` distinct FINRA periods | ≥ 2 | **0** | ❌ |
