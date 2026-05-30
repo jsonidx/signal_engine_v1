@@ -1325,11 +1325,11 @@ class TestOptionCandidatesEndpoint:
         assert body["thesis_direction"] == "BEAR"
         assert body["thesis_conviction"] == 2
 
-    def test_thesis_date_and_agreement_extracted_from_row(self):
-        """thesis_date and signal_agreement must be populated from the DB row for persistence.
-        thesis_id is always None — thesis_cache has composite PK (ticker, date), no surrogate id."""
+    def test_thesis_id_and_date_extracted_from_row(self):
+        """thesis_id, thesis_date, and signal_agreement must be populated from the DB row.
+        thesis_cache.id is a real BIGSERIAL in the live DB even though schema.sql omits it."""
         thesis_row = {
-            "date": "2026-05-29",
+            "id": 42, "date": "2026-05-29",
             "ticker": "AAPL", "direction": "BULL", "conviction": 3,
             "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
             "target_2": None, "stop_loss": 140.0, "time_horizon": "2-4 weeks",
@@ -1356,6 +1356,6 @@ class TestOptionCandidatesEndpoint:
         assert resp.status_code == 200
         # Give fire-and-forget executor a moment to run
         import time; time.sleep(0.05)
-        assert persisted.get("thesis_id") is None, "thesis_id must be None (no surrogate id column)"
+        assert persisted.get("thesis_id") == 42, "thesis_id must come from the DB row id field"
         assert persisted.get("thesis_date") == "2026-05-29", "thesis_date must be set"
         assert persisted.get("signal_agreement") == pytest.approx(0.75)

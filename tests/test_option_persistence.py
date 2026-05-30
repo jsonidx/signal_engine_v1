@@ -57,10 +57,10 @@ def _mock_conn(inserted_id: int = 42):
     mock_cur = MagicMock()
     # regclass check
     mock_cur.fetchone.side_effect = [
-        ("option_candidate_snapshots",),   # to_regclass check
-        (inserted_id,),                    # first INSERT RETURNING id
-        (inserted_id + 1,),                # second INSERT
-        (inserted_id + 2,),                # third INSERT
+        {"tbl": "option_candidate_snapshots"},  # to_regclass check (RealDictCursor returns dicts)
+        {"id": inserted_id},                     # first INSERT RETURNING id
+        {"id": inserted_id + 1},                 # second INSERT
+        {"id": inserted_id + 2},                 # third INSERT
     ]
     ctx = MagicMock()
     ctx.__enter__ = MagicMock(return_value=mock_cur)
@@ -229,8 +229,8 @@ class TestSaveOptionCandidateSnapshot:
 
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (42,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 42},
         ]
 
         def capture_execute(sql, params=None):
@@ -270,7 +270,7 @@ class TestSaveOptionCandidateSnapshot:
     @patch("utils.db.managed_connection")
     def test_missing_table_returns_empty_list(self, mock_conn_fn):
         mock_cur = MagicMock()
-        mock_cur.fetchone.return_value = (None,)   # to_regclass returns NULL
+        mock_cur.fetchone.return_value = {"tbl": None}   # to_regclass returns NULL
         ctx = MagicMock()
         ctx.__enter__ = MagicMock(return_value=mock_cur)
         ctx.__exit__ = MagicMock(return_value=False)
@@ -304,8 +304,8 @@ class TestIVColumnName:
         captured: list[str] = []
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (1,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
         ]
 
         def capture(sql, params=None):
@@ -354,8 +354,8 @@ class TestIVColumnName:
         captured_params: list[list] = []
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (1,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
         ]
 
         def capture(sql, params=None):
@@ -398,8 +398,8 @@ class TestThesisContextPersisted:
         captured_params: list[list] = []
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (1,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
         ]
 
         def capture(sql, params=None):
@@ -447,8 +447,8 @@ class TestThesisContextPersisted:
         """None thesis_context must not raise — fields default to None."""
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (1,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
         ]
         ctx = MagicMock()
         ctx.__enter__ = MagicMock(return_value=mock_cur)
@@ -475,8 +475,8 @@ class TestThesisContextPersisted:
         captured_sql: list[str] = []
         mock_cur = MagicMock()
         mock_cur.fetchone.side_effect = [
-            ("option_candidate_snapshots",),
-            (1,),
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
         ]
 
         def capture(sql, params=None):

@@ -6255,6 +6255,15 @@ def _serialize_candidate(c: "OptionCandidate") -> dict:
         "option_stop_loss": c.option_stop_loss,
         "max_holding_rule": c.max_holding_rule,
         "event_exit_rule": c.event_exit_rule,
+        # Execution guidance (TRD-031) — deterministic, derived from quotes/liquidity
+        "recommended_entry_price":  getattr(c, "recommended_entry_price", None),
+        "recommended_order_type":   getattr(c, "recommended_order_type", "limit"),
+        "max_chase_price":          getattr(c, "max_chase_price", None),
+        "entry_style":              getattr(c, "entry_style", "balanced"),
+        "entry_rationale":          getattr(c, "entry_rationale", ""),
+        "fill_quality_score":       getattr(c, "fill_quality_score", None),
+        "slippage_risk_label":      getattr(c, "slippage_risk_label", "moderate"),
+        "skip_if_spread_above_pct": getattr(c, "skip_if_spread_above_pct", None),
     }
 
 
@@ -6292,7 +6301,7 @@ async def ticker_option_candidates(symbol: str):
                 SELECT id, date, ticker, direction, conviction,
                        entry_low, entry_high, target_1, target_2, stop_loss,
                        time_horizon, signal_agreement_score,
-                       signals_json, current_price
+                       signals_json
                 FROM thesis_cache
                 WHERE ticker = %s
                 ORDER BY date DESC LIMIT 1
@@ -6356,10 +6365,11 @@ async def ticker_option_candidates(symbol: str):
 
     # TRD-026: persist snapshot (fire-and-forget; never block the response)
     try:
-        # thesis_cache has composite PK (ticker, date) — no surrogate id column in schema.sql
+        # thesis_cache.id is a real BIGSERIAL in the live DB (id column not in schema.sql but present at runtime)
         thesis_id: Optional[int] = None
         _tc: dict = {}
         if thesis_row:
+            thesis_id = thesis_row.get("id")
             _tc = {
                 "thesis_date":      thesis_row.get("date"),
                 "time_horizon":     thesis_row.get("time_horizon"),
@@ -6442,7 +6452,7 @@ def _fetch_screener_tickers(
             cur.execute(
                 """
                 SELECT DISTINCT ON (ticker)
-                       ticker, date, direction, conviction, signal_agreement_score,
+                       id, ticker, date, direction, conviction, signal_agreement_score,
                        entry_low, entry_high, target_1, target_2, stop_loss,
                        time_horizon, signals_json
                 FROM   thesis_cache
@@ -6579,8 +6589,7 @@ async def options_screener(
                         "time_horizon":     tr.get("time_horizon"),
                         "signal_agreement": tr.get("signal_agreement_score"),
                     }
-                    # thesis_cache has no surrogate id — thesis linkage is intentionally soft
-                    _persist(cr, thesis_id=None, thesis_context=tc)
+                    _persist(cr, thesis_id=tr.get("id"), thesis_context=tc)
                 except Exception:
                     pass  # per-ticker failure is silenced; never block response
 
@@ -6630,9 +6639,9 @@ async def options_accuracy(days: int = Query(90, ge=7, le=365)):
     try:
         conn = _db_connect()
 
-        def _q(sql: str, params=()) -> list[dict]:
+        def _q(sql: str) -> list[dict]:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                cur.execute(sql)
                 return [dict(r) for r in cur.fetchall()]
 
         cut = f"NOW() - INTERVAL '{days} days'"
@@ -6652,12 +6661,12 @@ async def options_accuracy(days: int = Query(90, ge=7, le=365)):
         def _cohort_sql(group_expr: str, extra_where: str = "") -> str:
             return f"""
             SELECT {group_expr} AS cohort,
-                   COUNT(*)                                          AS sample_size,
-                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
-                   ROUND(AVG(CASE WHEN o.hit_option_tp1 THEN 1.0 ELSE 0.0 END) * 100, 1) AS tp1_rate_pct,
-                   ROUND(AVG(CASE WHEN o.hit_option_stop THEN 1.0 ELSE 0.0 END) * 100, 1) AS stop_rate_pct,
-                   ROUND(AVG(o.option_return_5d_pct), 2)             AS avg_option_return_5d,
-                   ROUND(AVG(o.underlying_return_5d_pct), 2)        AS avg_underlying_return_5d
+                   COUNT(*)                                                               AS sample_size,
+                   ROUND((AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1)     AS win_rate_pct,
+                   ROUND((AVG(CASE WHEN o.hit_option_tp1 THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS tp1_rate_pct,
+                   ROUND((AVG(CASE WHEN o.hit_option_stop THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS stop_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct)::numeric, 2)    AS avg_option_return_5d,
+                   ROUND(AVG(o.underlying_return_5d_pct)::numeric, 2) AS avg_underlying_return_5d
             FROM   option_candidate_outcomes o
             JOIN   option_candidate_snapshots s ON s.id = o.candidate_snapshot_id
             WHERE  s.created_at >= {cut}
@@ -6790,9 +6799,9 @@ async def options_scoring_review(days: int = Query(90, ge=14, le=365)):
         preset_score = _q(f"""
             SELECT s.strategy_preset,
                    COUNT(*) AS n,
-                   ROUND(AVG(s.score), 1) AS avg_score,
-                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
-                   ROUND(CORR(s.score, CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 2) AS score_win_correlation
+                   ROUND(AVG(s.score)::numeric, 1) AS avg_score,
+                   ROUND((AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS win_rate_pct,
+                   ROUND((CORR(s.score, CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100)::numeric, 2) AS score_win_correlation
             FROM   option_candidate_snapshots s
             LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
             WHERE  s.created_at >= {cut} AND s.suppressed = FALSE
@@ -6804,9 +6813,9 @@ async def options_scoring_review(days: int = Query(90, ge=14, le=365)):
         delta_analysis = _q(f"""
             SELECT ROUND(ABS(s.delta)::NUMERIC, 1) AS delta_rounded,
                    COUNT(*) AS n,
-                   ROUND(AVG(s.score), 1) AS avg_score,
-                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
-                   ROUND(AVG(o.option_return_5d_pct), 2) AS avg_option_return_5d
+                   ROUND(AVG(s.score)::numeric, 1) AS avg_score,
+                   ROUND((AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS win_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct)::numeric, 2) AS avg_option_return_5d
             FROM   option_candidate_snapshots s
             LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
             WHERE  s.created_at >= {cut} AND s.suppressed = FALSE AND s.delta IS NOT NULL
@@ -6818,8 +6827,8 @@ async def options_scoring_review(days: int = Query(90, ge=14, le=365)):
         spread_analysis = _q(f"""
             SELECT ROUND(s.spread_pct::NUMERIC, 0) AS spread_pct_rounded,
                    COUNT(*) AS n,
-                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
-                   ROUND(AVG(o.option_return_5d_pct), 2) AS avg_option_return_5d
+                   ROUND((AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS win_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct)::numeric, 2) AS avg_option_return_5d
             FROM   option_candidate_snapshots s
             LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
             WHERE  s.created_at >= {cut} AND s.suppressed = FALSE AND s.spread_pct IS NOT NULL

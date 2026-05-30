@@ -1,5 +1,5 @@
 """
-Option Candidate Engine  (TRD-022)
+Option Candidate Engine  (TRD-022) + Execution Guidance (TRD-031)
 ================================================================================
 Deterministic filtering and scoring of option contracts for a single ticker,
 driven by the existing stock thesis context and the IBKR chain adapter output.
@@ -10,6 +10,7 @@ Flow:
       → preset matching  (long_call / long_put / leaps_call / leaps_put)
       → hard filters     (DTE, delta band, spread %, OI floor, min mid)
       → soft scoring     (delta quality, spread tightness, DTE centrality, liquidity)
+      → execution guidance (entry price, order type, max chase, rationale)
       → return up to N candidates + rejection reasons
 
 The LLM is NOT part of this module. It operates on the output of this module.
@@ -60,6 +61,23 @@ class ThesisContext:
 
 
 @dataclass
+class ExecutionGuidance:
+    """
+    Deterministic execution guidance for a single option candidate.
+    Derived from quote/liquidity inputs — the LLM must not originate these values.
+    All prices are guidance only; they are not guaranteed fills.
+    """
+    recommended_entry_price: Optional[float] = None   # limit order target
+    recommended_order_type: str = "limit"              # always "limit" for options
+    max_chase_price: Optional[float] = None            # do not pay above this level
+    entry_style: str = "balanced"                      # "passive" | "balanced" | "aggressive"
+    entry_rationale: str = ""                          # short human-readable explanation
+    fill_quality_score: Optional[float] = None         # 0.0–1.0; higher = better fill quality
+    slippage_risk_label: str = "moderate"              # "low" | "moderate" | "high" | "very_high"
+    skip_if_spread_above_pct: Optional[float] = None  # threshold above which trade is unactionable
+
+
+@dataclass
 class OptionCandidate:
     """A single option contract that passed all filters, scored and annotated."""
 
@@ -70,7 +88,7 @@ class OptionCandidate:
     right: str              # "C" | "P"
     dte: int
 
-    # Execution fields
+    # Quote fields
     bid: Optional[float]
     ask: Optional[float]
     mid: Optional[float]
@@ -100,6 +118,16 @@ class OptionCandidate:
     option_stop_loss: Optional[float] = None     # mid × 0.50
     max_holding_rule: Optional[str] = None       # prose rule e.g. "close 7d before expiry"
     event_exit_rule: Optional[str] = None        # e.g. "exit before earnings"
+
+    # Execution guidance (TRD-031 — deterministic, derived from quotes/liquidity)
+    recommended_entry_price: Optional[float] = None
+    recommended_order_type: str = "limit"
+    max_chase_price: Optional[float] = None
+    entry_style: str = "balanced"
+    entry_rationale: str = ""
+    fill_quality_score: Optional[float] = None
+    slippage_risk_label: str = "moderate"
+    skip_if_spread_above_pct: Optional[float] = None
 
 
 @dataclass
@@ -387,6 +415,131 @@ def _build_rationale(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Execution guidance  (TRD-031)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: Spread thresholds (%) separating tight / moderate / wide execution regimes.
+_SPREAD_TIGHT = 3.0
+_SPREAD_MODERATE = 8.0
+
+
+def compute_entry_guidance(
+    candidate: "OptionCandidate",
+) -> ExecutionGuidance:
+    """
+    Deterministic execution guidance derived from quote/liquidity inputs.
+
+    Inputs used:
+        bid, ask, mid, spread_pct, open_interest, volume, strategy_preset
+
+    Spread tiers:
+        tight    (≤ 3%)  → entry below mid; passive style; low slippage risk
+        moderate (3–8%)  → entry at mid; balanced style; moderate slippage risk
+        wide     (> 8%)  → entry conservative below mid; high slippage risk
+
+    The LLM must not modify or override these values.
+    All prices are guidance only — not guaranteed fills.
+    """
+    bid = candidate.bid
+    ask = candidate.ask
+    mid = candidate.mid
+    spread_pct = candidate.spread_pct
+    oi = candidate.open_interest or 0
+    volume = candidate.volume or 0
+    preset = candidate.strategy_preset or ""
+
+    # skip_if_spread_above_pct matches the hard filter limit per preset
+    if preset.startswith("leaps"):
+        skip_threshold = 15.0
+    else:
+        skip_threshold = 12.0
+
+    # ── No mid: cannot produce meaningful guidance ────────────────────────────
+    if mid is None or mid <= 0:
+        return ExecutionGuidance(
+            recommended_entry_price=None,
+            max_chase_price=None,
+            entry_style="balanced",
+            entry_rationale="Entry guidance unavailable — no valid mid price",
+            fill_quality_score=None,
+            slippage_risk_label="moderate",
+            skip_if_spread_above_pct=skip_threshold,
+        )
+
+    # ── No bid/ask: use mid as fallback ───────────────────────────────────────
+    if bid is None or ask is None:
+        return ExecutionGuidance(
+            recommended_entry_price=round(mid, 2),
+            max_chase_price=round(mid, 2),
+            entry_style="balanced",
+            entry_rationale="Entry at mid (bid/ask unavailable — limit order at mid; actual spread unknown)",
+            fill_quality_score=0.40,
+            slippage_risk_label="moderate",
+            skip_if_spread_above_pct=skip_threshold,
+        )
+
+    spread_abs = ask - bid
+    if spread_abs < 0:
+        spread_abs = 0.0
+
+    # Derive spread_pct from quotes if not supplied
+    sp = spread_pct if spread_pct is not None else (spread_abs / mid * 100.0 if mid > 0 else 50.0)
+
+    # ── Liquidity quality factor (0–1) ────────────────────────────────────────
+    # Weighted combination of OI and volume, both capped at typical liquid thresholds.
+    liq = min(1.0, (oi / 500.0) * 0.7 + (min(volume, 200) / 200.0) * 0.3)
+
+    # ── Spread tier logic ─────────────────────────────────────────────────────
+    if sp <= _SPREAD_TIGHT:
+        # Tight — enter patiently below mid; patient fills expected
+        entry_price = round(bid + spread_abs * 0.45, 2)  # just below mid
+        chase_price = round(mid, 2)                       # hard cap at mid
+        style = "passive"
+        risk_label = "low"
+        fill_score = round(min(1.0, 0.70 + liq * 0.30), 2)
+        rationale = (
+            f"Tight {sp:.1f}% spread — limit order below mid at ${entry_price:.2f}; "
+            f"expect fill near entry. Do not chase above mid (${chase_price:.2f})."
+        )
+
+    elif sp <= _SPREAD_MODERATE:
+        # Moderate — enter at mid; small chase tolerance above
+        entry_price = round(mid, 2)
+        chase_price = round(bid + spread_abs * 0.65, 2)   # slightly above mid
+        style = "balanced"
+        risk_label = "moderate"
+        fill_score = round(min(1.0, 0.40 + liq * 0.35), 2)
+        rationale = (
+            f"Moderate {sp:.1f}% spread — limit order at mid (${entry_price:.2f}); "
+            f"max chase ${chase_price:.2f}. Watch slippage on partial fills."
+        )
+
+    else:
+        # Wide (> 8%) — conservative entry below mid; hard cap at mid
+        entry_price = round(bid + spread_abs * 0.35, 2)   # conservative, well below mid
+        chase_price = round(mid, 2)                        # never pay above mid for wide spreads
+        style = "passive"
+        risk_label = "high" if sp <= 12.0 else "very_high"
+        fill_score = round(min(1.0, max(0.10, 0.35 - (sp - 8.0) * 0.015) + liq * 0.10), 2)
+        rationale = (
+            f"Wide {sp:.1f}% spread — enter conservatively at ${entry_price:.2f} "
+            f"(below mid ${mid:.2f}). Slippage risk is {risk_label}; "
+            f"do not pay above mid. Consider skipping if spread stays above {skip_threshold:.0f}%."
+        )
+
+    return ExecutionGuidance(
+        recommended_entry_price=entry_price,
+        recommended_order_type="limit",
+        max_chase_price=chase_price,
+        entry_style=style,
+        entry_rationale=rationale,
+        fill_quality_score=fill_score,
+        slippage_risk_label=risk_label,
+        skip_if_spread_above_pct=skip_threshold,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -508,6 +661,16 @@ def get_option_candidates(
                 source=contract.source,
                 **exit_plan,
             )
+            # TRD-031: attach deterministic execution guidance
+            eg = compute_entry_guidance(candidate)
+            candidate.recommended_entry_price = eg.recommended_entry_price
+            candidate.recommended_order_type = eg.recommended_order_type
+            candidate.max_chase_price = eg.max_chase_price
+            candidate.entry_style = eg.entry_style
+            candidate.entry_rationale = eg.entry_rationale
+            candidate.fill_quality_score = eg.fill_quality_score
+            candidate.slippage_risk_label = eg.slippage_risk_label
+            candidate.skip_if_spread_above_pct = eg.skip_if_spread_above_pct
             scored.append((score, candidate))
 
     # ── Select top N ──────────────────────────────────────────────────────────

@@ -1352,7 +1352,7 @@ export interface PatternWatchResponse {
   data: PatternWatchItem[]
 }
 
-// ─── Option Candidates  (TRD-022 / TRD-023 / TRD-026) ───────────────────────
+// ─── Option Candidates  (TRD-022 / TRD-023 / TRD-026 / TRD-031) ─────────────
 
 export interface OptionCandidate {
   ticker: string
@@ -1384,6 +1384,15 @@ export interface OptionCandidate {
   option_stop_loss: number | null
   max_holding_rule: string | null
   event_exit_rule: string | null
+  // Execution guidance (TRD-031) — deterministic, derived from quotes/liquidity
+  recommended_entry_price: number | null
+  recommended_order_type: string           // always "limit"
+  max_chase_price: number | null
+  entry_style: string                      // "passive" | "balanced" | "aggressive"
+  entry_rationale: string
+  fill_quality_score: number | null        // 0.0–1.0
+  slippage_risk_label: string              // "low" | "moderate" | "high" | "very_high"
+  skip_if_spread_above_pct: number | null
 }
 
 export interface OptionCandidatesResponse {

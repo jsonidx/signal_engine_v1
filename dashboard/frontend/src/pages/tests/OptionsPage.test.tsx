@@ -83,6 +83,15 @@ function makeScreenerRow(overrides: Partial<OptionsCrossTickerRow> = {}): Option
     underlying_price:     148,
     chain_source:         'yfinance',
     composite_rank_score: 74.8,
+    // Execution guidance (TRD-031)
+    recommended_entry_price:  1.96,
+    recommended_order_type:   'limit',
+    max_chase_price:          2.00,
+    entry_style:              'passive',
+    entry_rationale:          'Wide 9.5% spread — enter conservatively at $1.96.',
+    fill_quality_score:       0.38,
+    slippage_risk_label:      'high',
+    skip_if_spread_above_pct: 12.0,
     ...overrides,
   }
 }
@@ -240,6 +249,61 @@ describe('OptionsPage — Screener tab', () => {
     await screen.findByText('AAPL')
     expect(screen.getByText('MSFT')).toBeInTheDocument()
     expect(screen.getByText('NVDA')).toBeInTheDocument()
+  })
+
+  // ─── Execution guidance in screener (TRD-031) ──────────────────────────────
+
+  it('shows recommended entry price in screener row', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow({ recommended_entry_price: 1.96 })]),
+    )
+    renderPage()
+    expect(await screen.findByText('$1.96')).toBeInTheDocument()
+  })
+
+  it('shows max chase price below entry', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow({ recommended_entry_price: 1.96, max_chase_price: 2.00 })]),
+    )
+    renderPage()
+    await screen.findByText('$1.96')
+    expect(screen.getByText('≤$2.00')).toBeInTheDocument()
+  })
+
+  it('renders slippage risk badge', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow({ slippage_risk_label: 'high' })]),
+    )
+    renderPage()
+    expect(await screen.findByText('high')).toBeInTheDocument()
+  })
+
+  it('renders low slippage badge in green', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow({ slippage_risk_label: 'low', recommended_entry_price: 2.03 })]),
+    )
+    renderPage()
+    const badge = await screen.findByText('low')
+    expect(badge).toHaveClass('text-accent-green')
+  })
+
+  it('shows entry/chase dash when recommended_entry_price is null', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow({ recommended_entry_price: null, max_chase_price: null })]),
+    )
+    renderPage()
+    await screen.findByText('AAPL')
+    // The "—" dash should appear in the entry column
+    const dashes = screen.getAllByText('—')
+    expect(dashes.length).toBeGreaterThan(0)
+  })
+
+  it('shows Entry / Chase column header', async () => {
+    vi.mocked(api.optionsScreener).mockResolvedValue(
+      makeScreenerResponse([makeScreenerRow()]),
+    )
+    renderPage()
+    expect(await screen.findByText(/entry \/ chase/i)).toBeInTheDocument()
   })
 })
 

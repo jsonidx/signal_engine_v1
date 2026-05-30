@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS option_candidate_snapshots (
     expiry              DATE,
     dte                 INTEGER,
     strike              REAL,
-    right               CHAR(1),        -- C | P
+    contract_right      CHAR(1),        -- C | P  (renamed: 'right' is a SQL reserved keyword)
 
     -- Quotes
     bid                 REAL,
@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS option_candidate_snapshots (
     option_stop_loss    REAL,
     max_holding_rule    TEXT,
     event_exit_rule     TEXT,
+
+    -- Execution guidance (TRD-031)
+    recommended_entry_price  REAL,
+    recommended_order_type   TEXT,      -- 'limit' (always for options)
+    max_chase_price          REAL,
+    entry_style              TEXT,      -- 'passive' | 'balanced' | 'aggressive'
+    entry_rationale          TEXT,
+    fill_quality_score       REAL,      -- 0.0–1.0
+    slippage_risk_label      TEXT,      -- 'low' | 'moderate' | 'high' | 'very_high'
+    skip_if_spread_above_pct REAL,
 
     -- Scoring
     score               REAL,

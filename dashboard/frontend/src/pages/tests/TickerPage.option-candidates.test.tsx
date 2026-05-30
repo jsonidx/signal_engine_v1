@@ -96,7 +96,7 @@ function makeCandidate(overrides: Partial<OptionCandidate> = {}): OptionCandidat
     rationale:           'bullish long call — Δ+0.40, IV 35%, 21d DTE, spread 9.5%',
     strategy_preset:     'long_call',
     source:              'yfinance',
-    // Exit plan fields (required by OptionCandidate since TRD-026)
+    // Exit plan fields (TRD-026)
     holding_window_days: 10,
     exit_by_date:        EXPIRY_21D,
     underlying_target_1: 160,
@@ -107,6 +107,15 @@ function makeCandidate(overrides: Partial<OptionCandidate> = {}): OptionCandidat
     option_stop_loss:    1.05,
     max_holding_rule:    'Close 7d before expiry',
     event_exit_rule:     null,
+    // Execution guidance (TRD-031)
+    recommended_entry_price:  2.05,
+    recommended_order_type:   'limit',
+    max_chase_price:          2.12,   // deliberately ≠ mid (2.10) to avoid DOM ambiguity
+    entry_style:              'passive',
+    entry_rationale:          'Wide 9.5% spread — enter conservatively at $2.05 (below mid $2.10).',
+    fill_quality_score:       0.38,
+    slippage_risk_label:      'high',
+    skip_if_spread_above_pct: 12.0,
     ...overrides,
   }
 }
@@ -318,6 +327,112 @@ describe('OptionCandidatesCard', () => {
     await screen.findByText('Option Candidates')
     const rankLabels = screen.getAllByText(/^#[123]$/)
     expect(rankLabels).toHaveLength(3)
+  })
+})
+
+// ─── Tests: Execution Guidance (TRD-031) ─────────────────────────────────────
+
+describe('OptionCandidatesCard — Execution Guidance (TRD-031)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('renders recommended entry price', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ recommended_entry_price: 2.05 })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('$2.05')).toBeInTheDocument()
+  })
+
+  it('renders Entry Guidance section heading', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(makeCandidatesResponse())
+    renderTickerPage()
+    expect(await screen.findByText(/entry guidance/i)).toBeInTheDocument()
+  })
+
+  it('renders max chase price', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ max_chase_price: 2.15, recommended_entry_price: 2.05 })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('$2.05')
+    expect(screen.getByText('$2.15')).toBeInTheDocument()
+  })
+
+  it('renders order type label (limit)', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ recommended_entry_price: 2.05, recommended_order_type: 'limit' })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('$2.05')
+    expect(screen.getByText('limit')).toBeInTheDocument()
+  })
+
+  it('renders slippage risk badge', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ slippage_risk_label: 'high', recommended_entry_price: 2.05 })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText(/high slip/i)).toBeInTheDocument()
+  })
+
+  it('renders low slippage badge in green', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          slippage_risk_label: 'low',
+          recommended_entry_price: 2.03,
+        })],
+      }),
+    )
+    renderTickerPage()
+    const badge = await screen.findByText(/low slip/i)
+    expect(badge).toHaveClass('text-accent-green')
+  })
+
+  it('renders entry rationale text', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          entry_rationale: 'Wide 9.5% spread — enter conservatively at $2.05.',
+          recommended_entry_price: 2.05,
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText(/wide 9\.5%/i)).toBeInTheDocument()
+  })
+
+  it('renders fill quality score', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ fill_quality_score: 0.38, recommended_entry_price: 2.05 })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('$2.05')
+    // fill_quality_score 0.38 → "38%"
+    expect(screen.getByText('38%')).toBeInTheDocument()
+  })
+
+  it('hides entry guidance section when recommended_entry_price is null', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ recommended_entry_price: null, max_chase_price: null })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    expect(screen.queryByText(/entry guidance/i)).not.toBeInTheDocument()
   })
 })
 

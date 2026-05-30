@@ -82,6 +82,37 @@ function ScreenerRow({ row, rank }: { row: OptionsCrossTickerRow; rank: number }
       <td className="px-3 py-2 font-mono text-xs text-text-primary">
         {row.mid != null ? `$${row.mid.toFixed(2)}` : '—'}
       </td>
+      {/* Execution guidance: recommended entry + max chase (TRD-031) */}
+      <td className="px-3 py-2">
+        {row.recommended_entry_price != null ? (
+          <div>
+            <div className="font-mono text-xs font-semibold text-text-primary">
+              ${row.recommended_entry_price.toFixed(2)}
+            </div>
+            {row.max_chase_price != null && (
+              <div className="font-mono text-[9px] text-text-tertiary">
+                ≤${row.max_chase_price.toFixed(2)}
+              </div>
+            )}
+          </div>
+        ) : (
+          <span className="font-mono text-[10px] text-text-tertiary">—</span>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        {row.slippage_risk_label ? (
+          <span className={clsx(
+            'font-mono text-[9px] px-1 py-0.5 rounded',
+            row.slippage_risk_label === 'low'      ? 'bg-accent-green/10 text-accent-green' :
+            row.slippage_risk_label === 'moderate' ? 'bg-accent-amber/10 text-accent-amber' :
+            'bg-accent-red/10 text-accent-red'
+          )}>
+            {row.slippage_risk_label}
+          </span>
+        ) : (
+          <span className="font-mono text-[9px] text-text-tertiary">—</span>
+        )}
+      </td>
       <td className="px-3 py-2 font-mono text-xs">
         <span className={clsx(isCall ? 'text-accent-green' : 'text-accent-red')}>
           {row.delta != null ? `${row.delta >= 0 ? '+' : ''}${row.delta.toFixed(2)}` : '—'}
@@ -161,7 +192,7 @@ function ScreenerPanel() {
           <table className="w-full">
             <thead>
               <tr className="border-b border-border-subtle bg-bg-elevated">
-                {['#', 'Ticker', 'Preset', 'Contract', 'Mid', 'Δ', 'Spread', 'Score', 'Hold', 'Rationale'].map(h => (
+                {['#', 'Ticker', 'Preset', 'Contract', 'Mid', 'Entry / Chase', 'Slip', 'Δ', 'Spread', 'Score', 'Hold', 'Rationale'].map(h => (
                   <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
                     {h}
                   </th>

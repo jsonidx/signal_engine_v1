@@ -2243,10 +2243,10 @@ def save_option_candidate_snapshot(
             with conn.cursor() as cur:
                 # Ensure table exists (idempotent)
                 cur.execute("""
-                    SELECT to_regclass('public.option_candidate_snapshots')
+                    SELECT to_regclass('public.option_candidate_snapshots') AS tbl
                 """)
                 row = cur.fetchone()
-                if row is None or row[0] is None:
+                if row is None or row["tbl"] is None:
                     logger.warning(
                         "option_candidate_snapshots table missing — "
                         "run migrations/004_option_candidate_snapshots_and_outcomes.sql"
@@ -2262,7 +2262,7 @@ def save_option_candidate_snapshot(
                     )
                     cur.execute(sql, list(row_dict.values()))
                     r = cur.fetchone()
-                    return r[0] if r else None
+                    return r["id"] if r else None
 
                 base = {
                     "run_date": rd,
@@ -2296,7 +2296,7 @@ def save_option_candidate_snapshot(
                             "expiry": c.expiry,
                             "dte": c.dte,
                             "strike": c.strike,
-                            "right": c.right,
+                            "contract_right": c.right,
                             "bid": c.bid,
                             "ask": c.ask,
                             "mid": c.mid,
@@ -2328,6 +2328,15 @@ def save_option_candidate_snapshot(
                                 "oi": c.open_interest,
                                 "volume": c.volume,
                             }),
+                            # Execution guidance (TRD-031)
+                            "recommended_entry_price":  getattr(c, "recommended_entry_price", None),
+                            "recommended_order_type":   getattr(c, "recommended_order_type", "limit"),
+                            "max_chase_price":          getattr(c, "max_chase_price", None),
+                            "entry_style":              getattr(c, "entry_style", None),
+                            "entry_rationale":          getattr(c, "entry_rationale", None),
+                            "fill_quality_score":       getattr(c, "fill_quality_score", None),
+                            "slippage_risk_label":      getattr(c, "slippage_risk_label", None),
+                            "skip_if_spread_above_pct": getattr(c, "skip_if_spread_above_pct", None),
                         }
                         rid = _insert_row(row_dict)
                         if rid:

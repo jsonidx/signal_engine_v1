@@ -1724,7 +1724,58 @@ function OptionCandidateRow({
         </div>
       </div>
 
-      {/* Rationale */}
+      {/* Execution guidance (TRD-031) */}
+      {c.recommended_entry_price != null && (
+        <div className="border-t border-border-subtle pt-1.5 space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Entry Guidance</span>
+            <span className={clsx(
+              'font-mono text-[9px] px-1.5 py-0.5 rounded',
+              c.slippage_risk_label === 'low'      ? 'bg-accent-green/10 text-accent-green' :
+              c.slippage_risk_label === 'moderate' ? 'bg-accent-amber/10 text-accent-amber' :
+              'bg-accent-red/10 text-accent-red'
+            )}>
+              {c.slippage_risk_label} slip
+            </span>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className="space-y-0.5">
+              <div className="font-mono text-[9px] text-text-tertiary uppercase">Recommended Entry</div>
+              <div className="font-mono text-xs font-semibold text-text-primary">
+                ${c.recommended_entry_price.toFixed(2)}
+                <span className="font-normal text-text-tertiary ml-1">{c.recommended_order_type}</span>
+              </div>
+            </div>
+            <div className="space-y-0.5">
+              <div className="font-mono text-[9px] text-text-tertiary uppercase">Max Chase</div>
+              <div className="font-mono text-xs text-text-secondary">
+                {c.max_chase_price != null ? `$${c.max_chase_price.toFixed(2)}` : '—'}
+              </div>
+            </div>
+            {c.fill_quality_score != null && (
+              <div className="space-y-0.5">
+                <div className="font-mono text-[9px] text-text-tertiary uppercase">Fill Quality</div>
+                <div className="font-mono text-xs text-text-secondary">
+                  {(c.fill_quality_score * 100).toFixed(0)}%
+                </div>
+              </div>
+            )}
+            {c.entry_style && (
+              <div className="space-y-0.5">
+                <div className="font-mono text-[9px] text-text-tertiary uppercase">Style</div>
+                <div className="font-mono text-[10px] text-text-secondary capitalize">{c.entry_style}</div>
+              </div>
+            )}
+          </div>
+          {c.entry_rationale && (
+            <div className="font-mono text-[9px] text-text-tertiary leading-relaxed">
+              {c.entry_rationale}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Contract selection rationale */}
       {c.rationale && (
         <div className="font-mono text-[9px] text-text-tertiary leading-relaxed border-t border-border-subtle pt-1.5">
           {c.rationale}

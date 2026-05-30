@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS portfolio_settings (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS thesis_cache (
+    id                      SERIAL      PRIMARY KEY,                    -- surrogate key; live DB uses nextval('thesis_cache_id_seq')
     ticker                  TEXT        NOT NULL,
     date                    TEXT        NOT NULL,
     direction               TEXT,
@@ -147,7 +148,7 @@ CREATE TABLE IF NOT EXISTS thesis_cache (
     prob_options            FLOAT,
     prob_catalyst           FLOAT,
     prob_news               FLOAT,
-    PRIMARY KEY (ticker, date)
+    UNIQUE (ticker, date)
 );
 
 
