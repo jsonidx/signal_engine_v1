@@ -11,6 +11,7 @@ import { TickerPage } from './pages/TickerPage'
 import { ScreenersPage } from './pages/ScreenersPage'
 import { BacktestPage } from './pages/BacktestPage'
 import { ResolutionPage } from './pages/ResolutionPage'
+import { OptionsPage } from './pages/OptionsPage'
 import { RankingsPage } from './pages/RankingsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { ErrorBoundary } from './components/ErrorBoundary'
@@ -32,6 +33,7 @@ function KeyboardShortcuts() {
         case 'h': navigate('/heatmap'); break
         case 't': navigate('/deepdive'); break
         case 's': navigate('/screeners'); break
+        case 'o': navigate('/options'); break
         case 'b': navigate('/backtest'); break
         case 'r': navigate('/resolution'); break
         case 'k': navigate('/rankings'); break
@@ -122,6 +124,16 @@ export default function App() {
               <PrivateRoute>
                 <ErrorBoundary pageName="Backtest">
                   <BacktestPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/options"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Options">
+                  <OptionsPage />
                 </ErrorBoundary>
               </PrivateRoute>
             }

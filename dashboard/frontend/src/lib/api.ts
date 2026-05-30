@@ -1272,6 +1272,29 @@ export const api = {
   tickerOptionCandidates: (symbol: string): Promise<OptionCandidatesResponse> =>
     client.get(`/api/ticker/${symbol.toUpperCase()}/option-candidates`).then(r => r.data),
 
+  // Options Screener (TRD-028)
+  optionsScreener: (params?: { minConviction?: number; maxTickers?: number }): Promise<OptionsScreenerResponse> =>
+    client.get('/api/options/screener', {
+      params: {
+        min_conviction: params?.minConviction ?? 2,
+        max_tickers:    params?.maxTickers    ?? 20,
+      },
+    }).then(r => r.data),
+
+  // Options Accuracy Analytics (TRD-029)
+  optionsAccuracy: (days = 90): Promise<OptionsAccuracyResponse> =>
+    client.get('/api/options/accuracy', { params: { days } }).then(r => r.data),
+
+  // Options Resolve Outcomes (TRD-027)
+  optionsResolveOutcomes: (resolutionType: '1d' | '5d' | '10d' = '1d', limit = 100) =>
+    client.post('/api/options/resolve-outcomes', null, {
+      params: { resolution_type: resolutionType, limit },
+    }).then(r => r.data),
+
+  // Options Scoring Review (TRD-030)
+  optionsScoringReview: (days = 90) =>
+    client.get('/api/options/scoring-review', { params: { days } }).then(r => r.data),
+
   // Universe
   universeStats: (): Promise<UniverseStats> =>
     client.get('/api/universe/stats').then(r => {
@@ -1329,7 +1352,7 @@ export interface PatternWatchResponse {
   data: PatternWatchItem[]
 }
 
-// ─── Option Candidates  (TRD-022 / TRD-023) ──────────────────────────────────
+// ─── Option Candidates  (TRD-022 / TRD-023 / TRD-026) ───────────────────────
 
 export interface OptionCandidate {
   ticker: string
@@ -1350,6 +1373,17 @@ export interface OptionCandidate {
   rationale: string
   strategy_preset: string          // "long_call" | "long_put" | "leaps_call" | "leaps_put"
   source: string                   // "ibkr" | "yfinance" | "mock"
+  // Exit plan fields (TRD-026)
+  holding_window_days: number | null
+  exit_by_date: string | null
+  underlying_target_1: number | null
+  underlying_target_2: number | null
+  underlying_stop: number | null
+  option_take_profit_1: number | null
+  option_take_profit_2: number | null
+  option_stop_loss: number | null
+  max_holding_rule: string | null
+  event_exit_rule: string | null
 }
 
 export interface OptionCandidatesResponse {
@@ -1364,4 +1398,59 @@ export interface OptionCandidatesResponse {
   chain_error: string | null
   thesis_direction: 'BULL' | 'BEAR' | 'NEUTRAL' | null
   thesis_conviction: number | null
+}
+
+// ─── Options Screener  (TRD-028) ─────────────────────────────────────────────
+
+export interface OptionsCrossTickerRow extends OptionCandidate {
+  rank_global: number
+  rank_within_ticker: number
+  thesis_direction: 'BULL' | 'BEAR' | 'NEUTRAL'
+  thesis_conviction: number
+  thesis_agreement: number | null
+  underlying_price: number | null
+  chain_source: string
+  composite_rank_score: number
+}
+
+export interface OptionsScreenerResponse {
+  data_available: boolean
+  count: number
+  tickers_evaluated: number
+  generated_at: string
+  data: OptionsCrossTickerRow[]
+}
+
+// ─── Options Accuracy Analytics  (TRD-029) ───────────────────────────────────
+
+export interface OptionsCohortRow {
+  cohort: string
+  sample_size: number
+  win_rate_pct: number | null
+  tp1_rate_pct: number | null
+  stop_rate_pct: number | null
+  avg_option_return_5d: number | null
+  avg_underlying_return_5d: number | null
+}
+
+export interface OptionsFreqRow {
+  reason: string
+  count: number
+}
+
+export interface OptionsAccuracyResponse {
+  data_available: boolean
+  days: number
+  total_snapshots: number
+  total_resolved: number
+  generated_at: string
+  by_preset: OptionsCohortRow[]
+  by_delta_bucket: OptionsCohortRow[]
+  by_dte_bucket: OptionsCohortRow[]
+  by_iv_bucket: OptionsCohortRow[]
+  by_spread_bucket: OptionsCohortRow[]
+  by_chain_source: OptionsCohortRow[]
+  by_holding_window: OptionsCohortRow[]
+  suppression_reasons: OptionsFreqRow[]
+  rejection_reasons: OptionsFreqRow[]
 }

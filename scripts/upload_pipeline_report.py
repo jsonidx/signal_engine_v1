@@ -69,7 +69,7 @@ def main() -> None:
     print(f"[upload_report] Uploading {len(content):,} chars to Supabase pipeline_reports …")
 
     try:
-        from utils.db import get_connection
+        from utils.db import ensure_public_table_rls, get_connection
         conn = get_connection()
         cur = conn.cursor()
 
@@ -83,6 +83,7 @@ def main() -> None:
                 content       TEXT
             )
         """)
+        ensure_public_table_rls(conn, "pipeline_reports")
 
         cur.execute(
             """

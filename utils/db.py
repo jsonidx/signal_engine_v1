@@ -40,6 +40,7 @@ from typing import Generator
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -73,6 +74,49 @@ def get_connection() -> psycopg2.extensions.connection:
         _get_dsn(),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
+
+
+def ensure_public_table_rls(
+    conn: psycopg2.extensions.connection,
+    *tables: str,
+    policy_name: str = "authenticated_full_access",
+) -> None:
+    """
+    Ensure public-schema tables have RLS enabled with no anon access.
+
+    This matches the current app security model:
+      - `anon` gets no policy, so access is denied
+      - `authenticated` gets full access
+      - backend service connections bypass RLS as table owner / postgres
+    """
+    if not tables:
+        return
+
+    with conn.cursor() as cur:
+        for table in tables:
+            cur.execute(
+                sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
+                    sql.Identifier(table)
+                )
+            )
+            cur.execute(
+                sql.SQL("DROP POLICY IF EXISTS {} ON {}").format(
+                    sql.Identifier(policy_name),
+                    sql.Identifier(table),
+                )
+            )
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE POLICY {} ON {}
+                    FOR ALL TO authenticated
+                    USING (true) WITH CHECK (true)
+                    """
+                ).format(
+                    sql.Identifier(policy_name),
+                    sql.Identifier(table),
+                )
+            )
 
 
 @contextmanager

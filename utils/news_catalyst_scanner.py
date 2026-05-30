@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -48,6 +49,11 @@ from typing import Optional
 
 # ── Project root ──────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
+# Ensure project root is on sys.path so `from utils.x import y` works whether
+# this file is run as a script (python3 utils/news_catalyst_scanner.py) or as
+# a module (python3 -m utils.news_catalyst_scanner).
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -373,8 +379,14 @@ def run_scan(
     _price_override and _fetch_override are test-only injection points that
     bypass yfinance / network calls without patching global state.
     """
-    from utils.catalyst_enrichment import score_catalyst_bundle
-    from utils.event_queue import enqueue as eq_enqueue
+    try:
+        from utils.catalyst_enrichment import score_catalyst_bundle
+        from utils.event_queue import enqueue as eq_enqueue
+    except ModuleNotFoundError:
+        # Invocation-path fallback for direct script execution when the project
+        # root is not import-resolved as a package but this file's directory is.
+        from catalyst_enrichment import score_catalyst_bundle
+        from event_queue import enqueue as eq_enqueue
 
     if use_exa:
         logger.warning("--use-exa not yet implemented; ignoring")

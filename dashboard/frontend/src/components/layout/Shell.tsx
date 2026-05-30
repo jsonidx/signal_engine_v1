@@ -11,6 +11,7 @@ import {
   RefreshCw,
   ListOrdered,
   Settings,
+  TrendingUp,
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useRegime } from '../../hooks/useRegime'
@@ -25,6 +26,7 @@ const NAV_ITEMS = [
   { path: '/heatmap',    label: 'Signal Heatmap',     icon: Grid3x3,         shortcut: 'h' },
   { path: '/deepdive',   label: 'Deep Dive',          icon: Search,          shortcut: 't' },
   { path: '/screeners',  label: 'Screeners',          icon: Filter,          shortcut: 's' },
+  { path: '/options',    label: 'Options',            icon: TrendingUp,      shortcut: 'o' },
   { path: '/rankings',   label: 'Daily Top-20',       icon: ListOrdered,     shortcut: 'k' },
   { path: '/resolution', label: 'Resolution & Accuracy', icon: FileText,     shortcut: 'r' },
   { path: '/backtest',   label: 'Backtest',           icon: BarChart2,       shortcut: 'b' },

@@ -6244,6 +6244,17 @@ def _serialize_candidate(c: "OptionCandidate") -> dict:
         "rationale": c.rationale,
         "strategy_preset": c.strategy_preset,
         "source": c.source,
+        # Exit plan fields (TRD-026)
+        "holding_window_days": c.holding_window_days,
+        "exit_by_date": c.exit_by_date,
+        "underlying_target_1": c.underlying_target_1,
+        "underlying_target_2": c.underlying_target_2,
+        "underlying_stop": c.underlying_stop,
+        "option_take_profit_1": c.option_take_profit_1,
+        "option_take_profit_2": c.option_take_profit_2,
+        "option_stop_loss": c.option_stop_loss,
+        "max_holding_rule": c.max_holding_rule,
+        "event_exit_rule": c.event_exit_rule,
     }
 
 
@@ -6278,8 +6289,9 @@ async def ticker_option_candidates(symbol: str):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT ticker, direction, conviction, entry_low, entry_high,
-                       target_1, target_2, stop_loss, time_horizon,
+                SELECT id, date, ticker, direction, conviction,
+                       entry_low, entry_high, target_1, target_2, stop_loss,
+                       time_horizon, signal_agreement_score,
                        signals_json, current_price
                 FROM thesis_cache
                 WHERE ticker = %s
@@ -6342,5 +6354,528 @@ async def ticker_option_candidates(symbol: str):
         "thesis_conviction": thesis.conviction if thesis else None,
     }
 
+    # TRD-026: persist snapshot (fire-and-forget; never block the response)
+    try:
+        # thesis_cache has composite PK (ticker, date) — no surrogate id column in schema.sql
+        thesis_id: Optional[int] = None
+        _tc: dict = {}
+        if thesis_row:
+            _tc = {
+                "thesis_date":      thesis_row.get("date"),
+                "time_horizon":     thesis_row.get("time_horizon"),
+                "signal_agreement": thesis_row.get("signal_agreement_score"),
+            }
+        result.thesis_direction = thesis.direction if thesis else None  # type: ignore[attr-defined]
+        result.thesis_conviction = thesis.conviction if thesis else None  # type: ignore[attr-defined]
+        from utils.supabase_persist import save_option_candidate_snapshot
+        asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: save_option_candidate_snapshot(
+                result,
+                thesis_id=thesis_id,
+                thesis_context=_tc,
+            ),
+        )
+    except Exception:
+        pass  # persistence failure must never affect the API response
+
     _cache.set(cache_key, result_dict, 300)  # 5-min TTL
     return result_dict
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-027: Outcome Resolution  POST /api/options/resolve-outcomes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/options/resolve-outcomes")
+async def options_resolve_outcomes(
+    resolution_type: str = Query("1d", regex="^(1d|5d|10d)$"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """
+    Resolve unresolved option_candidate_snapshots into outcome records.
+
+    resolution_type: '1d' | '5d' | '10d'
+    Returns counts of resolved / failed / persisted rows.
+    """
+    try:
+        from utils.supabase_persist import fetch_unresolved_snapshots
+        from utils.option_outcomes import resolve_batch
+
+        snapshots = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: fetch_unresolved_snapshots(resolution_type, limit=limit),
+        )
+        counts = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: resolve_batch(snapshots, resolution_types=(resolution_type,), persist=True),
+        )
+        return {
+            "ok": True,
+            "resolution_type": resolution_type,
+            "snapshots_found": len(snapshots),
+            **counts,
+        }
+    except Exception as exc:
+        log.exception("options resolve-outcomes error")
+        return {"ok": False, "error": str(exc)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-028: Options Screener  GET /api/options/screener
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _fetch_screener_tickers(
+    min_conviction: int = 2,
+    max_tickers: int = 25,
+) -> list[dict]:
+    """
+    Return a curated set of actionable thesis tickers for the options screener.
+    Filters: direction != NEUTRAL, conviction >= min_conviction,
+             most recent thesis per ticker, ordered by signal_agreement DESC.
+    """
+    try:
+        conn = _db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (ticker)
+                       ticker, date, direction, conviction, signal_agreement_score,
+                       entry_low, entry_high, target_1, target_2, stop_loss,
+                       time_horizon, signals_json
+                FROM   thesis_cache
+                WHERE  direction IN ('BULL', 'BEAR')
+                  AND  conviction >= %s
+                  AND  entry_low IS NOT NULL
+                ORDER  BY ticker, date DESC
+                """,
+                (min_conviction,),
+            )
+            rows = cur.fetchall()
+        conn.close()
+        # Sort by agreement score and cap
+        results = [dict(r) for r in rows]
+        results.sort(key=lambda r: r.get("signal_agreement_score") or 0, reverse=True)
+        return results[:max_tickers]
+    except Exception as exc:
+        log.warning("_fetch_screener_tickers failed: %s", exc)
+        return []
+
+
+@app.get("/api/options/screener")
+async def options_screener(
+    min_conviction: int = Query(2, ge=1, le=5),
+    max_tickers: int = Query(20, ge=1, le=50),
+):
+    """
+    Cross-ticker options screener.
+
+    Fetches a curated set of thesis-filtered tickers (conviction ≥ min_conviction,
+    direction BULL/BEAR), runs the deterministic option candidate engine for each,
+    and returns a flat ranked list of the best opportunities across the universe.
+
+    Cached 15 minutes.  Do NOT call per-page-load; call from dashboard on mount.
+    """
+    cache_key = f"options_screener:{min_conviction}:{max_tickers}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    loop = asyncio.get_event_loop()
+
+    # 1. Get curated ticker list
+    thesis_rows = await loop.run_in_executor(
+        None,
+        lambda: _fetch_screener_tickers(min_conviction, max_tickers),
+    )
+
+    if not thesis_rows:
+        result = {"data_available": False, "count": 0, "data": [], "generated_at": datetime.utcnow().isoformat()}
+        _cache.set(cache_key, result, 300)
+        return result
+
+    # 2. Run candidate engine for each ticker (parallel via thread pool)
+    # Also collect CandidateResult objects for persistence (Issue #2 fix)
+    _results_for_persist: list[tuple[dict, "CandidateResult"]] = []
+
+    def _run_one(thesis_row: dict) -> tuple[list[dict], "CandidateResult | None"]:
+        try:
+            thesis = _build_thesis_context(thesis_row)
+            # Enrich with price if missing
+            if thesis.current_price is None:
+                prices = _fetch_current_prices([thesis.ticker])
+                thesis.current_price = prices.get(thesis.ticker)
+            cand_result = get_option_candidates(thesis.ticker, thesis=thesis)
+            # Stamp thesis context onto result for later persistence
+            cand_result.thesis_direction = thesis.direction   # type: ignore[attr-defined]
+            cand_result.thesis_conviction = thesis.conviction  # type: ignore[attr-defined]
+            out = []
+            for rank, c in enumerate(cand_result.candidates, start=1):
+                out.append({
+                    **_serialize_candidate(c),
+                    "rank_global": 0,  # filled in after sorting
+                    "ticker": c.ticker,
+                    "thesis_direction": thesis.direction,
+                    "thesis_conviction": thesis.conviction,
+                    "thesis_agreement": thesis_row.get("signal_agreement_score"),
+                    "underlying_price": cand_result.underlying_price,
+                    "chain_source": cand_result.chain_source,
+                    "rank_within_ticker": rank,
+                })
+            return out, cand_result
+        except Exception as exc:
+            log.debug("screener candidate error for %s: %s", thesis_row.get("ticker"), exc)
+            return [], None
+
+    import concurrent.futures
+    all_candidates: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="opt_scrn") as pool:
+        futures = {pool.submit(_run_one, tr): tr for tr in thesis_rows}
+        for f in concurrent.futures.as_completed(futures, timeout=30):
+            tr = futures[f]
+            try:
+                rows, cand_result = f.result()
+                all_candidates.extend(rows)
+                if cand_result is not None:
+                    _results_for_persist.append((tr, cand_result))
+            except Exception:
+                pass
+
+    # 3. Rank globally by score × conviction weight
+    for c in all_candidates:
+        conv = c.get("thesis_conviction") or 1
+        c["composite_rank_score"] = round(
+            (c.get("score") or 0) * (1 + (conv - 1) * 0.1), 2
+        )
+
+    all_candidates.sort(key=lambda c: c["composite_rank_score"], reverse=True)
+    for i, c in enumerate(all_candidates, start=1):
+        c["rank_global"] = i
+
+    result = {
+        "data_available": True,
+        "count": len(all_candidates),
+        "tickers_evaluated": len(thesis_rows),
+        "generated_at": datetime.utcnow().isoformat(),
+        "data": all_candidates,
+    }
+    _cache.set(cache_key, result, 15 * 60)  # 15-min cache
+
+    # TRD-026 / Issue #2: persist screener recommendations fire-and-forget
+    # Each per-ticker CandidateResult is persisted with available thesis context.
+    # Suppressed results are included to preserve no-trade decisions.
+    # Deduplication: runs within the same cache TTL window (15 min) will not
+    # re-fetch, so duplicate writes are naturally bounded to one per 15 min.
+    try:
+        from utils.supabase_persist import save_option_candidate_snapshot as _persist
+
+        def _persist_screener_results():
+            for tr, cr in _results_for_persist:
+                try:
+                    tc = {
+                        "thesis_date":      tr.get("date"),
+                        "time_horizon":     tr.get("time_horizon"),
+                        "signal_agreement": tr.get("signal_agreement_score"),
+                    }
+                    # thesis_cache has no surrogate id — thesis linkage is intentionally soft
+                    _persist(cr, thesis_id=None, thesis_context=tc)
+                except Exception:
+                    pass  # per-ticker failure is silenced; never block response
+
+        asyncio.get_event_loop().run_in_executor(None, _persist_screener_results)
+    except Exception:
+        pass
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-029: Options Accuracy Analytics  GET /api/options/accuracy
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/options/accuracy")
+async def options_accuracy(days: int = Query(90, ge=7, le=365)):
+    """
+    Option recommendation accuracy analytics.
+
+    Aggregates persisted option_candidate_snapshots + option_candidate_outcomes
+    into cohort performance metrics.  Includes sample size in every cohort.
+    Cached 30 minutes (historical data, not real-time).
+    """
+    cache_key = f"options_accuracy:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    _empty = {
+        "data_available": False,
+        "days": days,
+        "total_snapshots": 0,
+        "total_resolved": 0,
+        "generated_at": datetime.utcnow().isoformat(),
+        "by_preset": [],
+        "by_delta_bucket": [],
+        "by_dte_bucket": [],
+        "by_iv_bucket": [],
+        "by_spread_bucket": [],
+        "by_chain_source": [],
+        "by_holding_window": [],
+        "suppression_reasons": [],
+        "rejection_reasons": [],
+    }
+
+    try:
+        conn = _db_connect()
+
+        def _q(sql: str, params=()) -> list[dict]:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return [dict(r) for r in cur.fetchall()]
+
+        cut = f"NOW() - INTERVAL '{days} days'"
+
+        total_snaps = _q(
+            f"SELECT COUNT(*) AS n FROM option_candidate_snapshots WHERE created_at >= {cut}"
+        )
+        total_resolved = _q(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM   option_candidate_outcomes o
+            JOIN   option_candidate_snapshots s ON s.id = o.candidate_snapshot_id
+            WHERE  s.created_at >= {cut}
+            """
+        )
+
+        def _cohort_sql(group_expr: str, extra_where: str = "") -> str:
+            return f"""
+            SELECT {group_expr} AS cohort,
+                   COUNT(*)                                          AS sample_size,
+                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
+                   ROUND(AVG(CASE WHEN o.hit_option_tp1 THEN 1.0 ELSE 0.0 END) * 100, 1) AS tp1_rate_pct,
+                   ROUND(AVG(CASE WHEN o.hit_option_stop THEN 1.0 ELSE 0.0 END) * 100, 1) AS stop_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct), 2)             AS avg_option_return_5d,
+                   ROUND(AVG(o.underlying_return_5d_pct), 2)        AS avg_underlying_return_5d
+            FROM   option_candidate_outcomes o
+            JOIN   option_candidate_snapshots s ON s.id = o.candidate_snapshot_id
+            WHERE  s.created_at >= {cut}
+              AND  o.resolution_type = '5d'
+              AND  s.suppressed = FALSE
+              {extra_where}
+            GROUP  BY {group_expr}
+            ORDER  BY sample_size DESC
+            """
+
+        by_preset = _q(_cohort_sql("s.strategy_preset"))
+        by_chain  = _q(_cohort_sql("s.chain_source"))
+
+        # Delta buckets: OTM (<0.30), ATM (0.30–0.45), ITM (>0.45) — use absolute delta
+        by_delta = _q(_cohort_sql(
+            "CASE WHEN ABS(s.delta) < 0.30 THEN 'OTM (<0.30)'"
+            "     WHEN ABS(s.delta) <= 0.45 THEN 'ATM (0.30-0.45)'"
+            "     ELSE 'ITM (>0.45)' END",
+            "AND s.delta IS NOT NULL",
+        ))
+
+        # DTE buckets
+        by_dte = _q(_cohort_sql(
+            "CASE WHEN s.dte <= 21 THEN '≤21d'"
+            "     WHEN s.dte <= 45 THEN '22-45d'"
+            "     WHEN s.dte <= 90 THEN '46-90d'"
+            "     ELSE '>90d' END",
+            "AND s.dte IS NOT NULL",
+        ))
+
+        # IV buckets (as percentage stored in iv column)
+        by_iv = _q(_cohort_sql(
+            "CASE WHEN s.iv < 0.25 THEN 'Low (<25%)'"
+            "     WHEN s.iv <= 0.50 THEN 'Mid (25-50%)'"
+            "     ELSE 'High (>50%)' END",
+            "AND s.iv IS NOT NULL",
+        ))
+
+        # Spread buckets
+        by_spread = _q(_cohort_sql(
+            "CASE WHEN s.spread_pct < 5 THEN 'Tight (<5%)'"
+            "     WHEN s.spread_pct <= 10 THEN 'Moderate (5-10%)'"
+            "     ELSE 'Wide (>10%)' END",
+            "AND s.spread_pct IS NOT NULL",
+        ))
+
+        # Holding window buckets
+        by_hold = _q(_cohort_sql(
+            "CASE WHEN s.holding_window_days <= 14 THEN '≤14d'"
+            "     WHEN s.holding_window_days <= 30 THEN '15-30d'"
+            "     ELSE '>30d' END",
+            "AND s.holding_window_days IS NOT NULL",
+        ))
+
+        # Suppression reasons
+        supp_reasons = _q(
+            f"""
+            SELECT suppression_reason AS reason, COUNT(*) AS count
+            FROM   option_candidate_snapshots
+            WHERE  suppressed = TRUE
+              AND  created_at >= {cut}
+              AND  suppression_reason IS NOT NULL
+            GROUP  BY suppression_reason
+            ORDER  BY count DESC
+            LIMIT  20
+            """
+        )
+
+        conn.close()
+
+        result = {
+            "data_available": True,
+            "days": days,
+            "total_snapshots": total_snaps[0]["n"] if total_snaps else 0,
+            "total_resolved": total_resolved[0]["n"] if total_resolved else 0,
+            "generated_at": datetime.utcnow().isoformat(),
+            "by_preset": by_preset,
+            "by_delta_bucket": by_delta,
+            "by_dte_bucket": by_dte,
+            "by_iv_bucket": by_iv,
+            "by_spread_bucket": by_spread,
+            "by_chain_source": by_chain,
+            "by_holding_window": by_hold,
+            "suppression_reasons": supp_reasons,
+            "rejection_reasons": [],   # populated from features_json analysis if needed
+        }
+        _cache.set(cache_key, result, 30 * 60)
+        return result
+
+    except Exception as exc:
+        log.exception("options accuracy error")
+        _empty["error"] = str(exc)
+        return _empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-030: Options Scoring Review Workflow  GET /api/options/scoring-review
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/options/scoring-review")
+async def options_scoring_review(days: int = Query(90, ge=14, le=365)):
+    """
+    Structured scoring-review dataset for the options candidate engine.
+
+    Produces a JSON artifact suitable for Claude to analyze and propose
+    evidence-based scoring updates.
+
+    GOVERNANCE: Claude may analyze and PROPOSE changes. All actual scoring
+    changes require human review before deployment.  This endpoint does NOT
+    modify any scoring logic.
+
+    Cached 1 hour.
+    """
+    cache_key = f"options_scoring_review:{days}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    try:
+        conn = _db_connect()
+        cut = f"NOW() - INTERVAL '{days} days'"
+
+        def _q(sql: str) -> list[dict]:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                return [dict(r) for r in cur.fetchall()]
+
+        # Section 1: Preset performance vs score distribution
+        preset_score = _q(f"""
+            SELECT s.strategy_preset,
+                   COUNT(*) AS n,
+                   ROUND(AVG(s.score), 1) AS avg_score,
+                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
+                   ROUND(CORR(s.score, CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 2) AS score_win_correlation
+            FROM   option_candidate_snapshots s
+            LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
+            WHERE  s.created_at >= {cut} AND s.suppressed = FALSE
+            GROUP  BY s.strategy_preset
+            ORDER  BY win_rate_pct DESC NULLS LAST
+        """)
+
+        # Section 2: Delta range analysis — are the current delta bands well-calibrated?
+        delta_analysis = _q(f"""
+            SELECT ROUND(ABS(s.delta)::NUMERIC, 1) AS delta_rounded,
+                   COUNT(*) AS n,
+                   ROUND(AVG(s.score), 1) AS avg_score,
+                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct), 2) AS avg_option_return_5d
+            FROM   option_candidate_snapshots s
+            LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
+            WHERE  s.created_at >= {cut} AND s.suppressed = FALSE AND s.delta IS NOT NULL
+            GROUP  BY delta_rounded
+            ORDER  BY delta_rounded
+        """)
+
+        # Section 3: Spread quality — are the spread thresholds right?
+        spread_analysis = _q(f"""
+            SELECT ROUND(s.spread_pct::NUMERIC, 0) AS spread_pct_rounded,
+                   COUNT(*) AS n,
+                   ROUND(AVG(CASE WHEN o.hit_target THEN 1.0 ELSE 0.0 END) * 100, 1) AS win_rate_pct,
+                   ROUND(AVG(o.option_return_5d_pct), 2) AS avg_option_return_5d
+            FROM   option_candidate_snapshots s
+            LEFT JOIN option_candidate_outcomes o ON o.candidate_snapshot_id = s.id AND o.resolution_type = '5d'
+            WHERE  s.created_at >= {cut} AND s.suppressed = FALSE AND s.spread_pct IS NOT NULL
+            GROUP  BY spread_pct_rounded
+            ORDER  BY spread_pct_rounded
+        """)
+
+        # Section 4: Rejection reason frequency
+        rejection_freq = _q(f"""
+            SELECT rj.reason, COUNT(*) AS count
+            FROM   option_candidate_snapshots s,
+                   LATERAL jsonb_array_elements_text(s.rejection_reasons_json::jsonb) AS rj(reason)
+            WHERE  s.created_at >= {cut}
+            GROUP  BY rj.reason
+            ORDER  BY count DESC
+            LIMIT  30
+        """)
+
+        # Section 5: Suppression reason frequency
+        suppression_freq = _q(f"""
+            SELECT suppression_reason, COUNT(*) AS count
+            FROM   option_candidate_snapshots
+            WHERE  suppressed = TRUE AND created_at >= {cut}
+            GROUP  BY suppression_reason
+            ORDER  BY count DESC
+        """)
+
+        conn.close()
+
+        review = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "days_analyzed": days,
+            "governance_note": (
+                "This dataset is for evidence-based review only. "
+                "Scoring changes require human approval before deployment. "
+                "Claude may analyze and PROPOSE — not autonomously apply — changes."
+            ),
+            "sections": {
+                "preset_performance_vs_score": preset_score,
+                "delta_range_calibration": delta_analysis,
+                "spread_threshold_analysis": spread_analysis,
+                "top_rejection_reasons": rejection_freq,
+                "suppression_reason_frequency": suppression_freq,
+            },
+            "review_questions": [
+                "Which strategy preset has the highest win rate? Is the scoring rewarding that preset adequately?",
+                "Is there a delta range that correlates more strongly with wins than the current band covers?",
+                "Are the spread thresholds filtering out profitable opportunities or letting in losers?",
+                "Which rejection reasons are most frequent? Are they catching genuinely bad contracts?",
+                "Are suppression rates calibrated to conviction levels or too aggressive?",
+            ],
+        }
+
+        _cache.set(cache_key, review, 3600)
+        return review
+
+    except Exception as exc:
+        log.exception("options scoring review error")
+        return {"ok": False, "error": str(exc), "generated_at": datetime.utcnow().isoformat()}

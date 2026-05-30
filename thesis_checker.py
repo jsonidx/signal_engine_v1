@@ -62,6 +62,8 @@ def _connect():
 
 
 def _init_outcomes_table(conn) -> None:
+    from utils.db import ensure_public_table_rls
+
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS thesis_outcomes (
@@ -113,6 +115,7 @@ def _init_outcomes_table(conn) -> None:
             UNIQUE(thesis_id)
         )
     """)
+    ensure_public_table_rls(conn, "thesis_outcomes")
     conn.commit()
     _migrate_outcomes_table(cur, conn)
 

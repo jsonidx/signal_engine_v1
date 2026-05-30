@@ -39,6 +39,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import time
 from datetime import datetime, date
 from pathlib import Path
@@ -206,6 +207,16 @@ _INDEX_URLS: dict = {
         "https://www.ishares.com/us/products/239600/ishares-msci-acwi-etf"
         "/1467271812596.ajax?fileType=csv&fileName=ACWI_holdings&dataType=fund"
     ),
+}
+
+_INDEX_PORTFOLIO_IDS: dict = {
+    "russell1000": "239707",
+    "russell2000": "239710",
+    "sp500": "239726",
+    "sp400": "239763",
+    "iefa": "244049",
+    "iemg": "244050",
+    "acwi": "239600",
 }
 
 # ==============================================================================
@@ -385,6 +396,10 @@ def _parse_ishares_csv(text: str) -> tuple:
 
     Filters out: cash rows, '-' placeholders, blank tickers, len > 6, dot-tickers.
     """
+    if "<html" in text[:2000].lower():
+        logger.warning("iShares legacy CSV endpoint returned HTML instead of holdings data")
+        return [], {}
+
     try:
         df = pd.read_csv(io.StringIO(text), skiprows=9, header=0, on_bad_lines="skip")
     except Exception as exc:
@@ -424,6 +439,106 @@ def _parse_ishares_csv(text: str) -> tuple:
                 sector_map[raw] = sec
 
     return tickers, sector_map
+
+
+def _parse_ishares_workbook(xml_text: str) -> tuple:
+    """
+    Parse the current BlackRock/iShares holdings workbook export.
+
+    The endpoint returns SpreadsheetML XML with a worksheet named "Holdings".
+    We locate the header row dynamically so minor leading metadata shifts do not
+    break parsing.
+    """
+    if "<html" in xml_text[:2000].lower():
+        logger.warning("iShares workbook endpoint returned HTML instead of holdings data")
+        return [], {}
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        ns = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
+        safe_xml = re.sub(
+            r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9A-Fa-f]+;)",
+            "&amp;",
+            xml_text,
+        )
+        workbook = ET.fromstring(safe_xml)
+        holdings_ws = workbook.find(".//ss:Worksheet[@ss:Name='Holdings']", ns)
+        if holdings_ws is None:
+            logger.error("No 'Holdings' worksheet found in iShares workbook")
+            return [], {}
+
+        rows: list[list[str]] = []
+        for row in holdings_ws.findall(".//ss:Table/ss:Row", ns):
+            values: list[str] = []
+            for cell in row.findall("ss:Cell", ns):
+                data = cell.find("ss:Data", ns)
+                values.append((data.text or "").strip() if data is not None else "")
+            rows.append(values)
+    except Exception as exc:
+        logger.error("Workbook parse error: %s", exc)
+        return [], {}
+
+    header_idx = next(
+        (i for i, row in enumerate(rows) if row and row[0].strip().lower() == "ticker"),
+        None,
+    )
+    if header_idx is None:
+        logger.error("No 'Ticker' header row found in iShares workbook")
+        return [], {}
+
+    header = rows[header_idx]
+    ticker_idx = next(
+        (i for i, col in enumerate(header) if str(col).strip().lower() == "ticker"),
+        None,
+    )
+    if ticker_idx is None:
+        logger.error("No 'Ticker' column found in iShares workbook header: %s", header)
+        return [], {}
+
+    sector_idx = next(
+        (i for i, col in enumerate(header) if str(col).strip().lower() == "sector"),
+        None,
+    )
+
+    tickers: list[str] = []
+    sector_map: dict[str, str] = {}
+    for row in rows[header_idx + 1 :]:
+        raw = row[ticker_idx].strip() if len(row) > ticker_idx else ""
+        if not raw or raw == "-" or raw.upper().startswith("CASH") or len(raw) > 15:
+            continue
+        if "." in raw:
+            suffix = raw.rsplit(".", 1)[-1].upper()
+            if suffix in _US_JUNK_SUFFIXES and suffix not in _INTL_EXCHANGE_SUFFIXES:
+                continue
+        tickers.append(raw)
+        if sector_idx is not None and len(row) > sector_idx:
+            sec = row[sector_idx].strip()
+            if sec and sec.lower() not in ("nan", "-", ""):
+                sector_map[raw] = sec
+
+    return tickers, sector_map
+
+
+def _parse_ishares_payload(text: str) -> tuple:
+    """Parse either legacy CSV or current workbook/XML holdings payloads."""
+    sample = text[:4000].lstrip().lower()
+    if sample.startswith("<?xml") or "<ss:workbook" in sample:
+        return _parse_ishares_workbook(text)
+    return _parse_ishares_csv(text)
+
+
+def _fund_document_url(index: str) -> Optional[str]:
+    portfolio_id = _INDEX_PORTFOLIO_IDS.get(index)
+    if not portfolio_id:
+        return None
+    return (
+        "https://www.blackrock.com/varnish-api/blk-one01-product-data/"
+        "product-data/api/v1/get-fund-document"
+        f"?appType=PRODUCT_PAGE&appSubType=ISHARES&targetSite=us-ishares"
+        f"&locale=en_US&portfolioId={portfolio_id}&component=fundDownload"
+        "&userType=individual"
+    )
 
 
 # ==============================================================================
@@ -1130,16 +1245,30 @@ def fetch_index_constituents(index: str) -> list:
         return cached
 
     # 2. HTTP fetch
-    url = _INDEX_URLS[index]
-    resp = _fetch_with_retry(url)
-    if resp is not None:
-        tickers, sector_map = _parse_ishares_csv(resp.text)
+    source_urls = []
+    fund_doc_url = _fund_document_url(index)
+    if fund_doc_url:
+        source_urls.append(("BlackRock fund document", fund_doc_url))
+    source_urls.append(("legacy iShares CSV", _INDEX_URLS[index]))
+
+    for source_name, url in source_urls:
+        resp = _fetch_with_retry(url)
+        if resp is None:
+            continue
+
+        tickers, sector_map = _parse_ishares_payload(resp.text)
         if tickers:
             _SECTOR_MAP.update(sector_map)
             _save_cache(index, tickers, sector_map)
-            logger.info("Fetched %d constituents for %s from iShares", len(tickers), index)
+            logger.info(
+                "Fetched %d constituents for %s from %s",
+                len(tickers), index, source_name,
+            )
             return tickers
-        logger.warning("iShares CSV for %s parsed 0 tickers — check CSV format", index)
+        logger.warning(
+            "%s payload for %s parsed 0 tickers — trying next source if available",
+            source_name, index,
+        )
 
     # 3. Stale cache (up to 7 days)
     stale = _load_cache(index, max_age_hours=7 * 24)

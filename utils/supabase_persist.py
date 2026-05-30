@@ -2201,3 +2201,218 @@ def fetch_previous_squeeze_score_for_alert(
     except Exception as exc:
         logger.debug("fetch_previous_squeeze_score_for_alert(%s) failed: %s", ticker, exc)
         return None
+
+
+# ==============================================================================
+# TRD-026: Option Candidate Snapshot Persistence
+# ==============================================================================
+
+def save_option_candidate_snapshot(
+    result: "Any",                    # utils.option_candidates.CandidateResult
+    thesis_id: int | None = None,
+    run_date: str | None = None,
+    thesis_context: dict | None = None,  # extra thesis fields: thesis_date, time_horizon, signal_agreement
+) -> list[int]:
+    """
+    Persist a CandidateResult (candidates + suppressed state) to
+    option_candidate_snapshots.  Returns list of inserted row IDs.
+
+    Writes one row per candidate (rank 1–N), plus one suppression row when
+    result.suppressed is True and no candidates exist.  This preserves no-trade
+    decisions for later analytics.
+
+    thesis_context may include:
+        thesis_date       — ISO date string
+        time_horizon      — free text e.g. "2-4 weeks"
+        signal_agreement  — float 0-1
+
+    Column naming:
+        iv — the schema column is named ``iv`` (decimal, e.g. 0.35 = 35%).
+             The Python OptionCandidate field is ``implied_vol``; this
+             function maps it to ``iv`` at insert time.
+    """
+    from utils.option_candidates import CandidateResult, OptionCandidate
+
+    rd = run_date or _today()
+    inserted_ids: list[int] = []
+    tc = thesis_context or {}
+
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                # Ensure table exists (idempotent)
+                cur.execute("""
+                    SELECT to_regclass('public.option_candidate_snapshots')
+                """)
+                row = cur.fetchone()
+                if row is None or row[0] is None:
+                    logger.warning(
+                        "option_candidate_snapshots table missing — "
+                        "run migrations/004_option_candidate_snapshots_and_outcomes.sql"
+                    )
+                    return []
+
+                def _insert_row(row_dict: dict) -> int | None:
+                    cols = ", ".join(row_dict.keys())
+                    placeholders = ", ".join(["%s"] * len(row_dict))
+                    sql = (
+                        f"INSERT INTO option_candidate_snapshots ({cols}) "
+                        f"VALUES ({placeholders}) RETURNING id"
+                    )
+                    cur.execute(sql, list(row_dict.values()))
+                    r = cur.fetchone()
+                    return r[0] if r else None
+
+                base = {
+                    "run_date": rd,
+                    "ticker": result.ticker,
+                    "thesis_id": thesis_id,
+                    # Core thesis context (Issue #3 fix)
+                    "direction": getattr(result, "thesis_direction", None),
+                    "conviction": getattr(result, "thesis_conviction", None),
+                    "thesis_date": tc.get("thesis_date"),
+                    "time_horizon": tc.get("time_horizon"),
+                    "signal_agreement": tc.get("signal_agreement"),
+                    # Chain metadata
+                    "chain_source": result.chain_source,
+                    "underlying_price": result.underlying_price,
+                    "suppressed": result.suppressed,
+                    "suppression_reason": result.suppression_reason,
+                    "rejection_reasons_json": json.dumps(result.rejection_reasons) if result.rejection_reasons else None,
+                }
+
+                if result.suppressed or not result.candidates:
+                    # Persist suppression / no-trade row
+                    rid = _insert_row(base)
+                    if rid:
+                        inserted_ids.append(rid)
+                else:
+                    for rank, c in enumerate(result.candidates, start=1):
+                        row_dict = {
+                            **base,
+                            "strategy_preset": c.strategy_preset,
+                            "rank": rank,
+                            "expiry": c.expiry,
+                            "dte": c.dte,
+                            "strike": c.strike,
+                            "right": c.right,
+                            "bid": c.bid,
+                            "ask": c.ask,
+                            "mid": c.mid,
+                            "spread_pct": c.spread_pct,
+                            "delta": c.delta,
+                            # Issue #1 fix: schema column is "iv", not "implied_vol"
+                            "iv": c.implied_vol,
+                            "open_interest": c.open_interest,
+                            "volume": c.volume,
+                            "breakeven": c.breakeven,
+                            # Exit plan (TRD-026 mandatory fields)
+                            "holding_window_days": c.holding_window_days,
+                            "exit_by_date": c.exit_by_date,
+                            "underlying_target_1": c.underlying_target_1,
+                            "underlying_target_2": c.underlying_target_2,
+                            "underlying_stop": c.underlying_stop,
+                            "option_take_profit_1": c.option_take_profit_1,
+                            "option_take_profit_2": c.option_take_profit_2,
+                            "option_stop_loss": c.option_stop_loss,
+                            "max_holding_rule": c.max_holding_rule,
+                            "event_exit_rule": c.event_exit_rule,
+                            "score": c.score,
+                            "rationale": c.rationale,
+                            "features_json": json.dumps({
+                                "delta": c.delta,
+                                "iv": c.implied_vol,
+                                "spread_pct": c.spread_pct,
+                                "dte": c.dte,
+                                "oi": c.open_interest,
+                                "volume": c.volume,
+                            }),
+                        }
+                        rid = _insert_row(row_dict)
+                        if rid:
+                            inserted_ids.append(rid)
+    except Exception as exc:
+        logger.warning("save_option_candidate_snapshot failed: %s", exc)
+
+    return inserted_ids
+
+
+def save_option_candidate_outcome(
+    snapshot_id: int,
+    resolution_type: str,
+    outcome: dict,
+) -> bool:
+    """
+    Persist an outcome record for a previously stored snapshot.
+
+    Args:
+        snapshot_id: FK to option_candidate_snapshots.id
+        resolution_type: '1d' | '5d' | '10d' | 'expiry' | 'manual'
+        outcome: dict with fields matching option_candidate_outcomes columns
+    Returns True on success.
+    """
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                row = {
+                    "candidate_snapshot_id": snapshot_id,
+                    "resolution_type": resolution_type,
+                    **outcome,
+                }
+                cols = ", ".join(row.keys())
+                placeholders = ", ".join(["%s"] * len(row))
+                # ON CONFLICT DO UPDATE in case resolution is re-run
+                sql = (
+                    f"INSERT INTO option_candidate_outcomes ({cols}) "
+                    f"VALUES ({placeholders}) "
+                    f"ON CONFLICT (candidate_snapshot_id, resolution_type) "
+                    f"DO UPDATE SET {', '.join(f'{k}=EXCLUDED.{k}' for k in outcome.keys())}"
+                )
+                cur.execute(sql, list(row.values()))
+        return True
+    except Exception as exc:
+        logger.warning("save_option_candidate_outcome(%d, %s) failed: %s", snapshot_id, resolution_type, exc)
+        return False
+
+
+def fetch_unresolved_snapshots(
+    resolution_type: str = "1d",
+    limit: int = 200,
+) -> list[dict]:
+    """
+    Return option_candidate_snapshots rows that do not yet have an outcome
+    for the given resolution_type and are old enough to be resolved.
+
+    Minimum age:
+      1d  → created_at ≥ 1 calendar day ago
+      5d  → created_at ≥ 5 calendar days ago
+      10d → created_at ≥ 10 calendar days ago
+    """
+    min_age = {"1d": 1, "5d": 5, "10d": 10}.get(resolution_type, 1)
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s.*
+                    FROM   option_candidate_snapshots s
+                    LEFT JOIN option_candidate_outcomes o
+                           ON o.candidate_snapshot_id = s.id
+                          AND o.resolution_type = %s
+                    WHERE  o.id IS NULL
+                      AND  s.suppressed = FALSE
+                      AND  s.mid IS NOT NULL
+                      AND  s.created_at <= NOW() - INTERVAL '%s days'
+                    ORDER  BY s.created_at ASC
+                    LIMIT  %s
+                    """,
+                    (resolution_type, min_age, limit),
+                )
+                rows = cur.fetchall()
+                return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("fetch_unresolved_snapshots(%s) failed: %s", resolution_type, exc)
+        return []

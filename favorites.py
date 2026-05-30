@@ -39,6 +39,8 @@ def _supabase_conn():
 
 def _ensure_table(conn) -> None:
     """Create user_favorites if it doesn't exist (idempotent)."""
+    from utils.db import ensure_public_table_rls
+
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_favorites (
@@ -48,6 +50,7 @@ def _ensure_table(conn) -> None:
                 notes     TEXT DEFAULT ''
             )
         """)
+    ensure_public_table_rls(conn, "user_favorites")
     conn.commit()
 
 
