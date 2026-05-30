@@ -482,11 +482,8 @@ async def portfolio_summary():
     Aggregate performance summary from paper_trades.db.
     Returns NAV, weekly return, SPY benchmark, Sharpe, drawdown, hit rate.
     """
-    conn = _db_connect()
-    if conn is None:
-        return _no_data("paper_trades.db not found")
-
     try:
+        conn = _db_connect()
         # Weekly returns
         df = pd.read_sql("SELECT * FROM weekly_returns ORDER BY week_ending ASC", conn)
 
@@ -572,18 +569,18 @@ async def portfolio_summary():
         }
     except Exception as e:
         log.exception("portfolio_summary error")
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
         return _no_data(str(e))
 
 
 @app.get("/api/portfolio/history")
 async def portfolio_history(weeks: int = Query(52, ge=1, le=260)):
     """Weekly portfolio vs SPY history from paper_trades.db."""
-    conn = _db_connect()
-    if conn is None:
-        return _no_data("paper_trades.db not found")
-
     try:
+        conn = _db_connect()
         df = pd.read_sql(
             "SELECT week_ending, portfolio_return, benchmark_return, snapshot_id "
             "FROM weekly_returns ORDER BY week_ending ASC",
@@ -4434,7 +4431,7 @@ _analysis_jobs: dict = {}
 
 
 class AnalyzeRequest(BaseModel):
-    llm: str = "grok"   # "grok" | "grok-premium" | "claude"
+    llm: str = "grok-4.3"   # exact model ID; legacy aliases ("grok", "grok-premium", "claude", "chatgpt") still accepted
 
 
 @app.post("/api/ticker/{symbol}/analyze")
@@ -6159,3 +6156,191 @@ async def remove_from_blacklist(ticker: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-022: Option Candidates  /api/ticker/{symbol}/option-candidates
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from utils.option_candidates import (
+        CandidateResult,
+        OptionCandidate,
+        ThesisContext,
+        get_option_candidates,
+    )
+    from utils.ibkr_options import get_option_chain
+    _OPTION_CANDIDATES_AVAILABLE = True
+except ImportError:
+    _OPTION_CANDIDATES_AVAILABLE = False  # type: ignore[assignment]
+
+
+def _build_thesis_context(row: dict) -> "ThesisContext":
+    """
+    Build a ThesisContext from a thesis_cache row dict.
+    All optional fields are None-safe.
+    """
+
+    def _int(v: Any) -> Optional[int]:
+        try:
+            return int(float(v)) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _float(v: Any) -> Optional[float]:
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    sigs = {}
+    sigs_raw = row.get("signals_json")
+    if isinstance(sigs_raw, str):
+        try:
+            sigs = json.loads(sigs_raw)
+        except Exception:
+            pass
+    elif isinstance(sigs_raw, dict):
+        sigs = sigs_raw
+
+    of = sigs.get("options_flow") or {}
+    ce = sigs.get("catalyst") or sigs.get("catalyst_screener") or {}
+
+    return ThesisContext(
+        ticker=str(row.get("ticker", "")).upper(),
+        direction=str(row.get("direction") or "NEUTRAL").upper(),
+        conviction=_int(row.get("conviction")) or 1,
+        current_price=_float(row.get("current_price")),
+        entry_low=_float(row.get("entry_low")),
+        entry_high=_float(row.get("entry_high")),
+        target_1=_float(row.get("target_1")),
+        target_2=_float(row.get("target_2")),
+        stop_loss=_float(row.get("stop_loss")),
+        time_horizon=row.get("time_horizon"),
+        days_to_earnings=_int(ce.get("days_to_earnings")),
+        heat_score=_float(of.get("heat_score")),
+        expected_move_pct=_float(of.get("expected_move_pct")),
+    )
+
+
+def _serialize_candidate(c: "OptionCandidate") -> dict:
+    return {
+        "ticker": c.ticker,
+        "expiry": c.expiry,
+        "strike": c.strike,
+        "right": c.right,
+        "dte": c.dte,
+        "bid": c.bid,
+        "ask": c.ask,
+        "mid": c.mid,
+        "spread_pct": c.spread_pct,
+        "delta": c.delta,
+        "implied_vol": round(c.implied_vol * 100, 1) if c.implied_vol else None,
+        "open_interest": c.open_interest,
+        "volume": c.volume,
+        "breakeven": c.breakeven,
+        "score": c.score,
+        "rationale": c.rationale,
+        "strategy_preset": c.strategy_preset,
+        "source": c.source,
+    }
+
+
+@app.get("/api/ticker/{symbol}/option-candidates")
+async def ticker_option_candidates(symbol: str):
+    """
+    Deterministic option candidate recommendations for a single ticker.
+
+    Fetches the latest thesis from thesis_cache, builds a ThesisContext,
+    pulls the option chain (IBKR → yfinance fallback), scores all contracts,
+    and returns a compact shortlist (1–3 candidates) with rejection reasons
+    and a suppression state when no option trade is warranted.
+
+    Cached 5 minutes (chain data is near-live; thesis refreshes daily).
+    """
+    if not _OPTION_CANDIDATES_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="option_candidates module unavailable — check utils/option_candidates.py",
+        )
+
+    sym = symbol.upper()
+    cache_key = f"option_candidates:{sym}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    # ── Load thesis ───────────────────────────────────────────────────────────
+    thesis_row: Optional[dict] = None
+    try:
+        conn = _db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticker, direction, conviction, entry_low, entry_high,
+                       target_1, target_2, stop_loss, time_horizon,
+                       signals_json, current_price
+                FROM thesis_cache
+                WHERE ticker = %s
+                ORDER BY date DESC LIMIT 1
+                """,
+                (sym,),
+            )
+            row = cur.fetchone()
+            if row:
+                thesis_row = dict(row)
+        conn.close()
+    except Exception:
+        pass  # No thesis → candidate engine returns suppressed result
+
+    thesis: Optional["ThesisContext"] = None
+    if thesis_row:
+        try:
+            thesis = _build_thesis_context(thesis_row)
+            # Enrich with live price if thesis lacks it
+            if thesis.current_price is None:
+                prices = _fetch_current_prices([sym])
+                thesis.current_price = prices.get(sym)
+        except Exception as exc:
+            log.warning("thesis context build failed for %s: %s", sym, exc)
+
+    # ── Run candidate engine in thread (chain fetch is blocking IO) ───────────
+    loop = asyncio.get_event_loop()
+    try:
+        result: "CandidateResult" = await loop.run_in_executor(
+            None, lambda: get_option_candidates(sym, thesis=thesis)
+        )
+    except Exception as exc:
+        log.exception("option candidates error for %s", sym)
+        result_dict = {
+            "ticker": sym,
+            "generated_at": datetime.utcnow().isoformat(),
+            "suppressed": True,
+            "suppression_reason": f"Internal error: {exc}",
+            "candidates": [],
+            "rejection_reasons": [],
+            "underlying_price": None,
+            "chain_source": "error",
+            "chain_error": str(exc),
+        }
+        _cache.set(cache_key, result_dict, 60)
+        return result_dict
+
+    result_dict = {
+        "ticker": result.ticker,
+        "generated_at": result.generated_at,
+        "suppressed": result.suppressed,
+        "suppression_reason": result.suppression_reason,
+        "candidates": [_serialize_candidate(c) for c in result.candidates],
+        "rejection_reasons": result.rejection_reasons,
+        "underlying_price": result.underlying_price,
+        "chain_source": result.chain_source,
+        "chain_error": result.chain_error,
+        # Thesis summary for UI context
+        "thesis_direction": thesis.direction if thesis else None,
+        "thesis_conviction": thesis.conviction if thesis else None,
+    }
+
+    _cache.set(cache_key, result_dict, 300)  # 5-min TTL
+    return result_dict

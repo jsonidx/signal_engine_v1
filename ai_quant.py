@@ -3138,7 +3138,7 @@ def update_watchlist_from_screen(
 # ==============================================================================
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
-                   use_cache: bool = True, llm: str = "grok",
+                   use_cache: bool = True, llm: str = "grok-4.3",
                    force_ai: bool = False) -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
@@ -3342,7 +3342,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
 def analyze_tickers(tickers: List[str], verbose: bool = False,
                     raw_output: bool = False, use_cache: bool = True,
-                    force_ai: bool = False, llm: str = "grok") -> List[dict]:
+                    force_ai: bool = False, llm: str = "grok-4.3") -> List[dict]:
     """Analyze multiple tickers, returning sorted by conviction."""
     results = []
     for i, ticker in enumerate(tickers, 1):
@@ -3693,10 +3693,10 @@ def main():
         help="Run on ALL non-skipped tickers (WARNING: high API cost)",
     )
     parser.add_argument(
-        "--llm", type=str, default="grok",
+        "--llm", type=str, default="grok-4.3",
         choices=["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
                  "grok", "grok-premium", "claude", "chatgpt"],
-        help="LLM backend: grok (default xAI fast), grok-premium (forced premium Grok), claude (Anthropic Claude Sonnet)",
+        help="LLM backend: grok-4.3 (default), claude-sonnet-4-6, gpt-5.1, etc. Legacy aliases grok/grok-premium/claude/chatgpt still accepted.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

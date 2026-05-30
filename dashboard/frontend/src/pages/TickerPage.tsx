@@ -22,7 +22,7 @@ import {
   ResponsiveContainer, Cell, ReferenceLine, Legend,
 } from 'recharts'
 import { api } from '../lib/api'
-import type { ExpectedMove, TickerDetail, SecFiling, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus, RegimeCurrent } from '../lib/api'
+import type { ExpectedMove, TickerDetail, SecFiling, EarningsData, EarningsQuarter, EarningsAnnual, ActionZones, AnalyzeStatus, RegimeCurrent, OptionCandidatesResponse, OptionCandidate } from '../lib/api'
 
 // Cache TTL for regime data (1 hour, same as backend TTL_LONG)
 const TTL_LONG_MS = 60 * 60 * 1000
@@ -998,39 +998,165 @@ function buildPrompt(
   return lines.join('\n')
 }
 
+// ─── Options prompt builder  (TRD-024) ────────────────────────────────────────
+
+function buildOptionsPrompt(
+  signal: TickerDetail,
+  candidatesData: OptionCandidatesResponse | null | undefined,
+): string {
+  const usd = (v: number | null | undefined) => v != null ? `$${v.toFixed(2)}` : '—'
+  const today = new Date().toISOString().slice(0, 10)
+  const lines: string[] = []
+
+  lines.push(
+    `You are an expert options trader and quantitative analyst. ` +
+    `Review the following pre-filtered option candidates for ${signal.ticker} ` +
+    `and explain the tradeoffs between them. ` +
+    `IMPORTANT: You must rank ONLY the candidates listed below. ` +
+    `Do NOT suggest, invent, or reference any strikes, expiries, or contracts ` +
+    `outside the provided list.`
+  )
+  lines.push(``)
+  lines.push(
+    `For each candidate, explain: (1) why this strike/expiry fits the thesis, ` +
+    `(2) the key risk of this contract, (3) your ranking among the candidates.`
+  )
+  lines.push(``)
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(`OPTIONS CANDIDATES: ${signal.ticker}  |  ${today}`)
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(``)
+
+  // Thesis summary
+  lines.push(`## STOCK THESIS CONTEXT`)
+  lines.push(`Direction:     ${signal.direction ?? '—'}`)
+  lines.push(`Conviction:    ${signal.conviction ?? '—'}/5`)
+  if (signal.time_horizon) lines.push(`Horizon:       ${signal.time_horizon}`)
+  lines.push(`Entry Zone:    ${usd(signal.entry_low)} – ${usd(signal.entry_high)}`)
+  lines.push(`Target 1:      ${usd(signal.target_1)}`)
+  lines.push(`Target 2:      ${usd(signal.target_2)}`)
+  lines.push(`Stop Loss:     ${usd(signal.stop_loss)}`)
+  if (signal.thesis) {
+    lines.push(``)
+    lines.push(`Thesis Summary:`)
+    lines.push(signal.thesis.slice(0, 400) + (signal.thesis.length > 400 ? '…' : ''))
+  }
+  lines.push(``)
+
+  // Candidates
+  if (!candidatesData || candidatesData.suppressed || candidatesData.candidates.length === 0) {
+    const reason = candidatesData?.suppression_reason ?? 'No option candidates available.'
+    lines.push(`## OPTION CANDIDATES`)
+    lines.push(`No candidates available: ${reason}`)
+    lines.push(``)
+    lines.push(`Since no pre-filtered candidates are available, do NOT suggest any specific`)
+    lines.push(`option contracts. Instead, explain why no option trade is warranted here.`)
+  } else {
+    lines.push(`## OPTION CANDIDATES  (pre-filtered — rank ONLY these contracts)`)
+    lines.push(`Underlying price: ${candidatesData.underlying_price != null ? `$${candidatesData.underlying_price.toFixed(2)}` : '—'}`)
+    lines.push(`Chain source: ${candidatesData.chain_source}`)
+    lines.push(``)
+
+    candidatesData.candidates.forEach((c, i) => {
+      const rightFull = c.right === 'C' ? 'CALL' : 'PUT'
+      lines.push(`### Candidate ${i + 1}: ${c.strike} ${rightFull} ${c.expiry}  (${c.dte}d DTE)`)
+      lines.push(`  Strategy preset : ${c.strategy_preset.replace('_', ' ')}`)
+      lines.push(`  Mid premium     : ${c.mid != null ? `$${c.mid.toFixed(2)}` : '—'}`)
+      if (c.bid != null && c.ask != null)
+        lines.push(`  Bid / Ask       : $${c.bid.toFixed(2)} / $${c.ask.toFixed(2)}`)
+      if (c.spread_pct != null)
+        lines.push(`  Spread          : ${c.spread_pct.toFixed(1)}%`)
+      if (c.delta != null)
+        lines.push(`  Delta           : ${c.delta >= 0 ? '+' : ''}${c.delta.toFixed(2)}`)
+      if (c.implied_vol != null)
+        lines.push(`  Implied Vol     : ${c.implied_vol.toFixed(0)}%`)
+      if (c.open_interest != null)
+        lines.push(`  Open Interest   : ${c.open_interest.toLocaleString()}`)
+      if (c.volume != null)
+        lines.push(`  Volume          : ${c.volume.toLocaleString()}`)
+      if (c.breakeven != null)
+        lines.push(`  Breakeven (exp) : $${c.breakeven.toFixed(2)}`)
+      lines.push(`  Score           : ${c.score.toFixed(0)}/100`)
+      if (c.rationale)
+        lines.push(`  System note     : ${c.rationale}`)
+      lines.push(``)
+    })
+
+    lines.push(`### Constraint (mandatory)`)
+    lines.push(`Rank only the ${candidatesData.candidates.length} candidate(s) listed above.`)
+    lines.push(`Do NOT introduce or suggest any other contracts.`)
+  }
+
+  lines.push(`${'='.repeat(60)}`)
+  lines.push(`END OF DATA — provide your expert options analysis now.`)
+  return lines.join('\n')
+}
+
+type PromptMode = 'equity' | 'options'
+
 function CopyPromptButton({
-  signal, actionZones, earningsData, dpLatest, compact = false,
+  signal, actionZones, earningsData, dpLatest, candidatesData, compact = false,
 }: {
   signal: TickerDetail
   actionZones: ActionZones | null | undefined
   earningsData: EarningsData | null | undefined
   dpLatest: any
+  candidatesData?: OptionCandidatesResponse | null
   compact?: boolean
 }) {
   const [copied, setCopied] = useState(false)
+  const [mode, setMode] = useState<PromptMode>('equity')
+
+  const hasCandidates = candidatesData != null
 
   const handleCopy = async () => {
-    const prompt = buildPrompt(signal, actionZones, earningsData, dpLatest)
+    const prompt = mode === 'options' && hasCandidates
+      ? buildOptionsPrompt(signal, candidatesData)
+      : buildPrompt(signal, actionZones, earningsData, dpLatest)
     await navigator.clipboard.writeText(prompt)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
 
-  // Compact mode: inline button only (used inside AI Thesis card)
+  // Compact mode: inline button (used inside AI Thesis card) with optional mode toggle
   if (compact) {
     return (
-      <button
-        onClick={handleCopy}
-        title="Copy full deep-dive prompt for ChatGPT / Grok / Claude"
-        className={clsx(
-          'flex items-center gap-1.5 font-mono text-[10px] px-2.5 py-1 rounded border transition-all',
-          copied
-            ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
-            : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+      <div className="flex items-center gap-1.5">
+        {hasCandidates && (
+          <div className="flex items-center rounded border border-border-subtle overflow-hidden">
+            {(['equity', 'options'] as PromptMode[]).map(m => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                className={clsx(
+                  'font-mono text-[9px] px-2 py-1 transition-colors',
+                  mode === m
+                    ? 'bg-accent-blue/20 text-accent-blue'
+                    : 'text-text-tertiary hover:text-text-secondary'
+                )}
+              >
+                {m === 'equity' ? 'Equity' : 'Options'}
+              </button>
+            ))}
+          </div>
         )}
-      >
-        {copied ? '✓ Copied' : '⎘ Copy Prompt'}
-      </button>
+        <button
+          onClick={handleCopy}
+          title={
+            mode === 'options'
+              ? 'Copy options-candidate prompt (pre-filtered contracts only)'
+              : 'Copy full deep-dive prompt for ChatGPT / Grok / Claude'
+          }
+          className={clsx(
+            'flex items-center gap-1.5 font-mono text-[10px] px-2.5 py-1 rounded border transition-all',
+            copied
+              ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+              : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+          )}
+        >
+          {copied ? '✓ Copied' : '⎘ Copy Prompt'}
+        </button>
+      </div>
     )
   }
 
@@ -1042,24 +1168,48 @@ function CopyPromptButton({
             LLM Prompt
           </div>
           <div className="font-mono text-[9px] text-text-tertiary">
-            Full deep dive data formatted for ChatGPT, Grok, Claude, etc.
+            {mode === 'options'
+              ? 'Options candidate ranking prompt — pre-filtered contracts only.'
+              : 'Full deep dive data formatted for ChatGPT, Grok, Claude, etc.'}
           </div>
         </div>
-        <button
-          onClick={handleCopy}
-          className={clsx(
-            'flex items-center gap-1.5 font-mono text-xs px-3 py-1.5 rounded border transition-all',
-            copied
-              ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
-              : 'bg-bg-elevated text-text-secondary border-border-subtle hover:text-text-primary hover:border-border-active'
+        <div className="flex items-center gap-2">
+          {hasCandidates && (
+            <div className="flex items-center rounded border border-border-subtle overflow-hidden">
+              {(['equity', 'options'] as PromptMode[]).map(m => (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  className={clsx(
+                    'font-mono text-[9px] px-2.5 py-1.5 transition-colors',
+                    mode === m
+                      ? 'bg-accent-blue/20 text-accent-blue'
+                      : 'text-text-tertiary hover:text-text-secondary'
+                  )}
+                >
+                  {m === 'equity' ? 'Equity' : 'Options'}
+                </button>
+              ))}
+            </div>
           )}
-        >
-          {copied ? '✓ Copied' : '⎘ Copy Prompt'}
-        </button>
+          <button
+            onClick={handleCopy}
+            className={clsx(
+              'flex items-center gap-1.5 font-mono text-xs px-3 py-1.5 rounded border transition-all',
+              copied
+                ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
+                : 'bg-bg-elevated text-text-secondary border-border-subtle hover:text-text-primary hover:border-border-active'
+            )}
+          >
+            {copied ? '✓ Copied' : '⎘ Copy Prompt'}
+          </button>
+        </div>
       </div>
       {copied && (
         <div className="font-mono text-[9px] text-accent-green/80">
-          Paste into ChatGPT, Grok, Claude, or any LLM to get expert quant analysis.
+          {mode === 'options'
+            ? 'Options prompt copied — paste into ChatGPT, Grok, or Claude.'
+            : 'Paste into ChatGPT, Grok, Claude, or any LLM to get expert quant analysis.'}
         </div>
       )}
     </div>
@@ -1117,7 +1267,7 @@ type LLMChoice = typeof LLM_OPTIONS[number]['value']
 
 function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boolean }) {
   const [job, setJob] = useState<AnalyzeStatus | null>(null)
-  const [llm, setLlm] = useState<LLMChoice>('grok')
+  const [llm, setLlm] = useState<LLMChoice>('grok-4.3')
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
 
@@ -1396,6 +1546,192 @@ const FORM_COLOR: Record<string, string> = {
   'DEF 14A':'text-text-tertiary',
   'S-1':    'text-accent-green',
   '424B4':  'text-accent-green',
+}
+
+// ─── Option Candidates card  (TRD-023) ────────────────────────────────────────
+
+function OptionCandidatesCard({
+  data,
+  isLoading,
+  isError,
+}: {
+  data: OptionCandidatesResponse | null | undefined
+  isLoading: boolean
+  isError: boolean
+}) {
+  const fmt = (v: number | null | undefined, d = 2) =>
+    v != null ? v.toFixed(d) : '—'
+  const fmtPct = (v: number | null | undefined) =>
+    v != null ? `${v.toFixed(1)}%` : '—'
+  const fmtK = (v: number | null | undefined) => {
+    if (v == null) return '—'
+    if (v >= 1000) return `${(v / 1000).toFixed(0)}K`
+    return String(v)
+  }
+
+  const header = (
+    <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
+      Option Candidates
+    </div>
+  )
+
+  if (isLoading) {
+    return (
+      <div className="bg-bg-surface border border-border-subtle rounded p-3">
+        {header}
+        <div className="font-mono text-[10px] text-text-tertiary animate-pulse">Loading chain data…</div>
+      </div>
+    )
+  }
+
+  if (isError || !data) {
+    return (
+      <div className="bg-bg-surface border border-border-subtle rounded p-3">
+        {header}
+        <div className="font-mono text-[10px] text-accent-red">Failed to load option candidates.</div>
+      </div>
+    )
+  }
+
+  if (data.suppressed || data.candidates.length === 0) {
+    const reason = data.suppression_reason
+      || (data.candidates.length === 0 ? 'No contracts passed quality filters.' : null)
+      || 'No option trade warranted.'
+    return (
+      <div className="bg-bg-surface border border-border-subtle rounded p-3">
+        {header}
+        <div className="flex items-start gap-2">
+          <span className="text-text-tertiary text-xs mt-0.5">—</span>
+          <div className="font-mono text-[10px] text-text-tertiary leading-relaxed">{reason}</div>
+        </div>
+        {data.rejection_reasons.length > 0 && (
+          <details className="mt-2">
+            <summary className="font-mono text-[9px] text-text-tertiary cursor-pointer hover:text-text-secondary">
+              {data.rejection_reasons.length} rejection{data.rejection_reasons.length !== 1 ? 's' : ''} (click to expand)
+            </summary>
+            <ul className="mt-1 space-y-0.5">
+              {data.rejection_reasons.slice(0, 6).map((r, i) => (
+                <li key={i} className="font-mono text-[9px] text-text-tertiary truncate">{r}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-3 space-y-3">
+      {header}
+      <div className="space-y-3">
+        {data.candidates.map((c, idx) => (
+          <OptionCandidateRow key={`${c.expiry}-${c.strike}-${c.right}`} candidate={c} rank={idx + 1}
+            fmt={fmt} fmtPct={fmtPct} fmtK={fmtK} />
+        ))}
+      </div>
+      <div className="flex items-center justify-between pt-1 border-t border-border-subtle">
+        <span className="font-mono text-[9px] text-text-tertiary">
+          source: {data.chain_source}
+          {data.underlying_price != null && ` · underlying $${data.underlying_price.toFixed(2)}`}
+        </span>
+        {data.chain_source === 'yfinance' && (
+          <span className="font-mono text-[9px] text-accent-amber">
+            Greeks approx (no live IBKR)
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function OptionCandidateRow({
+  candidate: c,
+  rank,
+  fmt,
+  fmtPct,
+  fmtK,
+}: {
+  candidate: OptionCandidate
+  rank: number
+  fmt: (v: number | null | undefined, d?: number) => string
+  fmtPct: (v: number | null | undefined) => string
+  fmtK: (v: number | null | undefined) => string
+}) {
+  const isCall = c.right === 'C'
+  const rightColor = isCall ? 'text-accent-green' : 'text-accent-red'
+  const rightLabel = isCall ? 'CALL' : 'PUT'
+  const presetLabel = c.strategy_preset.replace('_', ' ').toUpperCase()
+
+  return (
+    <div className="rounded border border-border-subtle bg-bg-elevated p-2.5 space-y-2">
+      {/* Header row */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[9px] text-text-tertiary">#{rank}</span>
+          <span className={clsx('font-mono text-xs font-bold', rightColor)}>{rightLabel}</span>
+          <span className="font-mono text-sm font-semibold text-text-primary">${c.strike.toFixed(0)}</span>
+          <span className="font-mono text-[10px] text-text-secondary">{c.expiry}</span>
+          <span className="font-mono text-[9px] text-text-tertiary">{c.dte}d</span>
+        </div>
+        <span className="font-mono text-[9px] text-text-tertiary bg-bg-surface px-1.5 py-0.5 rounded border border-border-subtle">
+          {presetLabel}
+        </span>
+      </div>
+
+      {/* Key metrics grid */}
+      <div className="grid grid-cols-4 gap-2">
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">Mid</div>
+          <div className="font-mono text-xs text-text-primary font-semibold">
+            {c.mid != null ? `$${c.mid.toFixed(2)}` : '—'}
+          </div>
+          {c.bid != null && c.ask != null && (
+            <div className="font-mono text-[9px] text-text-tertiary">
+              {`$${c.bid.toFixed(2)}×$${c.ask.toFixed(2)}`}
+            </div>
+          )}
+        </div>
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">Delta</div>
+          <div className={clsx('font-mono text-xs font-semibold', isCall ? 'text-accent-green' : 'text-accent-red')}>
+            {c.delta != null ? `${c.delta >= 0 ? '+' : ''}${c.delta.toFixed(2)}` : '—'}
+          </div>
+          {c.spread_pct != null && (
+            <div className={clsx('font-mono text-[9px]', c.spread_pct > 8 ? 'text-accent-amber' : 'text-text-tertiary')}>
+              sprd {c.spread_pct.toFixed(1)}%
+            </div>
+          )}
+        </div>
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">IV</div>
+          <div className="font-mono text-xs text-text-primary">
+            {c.implied_vol != null ? `${c.implied_vol.toFixed(0)}%` : '—'}
+          </div>
+          {c.breakeven != null && (
+            <div className="font-mono text-[9px] text-text-tertiary">
+              BE ${c.breakeven.toFixed(2)}
+            </div>
+          )}
+        </div>
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">OI / Vol</div>
+          <div className="font-mono text-xs text-text-primary">
+            {fmtK(c.open_interest)}
+          </div>
+          {c.volume != null && (
+            <div className="font-mono text-[9px] text-text-tertiary">{fmtK(c.volume)} vol</div>
+          )}
+        </div>
+      </div>
+
+      {/* Rationale */}
+      {c.rationale && (
+        <div className="font-mono text-[9px] text-text-tertiary leading-relaxed border-t border-border-subtle pt-1.5">
+          {c.rationale}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function SecFilingsCard({ filings }: { filings: SecFiling[] }) {
@@ -1765,6 +2101,17 @@ export function TickerPage() {
     staleTime: TTL_LONG_MS,
   })
 
+  const {
+    data: optionCandidates,
+    isLoading: optionCandidatesLoading,
+    isError: optionCandidatesError,
+  } = useQuery<OptionCandidatesResponse | null>({
+    queryKey: ['option_candidates', symbol],
+    queryFn: () => api.tickerOptionCandidates(symbol),
+    staleTime: 5 * 60 * 1000,
+    enabled: !!symbol,
+  })
+
   const allTickers = useMemo(() => heatmapRows?.map(r => r.ticker).sort() ?? [], [heatmapRows])
 
   const dpLatest = dpHistory?.[0]
@@ -2009,6 +2356,7 @@ export function TickerPage() {
                       actionZones={actionZones}
                       earningsData={earningsData}
                       dpLatest={dpLatest}
+                      candidatesData={optionCandidates}
                       compact
                     />
                   </div>
@@ -2341,6 +2689,13 @@ export function TickerPage() {
                 </div>
               </div>
             )}
+
+            {/* Option Candidates  (TRD-023) */}
+            <OptionCandidatesCard
+              data={optionCandidates}
+              isLoading={optionCandidatesLoading}
+              isError={optionCandidatesError}
+            />
 
             {/* Dark pool */}
             {(signal.dark_pool_score !== undefined || dpLatest) && (

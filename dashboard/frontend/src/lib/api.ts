@@ -1202,7 +1202,7 @@ export const api = {
   tickerActionZones: (symbol: string): Promise<ActionZones | null> =>
     client.get(`/api/ticker/${symbol}/action-zones`).then(r => r.data?.data_available ? r.data : null).catch(() => null),
 
-  tickerAnalyze: (symbol: string, llm: string = 'grok'): Promise<AnalyzeStatus> =>
+  tickerAnalyze: (symbol: string, llm: string = 'grok-4.3'): Promise<AnalyzeStatus> =>
     client.post(`/api/ticker/${symbol}/analyze`, { llm }).then(r => r.data),
 
   tickerAnalyzeStatus: (symbol: string): Promise<AnalyzeStatus> =>
@@ -1268,6 +1268,10 @@ export const api = {
   patternWatch: (): Promise<PatternWatchResponse> =>
     client.get('/api/pattern-watch').then(r => r.data),
 
+  // Option Candidates (TRD-022)
+  tickerOptionCandidates: (symbol: string): Promise<OptionCandidatesResponse> =>
+    client.get(`/api/ticker/${symbol.toUpperCase()}/option-candidates`).then(r => r.data),
+
   // Universe
   universeStats: (): Promise<UniverseStats> =>
     client.get('/api/universe/stats').then(r => {
@@ -1323,4 +1327,41 @@ export interface PatternWatchResponse {
   count: number
   method_note: string
   data: PatternWatchItem[]
+}
+
+// ─── Option Candidates  (TRD-022 / TRD-023) ──────────────────────────────────
+
+export interface OptionCandidate {
+  ticker: string
+  expiry: string
+  strike: number
+  right: 'C' | 'P'
+  dte: number
+  bid: number | null
+  ask: number | null
+  mid: number | null
+  spread_pct: number | null
+  delta: number | null
+  implied_vol: number | null       // percentage, e.g. 42 = 42%
+  open_interest: number | null
+  volume: number | null
+  breakeven: number | null
+  score: number
+  rationale: string
+  strategy_preset: string          // "long_call" | "long_put" | "leaps_call" | "leaps_put"
+  source: string                   // "ibkr" | "yfinance" | "mock"
+}
+
+export interface OptionCandidatesResponse {
+  ticker: string
+  generated_at: string
+  suppressed: boolean
+  suppression_reason: string | null
+  candidates: OptionCandidate[]
+  rejection_reasons: string[]
+  underlying_price: number | null
+  chain_source: string
+  chain_error: string | null
+  thesis_direction: 'BULL' | 'BEAR' | 'NEUTRAL' | null
+  thesis_conviction: number | null
 }
