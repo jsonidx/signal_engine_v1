@@ -2386,6 +2386,617 @@ def save_option_candidate_outcome(
         return False
 
 
+# ==============================================================================
+# TRD-039: OPTIONS STATE HISTORY (daily chain-level snapshots for future research)
+# Not used in v1 pre-breakout scoring — collection only.
+# ==============================================================================
+
+_OPTIONS_STATE_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS options_state_history (
+    ticker              TEXT    NOT NULL,
+    snapshot_date       DATE    NOT NULL,
+    expiry              DATE    NOT NULL,
+    dte                 INTEGER,
+    call_volume_total   REAL,
+    put_volume_total    REAL,
+    call_put_volume_ratio REAL,
+    call_oi_total       REAL,
+    put_oi_total        REAL,
+    call_put_oi_ratio   REAL,
+    atm_iv              REAL,
+    underlying_price    REAL,
+    data_source         TEXT    NOT NULL DEFAULT 'yfinance_chain',
+    data_confidence     REAL    DEFAULT 0.7,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (ticker, snapshot_date, expiry)
+);
+"""
+
+
+def save_options_state_snapshots(records: list[dict]) -> None:
+    """
+    Upsert daily options-state snapshots into options_state_history.
+
+    Each record must contain: ticker, snapshot_date, expiry.
+    Call/put totals, ATM IV, and DTE are optional but encouraged.
+    Idempotent on (ticker, snapshot_date, expiry).
+    """
+    if not records:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_OPTIONS_STATE_HISTORY_DDL)
+        _ensure_table_security(conn, "options_state_history")
+
+        rows = []
+        for rec in records:
+            ticker = str(rec.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            rows.append((
+                ticker,
+                str(rec.get("snapshot_date") or _today()),
+                str(rec["expiry"]),
+                rec.get("dte"),
+                rec.get("call_volume_total"),
+                rec.get("put_volume_total"),
+                rec.get("call_put_volume_ratio"),
+                rec.get("call_oi_total"),
+                rec.get("put_oi_total"),
+                rec.get("call_put_oi_ratio"),
+                rec.get("atm_iv"),
+                rec.get("underlying_price"),
+                rec.get("data_source", "yfinance_chain"),
+                float(rec["data_confidence"]) if rec.get("data_confidence") is not None else 0.7,
+            ))
+
+        cur.executemany(
+            """
+            INSERT INTO options_state_history
+                (ticker, snapshot_date, expiry, dte,
+                 call_volume_total, put_volume_total, call_put_volume_ratio,
+                 call_oi_total, put_oi_total, call_put_oi_ratio,
+                 atm_iv, underlying_price, data_source, data_confidence)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (ticker, snapshot_date, expiry) DO UPDATE SET
+                dte                   = EXCLUDED.dte,
+                call_volume_total     = EXCLUDED.call_volume_total,
+                put_volume_total      = EXCLUDED.put_volume_total,
+                call_put_volume_ratio = EXCLUDED.call_put_volume_ratio,
+                call_oi_total         = EXCLUDED.call_oi_total,
+                put_oi_total          = EXCLUDED.put_oi_total,
+                call_put_oi_ratio     = EXCLUDED.call_put_oi_ratio,
+                atm_iv                = EXCLUDED.atm_iv,
+                underlying_price      = EXCLUDED.underlying_price,
+                data_source           = EXCLUDED.data_source,
+                data_confidence       = EXCLUDED.data_confidence
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("options_state_history: upserted %d records", len(rows))
+    except Exception as exc:
+        logger.warning("save_options_state_snapshots failed (non-fatal): %s", exc)
+
+
+def collect_options_state_for_ticker(
+    ticker: str,
+    snapshot_date: "date | None" = None,
+    target_dte_min: int = 20,
+    target_dte_max: int = 60,
+) -> "dict | None":
+    """
+    Fetch a daily options-state snapshot for *ticker* via yfinance.
+
+    Selects the nearest expiration within [target_dte_min, target_dte_max] trading days.
+    Returns None when no options exist, no suitable expiry is found, or on errors.
+    Does NOT persist — callers should batch records and call save_options_state_snapshots().
+
+    Cadence: daily. Date accuracy > feature richness.
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+        from datetime import date as _date, timedelta
+
+        snap_date = snapshot_date or _date.today()
+        t = yf.Ticker(ticker.upper())
+
+        # Find suitable expiry
+        try:
+            expirations = t.options
+        except Exception:
+            return None
+        if not expirations:
+            return None
+
+        chosen_expiry = None
+        chosen_dte = None
+        for exp_str in expirations:
+            try:
+                exp_date = _date.fromisoformat(exp_str)
+            except ValueError:
+                continue
+            dte = (exp_date - snap_date).days
+            if target_dte_min <= dte <= target_dte_max:
+                chosen_expiry = exp_str
+                chosen_dte = dte
+                break  # take first suitable expiry (nearest)
+
+        if chosen_expiry is None:
+            return None
+
+        try:
+            chain = t.option_chain(chosen_expiry)
+        except Exception:
+            return None
+
+        calls = chain.calls
+        puts = chain.puts
+
+        # Underlying price (best effort from chain strikes)
+        try:
+            info = t.fast_info
+            underlying = float(info.last_price) if hasattr(info, "last_price") else None
+        except Exception:
+            underlying = None
+
+        def _sum(df, col):
+            try:
+                v = df[col].fillna(0).sum()
+                return float(v) if v > 0 else None
+            except Exception:
+                return None
+
+        call_vol = _sum(calls, "volume")
+        put_vol = _sum(puts, "volume")
+        call_oi = _sum(calls, "openInterest")
+        put_oi = _sum(puts, "openInterest")
+
+        cp_vol_ratio = (call_vol / put_vol) if call_vol and put_vol and put_vol > 0 else None
+        cp_oi_ratio = (call_oi / put_oi) if call_oi and put_oi and put_oi > 0 else None
+
+        # ATM IV: IV at strike closest to underlying
+        atm_iv = None
+        if underlying and not calls.empty:
+            try:
+                atm_idx = (calls["strike"] - underlying).abs().idxmin()
+                atm_iv = float(calls.loc[atm_idx, "impliedVolatility"])
+                if atm_iv > 5.0:  # yfinance sometimes returns decimal fractions >1 — clamp
+                    atm_iv = None
+            except Exception:
+                pass
+
+        return {
+            "ticker": ticker.upper(),
+            "snapshot_date": snap_date.isoformat(),
+            "expiry": chosen_expiry,
+            "dte": chosen_dte,
+            "call_volume_total": call_vol,
+            "put_volume_total": put_vol,
+            "call_put_volume_ratio": cp_vol_ratio,
+            "call_oi_total": call_oi,
+            "put_oi_total": put_oi,
+            "call_put_oi_ratio": cp_oi_ratio,
+            "atm_iv": atm_iv,
+            "underlying_price": underlying,
+            "data_source": "yfinance_chain",
+            "data_confidence": 0.7,
+        }
+    except Exception as exc:
+        logger.debug("collect_options_state_for_ticker(%s) failed: %s", ticker, exc)
+        return None
+
+
+def collect_short_interest_for_ticker(
+    ticker: str,
+    snapshot_date: "date | None" = None,
+) -> "dict | None":
+    """
+    Fetch short-interest snapshot for *ticker* via yfinance.
+
+    Returns a record dict compatible with save_short_interest_history().
+    Returns None on missing data or errors.
+    yfinance only provides the most-recent FINRA publication date, not full history.
+    Date accuracy: use dateShortInterest as publication_date when available.
+    """
+    try:
+        import yfinance as yf
+        from datetime import date as _date, datetime as _dt
+
+        snap = snapshot_date or _date.today()
+        info = yf.Ticker(ticker.upper()).info
+
+        shares_short = info.get("sharesShort")
+        if shares_short is None:
+            return None
+
+        short_pct_float = info.get("shortPercentOfFloat")
+        float_shares = info.get("floatShares")
+        avg_vol = info.get("averageVolume")
+        vendor_short_ratio = info.get("shortRatio")
+
+        # dateShortInterest is a Unix timestamp
+        pub_ts = info.get("dateShortInterest")
+        if pub_ts:
+            try:
+                pub_date = _dt.utcfromtimestamp(int(pub_ts)).date().isoformat()
+            except Exception:
+                pub_date = snap.isoformat()
+        else:
+            pub_date = snap.isoformat()
+
+        dtc = None
+        if shares_short and avg_vol and avg_vol > 0:
+            dtc = shares_short / avg_vol
+
+        return {
+            "ticker": ticker.upper(),
+            "publication_date": pub_date,
+            "snapshot_date": snap.isoformat(),
+            "source": "yfinance_snapshot",
+            "shares_short": float(shares_short) if shares_short else None,
+            "short_pct_float": float(short_pct_float) if short_pct_float else None,
+            "float_shares": float(float_shares) if float_shares else None,
+            "avg_volume_30d": float(avg_vol) if avg_vol else None,
+            "computed_dtc_30d": dtc,
+            "vendor_short_ratio": float(vendor_short_ratio) if vendor_short_ratio else None,
+            "data_confidence_score": 0.7,
+        }
+    except Exception as exc:
+        logger.debug("collect_short_interest_for_ticker(%s) failed: %s", ticker, exc)
+        return None
+
+
+# ==============================================================================
+# TRD-034: SETUP WATCHLIST  (pre-breakout pipeline persistence)
+# ==============================================================================
+
+_SETUP_WATCHLIST_DDL = """
+CREATE TABLE IF NOT EXISTS setup_watchlist (
+    run_date          DATE    NOT NULL,
+    ticker            TEXT    NOT NULL,
+    composite_score   REAL    NOT NULL DEFAULT 0.0,
+    pfs_score         REAL,
+    psc_score         REAL,
+    erm_score         REAL,
+    stage2_passed     BOOLEAN NOT NULL DEFAULT FALSE,
+    archetype         TEXT,
+    invalidation_condition TEXT,
+    setup_grade       TEXT,
+    key_risk          TEXT,
+    stage3_run_at     TIMESTAMPTZ,
+    pipeline_version  TEXT    NOT NULL DEFAULT 'v1',
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (run_date, ticker)
+);
+"""
+
+_SETUP_WATCHLIST_MIGRATE_DDL = [
+    "ALTER TABLE setup_watchlist ADD COLUMN IF NOT EXISTS archetype TEXT;",
+    "ALTER TABLE setup_watchlist ADD COLUMN IF NOT EXISTS invalidation_condition TEXT;",
+    "ALTER TABLE setup_watchlist ADD COLUMN IF NOT EXISTS setup_grade TEXT;",
+    "ALTER TABLE setup_watchlist ADD COLUMN IF NOT EXISTS key_risk TEXT;",
+    "ALTER TABLE setup_watchlist ADD COLUMN IF NOT EXISTS stage3_run_at TIMESTAMPTZ;",
+]
+
+
+def save_setup_watchlist_rows(rows: list[dict], run_date: "str | None" = None) -> None:
+    """
+    Upsert pre-breakout setup-watchlist rows.
+
+    Each row must contain: ticker, composite_score.
+    Optional: pfs_score, psc_score, erm_score, stage2_passed, pipeline_version.
+    Stage 3 fields (archetype, setup_grade, etc.) are written via
+    update_setup_watchlist_stage3() after Claude synthesis.
+    Idempotent on (run_date, ticker).
+    """
+    if not rows:
+        return
+    rd = run_date or _today()
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SETUP_WATCHLIST_DDL)
+        _ensure_table_security(conn, "setup_watchlist")
+        for stmt in _SETUP_WATCHLIST_MIGRATE_DDL:
+            try:
+                cur.execute(stmt)
+            except Exception:
+                pass
+
+        db_rows = []
+        for r in rows:
+            ticker = str(r.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            db_rows.append((
+                rd,
+                ticker,
+                float(r.get("composite_score", 0.0)),
+                r.get("pfs_score"),
+                r.get("psc_score"),
+                r.get("erm_score"),
+                bool(r.get("stage2_passed", False)),
+                str(r.get("pipeline_version", "v1")),
+            ))
+
+        cur.executemany(
+            """
+            INSERT INTO setup_watchlist
+                (run_date, ticker, composite_score, pfs_score, psc_score,
+                 erm_score, stage2_passed, pipeline_version)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (run_date, ticker) DO UPDATE SET
+                composite_score  = EXCLUDED.composite_score,
+                pfs_score        = EXCLUDED.pfs_score,
+                psc_score        = EXCLUDED.psc_score,
+                erm_score        = EXCLUDED.erm_score,
+                stage2_passed    = EXCLUDED.stage2_passed,
+                pipeline_version = EXCLUDED.pipeline_version
+            """,
+            db_rows,
+        )
+        conn.commit()
+        conn.close()
+        logger.info("setup_watchlist: upserted %d rows for %s", len(db_rows), rd)
+    except Exception as exc:
+        logger.warning("save_setup_watchlist_rows failed (non-fatal): %s", exc)
+
+
+def update_setup_watchlist_stage3(
+    run_date: str,
+    ticker: str,
+    stage3_fields: dict,
+) -> None:
+    """
+    Write Stage 3 Claude synthesis fields to an existing setup_watchlist row.
+
+    stage3_fields may contain: archetype, invalidation_condition, setup_grade, key_risk.
+    This function does NOT overwrite composite_score or component scores.
+    """
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SETUP_WATCHLIST_DDL)
+        for stmt in _SETUP_WATCHLIST_MIGRATE_DDL:
+            try:
+                cur.execute(stmt)
+            except Exception:
+                pass
+        cur.execute(
+            """
+            UPDATE setup_watchlist
+            SET archetype              = %s,
+                invalidation_condition = %s,
+                setup_grade            = %s,
+                key_risk               = %s,
+                stage3_run_at          = NOW()
+            WHERE run_date = %s AND ticker = %s
+            """,
+            (
+                stage3_fields.get("archetype"),
+                stage3_fields.get("invalidation_condition"),
+                stage3_fields.get("setup_grade"),
+                stage3_fields.get("key_risk"),
+                str(run_date),
+                ticker.upper(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("update_setup_watchlist_stage3 failed: %s", exc)
+
+
+def fetch_setup_watchlist(
+    run_date: "str | None" = None,
+    stage2_only: bool = False,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Fetch setup-watchlist rows for a given run_date (defaults to today).
+    If stage2_only=True, returns only rows where stage2_passed=TRUE.
+    """
+    try:
+        rd = run_date or _today()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SETUP_WATCHLIST_DDL)
+        for stmt in _SETUP_WATCHLIST_MIGRATE_DDL:
+            try:
+                cur.execute(stmt)
+            except Exception:
+                pass
+        where = "WHERE run_date = %s"
+        params: list = [rd]
+        if stage2_only:
+            where += " AND stage2_passed = TRUE"
+        cur.execute(
+            f"SELECT * FROM setup_watchlist {where} ORDER BY composite_score DESC LIMIT %s",
+            params + [limit],
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("fetch_setup_watchlist failed: %s", exc)
+        return []
+
+
+# ==============================================================================
+# TRD-040: SETUP WATCHLIST OUTCOMES (pre-breakout learning loop)
+# ==============================================================================
+
+_SETUP_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS setup_watchlist_outcomes (
+    id                   BIGSERIAL PRIMARY KEY,
+    setup_date           DATE    NOT NULL,
+    ticker               TEXT    NOT NULL,
+    composite_score      REAL,
+    pfs_score            REAL,
+    psc_score            REAL,
+    erm_score            REAL,
+    archetype            TEXT,
+    ret_5d               REAL,
+    ret_10d              REAL,
+    ret_20d              REAL,
+    ret_40d              REAL,
+    ret_5d_excess        REAL,
+    ret_10d_excess       REAL,
+    ret_20d_excess       REAL,
+    ret_40d_excess       REAL,
+    mae_20d              REAL,
+    mae_40d              REAL,
+    mfe_20d              REAL,
+    mfe_40d              REAL,
+    success_20d          BOOLEAN,
+    success_40d          BOOLEAN,
+    failed_20d           BOOLEAN,
+    confirmed_later      BOOLEAN,
+    days_to_confirmation INTEGER,
+    market_regime        TEXT,
+    resolved_at          DATE,
+    mature_20d           BOOLEAN NOT NULL DEFAULT FALSE,
+    mature_40d           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at           TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (setup_date, ticker)
+);
+"""
+
+
+def save_setup_outcome(record: dict) -> None:
+    """
+    Upsert a resolved setup-watchlist outcome row.
+
+    record must contain: setup_date, ticker.
+    All return and label fields are optional (NULL until resolved).
+    Call only after the relevant forward window has closed (point-in-time safe).
+    """
+    if not record:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SETUP_OUTCOMES_DDL)
+        _ensure_table_security(conn, "setup_watchlist_outcomes")
+
+        def _f(key):
+            v = record.get(key)
+            return float(v) if v is not None else None
+
+        def _b(key):
+            v = record.get(key)
+            return bool(v) if v is not None else None
+
+        def _i(key):
+            v = record.get(key)
+            return int(v) if v is not None else None
+
+        cur.execute(
+            """
+            INSERT INTO setup_watchlist_outcomes
+                (setup_date, ticker, composite_score, pfs_score, psc_score,
+                 erm_score, archetype,
+                 ret_5d, ret_10d, ret_20d, ret_40d,
+                 ret_5d_excess, ret_10d_excess, ret_20d_excess, ret_40d_excess,
+                 mae_20d, mae_40d, mfe_20d, mfe_40d,
+                 success_20d, success_40d, failed_20d,
+                 confirmed_later, days_to_confirmation,
+                 market_regime, resolved_at, mature_20d, mature_40d)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (setup_date, ticker) DO UPDATE SET
+                composite_score      = EXCLUDED.composite_score,
+                pfs_score            = EXCLUDED.pfs_score,
+                psc_score            = EXCLUDED.psc_score,
+                erm_score            = EXCLUDED.erm_score,
+                archetype            = EXCLUDED.archetype,
+                ret_5d               = EXCLUDED.ret_5d,
+                ret_10d              = EXCLUDED.ret_10d,
+                ret_20d              = EXCLUDED.ret_20d,
+                ret_40d              = EXCLUDED.ret_40d,
+                ret_5d_excess        = EXCLUDED.ret_5d_excess,
+                ret_10d_excess       = EXCLUDED.ret_10d_excess,
+                ret_20d_excess       = EXCLUDED.ret_20d_excess,
+                ret_40d_excess       = EXCLUDED.ret_40d_excess,
+                mae_20d              = EXCLUDED.mae_20d,
+                mae_40d              = EXCLUDED.mae_40d,
+                mfe_20d              = EXCLUDED.mfe_20d,
+                mfe_40d              = EXCLUDED.mfe_40d,
+                success_20d          = EXCLUDED.success_20d,
+                success_40d          = EXCLUDED.success_40d,
+                failed_20d           = EXCLUDED.failed_20d,
+                confirmed_later      = EXCLUDED.confirmed_later,
+                days_to_confirmation = EXCLUDED.days_to_confirmation,
+                market_regime        = EXCLUDED.market_regime,
+                resolved_at          = EXCLUDED.resolved_at,
+                mature_20d           = EXCLUDED.mature_20d,
+                mature_40d           = EXCLUDED.mature_40d
+            """,
+            (
+                str(record["setup_date"]),
+                str(record["ticker"]).strip().upper(),
+                _f("composite_score"), _f("pfs_score"), _f("psc_score"),
+                _f("erm_score"), record.get("archetype"),
+                _f("ret_5d"), _f("ret_10d"), _f("ret_20d"), _f("ret_40d"),
+                _f("ret_5d_excess"), _f("ret_10d_excess"),
+                _f("ret_20d_excess"), _f("ret_40d_excess"),
+                _f("mae_20d"), _f("mae_40d"), _f("mfe_20d"), _f("mfe_40d"),
+                _b("success_20d"), _b("success_40d"), _b("failed_20d"),
+                _b("confirmed_later"), _i("days_to_confirmation"),
+                record.get("market_regime"),
+                str(record["resolved_at"]) if record.get("resolved_at") else None,
+                bool(record.get("mature_20d", False)),
+                bool(record.get("mature_40d", False)),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("save_setup_outcome failed (non-fatal): %s", exc)
+
+
+def fetch_unresolved_setup_watchlist_rows(
+    as_of_date: "date | None" = None,
+    min_days_old: int = 5,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Fetch setup_watchlist rows that are old enough to have partial forward data
+    but do not yet have a mature outcome row.
+
+    Used by the outcome resolver to find candidates for resolution.
+    """
+    try:
+        from datetime import date as _date
+        cutoff = (as_of_date or _date.today()).isoformat()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_SETUP_WATCHLIST_DDL)
+        cur.execute(_SETUP_OUTCOMES_DDL)
+        cur.execute(
+            """
+            SELECT w.*
+            FROM   setup_watchlist w
+            LEFT JOIN setup_watchlist_outcomes o
+                   ON o.setup_date = w.run_date AND o.ticker = w.ticker
+            WHERE  w.run_date <= %s::date - %s
+              AND  (o.id IS NULL OR o.mature_40d = FALSE)
+            ORDER  BY w.run_date ASC, w.composite_score DESC
+            LIMIT  %s
+            """,
+            (cutoff, min_days_old, limit),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("fetch_unresolved_setup_watchlist_rows failed: %s", exc)
+        return []
+
+
 def fetch_unresolved_snapshots(
     resolution_type: str = "1d",
     limit: int = 200,
