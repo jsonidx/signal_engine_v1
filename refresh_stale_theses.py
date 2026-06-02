@@ -25,7 +25,10 @@ import logging
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, Tuple
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 import yfinance as yf
 
@@ -333,7 +336,7 @@ def main():
         cmd = build_cmd(batch, args.llm)
         print(f"\n--- Batch {i // args.batch_size + 1}: {' '.join(batch)} ---")
         print(f"CMD: {' '.join(cmd)}")
-        result = subprocess.run(cmd, cwd="/Users/jason/signal_engine_v1")
+        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
         if result.returncode != 0:
             print(f"WARNING: batch exited with code {result.returncode}")
 
