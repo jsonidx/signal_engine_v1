@@ -1,6 +1,6 @@
-# Post-Fix Pipeline Smoke Check — Round 10
+# Post-Fix Pipeline Smoke Check — Round 11
 
-**Generated:** 2026-06-01 07:09 UTC  
+**Generated:** 2026-06-02 06:48 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
