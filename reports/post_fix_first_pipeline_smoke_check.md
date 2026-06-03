@@ -1,6 +1,6 @@
-# Post-Fix Pipeline Smoke Check — Round 11
+# Post-Fix Pipeline Smoke Check — Round 12
 
-**Generated:** 2026-06-02 06:48 UTC  
+**Generated:** 2026-06-03 07:48 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
@@ -21,35 +21,35 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 
 | Date | Row count |
 |---|---|
-| 2026-05-30 | 23 ← latest |
+| 2026-06-03 | 20 ← latest |
+| 2026-05-30 | 23 |
 | 2026-05-29 | 21 |
 | 2026-05-28 | 20 |
 | 2026-05-27 | 20 |
-| 2026-05-26 | 20 |
 
-**Unique tickers in latest run:** 23  
+**Unique tickers in latest run:** 20  
 **Post-fix run?** Yes ✅
 
 ### CHUNK field coverage — latest run
 
 | Field | Non-null | Coverage |
 |---|---|---|
-| `computed_dtc_30d` | 23/23 | 23/23 (100%) |
-| `compression_recovery_score` | 23/23 | 23/23 (100%) |
-| `volume_confirmation_flag` | 23/23 | 23/23 (100%) |
-| `si_persistence_score` | 23/23 | 23/23 (100%) |
-| `squeeze_state` | 23/23 | 23/23 (100%) |
-| `risk_score` | 23/23 | 23/23 (100%) |
-| `risk_level` | 23/23 | 23/23 (100%) |
-| `options_pressure_score` | 23/23 | 23/23 (100%) |
-| `explanation_summary` | 23/23 | 23/23 (100%) |
-| `explanation_json` | 23/23 | 23/23 (100%) |
-| `state_confidence` | 23/23 | 23/23 (100%) |
-| `state_reasons` | 23/23 | 23/23 (100%) |
-| `state_warnings` | 0/23 | 0/23 (0%) — old-format |
-| `dilution_risk_flag` | 23/23 | 23/23 (100%) |
-| `iv_rank` | 5/23 | 5/23 (22%) |
-| `effective_float_score` (via explanation_json) | 23/23 | 23/23 (100%) |
+| `computed_dtc_30d` | 20/20 | 20/20 (100%) |
+| `compression_recovery_score` | 20/20 | 20/20 (100%) |
+| `volume_confirmation_flag` | 20/20 | 20/20 (100%) |
+| `si_persistence_score` | 20/20 | 20/20 (100%) |
+| `squeeze_state` | 20/20 | 20/20 (100%) |
+| `risk_score` | 20/20 | 20/20 (100%) |
+| `risk_level` | 20/20 | 20/20 (100%) |
+| `options_pressure_score` | 20/20 | 20/20 (100%) |
+| `explanation_summary` | 20/20 | 20/20 (100%) |
+| `explanation_json` | 20/20 | 20/20 (100%) |
+| `state_confidence` | 20/20 | 20/20 (100%) |
+| `state_reasons` | 20/20 | 20/20 (100%) |
+| `state_warnings` | 0/20 | 0/20 (0%) — old-format |
+| `dilution_risk_flag` | 20/20 | 20/20 (100%) |
+| `iv_rank` | 3/20 | 3/20 (15%) |
+| `effective_float_score` (via explanation_json) | 20/20 | 20/20 (100%) |
 
 ---
 
@@ -66,12 +66,12 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 
 | Gate item | Required | Current | Status |
 |---|---:|---:|---|
-| Calendar days of post-fix squeeze_scores | ≥ 30 | **24** | ❌ |
-| New-format rows total | ≥ 500 | **484** | ❌ |
-| Rows with ARMED or ACTIVE state | ≥ 50 | **40** | ❌ |
-| 20-day forward return windows closed | ≥ 100 rows | **120** | ✅ |
-| Rows with non-null `risk_score` | ≥ 100 | **484** | ✅ |
-| Rows with non-null `options_pressure_score` | ≥ 20 | **484** | ✅ |
+| Calendar days of post-fix squeeze_scores | ≥ 30 | **25** | ❌ |
+| New-format rows total | ≥ 500 | **504** | ✅ |
+| Rows with ARMED or ACTIVE state | ≥ 50 | **43** | ❌ |
+| 20-day forward return windows closed | ≥ 100 rows | **140** | ✅ |
+| Rows with non-null `risk_score` | ≥ 100 | **504** | ✅ |
+| Rows with non-null `options_pressure_score` | ≥ 20 | **504** | ✅ |
 | `short_interest_history` distinct FINRA periods | ≥ 2 | **0** | ❌ |
 | `filing_catalysts` ownership_accumulation_flag tickers | ≥ 5 | **0** | ❌ |
 | `iv_history` tickers with ≥ 60 rows | ≥ 50 | **0** | ❌ |
