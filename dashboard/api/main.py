@@ -1775,7 +1775,7 @@ async def _refresh_deepdive_cache() -> None:
     try:
         result = await _build_deepdive_payload()
         _cache.set("deepdive_tickers", result, 300)
-        _cache.set("deepdive_tickers:stale", result, 3600)
+        _cache.set("deepdive_tickers:stale", result, 600)
     except Exception:
         log.exception("deepdive background refresh failed")
     finally:
@@ -1800,7 +1800,7 @@ async def deepdive_tickers():
     # First-ever load: build synchronously so both caches get seeded
     result = await _build_deepdive_payload()
     _cache.set("deepdive_tickers", result, 300)
-    _cache.set("deepdive_tickers:stale", result, 3600)
+    _cache.set("deepdive_tickers:stale", result, 600)
     return result
 
 
@@ -1921,8 +1921,10 @@ async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
                    o.hit_target_1, o.hit_target_2, o.hit_stop,
                    o.days_to_target_1, o.days_to_stop,
                    o.outcome, o.claude_correct, o.was_traded,
-                   o.last_checked
+                   o.last_checked,
+                   COALESCE(c.model_used, 'unknown') AS model
             FROM thesis_outcomes o
+            LEFT JOIN thesis_cache c ON c.id = o.thesis_id
             WHERE o.thesis_date >= %s
             ORDER BY o.thesis_date DESC
         """, (cutoff,)).fetchall()

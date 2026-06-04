@@ -347,7 +347,12 @@ python3 -c "from utils.prob_engine import compute_empirical_win_rate; compute_em
 
 # ── Post-run: invalidate dashboard cache ─────────────────
 echo "Invalidating dashboard cache (if running)..."
-curl -s -X POST http://localhost:8000/api/cache/invalidate || true
+INVALIDATE_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/api/cache/invalidate 2>/dev/null || echo "000")
+if [ "$INVALIDATE_HTTP" = "200" ]; then
+    echo "  Cache invalidated (HTTP 200)."
+else
+    echo "  WARNING: cache invalidation failed (HTTP $INVALIDATE_HTTP). Dashboard may show stale data until cache expires."
+fi
 
 # ── Timing summary ────────────────────────────────────────
 PIPELINE_END=$(date +%s)
