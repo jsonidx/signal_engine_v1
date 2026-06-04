@@ -1,20 +1,20 @@
 # Task: IBKR Options Integration Roadmap
 
 Status: proposed
-Stage: ready
-Type: product
+Stage: discovery
+Type: research
 Priority: P1
 Severity: medium
-Owner: Codex
+Owner: Human
 Reviewer: Human
 Product Area: dashboard
-Category: options
-Risk: market-data
+Category: research
+Risk: api
 Effort: L
 Target Release: backlog
 Due Date: TBD
-Dependencies: IBKR Pro account, market data subscriptions, option-trading permissions
-Blocked By: none
+Dependencies: TRD-042
+Blocked By: TRD-042
 Links: `dashboard/frontend/src/pages/TickerPage.tsx`, `dashboard/api/main.py`, `options_flow.py`, IBKR API docs
 Success Metric: the ticker deep dive can surface 1-3 structured option candidates per actionable ticker with contract-level fields and clear risk constraints.
 
@@ -33,6 +33,8 @@ Building a full cross-universe options screener first would create a large searc
 ## Objective
 
 Add an IBKR-backed option-candidate engine that converts an existing stock thesis into a small set of tradable option ideas, then surface those ideas directly on the ticker deep-dive page.
+
+This roadmap remains planning-only until `TRD-042` is complete and the required IBKR subscriptions are live.
 
 ## Recommendation
 
@@ -67,6 +69,14 @@ Reason:
 - `dashboard/api/main.py` exposes those summary metrics in `/api/signals/ticker/{ticker}`.
 - `dashboard/frontend/src/lib/api.ts` defines `TickerDetail` with no contract-level option chain fields.
 - `dashboard/frontend/src/pages/TickerPage.tsx` uses those summary metrics in the `Options Flow` card and in the existing LLM copy prompt.
+
+## Delivery Gate
+
+The team chose to wait for real IBKR subscriptions before implementation. That means:
+
+- discovery and sequencing can continue now
+- adapter and product implementation should not start yet
+- any task in this chain must stay blocked on `TRD-042`
 
 ## Why IBKR
 

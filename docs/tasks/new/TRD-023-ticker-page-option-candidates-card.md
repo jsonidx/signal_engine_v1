@@ -1,20 +1,20 @@
 # Task: Ticker Page Option Candidates Card
 
 Status: proposed
-Stage: ready
+Stage: discovery
 Type: feature
 Priority: P1
 Severity: medium
 Owner: Claude Code
 Reviewer: Human
 Product Area: dashboard
-Category: options
+Category: ux
 Risk: ui
 Effort: M
 Target Release: backlog
 Due Date: TBD
-Dependencies: TRD-022
-Blocked By: none
+Dependencies: TRD-022, TRD-042
+Blocked By: TRD-022, TRD-042
 Links: `docs/tasks/new/TRD-020-ibkr-options-roadmap.md`, `dashboard/frontend/src/pages/TickerPage.tsx`, `dashboard/frontend/src/lib/api.ts`
 Success Metric: the ticker deep-dive page shows a clear `Option Candidates` section with recommended contracts or a defensible no-trade state.
 
@@ -29,6 +29,8 @@ The user should be able to open one ticker page and immediately see whether ther
 ## Objective
 
 Add an `Option Candidates` card to the ticker deep-dive page that renders the top backend candidates and explains why the product recommends them or why it recommends no option trade.
+
+This work remains blocked until the subscription gate and backend chain are complete.
 
 ## Proposed Solution
 
@@ -118,6 +120,9 @@ Implement TRD-023, "Ticker Page Option Candidates Card," in this repo.
 
 Goal:
 - Render the backend option candidates directly on the ticker deep-dive page in a compact, execution-oriented card.
+
+Start condition:
+- Do not begin implementation until both `TRD-042` and `TRD-022` are complete.
 
 Scope:
 - `dashboard/frontend/src/lib/api.ts`

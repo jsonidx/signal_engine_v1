@@ -431,6 +431,19 @@ class TestNormalizeIBKRTicker:
         c = self._call(td)
         assert c.volume is None
 
+    def test_missing_opt_fields_do_not_crash(self):
+        td = self._make_td()
+        del td.optVolume
+        del td.optOpenInterest
+        del td.modelGreeks
+        del td.bidGreeks
+        del td.askGreeks
+
+        c = self._call(td)
+        assert c.volume is None
+        assert c.open_interest is None
+        assert c.delta is None
+
     def test_zero_open_interest_is_valid(self):
         """OI = 0 is a valid value (no open contracts), must not be treated as None."""
         td = self._make_td(opt_open_interest=0)

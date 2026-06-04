@@ -278,7 +278,9 @@ class IBKROptionsAdapter:
                 by_dist = sorted(all_strikes, key=lambda s: abs(s - underlying_price))
                 selected_strikes = sorted(by_dist[: strikes_around_atm * 2])
             else:
-                selected_strikes = all_strikes[:20]
+                window = min(len(all_strikes), max(20, strikes_around_atm * 2))
+                start = max(0, (len(all_strikes) - window) // 2)
+                selected_strikes = all_strikes[start : start + window]
 
             # ── Build contract list ───────────────────────────────────────────
             raw_specs: List[tuple] = []
@@ -298,22 +300,27 @@ class IBKROptionsAdapter:
 
             for i in range(0, len(raw_specs), batch_size):
                 batch = raw_specs[i : i + batch_size]
-                opts = [b[0] for b in batch]
+                qualified_batch: List[tuple] = []
+                for opt, exp_iso, dte, strike, right in batch:
+                    try:
+                        resolved = self._ib.qualifyContracts(opt)
+                    except Exception:
+                        resolved = []
+                    if resolved:
+                        qualified_batch.append((resolved[0], exp_iso, dte, strike, right))
 
-                try:
-                    self._ib.qualifyContracts(*opts)
-                except Exception:
-                    pass
+                if not qualified_batch:
+                    continue
 
                 tickers_data = []
-                for opt in opts:
+                for opt, _, _, _, _ in qualified_batch:
                     # tick 100 = option volume, 101 = option open interest, 106 = IV + greeks
                     td = self._ib.reqMktData(opt, "100,101,106", False, False)
                     tickers_data.append(td)
 
                 self._ib.sleep(2.5)
 
-                for td, (_, exp_iso, dte, strike, right) in zip(tickers_data, batch):
+                for td, (_, exp_iso, dte, strike, right) in zip(tickers_data, qualified_batch):
                     contract = self._normalize_ticker(
                         td, sym, exp_iso, dte, strike, right, underlying_price
                     )
@@ -390,8 +397,8 @@ class IBKROptionsAdapter:
         # tick 100 → optVolume  (option daily trading volume)
         # tick 101 → optOpenInterest  (option open interest — separate tick from volume)
         # td.volume is the underlying's intraday volume; not useful here.
-        vol_raw = td.optVolume        # option daily volume (tick 100)
-        oi_raw  = td.optOpenInterest  # option open interest (tick 101)
+        vol_raw = getattr(td, "optVolume", None)        # option daily volume (tick 100)
+        oi_raw  = getattr(td, "optOpenInterest", None)  # option open interest (tick 101)
         vol: Optional[int] = None
         oi: Optional[int] = None
         try:
@@ -406,7 +413,11 @@ class IBKROptionsAdapter:
             pass
 
         # Greeks come from model / bid / ask greeks (tick 106 / 107)
-        greeks = td.modelGreeks or td.bidGreeks or td.askGreeks
+        greeks = (
+            getattr(td, "modelGreeks", None)
+            or getattr(td, "bidGreeks", None)
+            or getattr(td, "askGreeks", None)
+        )
         delta = safe(greeks.delta) if greeks else None
         gamma = safe(greeks.gamma) if greeks else None
         theta = safe(greeks.theta) if greeks else None

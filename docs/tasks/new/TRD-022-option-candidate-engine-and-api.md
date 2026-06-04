@@ -1,20 +1,20 @@
 # Task: Option Candidate Engine and API
 
 Status: proposed
-Stage: ready
+Stage: discovery
 Type: feature
 Priority: P1
 Severity: high
 Owner: Claude Code
 Reviewer: Human
 Product Area: api
-Category: options
+Category: automation
 Risk: trading-logic
 Effort: L
 Target Release: backlog
 Due Date: TBD
-Dependencies: TRD-021
-Blocked By: none
+Dependencies: TRD-021, TRD-042
+Blocked By: TRD-021, TRD-042
 Links: `docs/tasks/new/TRD-020-ibkr-options-roadmap.md`, `docs/tasks/new/TRD-021-ibkr-option-chain-adapter.md`, `dashboard/api/main.py`, `ai_quant.py`
 Success Metric: the API can return 1-3 deterministic option candidates for a ticker based on the existing stock thesis and contract-level chain data.
 
@@ -29,6 +29,8 @@ Users do not need the full chain first. They need a small set of valid candidate
 ## Objective
 
 Build a deterministic option-candidate engine plus API endpoint that scores contracts for a ticker and returns a compact shortlist with explicit pass/fail reasons.
+
+This ticket stays blocked until the subscription gate in `TRD-042` is complete and the adapter in `TRD-021` is available.
 
 ## Proposed Solution
 
@@ -131,6 +133,9 @@ Implement TRD-022, "Option Candidate Engine and API," in this repo.
 
 Goal:
 - Build deterministic contract filtering/scoring on top of the IBKR chain adapter and expose the result via `/api/ticker/{symbol}/option-candidates`.
+
+Start condition:
+- Do not begin implementation until both `TRD-042` and `TRD-021` are complete.
 
 Scope:
 - new scoring module, likely `utils/option_candidates.py`

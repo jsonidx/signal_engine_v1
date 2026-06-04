@@ -1,20 +1,20 @@
 # Task: IBKR Option-Chain Adapter
 
 Status: proposed
-Stage: ready
+Stage: discovery
 Type: feature
 Priority: P1
 Severity: high
 Owner: Claude Code
 Reviewer: Human
 Product Area: data-pipeline
-Category: options
-Risk: market-data
+Category: automation
+Risk: api
 Effort: L
 Target Release: backlog
 Due Date: TBD
-Dependencies: IBKR Pro account, market data subscriptions, IB Gateway or TWS API access
-Blocked By: none
+Dependencies: TRD-042
+Blocked By: TRD-042
 Links: `docs/tasks/new/TRD-020-ibkr-options-roadmap.md`, `dashboard/api/main.py`, `options_flow.py`
 Success Metric: the backend can fetch and normalize a ticker-scoped IBKR options chain with quotes and Greeks for at least one US equity ticker.
 
@@ -30,11 +30,15 @@ Users can identify a good stock setup but still need to leave the product and ma
 
 Build a dedicated IBKR adapter that can retrieve and normalize option-chain metadata, quotes, and Greeks for a single underlying ticker.
 
+This ticket must not start until `TRD-042` confirms the live subscription and access prerequisites.
+
 ## Proposed Solution
 
 Add a new backend adapter module, likely `utils/ibkr_options.py`, that connects to `IB Gateway` or `TWS API`, resolves the underlying contract, fetches expiries and strikes, builds option contracts, and retrieves market data fields needed for contract screening.
 
 Prefer `TWS API` or `IB Gateway` as the primary runtime path. Do not make `Client Portal API` the primary data path for continuous screening because of brokerage-session fragility, though it may be useful for reference or fallback.
+
+Do not substitute a mock-only integration for the real entitlement check. The point of this ticket is to normalize actual broker behavior once subscriptions are live.
 
 ## Scope
 
@@ -120,6 +124,9 @@ Implement TRD-021, "IBKR Option-Chain Adapter," in this repo.
 
 Goal:
 - Add a backend adapter that fetches and normalizes a ticker-scoped IBKR option chain with contract metadata, quotes, and Greeks.
+
+Start condition:
+- Do not begin implementation until `TRD-042` is complete and the project has verified IBKR subscriptions plus a working API session.
 
 Scope:
 - new module, likely `utils/ibkr_options.py`

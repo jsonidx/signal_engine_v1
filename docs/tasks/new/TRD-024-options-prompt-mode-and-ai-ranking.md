@@ -1,20 +1,20 @@
 # Task: Options Prompt Mode and AI Candidate Ranking
 
 Status: proposed
-Stage: ready
+Stage: discovery
 Type: feature
 Priority: P2
 Severity: medium
 Owner: Claude Code
 Reviewer: Human
-Product Area: ai
-Category: options
-Risk: prompt-quality
+Product Area: dashboard
+Category: automation
+Risk: frontend
 Effort: M
 Target Release: backlog
 Due Date: TBD
-Dependencies: TRD-022, TRD-023
-Blocked By: none
+Dependencies: TRD-022, TRD-023, TRD-042
+Blocked By: TRD-022, TRD-023, TRD-042
 Links: `docs/tasks/new/TRD-020-ibkr-options-roadmap.md`, `dashboard/frontend/src/pages/TickerPage.tsx`, `ai_quant.py`
 Success Metric: the app can generate an options-specific prompt or AI explanation that ranks pre-filtered candidates without inventing contracts.
 
@@ -29,6 +29,8 @@ Users want help understanding which recommended contract is best and why, but th
 ## Objective
 
 Add an options-specific prompt mode and optional AI ranking layer that consumes only the pre-filtered candidate set and explains the strike/expiry tradeoffs.
+
+This ticket should remain blocked until the subscription gate and the deterministic candidate flow are already in place.
 
 ## Proposed Solution
 
@@ -114,6 +116,9 @@ Implement TRD-024, "Options Prompt Mode and AI Candidate Ranking," in this repo.
 
 Goal:
 - Extend the existing ticker-page copy-prompt flow so it can generate an options-specific prompt that ranks only the pre-filtered option candidates.
+
+Start condition:
+- Do not begin implementation until `TRD-042`, `TRD-022`, and `TRD-023` are complete.
 
 Scope:
 - `dashboard/frontend/src/pages/TickerPage.tsx`

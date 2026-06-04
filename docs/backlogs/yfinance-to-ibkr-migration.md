@@ -215,14 +215,16 @@ Preferred end state:
 - Full replacement of `yfinance` everywhere would add complexity without improving the weakest areas first.
 - Fundamentals and analyst-history regressions are likely if those paths are migrated too early.
 
-## Trigger to Split Into Tickets
+## Current Delivery Gate
 
-Split this backlog into task tickets when one of these becomes true:
+The IBKR/options ticket chain is explicitly gated by
+`TRD-042-ibkr-subscription-readiness-and-access.md`.
 
-- you subscribe to the IBKR bundles and want live testing
-- the option candidate engine is ready for implementation
-- the ticker page is ready to consume broker-grade option candidates
-- `yfinance` options quality becomes an active blocker in production use
+Until that ticket is complete:
+
+- `TRD-021` through `TRD-024` remain blocked
+- sequencing and PM planning can continue
+- implementation should not start
 
 ## Suggested Future Ticket Sequence
 
