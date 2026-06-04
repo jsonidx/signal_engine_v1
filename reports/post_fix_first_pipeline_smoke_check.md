@@ -1,6 +1,6 @@
-# Post-Fix Pipeline Smoke Check — Round 12
+# Post-Fix Pipeline Smoke Check — Round 13
 
-**Generated:** 2026-06-03 07:48 UTC  
+**Generated:** 2026-06-04 06:40 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
@@ -69,7 +69,7 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 | Calendar days of post-fix squeeze_scores | ≥ 30 | **25** | ❌ |
 | New-format rows total | ≥ 500 | **504** | ✅ |
 | Rows with ARMED or ACTIVE state | ≥ 50 | **43** | ❌ |
-| 20-day forward return windows closed | ≥ 100 rows | **140** | ✅ |
+| 20-day forward return windows closed | ≥ 100 rows | **160** | ✅ |
 | Rows with non-null `risk_score` | ≥ 100 | **504** | ✅ |
 | Rows with non-null `options_pressure_score` | ≥ 20 | **504** | ✅ |
 | `short_interest_history` distinct FINRA periods | ≥ 2 | **0** | ❌ |
