@@ -1,0 +1,75 @@
+name: Pre-Breakout Stage 3 (Manual, Anthropic API cost)
+
+# Manual-only workflow for optional Stage 3 Claude synthesis.
+# Costs Anthropic API tokens — do not run automatically.
+# Scores up to 10 Stage-2-cleared names per day via Claude.
+#
+# What this workflow does:
+#   Runs pre_breakout_pipeline.py --stage3, which:
+#     1. Scores the universe deterministically (PFS + PSC)
+#     2. Sends the Stage-2 shortlist (≤10 names) to Claude for structured enrichment
+#     3. Persists archetype / setup_grade / key_risk / invalidation_condition
+#
+# Separation guarantee: does not touch run_master.sh, daily_rankings, or thesis_cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Run pre-breakout Stage 3 with Claude synthesis — uses Anthropic API (small cost per run, ≤10 names)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+
+# Opt into Node.js 24 now to avoid the June 2026 forced migration.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pre-breakout-stage3:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record start time
+        run: echo "PIPELINE_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pre-breakout pipeline with Stage 3 Claude synthesis
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python3 pre_breakout_pipeline.py --stage3 2>&1 | tee logs/pre_breakout_stage3.txt
+        env:
+          DATABASE_URL:      ${{ secrets.DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          python3 scripts/notify_pipeline_result.py \
+            --status "${{ job.status }}" \
+            --workflow "Pre-Breakout Stage 3 (AI)" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "$(echo "scale=1; ($(date +%s) - ${PIPELINE_START:-$(date +%s)}) / 60" | bc)"
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-breakout-stage3-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14

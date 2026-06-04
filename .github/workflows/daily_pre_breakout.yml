@@ -1,0 +1,80 @@
+name: Pre-Breakout Pipeline (Deterministic, no AI cost)
+
+# Runs automatically after the daily confirmation pipeline succeeds.
+# Deterministic only — no LLM calls, no Anthropic cost.
+# For Stage 3 Claude synthesis, use manual_pre_breakout_stage3.yml.
+#
+# What this workflow does:
+#   1. Scores the universe with PFS + PSC signals → persists to setup_watchlist
+#   2. Collects daily options-state and short-interest snapshots
+#
+# Separation guarantee: does not touch run_master.sh, daily_rankings, or thesis_cache.
+
+on:
+  workflow_run:
+    workflows:
+      - "Daily Signal Pipeline (no AI cost)"
+    types:
+      - completed
+
+# Opt into Node.js 24 now to avoid the June 2026 forced migration.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pre-breakout-deterministic:
+    runs-on: ubuntu-latest
+    # Only proceed when the upstream pipeline succeeded — prevents scoring stale data.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record start time
+        run: echo "PIPELINE_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pre-breakout pipeline (Stage 1 + 2, deterministic)
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python3 pre_breakout_pipeline.py 2>&1 | tee logs/pre_breakout_pipeline.txt
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Collect options / short-interest state
+        # Runs after scoring so the same day's universe is used for both.
+        # Loads tickers from daily_rankings (last 7 days, max 100).
+        run: |
+          set -o pipefail
+          python3 scripts/collect_options_si_state.py 2>&1 | tee -a logs/pre_breakout_pipeline.txt
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Notify Telegram
+        if: always()
+        run: |
+          python3 scripts/notify_pipeline_result.py \
+            --status "${{ job.status }}" \
+            --workflow "Pre-Breakout Pipeline (Deterministic)" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "$(echo "scale=1; ($(date +%s) - ${PIPELINE_START:-$(date +%s)}) / 60" | bc)" \
+            --skip-ai
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-breakout-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
