@@ -461,18 +461,6 @@ class TestComputePriorityScore(unittest.TestCase):
         # 40 + 25 + 20 + (30-1)*0.5 + 2.0*5 = 40+25+20+14.5+10 = 109.5
         self.assertAlmostEqual(score, 109.5, places=1)
 
-    def test_post_squeeze_guard_penalty(self):
-        resolved = _make_resolved(
-            "X",
-            agreement=1.0,
-            confidence=1.0,
-            bull_weight=1.0,
-            override_flags=["override: post_squeeze_guard"],
-        )
-        base  = compute_priority_score("X", resolved)
-        clean = compute_priority_score("X", _make_resolved("X", agreement=1.0, confidence=1.0, bull_weight=1.0))
-        self.assertAlmostEqual(base, clean * 0.3, places=1)
-
     def test_pre_earnings_hold_penalty(self):
         resolved = _make_resolved(
             "X",

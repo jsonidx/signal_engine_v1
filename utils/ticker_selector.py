@@ -74,7 +74,6 @@ def compute_priority_score(
       base += max(bull_weight, bear_weight)*20 # max 20 pts — directional weight
       + equity rank bonus (max 15 pts if rank <= 30)
       + composite_z bonus  (max 10 pts)
-      - post_squeeze_guard penalty  (×0.3)
       - pre_earnings_hold  penalty  (×0.5)
 
     Returns -1.0 if skip_claude is True.
@@ -106,8 +105,6 @@ def compute_priority_score(
 
     # Penalties
     flags_str = " ".join(str(f) for f in override_flags).lower()
-    if "post_squeeze_guard" in flags_str:
-        base *= 0.3     # heavily penalize — already fired, low info value
     if "pre_earnings_hold" in flags_str:
         base *= 0.5     # penalize — binary event, Claude can't help much
 

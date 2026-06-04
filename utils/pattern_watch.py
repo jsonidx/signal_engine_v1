@@ -40,10 +40,6 @@ def _snow_score(cs: dict, snap: Optional[dict]) -> tuple[int, list[str]]:
     score = 0
     flags: list[str] = []
 
-    # SNOW is NOT a squeeze setup
-    if cs.get("post_squeeze_guard"):
-        return 0, []
-
     earnings_score  = float(cs.get("earnings_score")  or 0)
     options_score   = float(cs.get("options_score")   or 0)
     technical_score = float(cs.get("technical_score") or 0)

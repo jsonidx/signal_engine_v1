@@ -211,26 +211,7 @@ class TestWeightedVote:
 # ==============================================================================
 
 class TestHardOverrides:
-    # ── Override 1: Post-squeeze guard ──────────────────────────────────────
-
-    def test_post_squeeze_guard_sets_neutral_and_skips(self):
-        sigs = _bull_signals()
-        sigs["squeeze"]["recent_squeeze"] = True
-        vote = cr.compute_weighted_vote(sigs)
-        result = cr.apply_hard_overrides(vote, sigs, "RISK_ON", ticker="TEST")
-        assert result["net_direction"] == "NEUTRAL"
-        assert result["skip_claude"] is False  # guard flags but does not block thesis
-        assert any("post_squeeze_guard" in f for f in result["override_flags"])
-
-    def test_no_override_when_recent_squeeze_false(self):
-        sigs = _bull_signals()
-        sigs["squeeze"]["recent_squeeze"] = False
-        vote = cr.compute_weighted_vote(sigs)
-        result = cr.apply_hard_overrides(vote, sigs, "RISK_ON", ticker="TEST")
-        assert result["skip_claude"] is False
-        assert not any("post_squeeze_guard" in f for f in result["override_flags"])
-
-    # ── Override 2: Bear market circuit breaker ──────────────────────────────
+    # ── Override 1: Bear market circuit breaker ──────────────────────────────
 
     def test_bear_market_circuit_breaker_caps_conviction_and_position(self):
         sigs = _bull_signals()
@@ -289,23 +270,7 @@ class TestHardOverrides:
         assert result["skip_claude"] is False
         assert not any("pre_earnings_hold" in f for f in result["override_flags"])
 
-    def test_pre_earnings_hold_skipped_when_post_squeeze_already_fired(self):
-        """Override 1 no longer sets skip_claude, so Override 3 will run its earnings check."""
-        sigs = _bull_signals()
-        sigs["squeeze"]["recent_squeeze"] = True
-        vote = cr.compute_weighted_vote(sigs)
-        call_tracker = []
-        def mock_earnings(ticker):
-            call_tracker.append(ticker)
-            return 30  # far from earnings — Override 3 will not fire
-        with patch.object(cr, "_get_days_to_earnings", side_effect=mock_earnings):
-            result = cr.apply_hard_overrides(vote, sigs, "RISK_ON", ticker="TEST")
-        # Override 1 flags but doesn't skip, so Override 3 runs its earnings check
-        assert len(call_tracker) == 1
-        assert result["skip_claude"] is False
-        assert result["net_direction"] == "NEUTRAL"  # Override 1 still sets NEUTRAL
-
-    # ── Override 4: Squeeze-driven context flag ──────────────────────────────
+    # ── Override 3: Squeeze-driven context flag ──────────────────────────────
 
     def test_squeeze_driven_flag_is_context_only(self):
         """Override 4 adds a flag but must NOT change the direction."""
@@ -345,15 +310,6 @@ class TestHardOverrides:
 # ==============================================================================
 
 class TestResolveEndToEnd:
-    def test_skip_claude_false_for_post_squeeze(self):
-        sigs = _bull_signals()
-        sigs["squeeze"]["recent_squeeze"] = True
-        with patch.object(cr, "_log_resolution"):  # suppress log writes in tests
-            with patch.object(cr, "_get_days_to_earnings", return_value=30):
-                result = cr.resolve(sigs, "RISK_ON")
-        assert result["skip_claude"] is False  # guard flags but thesis is still generated
-        assert result["pre_resolved_direction"] == "NEUTRAL"
-
     def test_skip_claude_true_for_pre_earnings(self):
         sigs = _bull_signals()
         with patch.object(cr, "_get_days_to_earnings", return_value=2):

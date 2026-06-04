@@ -358,13 +358,9 @@ def apply_hard_overrides(
     ticker: str = "",
 ) -> dict:
     """
-    Apply 5 hard override rules after the weighted vote.
+    Apply hard override rules after the weighted vote.
 
-    Override 1 — Post-squeeze guard (cross-module):
-      squeeze.recent_squeeze == True → direction NEUTRAL, skip_claude=True
-      Rationale: squeeze already played out; remaining setup is noise/reversal.
-
-    Override 2 — Bear market circuit breaker:
+    Override 1 — Bear market circuit breaker:
       regime == 'RISK_OFF' → cap max_conviction at 2, cap position_size at 3%.
       Does NOT set skip_claude — Claude still provides a valid (cautious) thesis.
 
@@ -382,12 +378,6 @@ def apply_hard_overrides(
 
     squeeze = signals_dict.get("squeeze") or {}
     tech    = signals_dict.get("technical") or {}
-
-    # ── Override 1: Post-squeeze guard ──────────────────────────────────────
-    if squeeze.get("recent_squeeze") is True:
-        result["net_direction"] = "NEUTRAL"
-        result["override_flags"].append("override: post_squeeze_guard")
-        logger.debug("[%s] Override 1: post_squeeze_guard fired", ticker)
 
     # ── Override 2: Bear market circuit breaker ──────────────────────────────
     if str(regime).upper() == "RISK_OFF":
