@@ -386,7 +386,6 @@ def apply_hard_overrides(
     # ── Override 1: Post-squeeze guard ──────────────────────────────────────
     if squeeze.get("recent_squeeze") is True:
         result["net_direction"] = "NEUTRAL"
-        result["skip_claude"]   = True
         result["override_flags"].append("override: post_squeeze_guard")
         logger.debug("[%s] Override 1: post_squeeze_guard fired", ticker)
 
