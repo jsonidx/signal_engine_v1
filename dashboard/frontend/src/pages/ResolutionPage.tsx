@@ -271,13 +271,35 @@ function MonthlyTable({ months }: { months: ThesisAccuracyMonth[] }) {
 // ─── By-Model benchmark ───────────────────────────────────────────────────────
 
 function modelLabel(model: string): string {
-  if (model === 'unknown') return 'Unknown (legacy)'
-  return model.replace('claude-', 'Claude ').replace('grok-', 'Grok ')
+  const map: Record<string, string> = {
+    // Current first-party IDs
+    'claude-opus-4-8':            'Opus 4.8',
+    'claude-sonnet-4-6':          'Sonnet 4.6',
+    'grok-4.3':                   'Grok 4.3',
+    'gpt-5.1':                    'GPT-5.1',
+    'gpt-5.5':                    'GPT-5.5',
+    'gpt-5.5-pro':                'GPT-5.5 Pro',
+    // Historic IDs still present in stored outcomes
+    'claude-opus-4-7':            'Opus 4.7',
+    'claude-opus-4-6':            'Opus 4.6',
+    'claude-haiku-4-5':           'Haiku 4.5',
+    'grok-4.20-0309-reasoning':   'Grok 4.2',
+    'grok-4-1-fast-reasoning':    'Grok 4.1 Fast',
+    'grok-3':                     'Grok 3',
+    'gpt-4o':                     'GPT-4o',
+    'gpt-4.1':                    'GPT-4.1',
+    'o3':                         'o3',
+    'unknown':                    'Legacy',
+  }
+  if (map[model]) return map[model]
+  // fallback for future IDs: strip provider prefix
+  return model.replace(/^claude-/, '').replace(/^grok-/, 'Grok ').replace(/^gpt-/, 'GPT-')
 }
 
 function modelColor(model: string): string {
   if (model.includes('claude')) return 'text-accent-purple border-accent-purple/30 bg-accent-purple/10'
   if (model.includes('grok'))   return 'text-accent-blue   border-accent-blue/30   bg-accent-blue/10'
+  if (model.includes('gpt') || model.startsWith('o3')) return 'text-accent-green border-accent-green/30 bg-accent-green/10'
   return 'text-text-tertiary border-border-subtle bg-bg-elevated'
 }
 

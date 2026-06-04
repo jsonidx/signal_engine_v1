@@ -74,7 +74,7 @@ function WatchSetupPanel() {
             <div key={alert.ticker} className="px-4 py-3 flex items-start justify-between gap-4 hover:bg-bg-elevated/30 transition-colors">
               <div className="flex items-center gap-3 min-w-0">
                 <button
-                  onClick={() => navigate(`/deepdive?ticker=${alert.ticker}`)}
+                  onClick={() => navigate(`/ticker/${alert.ticker}`)}
                   className="font-mono text-sm font-semibold text-accent-blue hover:underline shrink-0"
                 >
                   {alert.ticker}
@@ -188,7 +188,7 @@ function PatternWatchPanel() {
                   {/* Left: ticker + pattern badge + flags */}
                   <div className="flex items-center gap-3 min-w-0 flex-wrap">
                     <button
-                      onClick={() => navigate(`/deepdive?ticker=${item.ticker}`)}
+                      onClick={() => navigate(`/ticker/${item.ticker}`)}
                       className="font-mono text-sm font-semibold text-accent-blue hover:underline shrink-0"
                     >
                       {item.ticker}
