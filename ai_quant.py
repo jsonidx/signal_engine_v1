@@ -353,7 +353,7 @@ def save_thesis(thesis: dict) -> None:
                  expected_moves_json, model_used, cost_usd,
                  prob_combined, prob_technical, prob_options, prob_catalyst, prob_news)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT(ticker, date) DO UPDATE SET
+            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
                 direction=excluded.direction,
                 conviction=excluded.conviction,
                 time_horizon=excluded.time_horizon,

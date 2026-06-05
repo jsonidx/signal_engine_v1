@@ -184,6 +184,48 @@ export interface TickerDetail extends TickerSignal {
   adv_20d?: number | null
   // Catalyst screener events
   catalyst_events?: CatalystEvents | null
+  // Latest thesis per model
+  latest_theses_by_model?: ThesisByModel[]
+  // Median across all theses from last 14 days (≥2 models)
+  consensus_14d?: Consensus14d | null
+}
+
+export interface Consensus14d {
+  model_count: number
+  entry_low?: number | null
+  entry_high?: number | null
+  target_1?: number | null
+  target_2?: number | null
+  stop_loss?: number | null
+  bull_probability?: number | null
+  bear_probability?: number | null
+  neutral_probability?: number | null
+  prob_combined?: number | null
+}
+
+export interface ThesisByModel {
+  model_used: string
+  date?: string
+  created_at?: string
+  direction?: string
+  conviction?: number
+  time_horizon?: string
+  entry_low?: number | null
+  entry_high?: number | null
+  stop_loss?: number | null
+  target_1?: number | null
+  target_2?: number | null
+  position_size_pct?: number | null
+  bull_probability?: number | null
+  bear_probability?: number | null
+  neutral_probability?: number | null
+  prob_combined?: number | null
+  primary_scenario?: string | null
+  bear_scenario?: string | null
+  key_invalidation?: string | null
+  thesis?: string | null
+  data_quality?: string | null
+  cost_usd?: number | null
 }
 
 export interface CatalystEvents {

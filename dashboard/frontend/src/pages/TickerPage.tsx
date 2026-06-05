@@ -187,9 +187,9 @@ function TradeSetupStrip({ signal }: { signal: TickerDetail }) {
         target2={target_2}
         stopLoss={stop_loss}
         currentPrice={current_price}
-        bullPct={bull_probability}
-        bearPct={bear_probability}
-        neutralPct={neutral_probability}
+        bullPct={bull_probability != null ? bull_probability * 100 : undefined}
+        bearPct={bear_probability != null ? bear_probability * 100 : undefined}
+        neutralPct={neutral_probability != null ? neutral_probability * 100 : undefined}
       />
     </div>
   )
@@ -784,6 +784,7 @@ function buildPrompt(
   actionZones: ActionZones | null | undefined,
   earningsData: EarningsData | null | undefined,
   dpLatest: any,
+  consensusNote?: string,
 ): string {
   const n = (v: number | null | undefined, decimals = 2) =>
     v != null ? v.toFixed(decimals) : '—'
@@ -818,6 +819,7 @@ function buildPrompt(
 
   // ── AI Thesis ──
   lines.push(`## AI THESIS`)
+  if (consensusNote) lines.push(`[${consensusNote}]`)
   lines.push(`Direction:         ${signal.direction ?? '—'}`)
   lines.push(`Conviction:        ${signal.conviction ?? '—'}/5`)
   lines.push(`Signal Agreement:  ${signal.signal_agreement_score != null ? `${(signal.signal_agreement_score * 100).toFixed(0)}%` : '—'}`)
@@ -833,8 +835,8 @@ function buildPrompt(
   lines.push(``)
   lines.push(`Time Horizon:      ${signal.time_horizon ?? '—'}`)
   lines.push(`Data Quality:      ${signal.data_quality ?? '—'}`)
-  lines.push(`Bull Probability:  ${signal.bull_probability != null ? `${signal.bull_probability}%` : '—'}`)
-  lines.push(`Bear Probability:  ${signal.bear_probability != null ? `${signal.bear_probability}%` : '—'}`)
+  lines.push(`Bull Probability:  ${signal.bull_probability != null ? `${(signal.bull_probability * 100).toFixed(1)}%` : '—'}`)
+  lines.push(`Bear Probability:  ${signal.bear_probability != null ? `${(signal.bear_probability * 100).toFixed(1)}%` : '—'}`)
   lines.push(``)
   if (signal.thesis) {
     lines.push(`Thesis:`)
@@ -1095,7 +1097,7 @@ function buildOptionsPrompt(
 type PromptMode = 'equity' | 'options'
 
 function CopyPromptButton({
-  signal, actionZones, earningsData, dpLatest, candidatesData, compact = false,
+  signal, actionZones, earningsData, dpLatest, candidatesData, compact = false, consensusNote,
 }: {
   signal: TickerDetail
   actionZones: ActionZones | null | undefined
@@ -1103,6 +1105,7 @@ function CopyPromptButton({
   dpLatest: any
   candidatesData?: OptionCandidatesResponse | null
   compact?: boolean
+  consensusNote?: string
 }) {
   const [copied, setCopied] = useState(false)
   const [mode, setMode] = useState<PromptMode>('equity')
@@ -1112,7 +1115,7 @@ function CopyPromptButton({
   const handleCopy = async () => {
     const prompt = mode === 'options' && hasCandidates
       ? buildOptionsPrompt(signal, candidatesData)
-      : buildPrompt(signal, actionZones, earningsData, dpLatest)
+      : buildPrompt(signal, actionZones, earningsData, dpLatest, consensusNote)
     await navigator.clipboard.writeText(prompt)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
@@ -1361,6 +1364,66 @@ function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boole
       </button>
 
       {error && <span className="font-mono text-[10px] text-accent-red">{error}</span>}
+    </div>
+  )
+}
+
+// ─── Per-model re-run button (used in Latest By Model cards) ──────────────────
+
+function ModelRerunButton({ symbol, model }: { symbol: string; model: string }) {
+  const validModel = LLM_OPTIONS.some(o => o.value === model)
+  const [job, setJob] = useState<AnalyzeStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const qc = useQueryClient()
+
+  const { data: statusData } = useQuery<AnalyzeStatus>({
+    queryKey: ['analyze_status', symbol],
+    queryFn: () => api.tickerAnalyzeStatus(symbol),
+    refetchInterval: job?.status === 'running' ? 5000 : false,
+    enabled: job?.status === 'running',
+  })
+
+  useEffect(() => {
+    if (statusData?.status === 'done' && job?.status === 'running') {
+      setJob(statusData)
+      qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
+      qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
+    }
+  }, [statusData?.status])
+
+  if (!validModel) return null
+
+  if (job?.status === 'running') {
+    return (
+      <span className="font-mono text-[9px] text-accent-amber animate-pulse flex-shrink-0">
+        ⬤ running…
+      </span>
+    )
+  }
+  if (job?.status === 'done') {
+    return (
+      <span className="font-mono text-[9px] text-accent-green flex-shrink-0">✓ done</span>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-1 flex-shrink-0">
+      <button
+        onClick={async () => {
+          setError(null)
+          try {
+            const res = await api.tickerAnalyze(symbol, model)
+            setJob(res)
+          } catch (e: any) {
+            setError(e?.response?.data?.detail ?? e?.message ?? 'error')
+          }
+        }}
+        className="font-mono text-[9px] px-2 py-0.5 rounded border border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active transition-colors"
+        title={`Re-run AI analysis using ${model}`}
+      >
+        ↻ re-run
+      </button>
+      {error && <span className="font-mono text-[9px] text-accent-red" title={error}>!</span>}
     </div>
   )
 }
@@ -2414,6 +2477,287 @@ export function TickerPage() {
                 </div>
               )
             })()}
+
+            {/* Latest By Model — per-model thesis comparison */}
+            {signal.latest_theses_by_model && signal.latest_theses_by_model.length > 0 && (
+              <div className="space-y-2">
+                <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary px-1">
+                  Latest By Model
+                </div>
+
+                {/* Consensus card — median across all theses in last 14 days */}
+                {signal.consensus_14d && (() => {
+                  const c = signal.consensus_14d!
+                  const latestModel = signal.latest_theses_by_model?.[0]?.model_used ?? null
+                  const entryMed = c.entry_low != null && c.entry_high != null
+                    ? (c.entry_low + c.entry_high) / 2
+                    : c.entry_low ?? c.entry_high ?? null
+                  if (entryMed == null) return null
+                  const pct = (p: number) => ((p - entryMed) / entryMed) * 100
+                  const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`
+                  const t1Pct   = c.target_1  != null ? pct(c.target_1)  : null
+                  const t2Pct   = c.target_2  != null ? pct(c.target_2)  : null
+                  const stopPct = c.stop_loss  != null ? pct(c.stop_loss) : null
+                  return (
+                    <div className="bg-bg-elevated border border-accent-purple/30 rounded p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-[9px] uppercase tracking-widest text-accent-purple">
+                            Consensus
+                          </span>
+                          <span className="font-mono text-[9px] text-text-tertiary">
+                            14d median · {c.model_count} models
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-4 gap-2">
+                        <div className="space-y-0.5">
+                          <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry (med)</div>
+                          <div className="font-mono text-xs font-semibold text-text-primary">${entryMed.toFixed(2)}</div>
+                          {c.entry_low != null && c.entry_high != null && (
+                            <div className="font-mono text-[9px] text-text-tertiary">${c.entry_low.toFixed(2)} – ${c.entry_high.toFixed(2)}</div>
+                          )}
+                        </div>
+                        <div className="space-y-0.5">
+                          <div className="font-mono text-[9px] text-text-tertiary uppercase">T1 Profit</div>
+                          {t1Pct != null ? (
+                            <>
+                              <div className={clsx('font-mono text-xs font-semibold', t1Pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>{fmt(t1Pct)}</div>
+                              <div className="font-mono text-[9px] text-text-tertiary">${c.target_1!.toFixed(2)}</div>
+                            </>
+                          ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                        </div>
+                        <div className="space-y-0.5">
+                          <div className="font-mono text-[9px] text-text-tertiary uppercase">T2 Profit</div>
+                          {t2Pct != null ? (
+                            <>
+                              <div className={clsx('font-mono text-xs font-semibold', t2Pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>{fmt(t2Pct)}</div>
+                              <div className="font-mono text-[9px] text-text-tertiary">${c.target_2!.toFixed(2)}</div>
+                            </>
+                          ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                        </div>
+                        <div className="space-y-0.5">
+                          <div className="font-mono text-[9px] text-text-tertiary uppercase">Risk (stop)</div>
+                          {stopPct != null ? (
+                            <>
+                              <div className="font-mono text-xs font-semibold text-accent-red">{fmt(stopPct)}</div>
+                              <div className="font-mono text-[9px] text-text-tertiary">${c.stop_loss!.toFixed(2)}</div>
+                            </>
+                          ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                        </div>
+                      </div>
+                      <RiskRewardBar
+                        entry={entryMed}
+                        target1={c.target_1}
+                        target2={c.target_2}
+                        stopLoss={c.stop_loss}
+                        currentPrice={signal.current_price}
+                        bullPct={c.bull_probability != null ? c.bull_probability * 100 : undefined}
+                        bearPct={c.bear_probability != null ? c.bear_probability * 100 : undefined}
+                        neutralPct={c.neutral_probability != null ? c.neutral_probability * 100 : undefined}
+                      />
+                      <div className="border-t border-border-subtle pt-2 flex justify-end">
+                        <CopyPromptButton
+                          signal={{
+                            ...signal,
+                            entry_low:          c.entry_low ?? signal.entry_low,
+                            entry_high:         c.entry_high ?? signal.entry_high,
+                            target_1:           c.target_1 ?? signal.target_1,
+                            target_2:           c.target_2 ?? signal.target_2,
+                            stop_loss:          c.stop_loss ?? signal.stop_loss,
+                            bull_probability:   c.bull_probability ?? signal.bull_probability,
+                            bear_probability:   c.bear_probability ?? signal.bear_probability,
+                            neutral_probability: c.neutral_probability ?? signal.neutral_probability,
+                            prob_combined:      c.prob_combined ?? signal.prob_combined,
+                          }}
+                          actionZones={actionZones}
+                          earningsData={earningsData}
+                          dpLatest={dpLatest}
+                          consensusNote={`Price levels & probabilities: medians from ${c.model_count} models (14d) — narrative from latest: ${latestModel ?? 'unknown'}`}
+                          compact
+                        />
+                      </div>
+                    </div>
+                  )
+                })()}
+                {signal.latest_theses_by_model.map((t, i) => {
+                  const dirColor =
+                    t.direction === 'BULL' ? 'text-accent-green' :
+                    t.direction === 'BEAR' ? 'text-accent-red' :
+                    'text-text-tertiary'
+                  const daysAgo = t.date
+                    ? Math.floor((Date.now() - new Date(t.date).getTime()) / 86400000)
+                    : null
+
+                  return (
+                    <div key={t.model_used ?? i} className="bg-bg-elevated border border-border-subtle rounded p-3 space-y-2">
+                      {/* Row 1: model + date + direction */}
+                      <div className="flex items-center justify-between flex-wrap gap-1.5">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <ModelBadge model={t.model_used} cost={t.cost_usd ?? undefined} />
+                          {daysAgo != null && (
+                            <span className="font-mono text-[9px] text-text-tertiary">{daysAgo}d ago</span>
+                          )}
+                          <ModelRerunButton symbol={symbol} model={t.model_used} />
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {t.direction && (
+                            <span className={clsx('font-mono text-[10px] font-semibold', dirColor)}>
+                              {t.direction}
+                            </span>
+                          )}
+                          {t.conviction != null && (
+                            <span className="font-mono text-[10px] text-text-tertiary">
+                              {t.conviction}/5
+                            </span>
+                          )}
+                          {t.time_horizon && (
+                            <span className="font-mono text-[9px] border border-border-subtle rounded px-1 py-0.5 text-text-tertiary">
+                              {t.time_horizon}
+                            </span>
+                          )}
+                          {t.data_quality && (
+                            <span className={clsx(
+                              'font-mono text-[9px] border rounded px-1 py-0.5',
+                              t.data_quality === 'HIGH'   ? 'border-accent-green/40 text-accent-green' :
+                              t.data_quality === 'MEDIUM' ? 'border-accent-amber/40 text-accent-amber' :
+                                                             'border-accent-red/40 text-accent-red'
+                            )}>
+                              {t.data_quality}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Trade setup grid + R:R bar — hidden when thesis > 14 days old */}
+                      {(daysAgo == null || daysAgo <= 14) && (() => {
+                        const entryMed =
+                          t.entry_low != null && t.entry_high != null
+                            ? (t.entry_low + t.entry_high) / 2
+                            : t.entry_low ?? t.entry_high ?? null
+                        if (entryMed == null) return null
+                        const hasAny = t.target_1 != null || t.target_2 != null || t.stop_loss != null
+                        if (!hasAny) return null
+                        const pct = (p: number) => ((p - entryMed) / entryMed) * 100
+                        const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`
+                        const t1Pct   = t.target_1  != null ? pct(t.target_1)  : null
+                        const t2Pct   = t.target_2  != null ? pct(t.target_2)  : null
+                        const stopPct = t.stop_loss  != null ? pct(t.stop_loss) : null
+                        return (
+                          <div className="border-t border-border-subtle pt-2 space-y-2">
+                            <div className="grid grid-cols-4 gap-2">
+                              <div className="space-y-0.5">
+                                <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry (med)</div>
+                                <div className="font-mono text-xs font-semibold text-text-primary">${entryMed.toFixed(2)}</div>
+                                {t.entry_low != null && t.entry_high != null && (
+                                  <div className="font-mono text-[9px] text-text-tertiary">${t.entry_low.toFixed(2)} – ${t.entry_high.toFixed(2)}</div>
+                                )}
+                              </div>
+                              <div className="space-y-0.5">
+                                <div className="font-mono text-[9px] text-text-tertiary uppercase">T1 Profit</div>
+                                {t1Pct != null ? (
+                                  <>
+                                    <div className={clsx('font-mono text-xs font-semibold', t1Pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>{fmt(t1Pct)}</div>
+                                    <div className="font-mono text-[9px] text-text-tertiary">${t.target_1!.toFixed(2)}</div>
+                                  </>
+                                ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                              </div>
+                              <div className="space-y-0.5">
+                                <div className="font-mono text-[9px] text-text-tertiary uppercase">T2 Profit</div>
+                                {t2Pct != null ? (
+                                  <>
+                                    <div className={clsx('font-mono text-xs font-semibold', t2Pct >= 0 ? 'text-accent-green' : 'text-accent-red')}>{fmt(t2Pct)}</div>
+                                    <div className="font-mono text-[9px] text-text-tertiary">${t.target_2!.toFixed(2)}</div>
+                                  </>
+                                ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                              </div>
+                              <div className="space-y-0.5">
+                                <div className="font-mono text-[9px] text-text-tertiary uppercase">Risk (stop)</div>
+                                {stopPct != null ? (
+                                  <>
+                                    <div className="font-mono text-xs font-semibold text-accent-red">{fmt(stopPct)}</div>
+                                    <div className="font-mono text-[9px] text-text-tertiary">${t.stop_loss!.toFixed(2)}</div>
+                                  </>
+                                ) : <div className="font-mono text-xs text-text-tertiary">—</div>}
+                              </div>
+                            </div>
+                            <RiskRewardBar
+                              entry={entryMed}
+                              target1={t.target_1}
+                              target2={t.target_2}
+                              stopLoss={t.stop_loss}
+                              currentPrice={signal.current_price}
+                              bullPct={t.bull_probability != null ? t.bull_probability * 100 : undefined}
+                              bearPct={t.bear_probability != null ? t.bear_probability * 100 : undefined}
+                              neutralPct={t.neutral_probability != null ? t.neutral_probability * 100 : undefined}
+                            />
+                            {t.position_size_pct != null && (
+                              <div className="font-mono text-[9px] text-text-tertiary">
+                                Size {t.position_size_pct.toFixed(1)}%
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+
+                      {/* Row 4: invalidation */}
+                      {t.key_invalidation && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="font-mono text-[9px] font-bold text-accent-amber flex-shrink-0 mt-0.5">⚡</span>
+                          <span className="font-mono text-[10px] text-text-tertiary leading-relaxed">{t.key_invalidation}</span>
+                        </div>
+                      )}
+
+                      {/* Row 5: short thesis (collapsible) */}
+                      {t.thesis && (
+                        <Accordion.Root type="single" collapsible>
+                          <Accordion.Item value="thesis" className="border-t border-border-subtle pt-1.5">
+                            <Accordion.Trigger className="group flex items-center gap-1 font-mono text-[9px] text-text-tertiary hover:text-text-secondary transition-colors w-full">
+                              <ChevronRight size={9} className="transition-transform group-data-[state=open]:rotate-90" />
+                              thesis
+                            </Accordion.Trigger>
+                            <Accordion.Content className="pt-1.5 data-[state=open]:animate-none">
+                              <p className="font-mono text-[10px] text-text-tertiary leading-relaxed">{t.thesis}</p>
+                            </Accordion.Content>
+                          </Accordion.Item>
+                        </Accordion.Root>
+                      )}
+
+                      {/* Copy prompt — uses this model's thesis fields over the parent signal */}
+                      <div className="border-t border-border-subtle pt-2 flex justify-end">
+                        <CopyPromptButton
+                          signal={{
+                            ...signal,
+                            direction:          t.direction ?? signal.direction,
+                            conviction:         t.conviction ?? signal.conviction,
+                            time_horizon:       t.time_horizon ?? signal.time_horizon,
+                            thesis:             t.thesis ?? signal.thesis,
+                            primary_scenario:   t.primary_scenario ?? signal.primary_scenario,
+                            bear_scenario:      t.bear_scenario ?? signal.bear_scenario,
+                            key_invalidation:   t.key_invalidation ?? signal.key_invalidation,
+                            bull_probability:   t.bull_probability ?? signal.bull_probability,
+                            bear_probability:   t.bear_probability ?? signal.bear_probability,
+                            neutral_probability: t.neutral_probability ?? signal.neutral_probability,
+                            prob_combined:      t.prob_combined ?? signal.prob_combined,
+                            data_quality:       t.data_quality ?? signal.data_quality,
+                            entry_low:          t.entry_low ?? signal.entry_low,
+                            entry_high:         t.entry_high ?? signal.entry_high,
+                            target_1:           t.target_1 ?? signal.target_1,
+                            target_2:           t.target_2 ?? signal.target_2,
+                            stop_loss:          t.stop_loss ?? signal.stop_loss,
+                            model_used:         t.model_used,
+                          }}
+                          actionZones={actionZones}
+                          earningsData={earningsData}
+                          dpLatest={dpLatest}
+                          compact
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
 
             {/* Price Ladder */}
             {signal.current_price != null && (() => {

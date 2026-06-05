@@ -97,7 +97,7 @@ export function RiskRewardBar({
             {evR >= 0 ? '+' : ''}{evR.toFixed(1)}R
           </span>
           <span className="font-mono text-[9px] text-text-tertiary">
-            {bullPct != null && `(${bullPct}% bull · ${neutralPct ?? 0}% ntrl · ${bearPct}% bear)`}
+            {bullPct != null && `(${bullPct.toFixed(0)}% bull · ${(neutralPct ?? 0).toFixed(0)}% ntrl · ${(bearPct ?? 0).toFixed(0)}% bear)`}
           </span>
         </div>
       )}

@@ -1325,6 +1325,40 @@ class TestOptionCandidatesEndpoint:
         assert body["thesis_direction"] == "BEAR"
         assert body["thesis_conviction"] == 2
 
+    def test_non_finite_underlying_price_is_sanitized(self):
+        """NaN values in the engine result must be converted to null before JSON serialization."""
+        import math
+        from utils.option_candidates import CandidateResult
+
+        thesis_row = {
+            "ticker": "DDOG", "direction": "BULL", "conviction": 4,
+            "entry_low": 168.0, "entry_high": 178.0, "target_1": 216.0,
+            "target_2": 238.0, "stop_loss": 147.0, "time_horizon": "2-4 weeks",
+            "signals_json": None, "current_price": 250.0,
+        }
+        mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+        engine_result = CandidateResult(
+            ticker="DDOG",
+            generated_at="2026-06-05T07:21:00",
+            suppressed=False,
+            suppression_reason="No contracts passed quality filters",
+            candidates=[],
+            rejection_reasons=["C 95.0 2026-06-26: no valid mid price"],
+            underlying_price=math.nan,
+            chain_source="yfinance",
+        )
+
+        with (
+            patch("dashboard.api.main._db_connect", return_value=mock_conn),
+            patch("dashboard.api.main.get_option_candidates", return_value=engine_result),
+        ):
+            resp = client.get("/api/ticker/DDOG/option-candidates")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["underlying_price"] is None
+        assert body["suppressed"] is False
+
     def test_thesis_id_and_date_extracted_from_row(self):
         """thesis_id, thesis_date, and signal_agreement must be populated from the DB row.
         thesis_cache.id is a real BIGSERIAL in the live DB even though schema.sql omits it."""

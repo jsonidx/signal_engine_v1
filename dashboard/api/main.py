@@ -1587,6 +1587,111 @@ async def signals_ticker(ticker: str):
             _cache.set(adv_cache_key, {"adv_20d": adv_20d}, TTL_SHORT)
             result["adv_20d"] = adv_20d
 
+        # ── Latest thesis per model ───────────────────────────────────────────────
+        try:
+            bm_conn = _db_connect()
+            if bm_conn is not None:
+                bm_rows = bm_conn.execute(
+                    """
+                    SELECT DISTINCT ON (COALESCE(model_used, 'unknown'))
+                        model_used, date, created_at, direction, conviction,
+                        time_horizon, entry_low, entry_high, stop_loss,
+                        target_1, target_2, position_size_pct,
+                        bull_probability, bear_probability, neutral_probability,
+                        prob_combined, primary_scenario, bear_scenario,
+                        key_invalidation, thesis, data_quality, cost_usd
+                    FROM thesis_cache
+                    WHERE ticker = %s
+                    ORDER BY COALESCE(model_used, 'unknown'), date DESC
+                    """,
+                    (ticker,),
+                ).fetchall()
+                bm_conn.close()
+
+                def _bm_row(r: dict) -> dict:
+                    return {
+                        "model_used":         r.get("model_used") or "unknown",
+                        "date":               r.get("date"),
+                        "created_at":         r.get("created_at"),
+                        "direction":          r.get("direction"),
+                        "conviction":         r.get("conviction"),
+                        "time_horizon":       r.get("time_horizon"),
+                        "entry_low":          r.get("entry_low"),
+                        "entry_high":         r.get("entry_high"),
+                        "stop_loss":          r.get("stop_loss"),
+                        "target_1":           r.get("target_1"),
+                        "target_2":           r.get("target_2"),
+                        "position_size_pct":  r.get("position_size_pct"),
+                        "bull_probability":   r.get("bull_probability"),
+                        "bear_probability":   r.get("bear_probability"),
+                        "neutral_probability": r.get("neutral_probability"),
+                        "prob_combined":      r.get("prob_combined"),
+                        "primary_scenario":   r.get("primary_scenario"),
+                        "bear_scenario":      r.get("bear_scenario"),
+                        "key_invalidation":   r.get("key_invalidation"),
+                        "thesis":             r.get("thesis"),
+                        "data_quality":       r.get("data_quality"),
+                        "cost_usd":           r.get("cost_usd"),
+                    }
+
+                latest_by_model = sorted(
+                    [_bm_row(dict(r)) for r in bm_rows],
+                    key=lambda x: x.get("date") or "",
+                    reverse=True,
+                )
+                result["latest_theses_by_model"] = latest_by_model
+            else:
+                result["latest_theses_by_model"] = []
+        except Exception:
+            log.exception("latest_theses_by_model failed for %s", ticker)
+            result["latest_theses_by_model"] = []
+
+        # ── Consensus: median across all theses within last 14 days ─────────────
+        try:
+            cs_conn = _db_connect()
+            if cs_conn is not None:
+                cs_row = cs_conn.execute(
+                    """
+                    SELECT
+                        COUNT(*)                                                         AS model_count,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY entry_low)          AS entry_low,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY entry_high)         AS entry_high,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY target_1)           AS target_1,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY target_2)           AS target_2,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY stop_loss)          AS stop_loss,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bull_probability)   AS bull_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bear_probability)   AS bear_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY neutral_probability) AS neutral_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY prob_combined)      AS prob_combined
+                    FROM thesis_cache
+                    WHERE ticker = %s
+                      AND date >= TO_CHAR(CURRENT_DATE - INTERVAL '14 days', 'YYYY-MM-DD')
+                      AND entry_low IS NOT NULL
+                    """,
+                    (ticker,),
+                ).fetchone()
+                cs_conn.close()
+                if cs_row and (cs_row.get("model_count") or 0) >= 2:
+                    result["consensus_14d"] = {
+                        "model_count":       int(cs_row["model_count"]),
+                        "entry_low":         cs_row.get("entry_low"),
+                        "entry_high":        cs_row.get("entry_high"),
+                        "target_1":          cs_row.get("target_1"),
+                        "target_2":          cs_row.get("target_2"),
+                        "stop_loss":         cs_row.get("stop_loss"),
+                        "bull_probability":  cs_row.get("bull_probability"),
+                        "bear_probability":  cs_row.get("bear_probability"),
+                        "neutral_probability": cs_row.get("neutral_probability"),
+                        "prob_combined":     cs_row.get("prob_combined"),
+                    }
+                else:
+                    result["consensus_14d"] = None
+            else:
+                result["consensus_14d"] = None
+        except Exception:
+            log.exception("consensus_14d failed for %s", ticker)
+            result["consensus_14d"] = None
+
         result = _json_safe(result)
         _cache.set(cache_key, result, TTL_SHORT)
         return result
@@ -6364,6 +6469,7 @@ async def ticker_option_candidates(symbol: str):
         "thesis_direction": thesis.direction if thesis else None,
         "thesis_conviction": thesis.conviction if thesis else None,
     }
+    result_dict = _json_safe(result_dict)
 
     # TRD-026: persist snapshot (fire-and-forget; never block the response)
     try:
