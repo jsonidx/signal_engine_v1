@@ -215,6 +215,44 @@ LIQUIDITY_TIER_THRESHOLDS: Dict[str, int] = {
 # === NEW: UNIVERSE RANK EXPORT FOR AI QUANT ===
 _RANKED_UNIVERSE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ranked_universe.json")
 
+
+def _get_env_clean(name: str) -> str:
+    """Trim whitespace and surrounding quotes from copied secret values."""
+    value = os.environ.get(name, "")
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
+def resolve_effective_model(llm: Optional[str] = None) -> str:
+    """Return the model to use: explicit llm arg takes precedence over AI_MODEL_DEFAULT."""
+    return llm if llm else AI_MODEL_DEFAULT
+
+
+def _require_api_key(effective_llm: str) -> None:
+    """Exit with a clear error if the required API key for effective_llm is missing."""
+    if effective_llm.startswith("grok-") or effective_llm in ("grok", "grok-premium"):
+        if not _get_env_clean("XAI_API_KEY"):
+            print(f"  ERROR: XAI_API_KEY not set (required for {effective_llm}).")
+            print("  Set it with: export XAI_API_KEY='your-key'")
+            sys.exit(1)
+    elif effective_llm.startswith("gpt-") or effective_llm == "chatgpt":
+        if not _get_env_clean("OPENAI_API_KEY"):
+            print(f"  ERROR: OPENAI_API_KEY not set (required for {effective_llm}).")
+            print("  Set it with: export OPENAI_API_KEY='your-key'")
+            sys.exit(1)
+    elif effective_llm.startswith("claude-") or effective_llm == "claude":
+        if not _get_env_clean("ANTHROPIC_API_KEY"):
+            print(f"  ERROR: ANTHROPIC_API_KEY not set (required for {effective_llm}).")
+            print("  Set it with: export ANTHROPIC_API_KEY='your-key'")
+            sys.exit(1)
+    else:
+        if not _get_env_clean("XAI_API_KEY"):
+            print(f"  ERROR: XAI_API_KEY not set (default provider for model {effective_llm}).")
+            print("  Set it with: export XAI_API_KEY='your-key'")
+            sys.exit(1)
+
 def _inject_universe_rank(signals: dict, ticker: str) -> dict:
     """Inject universe rank/status from ranked_universe.json into the signals dict."""
     default = {"rank": "N/A", "total": 215, "status": "Dynamic only"}
@@ -1796,12 +1834,9 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
         return
 
     # ── API key required beyond this point ───────────────────────────────────
-    if not os.environ.get("XAI_API_KEY"):
-        print("  ERROR: XAI_API_KEY not set.")
-        print("  Set it with: export XAI_API_KEY='your-key'")
-        sys.exit(1)
+    _require_api_key(resolve_effective_model(getattr(args, "llm", None)))
 
-    # ── Run Grok on selected tickers ──────────────────────────────────────────
+    # ── Run on selected tickers ───────────────────────────────────────────────
     results = []
     for i, selection in enumerate(selected, 1):
         ticker = selection["ticker"]
@@ -2604,14 +2639,15 @@ def _notify_anthropic_credits_exhausted() -> None:
     )
 
 
-def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False) -> Optional[str]:
+def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False,
+                 model: Optional[str] = None) -> Optional[str]:
     """
     Call xAI Grok with streaming (OpenAI-compatible API).
 
-    Model routing:
-      use_thinking=False → AI_MODEL_DEFAULT  (grok-4-1-fast-reasoning)
-      use_thinking=True  → AI_MODEL_PREMIUM  (grok-4.20-0309-reasoning)
-                           falls back to AI_MODEL_FALLBACK on any error
+    model: explicit model to use (takes precedence over use_thinking selection).
+    Model routing when model is None:
+      use_thinking=False → AI_MODEL_DEFAULT
+      use_thinking=True  → AI_MODEL_PREMIUM, falls back to AI_MODEL_FALLBACK on error
 
     Returns the response text, or None on failure.
     Token usage is stored in module-level _last_call_usage after each call.
@@ -2619,13 +2655,13 @@ def _call_claude(prompt: str, verbose: bool = False, use_thinking: bool = False)
     if not _OPENAI_AVAILABLE:
         print("ERROR: openai package not installed. Run: pip install openai")
         return None
-    api_key = os.environ.get("XAI_API_KEY")
+    api_key = _get_env_clean("XAI_API_KEY")
     if not api_key:
         print("  ERROR: XAI_API_KEY environment variable not set.")
         print("         export XAI_API_KEY='your-key-here'")
         return None
 
-    primary_model = AI_MODEL_PREMIUM if use_thinking else AI_MODEL_DEFAULT
+    primary_model = model if model else (AI_MODEL_PREMIUM if use_thinking else AI_MODEL_DEFAULT)
     client = _OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
 
     if verbose:
@@ -2686,7 +2722,7 @@ def _call_anthropic(prompt: str, verbose: bool = False,
     if not _ANTHROPIC_AVAILABLE:
         print("ERROR: anthropic package not installed. Run: pip install anthropic")
         return None
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = _get_env_clean("ANTHROPIC_API_KEY")
     if not api_key:
         print("  ERROR: ANTHROPIC_API_KEY environment variable not set.")
         return None
@@ -2739,7 +2775,7 @@ def _call_openai(prompt: str, verbose: bool = False,
     if not _OPENAI_AVAILABLE:
         print("ERROR: openai package not installed. Run: pip install openai")
         return None
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = _get_env_clean("OPENAI_API_KEY")
     if not api_key:
         print("  ERROR: OPENAI_API_KEY environment variable not set.")
         return None
@@ -3138,7 +3174,7 @@ def update_watchlist_from_screen(
 # ==============================================================================
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
-                   use_cache: bool = True, llm: str = "grok-4.3",
+                   use_cache: bool = True, llm: Optional[str] = None,
                    force_ai: bool = False) -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
@@ -3215,20 +3251,28 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         print(prompt)
         print("--- END PROMPT ---\n")
 
+    # Resolve effective model: explicit --llm arg > DB/config AI_MODEL_DEFAULT
+    effective_llm = resolve_effective_model(llm)
+
     # Route to the selected LLM backend by model-ID prefix
-    if llm.startswith("claude-"):
-        raw = _call_anthropic(prompt, verbose=verbose, model=llm)
-    elif llm.startswith("gpt-"):
-        raw = _call_openai(prompt, verbose=verbose, model=llm)
-    elif llm.startswith("grok-"):
-        raw = _call_claude(prompt, verbose=verbose, use_thinking=False)
+    if effective_llm.startswith("claude-"):
+        raw = _call_anthropic(prompt, verbose=verbose, model=effective_llm)
+    elif effective_llm.startswith("gpt-"):
+        raw = _call_openai(prompt, verbose=verbose, model=effective_llm)
+    elif effective_llm.startswith("grok-"):
+        _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
+        use_thinking = _prob_gate >= AI_PREMIUM_THRESHOLD
+        # Pin model only when caller passed an explicit override; otherwise let _call_claude
+        # select between AI_MODEL_DEFAULT and AI_MODEL_PREMIUM based on use_thinking.
+        _pinned_model = effective_llm if llm is not None else None
+        raw = _call_claude(prompt, verbose=verbose, use_thinking=use_thinking, model=_pinned_model)
     else:
-        # Legacy aliases + default
-        if llm == "claude":
+        # Legacy aliases
+        if effective_llm == "claude":
             raw = _call_anthropic(prompt, verbose=verbose)
-        elif llm == "chatgpt":
+        elif effective_llm == "chatgpt":
             raw = _call_openai(prompt, verbose=verbose)
-        elif llm == "grok-premium":
+        elif effective_llm == "grok-premium":
             raw = _call_claude(prompt, verbose=verbose, use_thinking=True)
         else:
             _prob_gate = signals.get("prob_combined") or signals.get("signal_agreement_score", 0.0) or 0.0
@@ -3342,7 +3386,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
 
 def analyze_tickers(tickers: List[str], verbose: bool = False,
                     raw_output: bool = False, use_cache: bool = True,
-                    force_ai: bool = False, llm: str = "grok-4.3") -> List[dict]:
+                    force_ai: bool = False, llm: Optional[str] = None) -> List[dict]:
     """Analyze multiple tickers, returning sorted by conviction."""
     results = []
     for i, ticker in enumerate(tickers, 1):
@@ -3586,7 +3630,7 @@ def analyze_report_file(report_path: str, verbose: bool = False) -> Optional[str
     if len(content) > max_chars:
         content = content[:max_chars] + f"\n\n[... report truncated at {max_chars} chars ...]"
 
-    api_key = os.environ.get("XAI_API_KEY")
+    api_key = _get_env_clean("XAI_API_KEY")
     if not api_key:
         print("  ERROR: XAI_API_KEY not set.")
         return None
@@ -3693,10 +3737,10 @@ def main():
         help="Run on ALL non-skipped tickers (WARNING: high API cost)",
     )
     parser.add_argument(
-        "--llm", type=str, default="grok-4.3",
+        "--llm", type=str, default=None,
         choices=["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
                  "grok", "grok-premium", "claude", "chatgpt"],
-        help="LLM backend: grok-4.3 (default), claude-sonnet-4-6, gpt-5.1, etc. Legacy aliases grok/grok-premium/claude/chatgpt still accepted.",
+        help="LLM backend override (default: uses ai_model_default from strategy_config DB). Options: grok-4.3, claude-sonnet-4-6, gpt-5.5, etc.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -3754,6 +3798,7 @@ def main():
         print_cache_table()
         return
 
+    _effective_llm_for_label = resolve_effective_model(args.llm)
     llm_label = {
         "grok":             "GROK 4.3",
         "grok-premium":     "GROK 4.3 (FULL)",
@@ -3765,7 +3810,7 @@ def main():
         "gpt-5.5-pro":      "GPT-5.5 PRO",
         "claude-sonnet-4-6":"CLAUDE SONNET 4.6",
         "claude-opus-4-8":  "CLAUDE OPUS 4.8",
-    }.get(args.llm, args.llm.upper())
+    }.get(_effective_llm_for_label, _effective_llm_for_label.upper())
 
     print()
     print("================================================================")
@@ -3957,10 +4002,7 @@ def main():
         # Optionally run Claude on the top N
         if args.top and qualified:
             top_candidates = display
-            if not os.environ.get("XAI_API_KEY"):
-                print("  ERROR: XAI_API_KEY not set — cannot run Grok analysis.")
-                print("  Set it with: export XAI_API_KEY='your-key'")
-                sys.exit(1)
+            _require_api_key(resolve_effective_model(args.llm))
 
             print(f"  Running Grok analysis on top {len(top_candidates)}: "
                   f"{', '.join(r['ticker'] for r in top_candidates)}")
@@ -4004,10 +4046,7 @@ def main():
         _run_top_n_mode(args, use_cache)
         return
 
-    if not os.environ.get("XAI_API_KEY"):
-        print("  ERROR: XAI_API_KEY not set.")
-        print("  Set it with: export XAI_API_KEY='your-key'")
-        sys.exit(1)
+    _require_api_key(resolve_effective_model(args.llm))
 
     if args.report:
         print(f"  Analyzing report: {args.report}")

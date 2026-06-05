@@ -115,12 +115,47 @@ def snapshot_theses(tickers: list[str]) -> dict[str, dict]:
             return {r["ticker"]: dict(r) for r in cur.fetchall()}
 
 
-def run_refresh(tickers: list[str], batch_size: int = 10) -> None:
+def _parse_created_at(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def classify_refresh_results(
+    tickers: list[str],
+    old_snap: dict[str, dict],
+    new_snap: dict[str, dict],
+) -> tuple[list[str], list[str]]:
+    updated: list[str] = []
+    untouched: list[str] = []
+    for ticker in tickers:
+        old_dt = _parse_created_at((old_snap.get(ticker) or {}).get("created_at"))
+        new_dt = _parse_created_at((new_snap.get(ticker) or {}).get("created_at"))
+        if new_dt and (old_dt is None or new_dt > old_dt):
+            updated.append(ticker)
+        else:
+            untouched.append(ticker)
+    return updated, untouched
+
+
+def run_refresh(tickers: list[str], batch_size: int = 10) -> list[tuple[list[str], int]]:
+    results: list[tuple[list[str], int]] = []
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         cmd = [sys.executable, str(_ROOT / "ai_quant.py"), "--tickers"] + batch + ["--no-cache", "--force-ai"]
         print(f"Running: {' '.join(cmd)}")
-        subprocess.run(cmd, cwd=str(_ROOT))
+        proc = subprocess.run(cmd, cwd=str(_ROOT))
+        results.append((batch, proc.returncode))
+    return results
 
 
 def build_diff_line(field: str, old_val, new_val, prefix="$") -> str | None:
@@ -135,14 +170,21 @@ def dir_emoji(direction: str | None) -> str:
     return {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "⚪"}.get((direction or "").upper(), "⚪")
 
 
-def build_message(refreshed: list[str], old_snap: dict, new_snap: dict, days: int) -> str:
+def build_message(
+    attempted: list[str],
+    updated: list[str],
+    untouched: list[str],
+    old_snap: dict,
+    new_snap: dict,
+    days: int,
+) -> str:
     lines = [f"<b>🔄 Stale Thesis Refresh ({days}d+)</b>"]
-    lines.append(f"<i>{len(refreshed)} tickers refreshed</i>\n")
+    lines.append(f"<i>{len(updated)} of {len(attempted)} tickers updated</i>\n")
 
     changed = []
     unchanged = []
 
-    for ticker in refreshed:
+    for ticker in updated:
         old = old_snap.get(ticker, {})
         new = new_snap.get(ticker, {})
         if not new:
@@ -191,6 +233,9 @@ def build_message(refreshed: list[str], old_snap: dict, new_snap: dict, days: in
     if unchanged:
         lines.append(f"\n<b>No change:</b> {', '.join(unchanged)}")
 
+    if untouched:
+        lines.append(f"\n<b>Not updated:</b> {', '.join(untouched)}")
+
     return "\n".join(lines)
 
 
@@ -216,13 +261,22 @@ def main():
         send_telegram(f"🔍 <b>Stale Thesis Refresh (dry run)</b>\n{len(stale)} tickers would be refreshed:\n{', '.join(stale)}")
         return
 
-    run_refresh(stale)
+    batch_results = run_refresh(stale)
 
     new_snap = snapshot_theses(stale)
-    msg = build_message(stale, old_snap, new_snap, args.days)
+    updated, untouched = classify_refresh_results(stale, old_snap, new_snap)
+    msg = build_message(stale, updated, untouched, old_snap, new_snap, args.days)
     print("\n--- Telegram message ---")
     print(msg)
     send_telegram(msg)
+
+    failed_batches = [batch for batch, code in batch_results if code != 0]
+    if failed_batches or untouched:
+        if failed_batches:
+            print(f"ERROR: {len(failed_batches)} batch(es) returned non-zero exit codes.")
+        if untouched:
+            print(f"ERROR: {len(untouched)} ticker(s) did not get a newer thesis timestamp.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
