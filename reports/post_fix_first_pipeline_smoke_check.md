@@ -1,6 +1,6 @@
-# Post-Fix Pipeline Smoke Check — Round 13
+# Post-Fix Pipeline Smoke Check — Round 14
 
-**Generated:** 2026-06-04 06:40 UTC  
+**Generated:** 2026-06-05 06:47 UTC  
 **Schema fix commits:** `7caf4e4` (2026-04-26 13:05) + `7af59be` (2026-04-26 13:08)  
 
 ---
@@ -21,11 +21,11 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 
 | Date | Row count |
 |---|---|
-| 2026-06-03 | 20 ← latest |
+| 2026-06-05 | 20 ← latest |
+| 2026-06-03 | 20 |
 | 2026-05-30 | 23 |
 | 2026-05-29 | 21 |
 | 2026-05-28 | 20 |
-| 2026-05-27 | 20 |
 
 **Unique tickers in latest run:** 20  
 **Post-fix run?** Yes ✅
@@ -48,7 +48,7 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 | `state_reasons` | 20/20 | 20/20 (100%) |
 | `state_warnings` | 0/20 | 0/20 (0%) — old-format |
 | `dilution_risk_flag` | 20/20 | 20/20 (100%) |
-| `iv_rank` | 3/20 | 3/20 (15%) |
+| `iv_rank` | 5/20 | 5/20 (25%) |
 | `effective_float_score` (via explanation_json) | 20/20 | 20/20 (100%) |
 
 ---
@@ -66,12 +66,12 @@ squeeze_state 100% / risk_score 100% / explanation_json 100%
 
 | Gate item | Required | Current | Status |
 |---|---:|---:|---|
-| Calendar days of post-fix squeeze_scores | ≥ 30 | **25** | ❌ |
-| New-format rows total | ≥ 500 | **504** | ✅ |
-| Rows with ARMED or ACTIVE state | ≥ 50 | **43** | ❌ |
-| 20-day forward return windows closed | ≥ 100 rows | **160** | ✅ |
-| Rows with non-null `risk_score` | ≥ 100 | **504** | ✅ |
-| Rows with non-null `options_pressure_score` | ≥ 20 | **504** | ✅ |
+| Calendar days of post-fix squeeze_scores | ≥ 30 | **26** | ❌ |
+| New-format rows total | ≥ 500 | **524** | ✅ |
+| Rows with ARMED or ACTIVE state | ≥ 50 | **45** | ❌ |
+| 20-day forward return windows closed | ≥ 100 rows | **180** | ✅ |
+| Rows with non-null `risk_score` | ≥ 100 | **524** | ✅ |
+| Rows with non-null `options_pressure_score` | ≥ 20 | **524** | ✅ |
 | `short_interest_history` distinct FINRA periods | ≥ 2 | **0** | ❌ |
 | `filing_catalysts` ownership_accumulation_flag tickers | ≥ 5 | **0** | ❌ |
 | `iv_history` tickers with ≥ 60 rows | ≥ 50 | **0** | ❌ |
