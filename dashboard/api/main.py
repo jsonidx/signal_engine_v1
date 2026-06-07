@@ -4755,6 +4755,9 @@ async def ticker_analyze_status(symbol: str):
         return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
     # Finished — clear cache so fresh thesis is fetched
     _cache._store.pop(f"signals_ticker:{sym}", None)
+    _cache._store.pop("deepdive_tickers", None)
+    _cache._store.pop("deepdive_tickers:stale", None)
+    _cache._store.pop("deepdive_live_zones", None)
     # Pull model + cost from the freshly saved thesis if available
     model_used = cost_usd = None
     try:
@@ -5887,7 +5890,11 @@ async def thesis_benchmark(days: int = 90):
                 AVG(CASE WHEN o.vs_target_1_pct IS NOT NULL THEN o.vs_target_1_pct END)   AS avg_vs_t1_pct,
                 SUM(CASE WHEN o.direction = 'BULL' THEN 1 ELSE 0 END) AS bull_count,
                 SUM(CASE WHEN o.direction = 'BEAR' THEN 1 ELSE 0 END) AS bear_count,
-                SUM(CASE WHEN o.direction = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral_count
+                SUM(CASE WHEN o.direction = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral_count,
+                SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'HIGH' THEN 1 ELSE 0 END) AS high_quality_count,
+                SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_quality_count,
+                SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'LOW' THEN 1 ELSE 0 END) AS low_quality_count,
+                SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') NOT IN ('HIGH', 'MEDIUM', 'LOW') THEN 1 ELSE 0 END) AS unknown_quality_count
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
             WHERE o.thesis_date >= %s
@@ -5921,6 +5928,10 @@ async def thesis_benchmark(days: int = 90):
                 "bull_count":     r["bull_count"] or 0,
                 "bear_count":     r["bear_count"] or 0,
                 "neutral_count":  r["neutral_count"] or 0,
+                "high_quality_count":    r["high_quality_count"] or 0,
+                "medium_quality_count":  r["medium_quality_count"] or 0,
+                "low_quality_count":     r["low_quality_count"] or 0,
+                "unknown_quality_count": r["unknown_quality_count"] or 0,
             })
 
         # ── Per-ticker outcomes ────────────────────────────────────────────────
@@ -5932,7 +5943,8 @@ async def thesis_benchmark(days: int = 90):
                 o.days_to_target_1, o.days_to_target_2, o.days_to_stop,
                 o.vs_target_1_pct, o.vs_target_2_pct,
                 o.entry_price, o.target_1, o.target_2, o.stop_loss,
-                COALESCE(tc.model_used, 'unknown') AS model
+                COALESCE(tc.model_used, 'unknown') AS model,
+                COALESCE(tc.data_quality, 'unknown') AS data_quality
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
             WHERE o.thesis_date >= %s
@@ -6282,6 +6294,66 @@ except ImportError:
     _OPTION_CANDIDATES_AVAILABLE = False  # type: ignore[assignment]
 
 
+def _build_portfolio_context() -> "Optional[Any]":
+    """
+    Build a PortfolioContext from available account data.
+
+    NAV proxy strategy (conservative, cost-basis — not mark-to-market):
+        1. Read cash_eur from portfolio_settings (Supabase).
+        2. Add deployed_eur from open BUY positions in trades table.
+        3. Convert EUR → USD at ~1.09 rate.
+
+    nav_label values:
+        "nav_proxy"  — cash + deployed cost-basis available
+        "cash_proxy" — cash only; deployed capital unknown
+        "model"      — no account data; $25k model portfolio used
+
+    Graceful degradation: any DB failure returns None so the caller
+    falls back to model-portfolio defaults.
+    """
+    try:
+        from utils.option_risk import PortfolioContext as _PC
+        _EUR_TO_USD = 1.09
+
+        cash_eur = 0.0
+        deployed_eur = 0.0
+        has_cash = False
+        has_deployed = False
+
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                # Cash balance from portfolio_settings
+                cash_eur, _ = _get_cash_eur(conn)
+                if cash_eur and cash_eur > 0:
+                    has_cash = True
+
+                # Deployed capital = entry cost of open equity positions
+                try:
+                    row = conn.execute(
+                        "SELECT COALESCE(SUM(size_eur), 0) AS total "
+                        "FROM trades WHERE action='BUY' AND status='open'"
+                    ).fetchone()
+                    if row and row["total"]:
+                        deployed_eur = float(row["total"])
+                        has_deployed = deployed_eur > 0
+                except Exception:
+                    pass  # trades table may not exist; deployed stays 0
+            finally:
+                conn.close()
+
+        total_eur = cash_eur + deployed_eur
+        if total_eur <= 0:
+            return _PC(nav_label="model")
+
+        nav_usd = round(total_eur * _EUR_TO_USD, 2)
+        nav_label = "nav_proxy" if has_deployed else "cash_proxy"
+        return _PC(account_nav_usd=nav_usd, nav_label=nav_label)
+
+    except Exception:
+        return None  # caller handles None → model defaults
+
+
 def _build_thesis_context(row: dict) -> "ThesisContext":
     """
     Build a ThesisContext from a thesis_cache row dict.
@@ -6371,6 +6443,43 @@ def _serialize_candidate(c: "OptionCandidate") -> dict:
         "fill_quality_score":       getattr(c, "fill_quality_score", None),
         "slippage_risk_label":      getattr(c, "slippage_risk_label", "moderate"),
         "skip_if_spread_above_pct": getattr(c, "skip_if_spread_above_pct", None),
+        # V2 target engine (TRD-043) — thesis-linked projected option levels
+        "projected_option_tp1":      getattr(c, "projected_option_tp1", None),
+        "projected_option_tp2":      getattr(c, "projected_option_tp2", None),
+        "projected_option_stop":     getattr(c, "projected_option_stop", None),
+        "projected_tp1_return_pct":  getattr(c, "projected_tp1_return_pct", None),
+        "projected_tp2_return_pct":  getattr(c, "projected_tp2_return_pct", None),
+        "projected_stop_return_pct": getattr(c, "projected_stop_return_pct", None),
+        "target_projection_method":  getattr(c, "target_projection_method", None),
+        # Structure archetype (TRD-048) — thesis-tempo to structure-family mapping
+        "structure_archetype":        getattr(c, "structure_archetype", None),
+        "structure_policy_reason":    getattr(c, "structure_policy_reason", None),
+        # PM/risk layer (TRD-046) — deterministic position sizing and risk gating
+        "risk_allowed":                       getattr(c, "risk_allowed", True),
+        "risk_block_reason":                  getattr(c, "risk_block_reason", None),
+        "max_premium_risk_usd":               getattr(c, "max_premium_risk_usd", None),
+        "suggested_contract_count":           getattr(c, "suggested_contract_count", None),
+        "position_size_tier":                 getattr(c, "position_size_tier", "standard"),
+        "event_risk_policy":                  getattr(c, "event_risk_policy", "no_event_window"),
+        "iv_regime_label":                    getattr(c, "iv_regime_label", "unknown_iv"),
+        "portfolio_concentration_warning":    getattr(c, "portfolio_concentration_warning", None),
+        "exit_hierarchy":                     getattr(c, "exit_hierarchy", []),
+        "risk_nav_source":                    getattr(c, "risk_nav_source", "model"),
+        # Live entry guardrails (TRD-049) — quote freshness + fair-value gating
+        "entry_action":           getattr(c, "entry_action", "enter_now"),
+        "quote_freshness_label":  getattr(c, "quote_freshness_label", "unknown"),
+        "quote_age_seconds":      getattr(c, "quote_age_seconds", None),
+        "fair_value_entry_low":   getattr(c, "fair_value_entry_low", None),
+        "fair_value_entry_high":  getattr(c, "fair_value_entry_high", None),
+        "entry_overpay_pct":      getattr(c, "entry_overpay_pct", None),
+        "market_quality_label":   getattr(c, "market_quality_label", "unknown"),
+        "live_guardrail_reason":  getattr(c, "live_guardrail_reason", ""),
+        # Scenario analysis (TRD-047) — 5 bounded paths
+        "scenarios": getattr(c, "scenarios", []),
+        # Pre-entry buy rule (TRD-054) — single top-level decision
+        "buy_decision":         getattr(c, "buy_decision", "do_not_buy"),
+        "buy_decision_reason":  getattr(c, "buy_decision_reason", ""),
+        "buy_decision_blocker": getattr(c, "buy_decision_blocker", None),
     }
 
 
@@ -6433,11 +6542,14 @@ async def ticker_option_candidates(symbol: str):
         except Exception as exc:
             log.warning("thesis context build failed for %s: %s", sym, exc)
 
+    # ── Portfolio context for PM/risk layer (TRD-046) ────────────────────────
+    portfolio_ctx = _build_portfolio_context()
+
     # ── Run candidate engine in thread (chain fetch is blocking IO) ───────────
     loop = asyncio.get_event_loop()
     try:
         result: "CandidateResult" = await loop.run_in_executor(
-            None, lambda: get_option_candidates(sym, thesis=thesis)
+            None, lambda: get_option_candidates(sym, thesis=thesis, portfolio_context=portfolio_ctx)
         )
     except Exception as exc:
         log.exception("option candidates error for %s", sym)
@@ -6468,6 +6580,9 @@ async def ticker_option_candidates(symbol: str):
         # Thesis summary for UI context
         "thesis_direction": thesis.direction if thesis else None,
         "thesis_conviction": thesis.conviction if thesis else None,
+        # Structure archetype (TRD-048) — at result level for quick inspection
+        "structure_archetype": getattr(result, "structure_archetype", None),
+        "structure_policy_reason": getattr(result, "structure_policy_reason", None),
     }
     result_dict = _json_safe(result_dict)
 
@@ -6479,9 +6594,16 @@ async def ticker_option_candidates(symbol: str):
         if thesis_row:
             thesis_id = thesis_row.get("id")
             _tc = {
-                "thesis_date":      thesis_row.get("date"),
-                "time_horizon":     thesis_row.get("time_horizon"),
-                "signal_agreement": thesis_row.get("signal_agreement_score"),
+                "thesis_date":       thesis_row.get("date"),
+                "time_horizon":      thesis_row.get("time_horizon"),
+                "signal_agreement":  thesis_row.get("signal_agreement_score"),
+                # TRD-050: thesis enrichment
+                "entry_low":         thesis_row.get("entry_low"),
+                "entry_high":        thesis_row.get("entry_high"),
+                # days_to_earnings is not a thesis_cache column; extracted from signals_json
+                "days_to_earnings":  thesis.days_to_earnings if thesis else None,
+                "heat_score":        thesis_row.get("heat_score"),
+                "expected_move_pct": thesis_row.get("expected_move_pct"),
             }
         result.thesis_direction = thesis.direction if thesis else None  # type: ignore[attr-defined]
         result.thesis_conviction = thesis.conviction if thesis else None  # type: ignore[attr-defined]
@@ -6618,6 +6740,9 @@ async def options_screener(
     # Also collect CandidateResult objects for persistence (Issue #2 fix)
     _results_for_persist: list[tuple[dict, "CandidateResult"]] = []
 
+    # Build portfolio context once for all tickers in this screener run (TRD-046)
+    _screener_portfolio_ctx = _build_portfolio_context()
+
     def _run_one(thesis_row: dict) -> tuple[list[dict], "CandidateResult | None"]:
         try:
             thesis = _build_thesis_context(thesis_row)
@@ -6625,7 +6750,9 @@ async def options_screener(
             if thesis.current_price is None:
                 prices = _fetch_current_prices([thesis.ticker])
                 thesis.current_price = prices.get(thesis.ticker)
-            cand_result = get_option_candidates(thesis.ticker, thesis=thesis)
+            cand_result = get_option_candidates(
+                thesis.ticker, thesis=thesis, portfolio_context=_screener_portfolio_ctx
+            )
             # Stamp thesis context onto result for later persistence
             cand_result.thesis_direction = thesis.direction   # type: ignore[attr-defined]
             cand_result.thesis_conviction = thesis.conviction  # type: ignore[attr-defined]
@@ -6693,9 +6820,15 @@ async def options_screener(
             for tr, cr in _results_for_persist:
                 try:
                     tc = {
-                        "thesis_date":      tr.get("date"),
-                        "time_horizon":     tr.get("time_horizon"),
-                        "signal_agreement": tr.get("signal_agreement_score"),
+                        "thesis_date":       tr.get("date"),
+                        "time_horizon":      tr.get("time_horizon"),
+                        "signal_agreement":  tr.get("signal_agreement_score"),
+                        # TRD-050: thesis enrichment
+                        "entry_low":         tr.get("entry_low"),
+                        "entry_high":        tr.get("entry_high"),
+                        "days_to_earnings":  tr.get("days_to_earnings"),
+                        "heat_score":        tr.get("heat_score"),
+                        "expected_move_pct": tr.get("expected_move_pct"),
                     }
                     _persist(cr, thesis_id=tr.get("id"), thesis_context=tc)
                 except Exception:
@@ -6871,6 +7004,97 @@ async def options_accuracy(days: int = Query(90, ge=7, le=365)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TRD-044: Option Target Calibration Comparator  GET /api/options/comparator
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/options/comparator")
+async def options_comparator(
+    days: int = Query(90, ge=7, le=365),
+    resolution_type: str = Query("5d", regex="^(1d|5d|10d)$"),
+):
+    """
+    Legacy vs v2 option target accuracy comparator.
+
+    Joins option_candidate_snapshots (which has target_projection_method and
+    projected_option_tp1/2/stop) with option_candidate_outcomes (which has
+    hit_option_tp1/2/stop for legacy and hit_v2_tp1/2/stop for v2) and
+    runs the pure-Python comparator.
+
+    Returns MethodComparison serialised as JSON.
+    Cached 30 minutes.
+    """
+    from utils.option_comparator import compare_methods, method_comparison_to_dict
+
+    cache_key = f"options_comparator:{days}:{resolution_type}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    _empty = {
+        "data_available": False,
+        "days": days,
+        "resolution_type": resolution_type,
+        "total_rows": 0,
+        "v2_eligible_rows": 0,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+    try:
+        conn = _db_connect()
+        cut = f"NOW() - INTERVAL '{days} days'"
+
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    s.strategy_preset,
+                    s.delta,
+                    s.dte,
+                    s.direction,
+                    s.target_projection_method,
+                    o.resolution_type,
+                    o.option_return_5d_pct,
+                    o.hit_option_tp1,
+                    o.hit_option_tp2,
+                    o.hit_option_stop,
+                    o.hit_v2_tp1,
+                    o.hit_v2_tp2,
+                    o.hit_v2_stop,
+                    o.hit_underlying_t1,
+                    o.hit_underlying_t2,
+                    o.hit_underlying_stop
+                FROM   option_candidate_outcomes o
+                JOIN   option_candidate_snapshots s ON s.id = o.candidate_snapshot_id
+                WHERE  s.created_at >= {cut}
+                  AND  s.suppressed = FALSE
+                  AND  o.resolution_type = %s
+                ORDER  BY s.run_date DESC
+            """, (resolution_type,))
+            rows = [dict(r) for r in cur.fetchall()]
+
+        conn.close()
+
+        if not rows:
+            _empty["data_available"] = False
+            _empty["message"] = "No resolved outcomes in this window"
+            return _empty
+
+        mc = compare_methods(rows, resolution_type=resolution_type)
+        result = method_comparison_to_dict(mc)
+        result["data_available"] = True
+        result["days"] = days
+        result["generated_at"] = datetime.utcnow().isoformat()
+
+        _cache.set(cache_key, result, 30 * 60)
+        return result
+
+    except Exception as exc:
+        log.exception("options comparator error")
+        _empty["error"] = str(exc)
+        return _empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRD-030: Options Scoring Review Workflow  GET /api/options/scoring-review
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -6996,3 +7220,92 @@ async def options_scoring_review(days: int = Query(90, ge=14, le=365)):
     except Exception as exc:
         log.exception("options scoring review error")
         return {"ok": False, "error": str(exc), "generated_at": datetime.utcnow().isoformat()}
+
+
+# ==============================================================================
+# SECTION 30: FUNNEL METRICS  (TRD-059)
+# ==============================================================================
+
+@app.get("/api/funnel/summary")
+async def funnel_summary():
+    """Return today's universe-to-AI funnel snapshot (most recent run)."""
+    try:
+        from utils.supabase_persist import fetch_funnel_metrics
+        rows = fetch_funnel_metrics(history_days=1)
+        if not rows:
+            return _no_data("no funnel metrics for today")
+        return rows[0]
+    except Exception as exc:
+        log.exception("funnel_summary error")
+        return _no_data("funnel_summary failed")
+
+
+@app.get("/api/funnel/history")
+async def funnel_history(days: int = Query(14, ge=1, le=90)):
+    """Return daily funnel metrics for the last N days (newest first)."""
+    try:
+        from utils.supabase_persist import fetch_funnel_metrics
+        rows = fetch_funnel_metrics(history_days=days)
+        return {"rows": rows, "count": len(rows)}
+    except Exception as exc:
+        log.exception("funnel_history error")
+        return {"rows": [], "count": 0}
+
+
+# ==============================================================================
+# SECTION 31: TICKER GOVERNANCE  (TRD-068)
+# ==============================================================================
+
+_VALID_GOV_STATES = {"A_LIST", "STANDARD", "PROBATION", "QUARANTINE"}
+
+
+@app.get("/api/governance")
+async def get_governance():
+    """Return all non-STANDARD ticker governance entries."""
+    try:
+        from utils.supabase_persist import fetch_ticker_governance_full
+        rows = fetch_ticker_governance_full()
+        return {"governance": rows, "count": len(rows)}
+    except Exception as exc:
+        log.exception("get_governance error")
+        return {"governance": [], "count": 0}
+
+
+class GovernanceSetRequest(BaseModel):
+    governance_state: str
+    reason: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.post("/api/governance/{ticker}")
+async def set_governance(ticker: str, req: GovernanceSetRequest):
+    """Set governance state for a ticker (A_LIST/STANDARD/PROBATION/QUARANTINE)."""
+    ticker = ticker.upper().strip()
+    state = req.governance_state.upper()
+    if state not in _VALID_GOV_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid governance_state: {state!r}. Valid: {sorted(_VALID_GOV_STATES)}",
+        )
+    try:
+        from utils.supabase_persist import set_ticker_governance
+        ok = set_ticker_governance(ticker, state, reason=req.reason, notes=req.notes)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to set governance")
+        return {"ok": True, "ticker": ticker, "governance_state": state}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/governance/{ticker}")
+async def remove_governance(ticker: str):
+    """Remove governance entry for ticker (resets to STANDARD)."""
+    ticker = ticker.upper().strip()
+    try:
+        from utils.supabase_persist import remove_ticker_governance
+        remove_ticker_governance(ticker)
+        return {"ok": True, "ticker": ticker}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

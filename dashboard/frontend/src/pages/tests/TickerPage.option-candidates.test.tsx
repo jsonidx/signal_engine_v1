@@ -116,6 +116,10 @@ function makeCandidate(overrides: Partial<OptionCandidate> = {}): OptionCandidat
     fill_quality_score:       0.38,
     slippage_risk_label:      'high',
     skip_if_spread_above_pct: 12.0,
+    // Pre-entry buy rule (TRD-054)
+    buy_decision:         'do_not_buy' as const,
+    buy_decision_reason:  'Do not buy: wait for a better entry.',
+    buy_decision_blocker: 'entry_quality' as const,
     ...overrides,
   }
 }
@@ -914,5 +918,104 @@ describe('OptionCandidatesCard — legacy rows unaffected by TRD-045 (regression
     renderTickerPage()
     expect(await screen.findByText(/entry guidance/i)).toBeInTheDocument()
     expect(screen.getByText(/high slip/i)).toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Pre-entry Buy Decision Badge (TRD-054) ────────────────────────────
+
+describe('OptionCandidatesCard — Buy Decision Badge (TRD-054)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('renders BUY NOW badge when buy_decision is buy_now', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          buy_decision:         'buy_now',
+          buy_decision_reason:  'Buy allowed: portfolio risk policy passed and entry quality is actionable now.',
+          buy_decision_blocker: null,
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('BUY NOW')).toBeInTheDocument()
+  })
+
+  it('renders DO NOT BUY badge when buy_decision is do_not_buy', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          buy_decision:         'do_not_buy',
+          buy_decision_reason:  'Do not buy: wait for a better entry.',
+          buy_decision_blocker: 'entry_quality',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('DO NOT BUY')).toBeInTheDocument()
+  })
+
+  it('renders buy_decision_reason text alongside the badge', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          buy_decision:         'do_not_buy',
+          buy_decision_reason:  'Do not buy: blocked by portfolio risk policy.',
+          buy_decision_blocker: 'risk_policy',
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('DO NOT BUY')
+    expect(screen.getByText('Do not buy: blocked by portfolio risk policy.')).toBeInTheDocument()
+  })
+
+  it('renders BUY NOW reason text for buy_now', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          buy_decision:         'buy_now',
+          buy_decision_reason:  'Buy allowed: portfolio risk policy passed and entry quality is actionable now.',
+          buy_decision_blocker: null,
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('BUY NOW')
+    expect(
+      screen.getByText('Buy allowed: portfolio risk policy passed and entry quality is actionable now.')
+    ).toBeInTheDocument()
+  })
+
+  it('legacy row without buy_decision field does not crash', async () => {
+    const candidate = makeCandidate({
+      buy_decision:         undefined as any,
+      buy_decision_reason:  undefined as any,
+      buy_decision_blocker: undefined as any,
+    })
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({ candidates: [candidate] }),
+    )
+    renderTickerPage()
+    // Should render without throwing — option card should still show the contract
+    expect(await screen.findByText('$150')).toBeInTheDocument()
+  })
+
+  it('shows DO NOT BUY for both-blocked candidate', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          buy_decision:         'do_not_buy',
+          buy_decision_reason:  'Do not buy: blocked by both portfolio risk policy and entry quality.',
+          buy_decision_blocker: 'both',
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('DO NOT BUY')
+    expect(
+      screen.getByText('Do not buy: blocked by both portfolio risk policy and entry quality.')
+    ).toBeInTheDocument()
   })
 })

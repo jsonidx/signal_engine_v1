@@ -99,6 +99,11 @@ class OptionCandidate:
     volume: Optional[int]
     breakeven: Optional[float]  # strike ± mid at expiry
 
+    # Additional Greeks (TRD-050) — populated when IBKR provides model greeks; None for yfinance
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+
     # Scoring / explanation
     score: float = 0.0
     rationale: str = ""
@@ -106,6 +111,7 @@ class OptionCandidate:
 
     # Provenance
     source: str = "yfinance"
+    quote_time: Optional[str] = None   # ISO-8601 UTC; per-contract from IBKR; None for yfinance
 
     # Exit plan (TRD-026 — mandatory for persistence and analytics)
     holding_window_days: Optional[int] = None   # planned hold in calendar days
@@ -129,6 +135,49 @@ class OptionCandidate:
     slippage_risk_label: str = "moderate"
     skip_if_spread_above_pct: Optional[float] = None
 
+    # V2 Target Engine (TRD-043) — thesis-linked option projections
+    projected_option_tp1: Optional[float] = None       # option price at underlying target_1
+    projected_option_tp2: Optional[float] = None       # option price at underlying target_2
+    projected_option_stop: Optional[float] = None      # option price at underlying stop_loss
+    projected_tp1_return_pct: Optional[float] = None   # % gain at tp1 vs entry mid
+    projected_tp2_return_pct: Optional[float] = None   # % gain at tp2 vs entry mid
+    projected_stop_return_pct: Optional[float] = None  # % loss at stop vs entry mid
+    target_projection_method: Optional[str] = None     # "delta_only" | "delta_dte_adjusted" | "insufficient_inputs"
+
+    # Structure archetype (TRD-048) — thesis-tempo to structure-family mapping
+    structure_archetype: Optional[str] = None      # short_breakout | medium_swing | slow_macro | event_sensitive | default_swing
+    structure_policy_reason: Optional[str] = None  # human-readable policy explanation
+
+    # Risk and Position Sizing (TRD-046) — deterministic PM/risk layer
+    risk_allowed: bool = True
+    risk_block_reason: Optional[str] = None
+    max_premium_risk_usd: Optional[float] = None
+    suggested_contract_count: Optional[int] = None
+    position_size_tier: str = "standard"             # "skip" | "reduced" | "standard" | "max"
+    event_risk_policy: str = "no_event_window"
+    iv_regime_label: str = "unknown_iv"
+    portfolio_concentration_warning: Optional[str] = None
+    exit_hierarchy: List[str] = field(default_factory=list)
+    risk_nav_source: str = "model"                   # "account" | "model"
+
+    # Live entry guardrails (TRD-049) — quote freshness + fair-value gating
+    entry_action: str = "enter_now"                  # enter_now | reduce_size | enter_if_repriced | skip_for_now
+    quote_freshness_label: str = "unknown"           # live | recent | stale | unknown
+    quote_age_seconds: Optional[float] = None
+    fair_value_entry_low: Optional[float] = None     # conservative entry target
+    fair_value_entry_high: Optional[float] = None    # fair-value ceiling (mid haircut for IV richness)
+    entry_overpay_pct: Optional[float] = None        # % above fv_high if entering at recommended price
+    market_quality_label: str = "unknown"            # tight | acceptable | wide | very_wide | one_sided
+    live_guardrail_reason: str = ""
+
+    # Scenario analysis (TRD-047) — 5 bounded paths; JSON-serialisable dicts
+    scenarios: List[dict] = field(default_factory=list)
+
+    # Pre-entry buy rule (TRD-054) — single top-level decision
+    buy_decision: str = "do_not_buy"              # "buy_now" | "do_not_buy"
+    buy_decision_reason: str = ""                  # one-sentence explanation
+    buy_decision_blocker: Optional[str] = None     # None | "risk_policy" | "entry_quality" | "both"
+
 
 @dataclass
 class CandidateResult:
@@ -146,6 +195,10 @@ class CandidateResult:
     underlying_price: Optional[float] = None
     chain_source: str = "unknown"
     chain_error: Optional[str] = None
+
+    # Structure archetype metadata (TRD-048)
+    structure_archetype: Optional[str] = None        # short_breakout | medium_swing | slow_macro | event_sensitive | default_swing
+    structure_policy_reason: Optional[str] = None    # human-readable policy explanation
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -338,6 +391,90 @@ def _breakeven(contract: Any) -> Optional[float]:
     return round(contract.strike - contract.mid, 2)
 
 
+_TARGET_V2_VERSION = "v2.0"   # bump when projection math changes materially
+
+
+def compute_target_projections(
+    mid: Optional[float],
+    delta: Optional[float],
+    current_price: Optional[float],
+    target_1: Optional[float],
+    target_2: Optional[float],
+    stop_loss: Optional[float],
+    dte: int,
+) -> dict:
+    """
+    Project option prices at the thesis underlying targets and stop via linear
+    delta approximation, with an optional DTE-based theta haircut for short-dated
+    contracts.
+
+    Formula:
+        projected_option = max(0.01, mid + delta × (underlying_target − current_price))
+
+    DTE haircut (method = "delta_dte_adjusted" when dte < 30):
+        haircut = (30 − dte) / 30 × 0.25   [linear ramp, capped at 25%]
+        Applied to the projected *gain* only, not to the existing mid.
+
+    Returns a dict with keys:
+        projected_option_tp1, projected_option_tp2, projected_option_stop
+        projected_tp1_return_pct, projected_tp2_return_pct, projected_stop_return_pct
+        target_projection_method
+        target_projection_version
+
+    Fails safely: if delta, mid, or current_price is missing, all projected
+    fields are None and method = "insufficient_inputs".
+    """
+    _null = {
+        "projected_option_tp1": None,
+        "projected_option_tp2": None,
+        "projected_option_stop": None,
+        "projected_tp1_return_pct": None,
+        "projected_tp2_return_pct": None,
+        "projected_stop_return_pct": None,
+        "target_projection_method": "insufficient_inputs",
+        "target_projection_version": _TARGET_V2_VERSION,
+    }
+
+    if mid is None or mid <= 0 or delta is None or current_price is None or current_price <= 0:
+        return _null
+
+    # DTE-based theta haircut on the projected gain component
+    if dte < 30:
+        haircut = max(0.0, min(0.25, (30 - dte) / 30 * 0.25))
+        method = "delta_dte_adjusted"
+    else:
+        haircut = 0.0
+        method = "delta_only"
+
+    def _project(und_target: Optional[float]) -> Optional[float]:
+        if und_target is None:
+            return None
+        move = und_target - current_price
+        gain = delta * move          # delta is naturally signed (+call, −put)
+        adjusted_gain = gain * (1.0 - haircut)
+        return round(max(0.01, mid + adjusted_gain), 4)
+
+    def _return_pct(projected: Optional[float]) -> Optional[float]:
+        if projected is None:
+            return None
+        return round((projected - mid) / mid * 100.0, 2)
+
+    tp1 = _project(target_1)
+    tp2 = _project(target_2)
+    stop = _project(stop_loss)
+
+    return {
+        "projected_option_tp1": tp1,
+        "projected_option_tp2": tp2,
+        "projected_option_stop": stop,
+        "projected_tp1_return_pct": _return_pct(tp1),
+        "projected_tp2_return_pct": _return_pct(tp2),
+        "projected_stop_return_pct": _return_pct(stop),
+        "target_projection_method": method,
+        "target_projection_version": _TARGET_V2_VERSION,
+    }
+
+
 def _compute_exit_plan(
     contract: Any,
     preset_name: str,
@@ -379,17 +516,37 @@ def _compute_exit_plan(
     if thesis.days_to_earnings is not None and 0 < thesis.days_to_earnings <= holding_days:
         event_rule = f"Exit before earnings ({thesis.days_to_earnings}d away)"
 
+    # V2 thesis-linked projections (TRD-043)
+    v2 = compute_target_projections(
+        mid=mid,
+        delta=getattr(contract, "delta", None),
+        current_price=thesis.current_price,
+        target_1=thesis.target_1,
+        target_2=thesis.target_2,
+        stop_loss=thesis.stop_loss,
+        dte=getattr(contract, "dte", 0) or 0,
+    )
+
     return {
         "holding_window_days": holding_days,
         "exit_by_date": exit_by_date,
         "underlying_target_1": thesis.target_1,
         "underlying_target_2": thesis.target_2,
         "underlying_stop": thesis.stop_loss,
+        # Legacy flat-multiplier fields (kept for backward compatibility)
         "option_take_profit_1": opt_tp1,
         "option_take_profit_2": opt_tp2,
         "option_stop_loss": opt_sl,
         "max_holding_rule": max_rule,
         "event_exit_rule": event_rule,
+        # V2 thesis-linked projections
+        "projected_option_tp1": v2["projected_option_tp1"],
+        "projected_option_tp2": v2["projected_option_tp2"],
+        "projected_option_stop": v2["projected_option_stop"],
+        "projected_tp1_return_pct": v2["projected_tp1_return_pct"],
+        "projected_tp2_return_pct": v2["projected_tp2_return_pct"],
+        "projected_stop_return_pct": v2["projected_stop_return_pct"],
+        "target_projection_method": v2["target_projection_method"],
     }
 
 
@@ -540,6 +697,59 @@ def compute_entry_guidance(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Pre-entry buy rule  (TRD-054)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def compute_buy_decision(
+    risk_allowed: bool,
+    entry_action: str,
+) -> dict:
+    """
+    Deterministic pre-entry buy decision for a single option candidate.
+
+    Truth table:
+        risk_allowed=True  + entry_action="enter_now" → buy_now
+        risk_allowed=False + entry_action="enter_now" → do_not_buy / risk_policy
+        risk_allowed=True  + entry_action=<other>     → do_not_buy / entry_quality
+        risk_allowed=False + entry_action=<other>     → do_not_buy / both
+        any missing/ambiguous input                   → do_not_buy / both
+
+    Returns a dict with keys:
+        buy_decision         – "buy_now" | "do_not_buy"
+        buy_decision_reason  – short one-sentence explanation
+        buy_decision_blocker – None | "risk_policy" | "entry_quality" | "both"
+    """
+    is_risk_ok = risk_allowed is True
+    is_entry_ok = (entry_action or "") == "enter_now"
+
+    if is_risk_ok and is_entry_ok:
+        return {
+            "buy_decision": "buy_now",
+            "buy_decision_reason": (
+                "Buy allowed: portfolio risk policy passed and entry quality is actionable now."
+            ),
+            "buy_decision_blocker": None,
+        }
+
+    if not is_risk_ok and not is_entry_ok:
+        blocker = "both"
+        reason = "Do not buy: blocked by both portfolio risk policy and entry quality."
+    elif not is_risk_ok:
+        blocker = "risk_policy"
+        reason = "Do not buy: blocked by portfolio risk policy."
+    else:
+        blocker = "entry_quality"
+        reason = "Do not buy: wait for a better entry."
+
+    return {
+        "buy_decision": "do_not_buy",
+        "buy_decision_reason": reason,
+        "buy_decision_blocker": blocker,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -550,6 +760,7 @@ def get_option_candidates(
     chain_result: Optional[Any] = None,    # OptionChainResult; fetched if None
     max_candidates: int = 3,
     include_leaps: bool = True,
+    portfolio_context: Optional[Any] = None,  # utils.option_risk.PortfolioContext; None = safe defaults
 ) -> CandidateResult:
     """
     Deterministic option candidate selection for a single ticker.
@@ -585,17 +796,23 @@ def get_option_candidates(
             suppression_reason=suppression_reason,
         )
 
-    # ── Active presets ────────────────────────────────────────────────────────
+    # ── Structure archetype (TRD-048) ─────────────────────────────────────────
+    from utils.option_structure import classify_structure_archetype, apply_policy_to_preset
+    structure_policy = classify_structure_archetype(thesis)
+
+    # ── Active presets (archetype-gated) ──────────────────────────────────────
     direction = (thesis.direction or "").upper()
     active_presets: List[str] = []
-    if direction == "BULL":
-        active_presets.append("long_call")
-        if include_leaps:
-            active_presets.append("leaps_call")
-    elif direction == "BEAR":
-        active_presets.append("long_put")
-        if include_leaps:
-            active_presets.append("leaps_put")
+    swing_preset   = "long_call" if direction == "BULL" else "long_put"
+    leaps_preset   = "leaps_call" if direction == "BULL" else "leaps_put"
+
+    if direction in ("BULL", "BEAR"):
+        if structure_policy.prefer_leaps and include_leaps and structure_policy.allow_leaps:
+            # Slow macro: LEAPS first so they outscore swing when both qualify
+            active_presets.append(leaps_preset)
+        active_presets.append(swing_preset)
+        if not structure_policy.prefer_leaps and include_leaps and structure_policy.allow_leaps:
+            active_presets.append(leaps_preset)
 
     # ── Fetch chain ───────────────────────────────────────────────────────────
     if chain_result is None:
@@ -627,14 +844,17 @@ def get_option_candidates(
     for preset_name in active_presets:
         preset = PRESETS[preset_name]
 
+        # Apply archetype DTE/spread constraints before filtering (TRD-048)
+        effective_preset = apply_policy_to_preset(preset, preset_name, structure_policy)
+
         matching = [
             c for c in chain_result.contracts
-            if c.right == preset["right"]
-            and preset["min_dte"] <= c.dte <= preset["max_dte"]
+            if c.right == effective_preset["right"]
+            and effective_preset["min_dte"] <= c.dte <= effective_preset["max_dte"]
         ]
 
         for contract in matching:
-            score, rejections = _score_contract(contract, preset, thesis)
+            score, rejections = _score_contract(contract, effective_preset, thesis)
             if rejections:
                 all_rejections.extend(rejections)
                 continue
@@ -655,10 +875,18 @@ def get_option_candidates(
                 open_interest=contract.open_interest,
                 volume=contract.volume,
                 breakeven=_breakeven(contract),
+                # Additional Greeks (TRD-050) — available from IBKR; None for yfinance
+                gamma=getattr(contract, "gamma", None),
+                theta=getattr(contract, "theta", None),
+                vega=getattr(contract, "vega", None),
                 score=score,
                 rationale=_build_rationale(contract, preset_name, thesis),
                 strategy_preset=preset_name,
+                # Structure archetype metadata (TRD-048)
+                structure_archetype=structure_policy.archetype,
+                structure_policy_reason=structure_policy.reason,
                 source=contract.source,
+                quote_time=getattr(contract, "quote_time", None),
                 **exit_plan,
             )
             # TRD-031: attach deterministic execution guidance
@@ -671,6 +899,63 @@ def get_option_candidates(
             candidate.fill_quality_score = eg.fill_quality_score
             candidate.slippage_risk_label = eg.slippage_risk_label
             candidate.skip_if_spread_above_pct = eg.skip_if_spread_above_pct
+            # TRD-046: attach deterministic PM/risk assessment
+            try:
+                from utils.option_risk import compute_option_risk
+                ra = compute_option_risk(candidate, thesis, portfolio_context)
+                candidate.risk_allowed = ra.risk_allowed
+                candidate.risk_block_reason = ra.risk_block_reason
+                candidate.max_premium_risk_usd = ra.max_premium_risk_usd
+                candidate.suggested_contract_count = ra.suggested_contract_count
+                candidate.position_size_tier = ra.position_size_tier
+                candidate.event_risk_policy = ra.event_risk_policy
+                candidate.iv_regime_label = ra.iv_regime_label
+                candidate.portfolio_concentration_warning = ra.portfolio_concentration_warning
+                candidate.exit_hierarchy = ra.exit_hierarchy
+                candidate.risk_nav_source = ra.nav_source
+            except Exception as _risk_exc:
+                log.warning("option_risk compute failed for %s: %s", sym, _risk_exc)
+            # TRD-049: live entry guardrails
+            try:
+                from utils.option_entry_guardrail import compute_entry_guardrail
+                guardrail = compute_entry_guardrail(
+                    candidate,
+                    chain_fetch_time=chain_result.fetch_time,
+                )
+                candidate.entry_action = guardrail.entry_action
+                candidate.quote_freshness_label = guardrail.quote_freshness_label
+                candidate.quote_age_seconds = guardrail.quote_age_seconds
+                candidate.fair_value_entry_low = guardrail.fair_value_entry_low
+                candidate.fair_value_entry_high = guardrail.fair_value_entry_high
+                candidate.entry_overpay_pct = guardrail.entry_overpay_pct
+                candidate.market_quality_label = guardrail.market_quality_label
+                candidate.live_guardrail_reason = guardrail.live_guardrail_reason
+            except Exception as _g_exc:
+                log.warning("entry_guardrail compute failed for %s: %s", sym, _g_exc)
+            # TRD-047: path-aware scenario analysis
+            try:
+                from utils.option_scenario import compute_scenario_set, scenario_set_to_dicts
+                ss = compute_scenario_set(
+                    mid=candidate.mid,
+                    delta=candidate.delta,
+                    current_price=thesis.current_price,
+                    target_1=thesis.target_1,
+                    target_2=thesis.target_2,
+                    stop_loss=thesis.stop_loss,
+                    dte=candidate.dte,
+                    holding_days=candidate.holding_window_days or max(7, candidate.dte // 2),
+                )
+                candidate.scenarios = scenario_set_to_dicts(ss)
+            except Exception as _sc_exc:
+                log.warning("scenario engine failed for %s: %s", sym, _sc_exc)
+            # TRD-054: top-level pre-entry buy decision
+            bd = compute_buy_decision(
+                risk_allowed=candidate.risk_allowed,
+                entry_action=candidate.entry_action,
+            )
+            candidate.buy_decision = bd["buy_decision"]
+            candidate.buy_decision_reason = bd["buy_decision_reason"]
+            candidate.buy_decision_blocker = bd["buy_decision_blocker"]
             scored.append((score, candidate))
 
     # ── Select top N ──────────────────────────────────────────────────────────
@@ -693,6 +978,8 @@ def get_option_candidates(
             rejection_reasons=unique_rejections,
             underlying_price=chain_result.underlying_price,
             chain_source=chain_result.source,
+            structure_archetype=structure_policy.archetype,
+            structure_policy_reason=structure_policy.reason,
         )
 
     return CandidateResult(
@@ -703,4 +990,6 @@ def get_option_candidates(
         rejection_reasons=unique_rejections,
         underlying_price=chain_result.underlying_price,
         chain_source=chain_result.source,
+        structure_archetype=structure_policy.archetype,
+        structure_policy_reason=structure_policy.reason,
     )

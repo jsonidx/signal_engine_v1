@@ -2065,6 +2065,30 @@ function OptionTradeSetupGrid({ c }: { c: OptionCandidate }) {
   )
 }
 
+// ─── TRD-054: Pre-entry buy decision badge ───────────────────────────────────
+
+function BuyDecisionBadge({ c }: { c: OptionCandidate }) {
+  const isBuy = c.buy_decision === 'buy_now'
+  return (
+    <div className={clsx(
+      'flex items-center justify-between rounded px-2 py-1.5',
+      isBuy ? 'bg-accent-green/10 border border-accent-green/30' : 'bg-accent-red/10 border border-accent-red/20',
+    )}>
+      <span className={clsx(
+        'font-mono text-xs font-bold tracking-wide',
+        isBuy ? 'text-accent-green' : 'text-accent-red',
+      )}>
+        {isBuy ? 'BUY NOW' : 'DO NOT BUY'}
+      </span>
+      {c.buy_decision_reason && (
+        <span className="font-mono text-[9px] text-text-tertiary ml-2 text-right leading-tight max-w-[60%]">
+          {c.buy_decision_reason}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function OptionCandidateRow({
   candidate: c,
   rank,
@@ -2098,6 +2122,9 @@ function OptionCandidateRow({
           {presetLabel}
         </span>
       </div>
+
+      {/* TRD-054: Pre-entry buy decision */}
+      {c.buy_decision != null && <BuyDecisionBadge c={c} />}
 
       {/* Key metrics grid */}
       <div className="grid grid-cols-4 gap-2">

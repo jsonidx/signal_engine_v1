@@ -861,6 +861,10 @@ export interface BenchmarkModelSummary {
   bull_count:        number
   bear_count:        number
   neutral_count:     number
+  high_quality_count: number
+  medium_quality_count: number
+  low_quality_count: number
+  unknown_quality_count: number
 }
 
 export interface LivePerformanceRow {
@@ -886,6 +890,7 @@ export interface BenchmarkOutcomeRow {
   thesis_date:       string
   ticker:            string
   model:             string
+  data_quality:      string
   direction:         string
   conviction:        number
   outcome:           string
@@ -1327,6 +1332,10 @@ export const api = {
   optionsAccuracy: (days = 90): Promise<OptionsAccuracyResponse> =>
     client.get('/api/options/accuracy', { params: { days } }).then(r => r.data),
 
+  // Options Target Calibration Comparator (TRD-044)
+  optionsComparator: (days = 90, resolutionType = '5d'): Promise<OptionsComparatorResponse> =>
+    client.get('/api/options/comparator', { params: { days, resolution_type: resolutionType } }).then(r => r.data),
+
   // Options Resolve Outcomes (TRD-027)
   optionsResolveOutcomes: (resolutionType: '1d' | '5d' | '10d' = '1d', limit = 100) =>
     client.post('/api/options/resolve-outcomes', null, {
@@ -1360,6 +1369,23 @@ export const api = {
 
   favoriteRemove: (symbol: string): Promise<{ ok: boolean; symbol: string }> =>
     client.delete(`/api/favorites/${symbol.toUpperCase()}`).then(r => r.data),
+
+  // Funnel Metrics (TRD-059)
+  funnelSummary: (): Promise<FunnelMetrics | null> =>
+    client.get('/api/funnel/summary').then(r => r.data?.run_date ? r.data : null),
+
+  funnelHistory: (days = 14): Promise<FunnelHistoryResponse> =>
+    client.get('/api/funnel/history', { params: { days } }).then(r => r.data ?? { rows: [], count: 0 }),
+
+  // Ticker Governance (TRD-068)
+  governanceGet: (): Promise<GovernanceResponse> =>
+    client.get('/api/governance').then(r => r.data ?? { governance: [], count: 0 }),
+
+  governanceSet: (ticker: string, state: GovernanceState, reason?: string, notes?: string) =>
+    client.post(`/api/governance/${ticker.toUpperCase()}`, { governance_state: state, reason, notes }).then(r => r.data),
+
+  governanceRemove: (ticker: string) =>
+    client.delete(`/api/governance/${ticker.toUpperCase()}`).then(r => r.data),
 }
 
 export interface FavoriteItem {
@@ -1394,7 +1420,22 @@ export interface PatternWatchResponse {
   data: PatternWatchItem[]
 }
 
-// ─── Option Candidates  (TRD-022 / TRD-023 / TRD-026 / TRD-031) ─────────────
+// ─── Option Candidates  (TRD-022 / TRD-023 / TRD-026 / TRD-031 / TRD-043–049) ─
+
+export interface OptionScenario {
+  scenario_id: string               // "fast_target" | "slow_target" | "sideways_decay" | "adverse_stop" | "gap_overshoot"
+  scenario_label: string
+  underlying_move: number | null
+  underlying_move_pct: number | null
+  days_to_resolution: number
+  dte_at_resolution: number
+  projected_option_price: number | null
+  projected_return_pct: number | null
+  theta_cost: number | null
+  scenario_weight_label: string     // "high" | "medium" | "low" | "tail"
+  exit_guidance: string
+  input_method: string              // "delta_theta" | "delta_only" | "insufficient_inputs"
+}
 
 export interface OptionCandidate {
   ticker: string
@@ -1435,6 +1476,32 @@ export interface OptionCandidate {
   fill_quality_score: number | null        // 0.0–1.0
   slippage_risk_label: string              // "low" | "moderate" | "high" | "very_high"
   skip_if_spread_above_pct: number | null
+  // V2 projected exits (TRD-043) — delta-projected from underlying thesis levels
+  projected_option_tp1: number | null
+  projected_option_tp2: number | null
+  projected_option_stop: number | null
+  projected_tp1_return_pct: number | null
+  projected_tp2_return_pct: number | null
+  projected_stop_return_pct: number | null
+  target_projection_method: string | null  // "delta_only" | "delta_dte_adjusted" | "insufficient_inputs"
+  // Structure policy (TRD-048)
+  structure_archetype: string | null       // "short_breakout" | "slow_macro" | etc.
+  structure_policy_reason: string | null
+  // Live entry guardrail (TRD-049)
+  entry_action: string                     // "enter_now" | "enter_if_repriced" | "reduce_size" | "skip_for_now"
+  quote_freshness_label: string            // "live" | "recent" | "stale" | "unknown"
+  quote_age_seconds: number | null
+  fair_value_entry_low: number | null
+  fair_value_entry_high: number | null
+  entry_overpay_pct: number | null
+  market_quality_label: string             // "tight" | "acceptable" | "wide" | "one_sided" | "unknown"
+  live_guardrail_reason: string
+  // Scenario path analysis (TRD-047)
+  scenarios: OptionScenario[]
+  // Pre-entry buy rule (TRD-054)
+  buy_decision: 'buy_now' | 'do_not_buy'
+  buy_decision_reason: string
+  buy_decision_blocker: 'risk_policy' | 'entry_quality' | 'both' | null
 }
 
 export interface OptionCandidatesResponse {
@@ -1504,4 +1571,111 @@ export interface OptionsAccuracyResponse {
   by_holding_window: OptionsCohortRow[]
   suppression_reasons: OptionsFreqRow[]
   rejection_reasons: OptionsFreqRow[]
+}
+
+// ─── Options Comparator  (TRD-044) ────────────────────────────────────────────
+
+export interface ComparatorMethodStats {
+  method: string                    // "legacy" | "v2" | "underlying"
+  n: number
+  tp1_hit_rate: number | null
+  tp2_hit_rate: number | null
+  stop_hit_rate: number | null
+  mean_return_pct: number | null
+  median_return_pct: number | null
+  sparse: boolean
+  note: string
+}
+
+export interface ComparatorCohort {
+  dimension: string
+  cohort_label: string
+  n: number
+  sparse: boolean
+  legacy: ComparatorMethodStats
+  v2: ComparatorMethodStats
+  underlying: ComparatorMethodStats
+}
+
+export interface OptionsComparatorResponse {
+  data_available: boolean
+  days: number
+  resolution_type: string
+  total_rows: number
+  v2_eligible_rows: number
+  generated_at: string
+  overall_legacy: ComparatorMethodStats
+  overall_v2: ComparatorMethodStats
+  overall_underlying: ComparatorMethodStats
+  by_preset: ComparatorCohort[]
+  by_delta_bucket: ComparatorCohort[]
+  by_dte_bucket: ComparatorCohort[]
+  message?: string
+  error?: string
+}
+
+// ─── Funnel Metrics  (TRD-059) ────────────────────────────────────────────────
+
+export interface BroadSourceHealthEntry {
+  source: string
+  fetch_mode: 'live_fetch' | 'fresh_cache' | 'stale_cache' | 'empty_fallback'
+  raw_rows: number | null
+  eligible_count: number
+  warning: string | null
+  fetched_at: string
+}
+
+export interface FunnelMetrics {
+  run_date: string
+  raw_universe_count: number | null
+  hard_excluded_count: number | null
+  lane_excluded_count: number | null
+  execution_core_count: number | null
+  execution_high_beta_count: number | null
+  research_broad_count: number | null
+  prescreened_count: number | null
+  agreement_eligible_count: number | null
+  ai_selected_count: number | null
+  active_thesis_count: number | null
+  watch_only_count: number | null
+  suppressed_count: number | null
+  no_trade_count: number | null
+  bull_count: number | null
+  bear_count: number | null
+  neutral_count: number | null
+  excluded_by_source: Record<string, number> | null
+  suppression_reasons: Record<string, number> | null
+  // Source/lane attribution (TRD-075)
+  candidates_by_lane: Record<string, number> | null
+  candidates_by_source: Record<string, number> | null
+  broad_source_only_candidates: number | null
+  ai_selected_by_lane: Record<string, number> | null
+  ai_selected_by_source: Record<string, number> | null
+  broad_source_only_ai_selected: number | null
+  // Broad-source health metadata (TRD-056 hardening)
+  broad_source_health: Record<string, BroadSourceHealthEntry> | null
+}
+
+export interface FunnelHistoryResponse {
+  rows: FunnelMetrics[]
+  count: number
+}
+
+// ─── Ticker Governance  (TRD-068) ─────────────────────────────────────────────
+
+export type GovernanceState = 'A_LIST' | 'STANDARD' | 'PROBATION' | 'QUARANTINE'
+
+export interface GovernanceEntry {
+  ticker: string
+  governance_state: GovernanceState
+  reason: string | null
+  notes: string | null
+  set_by: string | null
+  set_at: string | null
+  updated_at: string | null
+}
+
+export interface GovernanceResponse {
+  governance: GovernanceEntry[]
+  count: number
 }
