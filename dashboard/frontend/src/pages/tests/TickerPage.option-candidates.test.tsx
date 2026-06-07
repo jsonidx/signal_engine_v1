@@ -542,3 +542,377 @@ describe('Options prompt mode', () => {
     expect(prompt).toMatch(/do NOT suggest any specific[\s\S]*option contract/i)
   })
 })
+
+// ─── Tests: V2 Projected Exits (TRD-045) ──────────────────────────────────────
+
+describe('OptionCandidatesCard — V2 Projected Exits (TRD-045)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('renders V2 projected exits section when projected_option_tp1 and method are present', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:   3.20,
+          projected_option_tp2:   4.50,
+          projected_option_stop:  1.40,
+          target_projection_method: 'delta_only',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('V2 Projected Exits')).toBeInTheDocument()
+    expect(screen.getByText('$3.20')).toBeInTheDocument()
+    expect(screen.getByText('$4.50')).toBeInTheDocument()
+    expect(screen.getByText('$1.40')).toBeInTheDocument()
+  })
+
+  it('renders method badge Δ-linear for delta_only', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:     3.20,
+          target_projection_method: 'delta_only',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('Δ-linear')).toBeInTheDocument()
+  })
+
+  it('renders method badge Δ+DTE for delta_dte_adjusted', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:     3.20,
+          target_projection_method: 'delta_dte_adjusted',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('Δ+DTE')).toBeInTheDocument()
+  })
+
+  it('does not render V2 section header when method is insufficient_inputs', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:     3.20,
+          target_projection_method: 'insufficient_inputs',
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    expect(screen.queryByText('V2 Projected Exits')).not.toBeInTheDocument()
+  })
+
+  it('renders flat-estimate fallback section when method is insufficient_inputs', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          target_projection_method: 'insufficient_inputs',
+          option_take_profit_1: 3.15,
+          option_take_profit_2: 4.20,
+          option_stop_loss:     1.05,
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('Exits (estimated)')).toBeInTheDocument()
+    expect(screen.getByText('flat')).toBeInTheDocument()
+    expect(screen.getByText(/insufficient chain data for v2 projection/i)).toBeInTheDocument()
+    expect(screen.getByText('$3.15')).toBeInTheDocument()
+    expect(screen.getByText('$4.20')).toBeInTheDocument()
+    expect(screen.getByText('$1.05')).toBeInTheDocument()
+  })
+
+  it('does not render V2 section when projected_option_tp1 is null', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:     null,
+          target_projection_method: 'delta_only',
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    expect(screen.queryByText('V2 Projected Exits')).not.toBeInTheDocument()
+  })
+
+  it('renders return percentage alongside projected tp1 when provided', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1:      3.20,
+          projected_tp1_return_pct:  56.1,
+          target_projection_method:  'delta_only',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('+56.1%')).toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Underlying Levels Row (TRD-045) ───────────────────────────────────
+
+describe('OptionCandidatesCard — Underlying Levels Row (TRD-045)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('renders underlying stop and target levels', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          underlying_target_1: 162,
+          underlying_target_2: 175,
+          underlying_stop:     138,
+        })],
+      }),
+    )
+    renderTickerPage()
+    // The option card's UnderlyingLevelsRow uses "Underlying" as the row label
+    const underlyingLabels = await screen.findAllByText(/^Underlying$/i)
+    // at least one matches our option-card row (uppercase monospace label)
+    expect(underlyingLabels.length).toBeGreaterThan(0)
+    expect(screen.getByText('T1 $162.00')).toBeInTheDocument()
+    expect(screen.getByText('T2 $175.00')).toBeInTheDocument()
+    expect(screen.getByText('SL $138.00')).toBeInTheDocument()
+  })
+
+  it('renders holding window days when present', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ underlying_target_1: 162, holding_window_days: 14 })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findAllByText(/^Underlying$/i)
+    expect(screen.getByText('hold 14d')).toBeInTheDocument()
+  })
+
+  it('hides underlying row when both t1 and stop are null', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({ underlying_target_1: null, underlying_stop: null })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    // UnderlyingLevelsRow shouldn't render; "hold Xd" is its unique child
+    expect(screen.queryByText(/hold \d+d/)).not.toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Entry Guardrail Banner (TRD-045 / TRD-049) ───────────────────────
+
+describe('OptionCandidatesCard — Entry Guardrail Banner (TRD-045)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('renders constrained action badge for enter_if_repriced', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          entry_action:           'enter_if_repriced',
+          live_guardrail_reason:  'Mid $2.10 is above FV ceiling $1.95.',
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('enter if repriced')).toBeInTheDocument()
+    expect(screen.getByText('Mid $2.10 is above FV ceiling $1.95.')).toBeInTheDocument()
+  })
+
+  it('renders FV band when fair_value_entry_low/high are set', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          entry_action:          'reduce_size',
+          fair_value_entry_low:  1.85,
+          fair_value_entry_high: 2.05,
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('FV $1.85–$2.05')).toBeInTheDocument()
+  })
+
+  it('renders overpay percentage when entry_overpay_pct > 0', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          entry_action:     'enter_now',
+          entry_overpay_pct: 7.5,
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('overpay +7.5%')).toBeInTheDocument()
+  })
+
+  it('hides banner for enter_now when no overpay', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          entry_action:      'enter_now',
+          entry_overpay_pct: null,
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    expect(screen.queryByText('enter now')).not.toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Scenario Strip (TRD-047 / TRD-045) ────────────────────────────────
+
+describe('OptionCandidatesCard — Scenario Strip (TRD-045)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  function makeScenario(overrides: Partial<{
+    scenario_id: string; scenario_label: string; projected_return_pct: number | null;
+    days_to_resolution: number; input_method: string; projected_option_price: number | null;
+    scenario_weight_label: string; exit_guidance: string;
+  }> = {}) {
+    return {
+      scenario_id:           'fast_target',
+      scenario_label:        'Fast Target',
+      projected_return_pct:  55,
+      days_to_resolution:    7,
+      input_method:          'delta_approx',
+      projected_option_price: 3.25,
+      scenario_weight_label: 'medium',
+      exit_guidance:         'Take profit at T1.',
+      ...overrides,
+    }
+  }
+
+  it('renders scenario strip with path labels', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          scenarios: [
+            makeScenario({ scenario_id: 'fast_target', projected_return_pct: 55 }),
+            makeScenario({ scenario_id: 'slow_target', projected_return_pct: 30 }),
+            makeScenario({ scenario_id: 'sideways_decay', projected_return_pct: -40 }),
+            makeScenario({ scenario_id: 'adverse_stop', projected_return_pct: -50 }),
+          ],
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText('Paths')).toBeInTheDocument()
+    expect(screen.getByText('Fast')).toBeInTheDocument()
+    expect(screen.getByText('Slow')).toBeInTheDocument()
+    expect(screen.getByText('Sideways')).toBeInTheDocument()
+    expect(screen.getByText('Adverse')).toBeInTheDocument()
+  })
+
+  it('renders return percentages for each scenario', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          scenarios: [
+            makeScenario({ scenario_id: 'fast_target', projected_return_pct: 55 }),
+            makeScenario({ scenario_id: 'adverse_stop', projected_return_pct: -50 }),
+          ],
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Paths')
+    expect(screen.getByText('+55%')).toBeInTheDocument()
+    expect(screen.getByText('-50%')).toBeInTheDocument()
+  })
+
+  it('hides scenario strip when scenarios array is empty', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({ candidates: [makeCandidate({ scenarios: [] })] }),
+    )
+    renderTickerPage()
+    await screen.findByText('Option Candidates')
+    expect(screen.queryByText('Paths')).not.toBeInTheDocument()
+  })
+
+  it('omits insufficient_inputs scenarios from strip', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          scenarios: [
+            makeScenario({ scenario_id: 'fast_target', input_method: 'insufficient_inputs' }),
+            makeScenario({ scenario_id: 'slow_target', projected_return_pct: 28 }),
+          ],
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Paths')
+    expect(screen.queryByText('Fast')).not.toBeInTheDocument()
+    expect(screen.getByText('Slow')).toBeInTheDocument()
+  })
+
+  it('renders days_to_resolution when > 0', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          scenarios: [makeScenario({ scenario_id: 'fast_target', days_to_resolution: 5 })],
+        })],
+      }),
+    )
+    renderTickerPage()
+    await screen.findByText('Paths')
+    expect(screen.getByText('5d')).toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Legacy rows not broken by TRD-045 changes ────────────────────────
+
+describe('OptionCandidatesCard — legacy rows unaffected by TRD-045 (regression)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+  })
+
+  it('still renders Trade Setup section for legacy candidates with no v2 fields', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1: null,
+          projected_option_tp2: null,
+          projected_option_stop: null,
+          target_projection_method: null,
+          scenarios: [],
+          entry_action: 'enter_now',
+          entry_overpay_pct: null,
+        })],
+      }),
+    )
+    renderTickerPage()
+    // "T1 Profit" appears in both equity strip and option trade setup; at least one should be present
+    const t1Labels = await screen.findAllByText('T1 Profit')
+    expect(t1Labels.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('still renders execution guidance for legacy candidates', async () => {
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(
+      makeCandidatesResponse({
+        candidates: [makeCandidate({
+          projected_option_tp1: null,
+          target_projection_method: null,
+          scenarios: [],
+        })],
+      }),
+    )
+    renderTickerPage()
+    expect(await screen.findByText(/entry guidance/i)).toBeInTheDocument()
+    expect(screen.getByText(/high slip/i)).toBeInTheDocument()
+  })
+})

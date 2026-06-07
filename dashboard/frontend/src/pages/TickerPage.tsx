@@ -1762,14 +1762,80 @@ const METHOD_LABEL: Record<string, string> = {
   insufficient_inputs: '',
 }
 
-function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
-  const tp1   = c.projected_option_tp1
-  const tp2   = c.projected_option_tp2
-  const sl    = c.projected_option_stop
-  const method = c.target_projection_method
-  if (tp1 == null || method === 'insufficient_inputs' || method == null) return null
-
+// Shared entry column used by both the v2 and flat-fallback grids.
+function _EntryCol({ c }: { c: OptionCandidate }) {
   const entry = c.recommended_entry_price ?? c.mid
+  if (entry == null) return <div />
+  return (
+    <div className="space-y-0.5">
+      <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry</div>
+      <div className="font-mono text-xs font-semibold text-text-primary">
+        ${entry.toFixed(2)}
+        {c.recommended_order_type && (
+          <span className="font-normal text-[9px] text-text-tertiary ml-1">{c.recommended_order_type}</span>
+        )}
+      </div>
+      {c.bid != null && c.ask != null && (
+        <div className="font-mono text-[9px] text-text-tertiary">${c.bid.toFixed(2)}–${c.ask.toFixed(2)}</div>
+      )}
+    </div>
+  )
+}
+
+function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
+  const tp1    = c.projected_option_tp1
+  const tp2    = c.projected_option_tp2
+  const sl     = c.projected_option_stop
+  const method = c.target_projection_method
+
+  // ── Flat-estimate fallback when v2 lacks chain data ───────────────────────
+  if (method === 'insufficient_inputs' || method == null || tp1 == null) {
+    const flatTp1 = c.option_take_profit_1
+    const flatTp2 = c.option_take_profit_2
+    const flatSl  = c.option_stop_loss
+    if (flatTp1 == null) return null
+
+    const entry  = c.recommended_entry_price ?? c.mid
+    const flatR1 = entry ? ((flatTp1 - entry) / entry) * 100 : null
+    const flatR2 = flatTp2 && entry ? ((flatTp2 - entry) / entry) * 100 : null
+    const flatRs = flatSl  && entry ? ((flatSl  - entry) / entry) * 100 : null
+
+    return (
+      <div className="border-t border-border-subtle pt-1.5 space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Exits (estimated)</span>
+          <span className="font-mono text-[9px] text-text-tertiary border border-border-subtle px-1 rounded">flat</span>
+        </div>
+        <div className="font-mono text-[9px] text-text-tertiary">
+          Insufficient chain data for v2 projection — using 1.5× / 2× / 0.5× flat estimates.
+        </div>
+        <div className="grid grid-cols-4 gap-2">
+          <_EntryCol c={c} />
+          <div className="space-y-0.5">
+            <div className="font-mono text-[9px] text-text-tertiary uppercase">T1</div>
+            <div className="font-mono text-xs font-semibold text-accent-green/70">${flatTp1.toFixed(2)}</div>
+            {flatR1 != null && <div className="font-mono text-[9px] text-accent-green/70">+{flatR1.toFixed(1)}%</div>}
+          </div>
+          {flatTp2 != null ? (
+            <div className="space-y-0.5">
+              <div className="font-mono text-[9px] text-text-tertiary uppercase">T2</div>
+              <div className="font-mono text-xs font-semibold text-accent-green/70">${flatTp2.toFixed(2)}</div>
+              {flatR2 != null && <div className="font-mono text-[9px] text-accent-green/70">+{flatR2.toFixed(1)}%</div>}
+            </div>
+          ) : <div />}
+          {flatSl != null ? (
+            <div className="space-y-0.5">
+              <div className="font-mono text-[9px] text-text-tertiary uppercase">SL</div>
+              <div className="font-mono text-xs font-semibold text-accent-red/70">${flatSl.toFixed(2)}</div>
+              {flatRs != null && <div className="font-mono text-[9px] text-accent-red/70">{flatRs.toFixed(1)}%</div>}
+            </div>
+          ) : <div />}
+        </div>
+      </div>
+    )
+  }
+
+  // ── V2 thesis-linked projected exits (primary path) ───────────────────────
   const r1 = c.projected_tp1_return_pct
   const r2 = c.projected_tp2_return_pct
   const rs = c.projected_stop_return_pct
@@ -1785,43 +1851,24 @@ function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
         )}
       </div>
       <div className="grid grid-cols-4 gap-2">
-        {entry != null ? (
-          <div className="space-y-0.5">
-            <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry</div>
-            <div className="font-mono text-xs font-semibold text-text-primary">
-              ${entry.toFixed(2)}
-              {c.recommended_order_type && (
-                <span className="font-normal text-[9px] text-text-tertiary ml-1">{c.recommended_order_type}</span>
-              )}
-            </div>
-            {c.bid != null && c.ask != null && (
-              <div className="font-mono text-[9px] text-text-tertiary">${c.bid.toFixed(2)}–${c.ask.toFixed(2)}</div>
-            )}
-          </div>
-        ) : <div />}
+        <_EntryCol c={c} />
         <div className="space-y-0.5">
           <div className="font-mono text-[9px] text-text-tertiary uppercase">T1</div>
           <div className="font-mono text-xs font-semibold text-accent-green">${tp1.toFixed(2)}</div>
-          {r1 != null && (
-            <div className="font-mono text-[9px] text-accent-green">+{r1.toFixed(1)}%</div>
-          )}
+          {r1 != null && <div className="font-mono text-[9px] text-accent-green">+{r1.toFixed(1)}%</div>}
         </div>
         {tp2 != null ? (
           <div className="space-y-0.5">
             <div className="font-mono text-[9px] text-text-tertiary uppercase">T2</div>
             <div className="font-mono text-xs font-semibold text-accent-green">${tp2.toFixed(2)}</div>
-            {r2 != null && (
-              <div className="font-mono text-[9px] text-accent-green">+{r2.toFixed(1)}%</div>
-            )}
+            {r2 != null && <div className="font-mono text-[9px] text-accent-green">+{r2.toFixed(1)}%</div>}
           </div>
         ) : <div />}
         {sl != null ? (
           <div className="space-y-0.5">
             <div className="font-mono text-[9px] text-text-tertiary uppercase">SL</div>
             <div className="font-mono text-xs font-semibold text-accent-red">${sl.toFixed(2)}</div>
-            {rs != null && (
-              <div className="font-mono text-[9px] text-accent-red">{rs.toFixed(1)}%</div>
-            )}
+            {rs != null && <div className="font-mono text-[9px] text-accent-red">{rs.toFixed(1)}%</div>}
           </div>
         ) : <div />}
       </div>
@@ -2101,10 +2148,7 @@ function OptionCandidateRow({
       {/* Live entry guardrail (TRD-049) — only shown for constrained states */}
       <EntryGuardrailBanner c={c} />
 
-      {/* Trade setup: legacy flat-multiplier exits (TRD-026) */}
-      <OptionTradeSetupGrid c={c} />
-
-      {/* V2 projected exits (TRD-043) */}
+      {/* Exits: v2 thesis-linked (primary) or flat-estimate fallback when insufficient chain data */}
       <ProjectedExitsSection c={c} />
 
       {/* Underlying thesis levels */}
