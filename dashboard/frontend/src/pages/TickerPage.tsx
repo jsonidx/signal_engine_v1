@@ -1707,6 +1707,317 @@ function OptionCandidatesCard({
   )
 }
 
+// ─── TRD-049: Live entry guardrail strip ─────────────────────────────────────
+
+const ENTRY_ACTION_COLOR: Record<string, string> = {
+  enter_now:        'bg-accent-green/10 text-accent-green',
+  enter_if_repriced:'bg-accent-amber/10 text-accent-amber',
+  reduce_size:      'bg-accent-amber/10 text-accent-amber',
+  skip_for_now:     'bg-accent-red/10 text-accent-red',
+}
+
+function EntryGuardrailBanner({ c }: { c: OptionCandidate }) {
+  const action = c.entry_action ?? 'enter_now'
+  // Only show the banner for non-default or constrained states; don't clutter enter_now rows
+  const isActionable = action !== 'enter_now'
+  const hasOvepay = c.entry_overpay_pct != null && c.entry_overpay_pct > 0
+  const hasFvBand = c.fair_value_entry_low != null && c.fair_value_entry_high != null
+  if (!isActionable && !hasOvepay) return null
+
+  const actionLabel = action.replace(/_/g, ' ')
+  const colorCls = ENTRY_ACTION_COLOR[action] ?? 'bg-bg-elevated text-text-secondary'
+
+  return (
+    <div className="border-t border-border-subtle pt-1.5 space-y-1">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={clsx('font-mono text-[9px] px-1.5 py-0.5 rounded font-semibold', colorCls)}>
+          {actionLabel}
+        </span>
+        {hasFvBand && (
+          <span className="font-mono text-[9px] text-text-tertiary">
+            FV ${c.fair_value_entry_low!.toFixed(2)}–${c.fair_value_entry_high!.toFixed(2)}
+          </span>
+        )}
+        {hasOvepay && (
+          <span className="font-mono text-[9px] text-accent-amber">
+            overpay +{c.entry_overpay_pct!.toFixed(1)}%
+          </span>
+        )}
+        {c.market_quality_label && c.market_quality_label !== 'unknown' && c.market_quality_label !== 'acceptable' && (
+          <span className="font-mono text-[9px] text-text-tertiary">{c.market_quality_label}</span>
+        )}
+      </div>
+      {c.live_guardrail_reason && (
+        <div className="font-mono text-[9px] text-text-tertiary leading-relaxed">{c.live_guardrail_reason}</div>
+      )}
+    </div>
+  )
+}
+
+// ─── TRD-043 / TRD-045: V2 projected exits ───────────────────────────────────
+
+const METHOD_LABEL: Record<string, string> = {
+  delta_only:          'Δ-linear',
+  delta_dte_adjusted:  'Δ+DTE',
+  insufficient_inputs: '',
+}
+
+function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
+  const tp1   = c.projected_option_tp1
+  const tp2   = c.projected_option_tp2
+  const sl    = c.projected_option_stop
+  const method = c.target_projection_method
+  if (tp1 == null || method === 'insufficient_inputs' || method == null) return null
+
+  const entry = c.recommended_entry_price ?? c.mid
+  const r1 = c.projected_tp1_return_pct
+  const r2 = c.projected_tp2_return_pct
+  const rs = c.projected_stop_return_pct
+
+  return (
+    <div className="border-t border-border-subtle pt-1.5 space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">V2 Projected Exits</span>
+        {method && METHOD_LABEL[method] && (
+          <span className="font-mono text-[9px] text-text-tertiary border border-border-subtle px-1 rounded">
+            {METHOD_LABEL[method]}
+          </span>
+        )}
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        {entry != null ? (
+          <div className="space-y-0.5">
+            <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry</div>
+            <div className="font-mono text-xs font-semibold text-text-primary">
+              ${entry.toFixed(2)}
+              {c.recommended_order_type && (
+                <span className="font-normal text-[9px] text-text-tertiary ml-1">{c.recommended_order_type}</span>
+              )}
+            </div>
+            {c.bid != null && c.ask != null && (
+              <div className="font-mono text-[9px] text-text-tertiary">${c.bid.toFixed(2)}–${c.ask.toFixed(2)}</div>
+            )}
+          </div>
+        ) : <div />}
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">T1</div>
+          <div className="font-mono text-xs font-semibold text-accent-green">${tp1.toFixed(2)}</div>
+          {r1 != null && (
+            <div className="font-mono text-[9px] text-accent-green">+{r1.toFixed(1)}%</div>
+          )}
+        </div>
+        {tp2 != null ? (
+          <div className="space-y-0.5">
+            <div className="font-mono text-[9px] text-text-tertiary uppercase">T2</div>
+            <div className="font-mono text-xs font-semibold text-accent-green">${tp2.toFixed(2)}</div>
+            {r2 != null && (
+              <div className="font-mono text-[9px] text-accent-green">+{r2.toFixed(1)}%</div>
+            )}
+          </div>
+        ) : <div />}
+        {sl != null ? (
+          <div className="space-y-0.5">
+            <div className="font-mono text-[9px] text-text-tertiary uppercase">SL</div>
+            <div className="font-mono text-xs font-semibold text-accent-red">${sl.toFixed(2)}</div>
+            {rs != null && (
+              <div className="font-mono text-[9px] text-accent-red">{rs.toFixed(1)}%</div>
+            )}
+          </div>
+        ) : <div />}
+      </div>
+    </div>
+  )
+}
+
+// ─── TRD-045: Underlying levels row ──────────────────────────────────────────
+
+function UnderlyingLevelsRow({ c }: { c: OptionCandidate }) {
+  const t1   = c.underlying_target_1
+  const t2   = c.underlying_target_2
+  const stop = c.underlying_stop
+  if (t1 == null && stop == null) return null
+
+  return (
+    <div className="flex items-center gap-3 flex-wrap pt-1 border-t border-border-subtle">
+      <span className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary shrink-0">Underlying</span>
+      {stop != null && (
+        <span className="font-mono text-[9px] text-accent-red">SL ${stop.toFixed(2)}</span>
+      )}
+      {t1 != null && (
+        <span className="font-mono text-[9px] text-accent-green">T1 ${t1.toFixed(2)}</span>
+      )}
+      {t2 != null && (
+        <span className="font-mono text-[9px] text-accent-green">T2 ${t2.toFixed(2)}</span>
+      )}
+      {c.holding_window_days != null && (
+        <span className="font-mono text-[9px] text-text-tertiary">hold {c.holding_window_days}d</span>
+      )}
+    </div>
+  )
+}
+
+// ─── TRD-047 / TRD-045: Scenario strip ───────────────────────────────────────
+
+const SCENARIO_COLOR: Record<string, string> = {
+  fast_target:    'text-accent-green',
+  slow_target:    'text-accent-green',
+  sideways_decay: 'text-accent-amber',
+  adverse_stop:   'text-accent-red',
+  gap_overshoot:  'text-accent-blue',
+}
+
+const SCENARIO_SHORT: Record<string, string> = {
+  fast_target:    'Fast',
+  slow_target:    'Slow',
+  sideways_decay: 'Sideways',
+  adverse_stop:   'Adverse',
+  gap_overshoot:  'Gap',
+}
+
+function ScenarioStrip({ c }: { c: OptionCandidate }) {
+  const scenarios = c.scenarios
+  if (!scenarios || scenarios.length === 0) return null
+  const visible = ['fast_target', 'slow_target', 'sideways_decay', 'adverse_stop']
+  const shown = scenarios.filter(s => visible.includes(s.scenario_id) && s.input_method !== 'insufficient_inputs')
+  if (shown.length === 0) return null
+
+  return (
+    <div className="border-t border-border-subtle pt-1.5 space-y-1">
+      <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Paths</div>
+      <div className="flex flex-wrap gap-3">
+        {shown.map(s => {
+          const ret = s.projected_return_pct
+          const colorCls = SCENARIO_COLOR[s.scenario_id] ?? 'text-text-secondary'
+          const shortLabel = SCENARIO_SHORT[s.scenario_id] ?? s.scenario_id
+          return (
+            <div key={s.scenario_id} className="space-y-0.5 min-w-[52px]" title={s.exit_guidance}>
+              <div className="font-mono text-[9px] text-text-tertiary">{shortLabel}</div>
+              <div className={clsx('font-mono text-xs font-semibold', colorCls)}>
+                {ret != null ? `${ret >= 0 ? '+' : ''}${ret.toFixed(0)}%` : '—'}
+              </div>
+              {s.days_to_resolution > 0 && (
+                <div className="font-mono text-[9px] text-text-tertiary">{s.days_to_resolution}d</div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─── Trade Setup grid (legacy flat-multiplier exits, TRD-026) ────────────────
+
+function OptionTradeSetupGrid({ c }: { c: OptionCandidate }) {
+  const entry = c.recommended_entry_price
+  const sl    = c.option_stop_loss
+  const tp1   = c.option_take_profit_1
+  const tp2   = c.option_take_profit_2
+  if (entry == null || sl == null || tp1 == null) return null
+
+  const slPct  = ((sl  - entry) / entry) * 100
+  const tp1Pct = ((tp1 - entry) / entry) * 100
+  const tp2Pct = tp2 != null ? ((tp2 - entry) / entry) * 100 : null
+  const rrT1   = Math.abs(slPct) > 0 ? tp1Pct / Math.abs(slPct) : null
+
+  const min   = sl
+  const max   = tp2 ?? tp1
+  const range = max - min || 1
+  const entryPos = ((entry - min) / range) * 100
+  const tp1Pos   = ((tp1   - min) / range) * 100
+  const tp2Pos   = tp2 != null ? ((tp2 - min) / range) * 100 : null
+
+  return (
+    <div className="border-t border-border-subtle pt-2 space-y-2">
+      <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">Trade Setup</div>
+
+      {/* 4-col metric grid */}
+      <div className="grid grid-cols-4 gap-2">
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">Entry (mid)</div>
+          <div className="font-mono text-sm font-bold text-text-primary">
+            ${entry.toFixed(2)}
+            {c.recommended_order_type && (
+              <span className="font-normal text-[9px] text-text-tertiary ml-1">{c.recommended_order_type}</span>
+            )}
+          </div>
+          {c.bid != null && c.ask != null && (
+            <div className="font-mono text-[9px] text-text-tertiary">${c.bid.toFixed(2)}–${c.ask.toFixed(2)}</div>
+          )}
+        </div>
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">T1 Profit</div>
+          <div className="font-mono text-sm font-bold text-accent-green">+{tp1Pct.toFixed(1)}%</div>
+          <div className="font-mono text-[9px] text-text-tertiary">${tp1.toFixed(2)}</div>
+        </div>
+        {tp2 != null && tp2Pct != null ? (
+          <div className="space-y-0.5">
+            <div className="font-mono text-[9px] text-text-tertiary uppercase">T2 Profit</div>
+            <div className="font-mono text-sm font-bold text-accent-green">+{tp2Pct.toFixed(1)}%</div>
+            <div className="font-mono text-[9px] text-text-tertiary">${tp2.toFixed(2)}</div>
+          </div>
+        ) : <div />}
+        <div className="space-y-0.5">
+          <div className="font-mono text-[9px] text-text-tertiary uppercase">Risk (Stop)</div>
+          <div className="font-mono text-sm font-bold text-accent-red">{slPct.toFixed(1)}%</div>
+          <div className="font-mono text-[9px] text-text-tertiary">${sl.toFixed(2)}</div>
+        </div>
+      </div>
+
+      {/* Visual bar */}
+      <div className="relative h-2.5 rounded overflow-hidden bg-bg-surface">
+        {/* Red zone: SL → entry */}
+        <div className="absolute top-0 left-0 h-full bg-accent-red/50" style={{ width: `${entryPos}%` }} />
+        {/* Green zone: entry → T1 */}
+        <div
+          className="absolute top-0 h-full bg-accent-green/40"
+          style={{ left: `${entryPos}%`, width: `${tp1Pos - entryPos}%` }}
+        />
+        {/* Brighter zone: T1 → T2 */}
+        {tp2Pos != null && (
+          <div
+            className="absolute top-0 h-full bg-accent-green/65"
+            style={{ left: `${tp1Pos}%`, width: `${tp2Pos - tp1Pos}%` }}
+          />
+        )}
+        {/* Entry dot */}
+        <div
+          className="absolute top-1/2 -translate-y-1/2 w-2 h-2 rounded-full bg-white border border-bg-surface"
+          style={{ left: `calc(${entryPos}% - 4px)` }}
+        />
+        {/* T1 tick */}
+        <div className="absolute top-0 bottom-0 w-px bg-accent-green" style={{ left: `${tp1Pos}%` }} />
+        {/* T2 tick */}
+        {tp2Pos != null && (
+          <div className="absolute top-0 bottom-0 w-px bg-accent-green" style={{ left: `${tp2Pos}%` }} />
+        )}
+      </div>
+
+      {/* Footer labels — absolute-positioned to align with bar markers */}
+      <div className="relative h-4 font-mono text-[9px]">
+        <span className="absolute left-0 text-accent-red">SL {slPct.toFixed(1)}%</span>
+        <span
+          className="absolute text-text-secondary"
+          style={{ left: `${entryPos}%`, transform: 'translateX(-50%)' }}
+        >ENTRY</span>
+        <span
+          className="absolute text-accent-green"
+          style={{ left: `${tp1Pos}%`, transform: 'translateX(-50%)' }}
+        >T1 +{tp1Pct.toFixed(1)}%</span>
+        {tp2Pct != null && tp2Pos != null && (
+          <span
+            className="absolute text-accent-green"
+            style={{ left: `${tp2Pos}%`, transform: 'translateX(-50%)' }}
+          >T2 +{tp2Pct.toFixed(1)}%</span>
+        )}
+        {rrT1 != null && (
+          <span className="absolute right-0 text-text-tertiary">R:R {rrT1.toFixed(1)}:1</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function OptionCandidateRow({
   candidate: c,
   rank,
@@ -1787,6 +2098,18 @@ function OptionCandidateRow({
         </div>
       </div>
 
+      {/* Live entry guardrail (TRD-049) — only shown for constrained states */}
+      <EntryGuardrailBanner c={c} />
+
+      {/* Trade setup: legacy flat-multiplier exits (TRD-026) */}
+      <OptionTradeSetupGrid c={c} />
+
+      {/* V2 projected exits (TRD-043) */}
+      <ProjectedExitsSection c={c} />
+
+      {/* Underlying thesis levels */}
+      <UnderlyingLevelsRow c={c} />
+
       {/* Execution guidance (TRD-031) */}
       {c.recommended_entry_price != null && (
         <div className="border-t border-border-subtle pt-1.5 space-y-1">
@@ -1802,13 +2125,6 @@ function OptionCandidateRow({
             </span>
           </div>
           <div className="flex items-center gap-3 flex-wrap">
-            <div className="space-y-0.5">
-              <div className="font-mono text-[9px] text-text-tertiary uppercase">Recommended Entry</div>
-              <div className="font-mono text-xs font-semibold text-text-primary">
-                ${c.recommended_entry_price.toFixed(2)}
-                <span className="font-normal text-text-tertiary ml-1">{c.recommended_order_type}</span>
-              </div>
-            </div>
             <div className="space-y-0.5">
               <div className="font-mono text-[9px] text-text-tertiary uppercase">Max Chase</div>
               <div className="font-mono text-xs text-text-secondary">
@@ -1837,6 +2153,9 @@ function OptionCandidateRow({
           )}
         </div>
       )}
+
+      {/* Scenario paths (TRD-047) */}
+      <ScenarioStrip c={c} />
 
       {/* Contract selection rationale */}
       {c.rationale && (
