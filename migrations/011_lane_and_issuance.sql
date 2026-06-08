@@ -36,8 +36,18 @@ CREATE INDEX IF NOT EXISTS idx_rlc_lane_date ON research_lane_candidates (lane, 
 -- Enable RLS (matches project policy)
 ALTER TABLE research_lane_candidates ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY IF NOT EXISTS "allow_all_research_lane_candidates"
-    ON research_lane_candidates
-    FOR ALL
-    USING (true)
-    WITH CHECK (true);
+-- CREATE POLICY does not support IF NOT EXISTS; guard with a DO block.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE tablename = 'research_lane_candidates'
+          AND policyname = 'allow_all_research_lane_candidates'
+    ) THEN
+        CREATE POLICY "allow_all_research_lane_candidates"
+            ON research_lane_candidates
+            FOR ALL
+            USING (true)
+            WITH CHECK (true);
+    END IF;
+END $$;
