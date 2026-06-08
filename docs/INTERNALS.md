@@ -710,6 +710,11 @@ Navigate to `/rankings` (sidebar shortcut `k`). Click any row to open a side pan
 
 > See [../KNOWN_ISSUES.md](../KNOWN_ISSUES.md) for the full living issues tracker.
 
+**Schema migrations are not applied automatically by CI/CD.** The screener / PM-analytics wave
+(TRD-055–069, shipped 2026-06-08) requires DB migrations 011–017 to be applied manually before the
+first post-ship pipeline run. See [`migrations/ROLLOUT.md`](../migrations/ROLLOUT.md) for the apply
+order and post-rollout verification checklist.
+
 **Critical gaps (free-data limitations):**
 - True historical IV unavailable → IV rank is approximated
 - % float on loan and cost-to-borrow are proprietary (Ortex/S3)
