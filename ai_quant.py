@@ -311,12 +311,7 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
 def _migrate_prob_columns(cur, conn) -> None:
     """Add prob_* columns to thesis_cache if not already present (idempotent)."""
     try:
-        cur.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'thesis_cache'
-        """)
-        existing = {row["column_name"] for row in cur.fetchall()}
-        new_cols = {
+        for col, col_type in {
             "prob_combined":  "FLOAT",
             "prob_technical": "FLOAT",
             "prob_options":   "FLOAT",
@@ -324,13 +319,56 @@ def _migrate_prob_columns(cur, conn) -> None:
             "prob_news":      "FLOAT",
             "model_used":     "TEXT",
             "cost_usd":       "FLOAT",
-        }
-        for col, col_type in new_cols.items():
-            if col not in existing:
-                cur.execute(f"ALTER TABLE thesis_cache ADD COLUMN {col} {col_type}")
+        }.items():
+            cur.execute(
+                f"ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS {col} {col_type}"
+            )
         conn.commit()
     except Exception as exc:
         logger.warning("_migrate_prob_columns: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _migrate_issuance_state_column(cur, conn) -> None:
+    """Add issuance_state column to thesis_cache if not already present (idempotent)."""
+    try:
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS issuance_state TEXT")
+        conn.commit()
+    except Exception:
+        # Rollback so the connection is not left in an aborted transaction state.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _migrate_attribution_columns(cur, conn) -> None:
+    """Add candidate_lane / sources / broad_source_only to thesis_cache (idempotent)."""
+    try:
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS candidate_lane TEXT")
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS sources JSONB")
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS broad_source_only BOOLEAN")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _migrate_governance_state_column(cur, conn) -> None:
+    """Add governance_state column to thesis_cache if not already present (idempotent)."""
+    try:
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS governance_state TEXT")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def save_thesis(thesis: dict) -> None:
@@ -341,52 +379,16 @@ def save_thesis(thesis: dict) -> None:
         cur = conn.cursor()
         # Ensure prob_combined columns exist (added in Step 5 of prob_engine build)
         _migrate_prob_columns(cur, conn)
+        # Ensure issuance_state column exists (TRD-066).
+        # This may time out on Supabase before migration 011 is applied — the INSERT
+        # below handles that gracefully by retrying without the column.
+        _migrate_issuance_state_column(cur, conn)
+        # Ensure attribution columns exist (migration 016).
+        _migrate_attribution_columns(cur, conn)
+        # Ensure governance_state column exists (migration 017).
+        _migrate_governance_state_column(cur, conn)
 
-        cur.execute("""
-            INSERT INTO thesis_cache
-                (ticker, date, direction, conviction, time_horizon,
-                 entry_low, entry_high, stop_loss, target_1, target_2,
-                 position_size_pct, thesis, data_quality, notes,
-                 catalysts_json, risks_json, raw_response, signals_json, created_at,
-                 bull_probability, bear_probability, neutral_probability,
-                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
-                 expected_moves_json, model_used, cost_usd,
-                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
-                direction=excluded.direction,
-                conviction=excluded.conviction,
-                time_horizon=excluded.time_horizon,
-                entry_low=excluded.entry_low,
-                entry_high=excluded.entry_high,
-                stop_loss=excluded.stop_loss,
-                target_1=excluded.target_1,
-                target_2=excluded.target_2,
-                position_size_pct=excluded.position_size_pct,
-                thesis=excluded.thesis,
-                data_quality=excluded.data_quality,
-                notes=excluded.notes,
-                catalysts_json=excluded.catalysts_json,
-                risks_json=excluded.risks_json,
-                raw_response=excluded.raw_response,
-                signals_json=excluded.signals_json,
-                created_at=excluded.created_at,
-                bull_probability=excluded.bull_probability,
-                bear_probability=excluded.bear_probability,
-                neutral_probability=excluded.neutral_probability,
-                signal_agreement_score=excluded.signal_agreement_score,
-                key_invalidation=excluded.key_invalidation,
-                primary_scenario=excluded.primary_scenario,
-                bear_scenario=excluded.bear_scenario,
-                expected_moves_json=excluded.expected_moves_json,
-                model_used=excluded.model_used,
-                cost_usd=excluded.cost_usd,
-                prob_combined=excluded.prob_combined,
-                prob_technical=excluded.prob_technical,
-                prob_options=excluded.prob_options,
-                prob_catalyst=excluded.prob_catalyst,
-                prob_news=excluded.prob_news
-        """, (
+        _base_params = (
             thesis.get("ticker", "").upper(),
             date,
             thesis.get("direction"),
@@ -421,7 +423,192 @@ def save_thesis(thesis: dict) -> None:
             thesis.get("prob_options"),
             thesis.get("prob_catalyst"),
             thesis.get("prob_news"),
-        ))
+        )
+
+        _SQL_WITH_ALL = """
+            INSERT INTO thesis_cache
+                (ticker, date, direction, conviction, time_horizon,
+                 entry_low, entry_high, stop_loss, target_1, target_2,
+                 position_size_pct, thesis, data_quality, notes,
+                 catalysts_json, risks_json, raw_response, signals_json, created_at,
+                 bull_probability, bear_probability, neutral_probability,
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
+                 expected_moves_json, model_used, cost_usd,
+                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news,
+                 issuance_state, candidate_lane, sources, broad_source_only,
+                 governance_state)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
+                direction=excluded.direction, conviction=excluded.conviction,
+                time_horizon=excluded.time_horizon, entry_low=excluded.entry_low,
+                entry_high=excluded.entry_high, stop_loss=excluded.stop_loss,
+                target_1=excluded.target_1, target_2=excluded.target_2,
+                position_size_pct=excluded.position_size_pct, thesis=excluded.thesis,
+                data_quality=excluded.data_quality, notes=excluded.notes,
+                catalysts_json=excluded.catalysts_json, risks_json=excluded.risks_json,
+                raw_response=excluded.raw_response, signals_json=excluded.signals_json,
+                created_at=excluded.created_at, bull_probability=excluded.bull_probability,
+                bear_probability=excluded.bear_probability, neutral_probability=excluded.neutral_probability,
+                signal_agreement_score=excluded.signal_agreement_score,
+                key_invalidation=excluded.key_invalidation, primary_scenario=excluded.primary_scenario,
+                bear_scenario=excluded.bear_scenario, expected_moves_json=excluded.expected_moves_json,
+                model_used=excluded.model_used, cost_usd=excluded.cost_usd,
+                prob_combined=excluded.prob_combined, prob_technical=excluded.prob_technical,
+                prob_options=excluded.prob_options, prob_catalyst=excluded.prob_catalyst,
+                prob_news=excluded.prob_news, issuance_state=excluded.issuance_state,
+                candidate_lane=excluded.candidate_lane, sources=excluded.sources,
+                broad_source_only=excluded.broad_source_only,
+                governance_state=excluded.governance_state
+        """
+
+        _SQL_WITHOUT_GOVERNANCE = """
+            INSERT INTO thesis_cache
+                (ticker, date, direction, conviction, time_horizon,
+                 entry_low, entry_high, stop_loss, target_1, target_2,
+                 position_size_pct, thesis, data_quality, notes,
+                 catalysts_json, risks_json, raw_response, signals_json, created_at,
+                 bull_probability, bear_probability, neutral_probability,
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
+                 expected_moves_json, model_used, cost_usd,
+                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news,
+                 issuance_state, candidate_lane, sources, broad_source_only)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
+                direction=excluded.direction, conviction=excluded.conviction,
+                time_horizon=excluded.time_horizon, entry_low=excluded.entry_low,
+                entry_high=excluded.entry_high, stop_loss=excluded.stop_loss,
+                target_1=excluded.target_1, target_2=excluded.target_2,
+                position_size_pct=excluded.position_size_pct, thesis=excluded.thesis,
+                data_quality=excluded.data_quality, notes=excluded.notes,
+                catalysts_json=excluded.catalysts_json, risks_json=excluded.risks_json,
+                raw_response=excluded.raw_response, signals_json=excluded.signals_json,
+                created_at=excluded.created_at, bull_probability=excluded.bull_probability,
+                bear_probability=excluded.bear_probability, neutral_probability=excluded.neutral_probability,
+                signal_agreement_score=excluded.signal_agreement_score,
+                key_invalidation=excluded.key_invalidation, primary_scenario=excluded.primary_scenario,
+                bear_scenario=excluded.bear_scenario, expected_moves_json=excluded.expected_moves_json,
+                model_used=excluded.model_used, cost_usd=excluded.cost_usd,
+                prob_combined=excluded.prob_combined, prob_technical=excluded.prob_technical,
+                prob_options=excluded.prob_options, prob_catalyst=excluded.prob_catalyst,
+                prob_news=excluded.prob_news, issuance_state=excluded.issuance_state,
+                candidate_lane=excluded.candidate_lane, sources=excluded.sources,
+                broad_source_only=excluded.broad_source_only
+        """
+
+        _SQL_WITH_ISSUANCE = """
+            INSERT INTO thesis_cache
+                (ticker, date, direction, conviction, time_horizon,
+                 entry_low, entry_high, stop_loss, target_1, target_2,
+                 position_size_pct, thesis, data_quality, notes,
+                 catalysts_json, risks_json, raw_response, signals_json, created_at,
+                 bull_probability, bear_probability, neutral_probability,
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
+                 expected_moves_json, model_used, cost_usd,
+                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news,
+                 issuance_state)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
+                direction=excluded.direction, conviction=excluded.conviction,
+                time_horizon=excluded.time_horizon, entry_low=excluded.entry_low,
+                entry_high=excluded.entry_high, stop_loss=excluded.stop_loss,
+                target_1=excluded.target_1, target_2=excluded.target_2,
+                position_size_pct=excluded.position_size_pct, thesis=excluded.thesis,
+                data_quality=excluded.data_quality, notes=excluded.notes,
+                catalysts_json=excluded.catalysts_json, risks_json=excluded.risks_json,
+                raw_response=excluded.raw_response, signals_json=excluded.signals_json,
+                created_at=excluded.created_at, bull_probability=excluded.bull_probability,
+                bear_probability=excluded.bear_probability, neutral_probability=excluded.neutral_probability,
+                signal_agreement_score=excluded.signal_agreement_score,
+                key_invalidation=excluded.key_invalidation, primary_scenario=excluded.primary_scenario,
+                bear_scenario=excluded.bear_scenario, expected_moves_json=excluded.expected_moves_json,
+                model_used=excluded.model_used, cost_usd=excluded.cost_usd,
+                prob_combined=excluded.prob_combined, prob_technical=excluded.prob_technical,
+                prob_options=excluded.prob_options, prob_catalyst=excluded.prob_catalyst,
+                prob_news=excluded.prob_news, issuance_state=excluded.issuance_state
+        """
+
+        _SQL_WITHOUT_ISSUANCE = """
+            INSERT INTO thesis_cache
+                (ticker, date, direction, conviction, time_horizon,
+                 entry_low, entry_high, stop_loss, target_1, target_2,
+                 position_size_pct, thesis, data_quality, notes,
+                 catalysts_json, risks_json, raw_response, signals_json, created_at,
+                 bull_probability, bear_probability, neutral_probability,
+                 signal_agreement_score, key_invalidation, primary_scenario, bear_scenario,
+                 expected_moves_json, model_used, cost_usd,
+                 prob_combined, prob_technical, prob_options, prob_catalyst, prob_news)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker, date, model_used) DO UPDATE SET
+                direction=excluded.direction, conviction=excluded.conviction,
+                time_horizon=excluded.time_horizon, entry_low=excluded.entry_low,
+                entry_high=excluded.entry_high, stop_loss=excluded.stop_loss,
+                target_1=excluded.target_1, target_2=excluded.target_2,
+                position_size_pct=excluded.position_size_pct, thesis=excluded.thesis,
+                data_quality=excluded.data_quality, notes=excluded.notes,
+                catalysts_json=excluded.catalysts_json, risks_json=excluded.risks_json,
+                raw_response=excluded.raw_response, signals_json=excluded.signals_json,
+                created_at=excluded.created_at, bull_probability=excluded.bull_probability,
+                bear_probability=excluded.bear_probability, neutral_probability=excluded.neutral_probability,
+                signal_agreement_score=excluded.signal_agreement_score,
+                key_invalidation=excluded.key_invalidation, primary_scenario=excluded.primary_scenario,
+                bear_scenario=excluded.bear_scenario, expected_moves_json=excluded.expected_moves_json,
+                model_used=excluded.model_used, cost_usd=excluded.cost_usd,
+                prob_combined=excluded.prob_combined, prob_technical=excluded.prob_technical,
+                prob_options=excluded.prob_options, prob_catalyst=excluded.prob_catalyst,
+                prob_news=excluded.prob_news
+        """
+
+        _attr_params = (
+            thesis.get("issuance_state"),
+            thesis.get("candidate_lane"),
+            json.dumps(thesis.get("sources") or []),
+            thesis.get("broad_source_only"),
+            thesis.get("governance_state"),
+        )
+
+        def _try_with_issuance(cur, conn):
+            try:
+                cur.execute(_SQL_WITH_ISSUANCE, _base_params + (thesis.get("issuance_state"),))
+            except Exception as _exc:
+                if "issuance_state" in str(_exc):
+                    conn.rollback()
+                    cur2 = conn.cursor()
+                    cur2.execute(_SQL_WITHOUT_ISSUANCE, _base_params)
+                    logger.debug("save_thesis: issuance_state column absent, saved without it")
+                else:
+                    raise
+
+        try:
+            cur.execute(_SQL_WITH_ALL, _base_params + _attr_params)
+        except Exception as _exc1:
+            _e1 = str(_exc1)
+            conn.rollback()
+            cur = conn.cursor()
+            if "governance_state" in _e1:
+                # governance_state column absent — migration 017 not yet applied
+                logger.debug("save_thesis: governance_state column absent, saved without it")
+                try:
+                    cur.execute(_SQL_WITHOUT_GOVERNANCE, _base_params + _attr_params[:-1])
+                except Exception as _exc2:
+                    _e2 = str(_exc2)
+                    conn.rollback()
+                    cur = conn.cursor()
+                    if any(c in _e2 for c in ("candidate_lane", "sources", "broad_source_only")):
+                        logger.debug("save_thesis: attribution columns absent, saved without them")
+                        _try_with_issuance(cur, conn)
+                    elif "issuance_state" in _e2:
+                        cur.execute(_SQL_WITHOUT_ISSUANCE, _base_params)
+                    else:
+                        raise
+            elif any(c in _e1 for c in ("candidate_lane", "sources", "broad_source_only")):
+                # Attribution columns absent — migration 016 not yet applied; degrade gracefully
+                logger.debug("save_thesis: attribution columns absent, saved without them")
+                _try_with_issuance(cur, conn)
+            elif "issuance_state" in _e1:
+                cur.execute(_SQL_WITHOUT_ISSUANCE, _base_params)
+                logger.debug("save_thesis: issuance_state column absent, saved without it")
+            else:
+                raise
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1836,11 +2023,33 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
     # ── API key required beyond this point ───────────────────────────────────
     _require_api_key(resolve_effective_model(getattr(args, "llm", None)))
 
+    # TRD-068: Load governance for quarantine enforcement at synthesis stage
+    _ai_governance: dict = {}
+    try:
+        from utils.supabase_persist import fetch_ticker_governance
+        _ai_governance = fetch_ticker_governance()
+    except Exception:
+        pass
+
+    # Pre-load ranked_universe.json for per-ticker sources / broad_source_only lookup.
+    _ru_dict: dict = {}
+    try:
+        import json as _json_ru
+        if os.path.exists(_RANKED_UNIVERSE_PATH):
+            _ru_dict = _json_ru.load(open(_RANKED_UNIVERSE_PATH))
+    except Exception:
+        pass
+
     # ── Run on selected tickers ───────────────────────────────────────────────
     results = []
     for i, selection in enumerate(selected, 1):
         ticker = selection["ticker"]
         print(f"\n[{i}/{len(selected)}] {ticker}")
+
+        # TRD-068: Governance hard block at synthesis stage (belt-and-suspenders)
+        if _ai_governance.get(ticker, "STANDARD") == "QUARANTINE":
+            print(f"  [{ticker}] Governance QUARANTINE — skipping AI synthesis.")
+            continue
 
         # Cache check
         if use_cache:
@@ -1850,9 +2059,17 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
                 results.append(cached)
                 continue
 
+        _ru_entry = _ru_dict.get(ticker, {})
+        _attribution = {
+            "candidate_lane":    selection.get("candidate_lane"),
+            "sources":           _ru_entry.get("sources"),
+            "broad_source_only": _ru_entry.get("broad_source_only"),
+            "governance_state":  selection.get("governance_state"),
+        }
         result = analyze_ticker(
             ticker, verbose=args.verbose, raw_output=args.raw, use_cache=False,
             force_ai=getattr(args, "force_ai", False),
+            attribution=_attribution,
         )
         if result:
             result["selection_rank"]   = i
@@ -1863,15 +2080,340 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
 
     print_full_report(results)
 
+    # TRD-059: Persist AI-stage funnel metrics including suppression reason breakdown
+    try:
+        from collections import Counter as _Counter
+        from utils.supabase_persist import persist_funnel_metrics
+        try:
+            from config import BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION
+        except ImportError:
+            BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION = 3, 2
+
+        _isc  = _Counter(r.get("issuance_state", "SUPPRESSED") for r in results)
+        _dirc = _Counter(r.get("direction", "NEUTRAL") for r in results)
+
+        # Derive per-result suppression reasons (only for non-ACTIVE_THESIS)
+        _supr: dict = {}
+        # QUARANTINE skips: these tickers were in selected but never entered the results list
+        _quarantine_count = sum(
+            1 for s in selected
+            if _ai_governance.get(s["ticker"], "STANDARD") == "QUARANTINE"
+        )
+        if _quarantine_count:
+            _supr["governance_quarantine"] = _quarantine_count
+
+        for _r in results:
+            _st = _r.get("issuance_state", ISSUANCE_SUPPRESSED)
+            if _st == ISSUANCE_ACTIVE_THESIS:
+                continue
+            if _st == ISSUANCE_SUPPRESSED:
+                _supr["skip_ai_synthesis"] = _supr.get("skip_ai_synthesis", 0) + 1
+            elif _st == ISSUANCE_NO_TRADE:
+                # Distinguish neutral direction from zero/missing conviction
+                _dir = (_r.get("direction") or "NEUTRAL").upper()
+                _no_trade_reason = "neutral_direction" if _dir == "NEUTRAL" else "no_conviction"
+                _supr[_no_trade_reason] = _supr.get(_no_trade_reason, 0) + 1
+            elif _st == ISSUANCE_WATCH_ONLY:
+                # Use the reason stored on the thesis by analyze_ticker at synthesis time.
+                # Falls back to _watch_only_reason() for edge cases (e.g. cached theses).
+                _wo_reason = _r.get("issuance_reason") or _watch_only_reason(_r, {})
+                _supr[_wo_reason] = _supr.get(_wo_reason, 0) + 1
+
+        # AI-stage source/lane attribution — derived from results (post-gate synthesized set).
+        # 'selected' is the pre-gate shortlist; QUARANTINE tickers never reach results and
+        # must not inflate ai_selected_* metrics. Lane is resolved first from the pre-gate
+        # selection list (which carries candidate_lane) then falls back to ranked_universe.json.
+        _ai_sel_by_lane:   dict = {}
+        _ai_sel_by_source: dict = {}
+        _bso_ai = 0
+        try:
+            import json as _json
+            _ru: dict = {}
+            if os.path.exists(_RANKED_UNIVERSE_PATH):
+                _ru = _json.load(open(_RANKED_UNIVERSE_PATH))
+            # Build lane lookup from pre-gate list (ticker_selector carries candidate_lane)
+            _sel_lane_map: dict = {
+                _s["ticker"]: _s.get("candidate_lane")
+                for _s in selected if "ticker" in _s
+            }
+            for _r in results:
+                _rt = _r.get("ticker", "")
+                _ru_entry = _ru.get(_rt, {})
+                _sl = _sel_lane_map.get(_rt) or _ru_entry.get("lane", "unknown")
+                _ai_sel_by_lane[_sl] = _ai_sel_by_lane.get(_sl, 0) + 1
+                for _src in (_ru_entry.get("sources") or []):
+                    _ai_sel_by_source[_src] = _ai_sel_by_source.get(_src, 0) + 1
+                if _ru_entry.get("broad_source_only"):
+                    _bso_ai += 1
+        except Exception as _attr_exc:
+            logger.debug("AI attribution derivation failed: %s", _attr_exc)
+
+        persist_funnel_metrics({
+            "ai_selected_count":          len(results),   # post-gate: tickers that reached synthesis
+            "active_thesis_count":        _isc.get("ACTIVE_THESIS", 0),
+            "watch_only_count":           _isc.get("WATCH_ONLY", 0),
+            "suppressed_count":           _isc.get("SUPPRESSED", 0),
+            "no_trade_count":             _isc.get("NO_TRADE", 0),
+            "bull_count":                 _dirc.get("BULL", 0),
+            "bear_count":                 _dirc.get("BEAR", 0),
+            "neutral_count":              _dirc.get("NEUTRAL", 0),
+            "suppression_reasons":        _supr if _supr else None,
+            "ai_selected_by_lane":        _ai_sel_by_lane if _ai_sel_by_lane else None,
+            "ai_selected_by_source":      _ai_sel_by_source if _ai_sel_by_source else None,
+            "broad_source_only_ai_selected": _bso_ai if _bso_ai else None,
+        })
+    except Exception as _fm_exc:
+        logger.debug("Funnel metrics AI-stage persistence unavailable: %s", _fm_exc)
+
 
 # ==============================================================================
-# SECTION 2: PROMPT CONSTRUCTION
+# SECTION 2: ISSUANCE STATES, DETERMINISTIC GEOMETRY, PROMPT CONSTRUCTION
 # ==============================================================================
+
+# TRD-066 — Issuance state constants
+ISSUANCE_ACTIVE_THESIS = "ACTIVE_THESIS"    # BULL/BEAR, tradeable, geometry passes
+ISSUANCE_WATCH_ONLY    = "WATCH_ONLY"       # directional but not actionable (low conv/event risk)
+ISSUANCE_SUPPRESSED    = "SUPPRESSED"       # AI synthesis skipped — no API call made
+ISSUANCE_NO_TRADE      = "NO_TRADE"         # NEUTRAL direction, or geometry failure
+
+
+def _has_executable_geometry(thesis: dict) -> bool:
+    """
+    Return True if the thesis contains usable entry/stop/target geometry.
+
+    Called after _apply_deterministic_geometry so values have already been
+    normalized.  Checks that:
+      - entry_low and entry_high are present and positive
+      - stop_loss is present and directionally correct (outside the band)
+      - target_1 clears the ADVERSE side of the entry band, ensuring a fill at
+        the worst end of the range still has positive upside to T1:
+          BULL: stop < entry_low  AND  target_1 > entry_high  (worst fill = top of band)
+          BEAR: stop > entry_high AND  target_1 < entry_low   (worst fill = bottom of band)
+    Returns False (degrades issuance state) rather than raising.
+    """
+    direction  = (thesis.get("direction") or "NEUTRAL").upper()
+    entry_low  = thesis.get("entry_low")
+    entry_high = thesis.get("entry_high")
+    stop       = thesis.get("stop_loss")
+    t1         = thesis.get("target_1")
+
+    # All four fields must be present and numeric
+    for val in (entry_low, entry_high, stop, t1):
+        if val is None:
+            return False
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            return False
+        if fval <= 0:
+            return False
+
+    entry_low  = float(entry_low)
+    entry_high = float(entry_high)
+    stop       = float(stop)
+    t1         = float(t1)
+
+    if direction == "BULL":
+        # Stop below the full entry band; target above the worst-case fill (entry_high)
+        return stop < entry_low and t1 > entry_high
+    elif direction == "BEAR":
+        # Stop above the full entry band; target below the worst-case short fill (entry_low)
+        return stop > entry_high and t1 < entry_low
+
+    return False  # NEUTRAL — no executable geometry expected
+
+
+def _watch_only_reason(thesis: dict, resolved: dict) -> str:
+    """
+    Classify the specific reason _get_issuance_state returned WATCH_ONLY.
+    Must mirror _get_issuance_state's conditional order exactly so that
+    the stored reason is always accurate.
+
+    Returns one of: low_conviction | pre_earnings_hold | bear_below_threshold | no_geometry
+    """
+    direction  = (thesis.get("direction") or "NEUTRAL").upper()
+    conviction = thesis.get("conviction") or 0
+    override_flags = (resolved or {}).get("override_flags") or []
+
+    try:
+        from config import BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION
+    except ImportError:
+        BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION = 3, 2
+
+    min_conviction = BEAR_MIN_CONVICTION if direction == "BEAR" else BULL_MIN_CONVICTION
+
+    if conviction <= 1:
+        return "low_conviction"
+    has_earnings_hold = any("pre_earnings_hold" in str(f).lower() for f in override_flags)
+    if has_earnings_hold:
+        return "pre_earnings_hold"
+    if conviction < min_conviction:
+        return "bear_below_threshold"
+    return "no_geometry"
+
+
+def _get_issuance_state(thesis: dict, resolved: dict = None) -> str:
+    """
+    Determine the issuance state for a thesis.
+
+    SUPPRESSED    : skip_ai_synthesis was True — no API call was made.
+    NO_TRADE      : direction is NEUTRAL, or conviction is 0/None, or geometry
+                    is missing/non-executable even after normalization.
+    WATCH_ONLY    : direction is BULL/BEAR but conviction below direction threshold,
+                    pre_earnings_hold override active, or geometry fails.
+    ACTIVE_THESIS : direction is BULL/BEAR, conviction ≥ threshold, executable geometry.
+
+    Direction-specific conviction thresholds (TRD-067):
+      BULL: conviction ≥ BULL_MIN_CONVICTION (2) for ACTIVE_THESIS
+      BEAR: conviction ≥ BEAR_MIN_CONVICTION (3) for ACTIVE_THESIS
+            conviction = 2 → WATCH_ONLY (directional but not actionable)
+
+    Called after _apply_deterministic_geometry so geometry has already been
+    normalized where possible.
+    """
+    resolved = resolved or {}
+
+    # SUPPRESSED — set before any AI call
+    if resolved.get("skip_ai_synthesis") or resolved.get("skip_claude"):
+        return ISSUANCE_SUPPRESSED
+
+    direction  = (thesis.get("direction") or "NEUTRAL").upper()
+    conviction = thesis.get("conviction") or 0
+
+    if direction == "NEUTRAL" or not conviction:
+        return ISSUANCE_NO_TRADE
+
+    # TRD-067: Direction-specific conviction gate
+    try:
+        from config import BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION
+    except ImportError:
+        BEAR_MIN_CONVICTION = 3
+        BULL_MIN_CONVICTION = 2
+    min_conviction = BEAR_MIN_CONVICTION if direction == "BEAR" else BULL_MIN_CONVICTION
+
+    # WATCH_ONLY: low conviction or earnings event hold
+    override_flags = resolved.get("override_flags") or []
+    has_earnings_hold = any("pre_earnings_hold" in str(f).lower() for f in override_flags)
+    if conviction <= 1 or has_earnings_hold:
+        return ISSUANCE_WATCH_ONLY
+
+    # TRD-067: Bear below min_conviction (e.g. conviction=2 for BEAR) → WATCH_ONLY
+    if conviction < min_conviction:
+        return ISSUANCE_WATCH_ONLY
+
+    # ACTIVE_THESIS requires executable geometry — downgrade to WATCH_ONLY if absent
+    if not _has_executable_geometry(thesis):
+        return ISSUANCE_WATCH_ONLY
+
+    return ISSUANCE_ACTIVE_THESIS
+
+
+def _apply_deterministic_geometry(thesis: dict, signals: dict = None) -> dict:
+    """
+    Normalize entry/stop/target geometry after the LLM response.
+
+    Risk/reward is always computed from the ADVERSE end of the entry band so
+    that a fill at the worst price inside the range still satisfies the minimum
+    R/R requirement:
+
+    BULL (adverse fill = entry_high — worst buy price):
+      - stop_loss  < entry_low   (otherwise clamped to entry_low - 1 ATR)
+      - risk       = entry_high - stop_loss  (from adverse fill side)
+      - target_1   > entry_high  with entry_high + 1.5 × risk  (min)
+      - target_2   > target_1   with entry_high + 2.5 × risk  (min)
+
+    BEAR (adverse fill = entry_low — worst short entry price):
+      - stop_loss  > entry_high  (otherwise clamped to entry_high + 1 ATR)
+      - risk       = stop_loss - entry_low   (from adverse fill side)
+      - target_1   < entry_low   with entry_low - 1.5 × risk  (min)
+      - target_2   < target_1   with entry_low - 2.5 × risk  (min)
+
+    When the LLM values already satisfy the rules they are left unchanged.
+    Changes are annotated in thesis["geometry_notes"].
+
+    Returns the (possibly modified) thesis dict.
+    """
+    direction  = (thesis.get("direction") or "NEUTRAL").upper()
+    if direction == "NEUTRAL":
+        return thesis
+
+    entry_low  = thesis.get("entry_low")
+    entry_high = thesis.get("entry_high")
+    stop       = thesis.get("stop_loss")
+    t1         = thesis.get("target_1")
+    t2         = thesis.get("target_2")
+
+    notes: list = []
+
+    # ── Derive ATR from signals for stop clamp fallback ───────────────────
+    atr: Optional[float] = None
+    if signals:
+        tech = signals.get("technical") or {}
+        atr  = tech.get("atr_20d") or tech.get("atr") or None
+        if atr is None and entry_low and entry_high:
+            atr = (entry_high - entry_low) * 2.0  # rough band as ATR proxy
+
+    if entry_low is None or entry_high is None:
+        return thesis  # can't validate without entry band
+
+    entry_low  = float(entry_low)
+    entry_high = float(entry_high)
+
+    if direction == "BULL":
+        # Stop must be below entry_low (the favorable end of the band)
+        if stop is not None and float(stop) >= entry_low:
+            fallback_stop = entry_low - (atr if atr else entry_low * 0.03)
+            notes.append(f"stop clamped {stop:.2f}→{fallback_stop:.2f} (was above entry)")
+            thesis["stop_loss"] = round(fallback_stop, 2)
+            stop = thesis["stop_loss"]
+
+        # R/R computed from entry_high (adverse fill = worst buy price in band)
+        stop_f = float(thesis["stop_loss"]) if thesis.get("stop_loss") is not None else None
+        if stop_f is not None:
+            risk = entry_high - stop_f
+            if risk > 0:
+                min_t1 = entry_high + 1.5 * risk
+                min_t2 = entry_high + 2.5 * risk
+                if t1 is not None and float(t1) < min_t1:
+                    notes.append(f"t1 raised {t1:.2f}→{min_t1:.2f} (min 1.5× RR from entry_high)")
+                    thesis["target_1"] = round(min_t1, 2)
+                if t2 is not None and float(t2) < min_t2:
+                    notes.append(f"t2 raised {t2:.2f}→{min_t2:.2f} (min 2.5× RR from entry_high)")
+                    thesis["target_2"] = round(min_t2, 2)
+
+    elif direction == "BEAR":
+        # Stop must be above entry_high (the favorable short entry side)
+        if stop is not None and float(stop) <= entry_high:
+            fallback_stop = entry_high + (atr if atr else entry_high * 0.03)
+            notes.append(f"stop clamped {stop:.2f}→{fallback_stop:.2f} (was below entry for BEAR)")
+            thesis["stop_loss"] = round(fallback_stop, 2)
+            stop = thesis["stop_loss"]
+
+        # R/R computed from entry_low (adverse fill = worst short price in band)
+        stop_f = float(thesis["stop_loss"]) if thesis.get("stop_loss") is not None else None
+        if stop_f is not None:
+            risk = stop_f - entry_low
+            if risk > 0:
+                min_t1 = entry_low - 1.5 * risk
+                min_t2 = entry_low - 2.5 * risk
+                if t1 is not None and float(t1) > min_t1:
+                    notes.append(f"t1 lowered {t1:.2f}→{min_t1:.2f} (min 1.5× RR from entry_low, BEAR)")
+                    thesis["target_1"] = round(min_t1, 2)
+                if t2 is not None and float(t2) > min_t2:
+                    notes.append(f"t2 lowered {t2:.2f}→{min_t2:.2f} (min 2.5× RR from entry_low, BEAR)")
+                    thesis["target_2"] = round(min_t2, 2)
+
+    if notes:
+        existing = thesis.get("geometry_notes") or ""
+        thesis["geometry_notes"] = (existing + " | " if existing else "") + " | ".join(notes)
+
+    return thesis
+
 
 def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
     """
-    Return a templated NEUTRAL thesis when conflict_resolver sets skip_claude=True.
-    Saves ~$0.04/ticker for post-squeeze guards, pre-earnings holds, and similar blocks.
+    Return a templated NEUTRAL thesis when skip_ai_synthesis is True.
+    Saves an API call for post-squeeze guards, pre-earnings holds, and similar blocks.
 
     The returned dict has all fields expected by save_thesis() and print_thesis().
     """
@@ -1881,7 +2423,7 @@ def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
     price         = tech.get("price")
     max_conv      = resolved.get("max_conviction_override")  # None means no cap
 
-    notes_parts = [f"Claude API call skipped — {override_str}"]
+    notes_parts = [f"AI synthesis skipped — {override_str}"]
     if max_conv is not None:
         notes_parts.append(f"Max conviction cap: {max_conv}")
 
@@ -1911,6 +2453,7 @@ def _make_neutral_thesis(ticker: str, signals: dict, resolved: dict) -> dict:
         "primary_scenario":    f"Blocked: {override_str}",
         "bear_scenario":       None,
         "expected_moves":      [],
+        "issuance_state":      ISSUANCE_SUPPRESSED,   # TRD-066
     }
 
 
@@ -3175,12 +3718,16 @@ def update_watchlist_from_screen(
 
 def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
                    use_cache: bool = True, llm: Optional[str] = None,
-                   force_ai: bool = False) -> Optional[dict]:
+                   force_ai: bool = False,
+                   attribution: Optional[dict] = None) -> Optional[dict]:
     """
     Full AI quant analysis for one ticker.
     Returns parsed thesis dict, or None on failure.
     Checks SQLite cache first (today's date); skips API call if hit.
     Pass use_cache=False to force a fresh analysis.
+
+    attribution: optional dict with candidate_lane, sources, broad_source_only.
+    When provided these fields are persisted on the thesis_cache row.
     """
     ticker = ticker.upper().strip()
 
@@ -3229,17 +3776,23 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
             # Resolver's agreement score uses MODULE_WEIGHTS; prefer it over simple vote
             signals["signal_agreement_score"] = resolved["signal_agreement_score"]
 
-            if resolved["skip_claude"] and not force_ai:
+            # TRD-069: read skip_ai_synthesis (neutral) with fallback to legacy skip_claude
+            _skip_ai = resolved.get("skip_ai_synthesis") or resolved.get("skip_claude", False)
+            if _skip_ai and not force_ai:
                 flags = resolved.get("override_flags", [])
                 flag0 = flags[0] if flags else "pre-resolved block"
-                print(f"  [{ticker}] Claude skipped — {flag0}")
+                print(f"  [{ticker}] AI synthesis skipped — {flag0}")
                 thesis = _make_neutral_thesis(ticker, signals, resolved)
+                if attribution:
+                    for _k in ("candidate_lane", "sources", "broad_source_only", "governance_state"):
+                        if thesis.get(_k) is None:
+                            thesis[_k] = attribution.get(_k)
                 save_thesis(thesis)
                 return thesis
-            elif resolved["skip_claude"] and force_ai:
+            elif _skip_ai and force_ai:
                 flags = resolved.get("override_flags", [])
                 flag0 = flags[0] if flags else "pre-resolved block"
-                print(f"  [{ticker}] --force-ai: overriding skip_claude ({flag0}) — calling AI anyway")
+                print(f"  [{ticker}] --force-ai: overriding ai_synthesis_skipped ({flag0}) — calling AI anyway")
         except Exception as exc:
             logger.warning("Conflict resolver failed for %s: %s", ticker, exc)
 
@@ -3289,7 +3842,7 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
     # Parse response
     thesis = _parse_response(raw)
     if thesis is None:
-        print(f"  WARNING: Could not parse JSON from Claude response for {ticker}")
+        print(f"  WARNING: Could not parse JSON from AI synthesis response for {ticker}")
         print(f"  Raw response: {raw[:500]}...")
         return None
 
@@ -3350,6 +3903,23 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         except Exception:
             pass
 
+    # TRD-066: Apply deterministic geometry layer (normalizes stop/target if needed)
+    _resolved_for_geom = signals.get("conflict_resolution") or {}
+    thesis = _apply_deterministic_geometry(thesis, signals)
+
+    # TRD-066: Assign issuance state and, for WATCH_ONLY, the specific reason
+    thesis["issuance_state"] = _get_issuance_state(thesis, _resolved_for_geom)
+    if thesis["issuance_state"] == ISSUANCE_WATCH_ONLY:
+        thesis["issuance_reason"] = _watch_only_reason(thesis, _resolved_for_geom)
+
+    # TRD-057 fix: mark this ticker as advanced to AI synthesis in research_lane_candidates.
+    # Called only on the live AI path (not for suppressed/neutral theses).
+    try:
+        from utils.supabase_persist import mark_research_candidate_advanced
+        mark_research_candidate_advanced(ticker)
+    except Exception:
+        pass
+
     # Validate probability sum; emit warning if not ~1.0
     _validate_probabilities(thesis)
 
@@ -3363,6 +3933,12 @@ def analyze_ticker(ticker: str, verbose: bool = False, raw_output: bool = False,
         thesis["cost_usd"]   = round(compute_cost(_model, _in_tok, _out_tok), 4)
     except Exception:
         pass
+
+    # --- Merge attribution and governance metadata before save ---
+    if attribution:
+        for _k in ("candidate_lane", "sources", "broad_source_only", "governance_state"):
+            if thesis.get(_k) is None:
+                thesis[_k] = attribution.get(_k)
 
     # --- Save to cache ---
     save_thesis(thesis)

@@ -1,7 +1,7 @@
 # Task: Standardize Resolution Page LLM Model Labels
 
-Status: proposed
-Stage: ready
+Status: done
+Stage: done
 Type: bug
 Priority: P2
 Severity: low

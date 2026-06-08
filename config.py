@@ -153,14 +153,56 @@ YAHOO_FINANCE_TIMEOUT = 30      # Seconds before timeout per ticker
 # ============================================================
 UNIVERSE_INDICES = [
     "russell1000", "russell2000", "sp500", "sp400",   # US large/mid/small
-    # "iefa", "iemg", "acwi",                          # international — slow (~5500 tickers), covered by LIQUID_ADRS
+    "sp600",                                           # TRD-064: S&P Small-Cap 600 — quality small-cap lane
+    "nasdaq_broad",                                    # TRD-063: broad Nasdaq common stocks — research lane only
+    "nyse_listed",                                     # TRD-056: NYSE/NYSE American/NYSE Arca common stocks — research lane
+    # "sp1500",                                        # S&P Composite 1500 = sp500+sp400+sp600 (TRD-061)
+    # "nasdaq100",                                     # Nasdaq-100 high-liquidity overlay (TRD-062)
+    # "iefa", "iemg", "acwi",                         # international — slow (~5500 tickers), covered by LIQUID_ADRS
 ]
+
 UNIVERSE_PRESCREEN_TOP_N    = 200
 UNIVERSE_MIN_DOLLAR_VOLUME  = 3_000_000   # 30-day avg dollar volume ($)
 UNIVERSE_MIN_PRICE          = 1.5          # Minimum share price ($) — global-compatible
 UNIVERSE_CACHE_TTL_HOURS    = 24           # Cache TTL for index constituents (hours)
 UNIVERSE_ATR_PCT_MAX        = 6.0          # Drop if 20-day ATR% > this (quality gate)
 UNIVERSE_BETA_MAX           = 2.0          # Drop if 60-day beta vs SPY > this
+
+# ── Lane-based adaptive filter thresholds (TRD-065) ─────────────────────────
+# Lane routing determines tradability — replaces a single global quality gate.
+# execution_core      — highest-quality, directly tradeable names
+# execution_high_beta — momentum/growth names with wider vol/beta tolerance
+# research_broad      — coverage universe; wider net, not all immediately tradeable
+LANE_THRESHOLDS: dict = {
+    "execution_core": {
+        "min_price":        5.0,
+        "min_adv":          10_000_000,
+        "min_history_bars": 252,
+        "atr_pct_max":      5.0,
+        "beta_max":         1.8,
+    },
+    "execution_high_beta": {
+        "min_price":        3.0,
+        "min_adv":          10_000_000,
+        "min_history_bars": 126,
+        "atr_pct_max":      8.0,
+        "beta_max":         3.5,
+    },
+    "research_broad": {
+        "min_price":        2.0,
+        "min_adv":          5_000_000,
+        "min_history_bars": 126,
+        "atr_pct_max":      12.0,
+        "beta_max":         5.0,
+    },
+}
+# Hard-drop threshold: above research_broad ceiling — effectively unusable
+LANE_HARD_DROP_ATR_PCT: float = 15.0
+LANE_HARD_DROP_BETA:    float = 6.0
+
+# ── Research / execution funnel capacities (TRD-057) ─────────────────────────
+RESEARCH_LANE_MAX_CANDIDATES:  int = 100  # max candidates persisted per run
+EXECUTION_LANE_MAX_CANDIDATES: int = 5    # bound for AI synthesis calls
 
 # ── Early catalyst momentum force-include gates ───────────────────────────────
 # These are Deep-Dive queue inclusion triggers, NOT buy signals.
@@ -232,10 +274,30 @@ AI_PREMIUM_THRESHOLD = 0.85                       # signal_agreement_score ≥ t
 # ============================================================
 # AI QUANT API CALL LIMITS
 # ============================================================
-AI_QUANT_MAX_TICKERS = 5            # Hard cap on Grok API calls per run
+AI_QUANT_MAX_TICKERS = 5            # Baseline AI call budget per run (adaptive floor)
 AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
 AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
 AI_QUANT_ALWAYS_INCLUDE: list = []  # Populated at runtime from trade_journal open positions
+
+# ── TRD-058: Adaptive AI capacity controls ────────────────────────────────────
+# On strong signal days (many tickers scoring above SCORE_THRESHOLD_HIGH), the
+# selection expands up to CAPACITY_MAX.  Weak days stay at MAX_TICKERS floor.
+# Never drops below CAPACITY_MIN even when very few tickers qualify.
+AI_QUANT_CAPACITY_MIN: int   = 2     # Absolute floor (skip only if nothing qualifies)
+AI_QUANT_CAPACITY_MAX: int   = 8     # Absolute ceiling
+AI_QUANT_SCORE_THRESHOLD_HIGH: float = 70.0  # Priority score above this = strong qualifier
+# BEAR direction gets a modest priority penalty so bulls fill top slots first at equal strength
+AI_QUANT_BEAR_DIRECTION_PENALTY: float = 0.85
+
+# ── TRD-067: Short-side conviction requirements ───────────────────────────────
+# BEAR theses require higher conviction for ACTIVE_THESIS issuance.
+# Weak bear setups (below threshold) are downgraded to WATCH_ONLY automatically.
+BEAR_MIN_CONVICTION: int = 3   # BEAR: needs this conviction for ACTIVE_THESIS
+BULL_MIN_CONVICTION: int = 2   # BULL: lower bar (existing behavior)
+
+# ── TRD-068: Ticker governance priority multipliers ───────────────────────────
+GOVERNANCE_A_LIST_MULTIPLIER: float   = 1.15  # A_LIST: slight priority boost
+GOVERNANCE_PROBATION_MULTIPLIER: float = 0.70  # PROBATION: significant priority penalty
 
 # Paths
 import pathlib

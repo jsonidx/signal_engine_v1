@@ -1,11 +1,11 @@
 import { useState, useMemo, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import * as Tabs from '@radix-ui/react-tabs'
-import { ArrowUpDown, Download, ShieldAlert, BarChart2, RefreshCw } from 'lucide-react'
+import { ArrowUpDown, Download, ShieldAlert, BarChart2, RefreshCw, Filter } from 'lucide-react'
 import { Shell } from '../components/layout/Shell'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { EmptyState } from '../components/ui/EmptyState'
-import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow, type EquityScreenerRow, type RedFlagRow } from '../lib/api'
+import { api, type SqueezeScreenerRow, type CatalystScreenerRow, type OptionsScreenerRow, type EquityScreenerRow, type RedFlagRow, type FunnelMetrics, type OutcomeAttributionBucket, type OutcomeAttributionResponse, type GovernanceRecommendationEntry, type GovernanceRecommendationsResponse } from '../lib/api'
 import { FundamentalScreenerTable } from '../components/FundamentalScreenerTable'
 import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
@@ -898,6 +898,503 @@ function RedFlagsTab() {
   )
 }
 
+// ─── Funnel Tab (TRD-059 / TRD-075) ──────────────────────────────────────────
+
+function SourceLaneTable({ title, data, total }: {
+  title: string
+  data: Record<string, number> | null | undefined
+  total: number
+}) {
+  if (!data || Object.keys(data).length === 0) return null
+  const entries = Object.entries(data).sort(([, a], [, b]) => b - a)
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-4">
+      <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">{title}</p>
+      <div className="space-y-1.5">
+        {entries.map(([key, count]) => {
+          const pct = total > 0 ? Math.min(100, (count / total) * 100) : 0
+          return (
+            <div key={key} className="flex items-center gap-2">
+              <span className="font-mono text-[11px] text-text-secondary w-36 truncate shrink-0">
+                {key.replace(/_/g, ' ')}
+              </span>
+              <div className="flex-1 h-1.5 bg-bg-muted rounded overflow-hidden">
+                <div className="h-full rounded bg-accent-blue/60" style={{ width: `${pct}%` }} />
+              </div>
+              <span className="font-mono text-[11px] text-text-primary shrink-0 w-8 text-right">{count}</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function FunnelStatCard({ label, value, sub }: { label: string; value: number | null; sub?: string }) {
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded p-4 flex flex-col gap-1">
+      <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">{label}</span>
+      <span className="font-mono text-2xl font-semibold text-text-primary">
+        {value == null ? '—' : value.toLocaleString()}
+      </span>
+      {sub && <span className="font-mono text-[10px] text-text-tertiary">{sub}</span>}
+    </div>
+  )
+}
+
+function FunnelBarRow({ label, value, max, color = '#3b82f6' }: {
+  label: string; value: number | null; max: number; color?: string
+}) {
+  const pct = value == null || max === 0 ? 0 : Math.min(100, (value / max) * 100)
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-36 font-mono text-[10px] text-text-tertiary text-right flex-shrink-0">{label}</span>
+      <div className="flex-1 h-2 bg-bg-elevated rounded overflow-hidden">
+        <div style={{ width: `${pct}%`, background: color }} className="h-full rounded transition-all" />
+      </div>
+      <span className="w-8 font-mono text-xs text-text-secondary text-right flex-shrink-0">
+        {value == null ? '—' : value}
+      </span>
+    </div>
+  )
+}
+
+const _REC_COLOR: Record<string, string> = {
+  promote_to_a_list:   'text-accent-green',
+  move_to_probation:   'text-accent-yellow',
+  consider_quarantine: 'text-accent-red',
+  keep_current_state:  'text-text-tertiary',
+  insufficient_sample: 'text-text-tertiary',
+}
+const _STATE_SHORT: Record<string, string> = {
+  A_LIST: 'A★', STANDARD: 'STD', PROBATION: 'PROB', QUARANTINE: 'QUAR',
+}
+
+function GovernanceRecRow({ entry }: { entry: GovernanceRecommendationEntry }) {
+  const color  = _REC_COLOR[entry.recommendation] ?? 'text-text-secondary'
+  const state  = _STATE_SHORT[entry.current_state] ?? entry.current_state
+  const accPct = Math.round(entry.directional_accuracy * 100)
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="font-mono text-[11px] text-text-primary font-semibold w-14 shrink-0">{entry.ticker}</span>
+        <span className="font-mono text-[9px] text-text-tertiary w-10 shrink-0">{state}</span>
+        <span className="font-mono text-[10px] text-text-tertiary truncate hidden sm:block">{entry.reason_summary}</span>
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <span className="font-mono text-[10px] text-text-tertiary">{entry.resolved}r</span>
+        <span className="font-mono text-[10px] text-text-secondary">{accPct}%</span>
+        <span className={`font-mono text-[9px] uppercase tracking-wide ${color}`}>
+          {entry.recommendation.replace(/_/g, ' ')}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function AccuracyRow({ bucket }: { bucket: OutcomeAttributionBucket }) {
+  const acc = bucket.directional_accuracy
+  const pct = acc != null ? Math.round(acc * 100) : null
+  const color = pct == null ? 'text-text-tertiary' : pct >= 60 ? 'text-accent-green' : pct >= 45 ? 'text-accent-yellow' : 'text-accent-red'
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="font-mono text-[11px] text-text-secondary truncate max-w-[140px]">
+        {bucket.label.replace(/_/g, ' ')}
+      </span>
+      <div className="flex items-center gap-3 flex-shrink-0">
+        <span className="font-mono text-[10px] text-text-tertiary">
+          {bucket.resolved}r
+        </span>
+        {bucket.avg_return_30d != null && (
+          <span className={`font-mono text-[10px] ${bucket.avg_return_30d >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+            {bucket.avg_return_30d > 0 ? '+' : ''}{(bucket.avg_return_30d * 100).toFixed(1)}%
+          </span>
+        )}
+        <span className={`font-mono text-[11px] font-semibold ${color}`}>
+          {pct != null ? `${pct}%` : '—'}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function FunnelTab() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['funnel-summary'],
+    queryFn: () => api.funnelSummary(),
+    staleTime: 5 * 60_000,
+  })
+  const { data: hist } = useQuery({
+    queryKey: ['funnel-history'],
+    queryFn: () => api.funnelHistory(7),
+    staleTime: 5 * 60_000,
+  })
+  const { data: attr } = useQuery({
+    queryKey: ['outcome-attribution'],
+    queryFn: () => api.outcomeAttribution(90),
+    staleTime: 10 * 60_000,
+  })
+  const { data: govRec } = useQuery({
+    queryKey: ['governance-recommendations'],
+    queryFn: () => api.governanceRecommendations(90),
+    staleTime: 10 * 60_000,
+  })
+
+  if (isLoading) return <LoadingSkeleton />
+  if (!data) return (
+    <EmptyState
+      message="No funnel data — run the pipeline to generate coverage analytics."
+      command="./run_master.sh"
+    />
+  )
+
+  const f = data as FunnelMetrics
+  const rawUniverse = f.raw_universe_count ?? 0
+  const totalExcluded = (f.hard_excluded_count ?? 0) + (f.lane_excluded_count ?? 0)
+  const totalLaned = (f.execution_core_count ?? 0) + (f.execution_high_beta_count ?? 0) + (f.research_broad_count ?? 0)
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <p className="font-mono text-[11px] text-text-tertiary">
+          Run date: <span className="text-text-secondary">{f.run_date}</span>
+        </p>
+      </div>
+
+      {/* Flow summary */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <FunnelStatCard label="Raw Universe" value={f.raw_universe_count} />
+        <FunnelStatCard label="Prescreened" value={f.prescreened_count} sub="after momentum prescreen" />
+        <FunnelStatCard label="AI Selected" value={f.ai_selected_count} sub="sent to AI synthesis" />
+        <FunnelStatCard label="Active Theses" value={f.active_thesis_count} sub="ACTIVE_THESIS issued" />
+      </div>
+
+      {/* Lane distribution */}
+      <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-3">
+        <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
+          Lane Distribution ({rawUniverse} raw tickers)
+        </p>
+        <FunnelBarRow label="Execution Core" value={f.execution_core_count} max={rawUniverse} color="#22c55e" />
+        <FunnelBarRow label="High Beta" value={f.execution_high_beta_count} max={rawUniverse} color="#84cc16" />
+        <FunnelBarRow label="Research Broad" value={f.research_broad_count} max={rawUniverse} color="#f59e0b" />
+        <FunnelBarRow label="Lane Excluded" value={f.lane_excluded_count} max={rawUniverse} color="#6b7280" />
+        <FunnelBarRow label="Hard Excluded" value={f.hard_excluded_count} max={rawUniverse} color="#ef4444" />
+      </div>
+
+      {/* AI funnel outcome */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-2">
+          <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">Direction</p>
+          <FunnelBarRow label="Bull" value={f.bull_count} max={f.ai_selected_count ?? 1} color="#22c55e" />
+          <FunnelBarRow label="Bear" value={f.bear_count} max={f.ai_selected_count ?? 1} color="#ef4444" />
+          <FunnelBarRow label="Neutral" value={f.neutral_count} max={f.ai_selected_count ?? 1} color="#6b7280" />
+        </div>
+        <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-2">
+          <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">Issuance State</p>
+          <FunnelBarRow label="ACTIVE_THESIS" value={f.active_thesis_count} max={f.ai_selected_count ?? 1} color="#22c55e" />
+          <FunnelBarRow label="WATCH_ONLY" value={f.watch_only_count} max={f.ai_selected_count ?? 1} color="#f59e0b" />
+          <FunnelBarRow label="NO_TRADE" value={f.no_trade_count} max={f.ai_selected_count ?? 1} color="#6b7280" />
+          <FunnelBarRow label="SUPPRESSED" value={f.suppressed_count} max={f.ai_selected_count ?? 1} color="#ef4444" />
+        </div>
+
+        {/* Exclusion reason breakdown */}
+        {f.excluded_by_source && Object.keys(f.excluded_by_source).length > 0 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">Exclusion Reasons</p>
+            <div className="space-y-2">
+              {Object.entries(f.excluded_by_source)
+                .sort(([, a], [, b]) => b - a)
+                .map(([reason, count]) => (
+                  <div key={reason} className="flex items-center justify-between gap-3">
+                    <span className="font-mono text-[11px] text-text-secondary truncate">{reason.replace(/_/g, ' ')}</span>
+                    <span className="font-mono text-[11px] text-text-primary shrink-0">{count}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* Suppression reason breakdown */}
+        {f.suppression_reasons && Object.keys(f.suppression_reasons).length > 0 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">Non-Active Reasons</p>
+            <div className="space-y-2">
+              {Object.entries(f.suppression_reasons)
+                .sort(([, a], [, b]) => b - a)
+                .map(([reason, count]) => (
+                  <div key={reason} className="flex items-center justify-between gap-3">
+                    <span className="font-mono text-[11px] text-text-secondary truncate">{reason.replace(/_/g, ' ')}</span>
+                    <span className="font-mono text-[11px] text-text-primary shrink-0">{count}</span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* Source / lane attribution (TRD-075) */}
+        {(f.candidates_by_source || f.candidates_by_lane || f.ai_selected_by_source) && (
+          <div className="space-y-3">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+              Source &amp; Lane Attribution
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <SourceLaneTable
+                title={`Candidates by Source (${f.prescreened_count ?? 0} total)`}
+                data={f.candidates_by_source}
+                total={f.prescreened_count ?? 0}
+              />
+              <SourceLaneTable
+                title={`Candidates by Lane (${f.prescreened_count ?? 0} total)`}
+                data={f.candidates_by_lane}
+                total={f.prescreened_count ?? 0}
+              />
+              <SourceLaneTable
+                title={`AI Selected by Source (${f.ai_selected_count ?? 0} total)`}
+                data={f.ai_selected_by_source}
+                total={f.ai_selected_count ?? 0}
+              />
+              <SourceLaneTable
+                title={`AI Selected by Lane (${f.ai_selected_count ?? 0} total)`}
+                data={f.ai_selected_by_lane}
+                total={f.ai_selected_count ?? 0}
+              />
+            </div>
+            {/* Broad-source-only summary */}
+            {(f.broad_source_only_candidates != null || f.broad_source_only_ai_selected != null) && (
+              <div className="bg-bg-surface border border-border-subtle rounded p-4 flex items-center gap-6">
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                    Broad-Source-Only Candidates
+                  </p>
+                  <p className="font-mono text-xl font-semibold text-accent-yellow mt-0.5">
+                    {f.broad_source_only_candidates ?? '—'}
+                  </p>
+                </div>
+                <div className="border-l border-border-subtle pl-6">
+                  <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                    Broad-Source-Only AI Selected
+                  </p>
+                  <p className="font-mono text-xl font-semibold text-accent-yellow mt-0.5">
+                    {f.broad_source_only_ai_selected ?? '—'}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Broad-source health (TRD-056 hardening) */}
+        {f.broad_source_health && Object.keys(f.broad_source_health).length > 0 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">
+              Broad Source Health
+            </p>
+            <div className="space-y-3">
+              {Object.values(f.broad_source_health).map(h => {
+                const modeColor: Record<string, string> = {
+                  live_fetch:    'text-accent-green',
+                  fresh_cache:   'text-accent-blue',
+                  stale_cache:   'text-accent-yellow',
+                  empty_fallback:'text-accent-red',
+                }
+                const modeClass = modeColor[h.fetch_mode] ?? 'text-text-secondary'
+                return (
+                  <div key={h.source} className="border border-border-subtle rounded p-3 space-y-1.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-mono text-[11px] font-semibold text-text-primary">
+                        {h.source.replace(/_/g, ' ')}
+                      </span>
+                      <span className={`font-mono text-[10px] uppercase tracking-wide ${modeClass}`}>
+                        {h.fetch_mode.replace(/_/g, ' ')}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 flex-wrap">
+                      <span className="font-mono text-[11px] text-text-secondary">
+                        eligible: <span className="text-text-primary">{h.eligible_count}</span>
+                      </span>
+                      {h.raw_rows != null && (
+                        <span className="font-mono text-[11px] text-text-secondary">
+                          raw rows: <span className="text-text-primary">{h.raw_rows}</span>
+                        </span>
+                      )}
+                      <span className="font-mono text-[10px] text-text-tertiary">{h.fetched_at}</span>
+                    </div>
+                    {h.warning && (
+                      <p className="font-mono text-[10px] text-accent-yellow break-all">
+                        ⚠ {h.warning}
+                      </p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Outcome Attribution (TRD-077) */}
+        {attr && attr.total_resolved > 0 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+                  Outcome Attribution
+                </p>
+                <p className="font-mono text-[9px] text-text-tertiary mt-0.5">
+                  Directional accuracy (claude_correct) — not trade P&amp;L win rate
+                </p>
+              </div>
+              <span className="font-mono text-[10px] text-text-tertiary flex-shrink-0">
+                {attr.total_resolved} resolved · last {attr.days}d
+              </span>
+            </div>
+
+            {/* By Lane */}
+            {attr.by_lane.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-2">By Lane</p>
+                <div className="space-y-1.5">
+                  {attr.by_lane.map(b => <AccuracyRow key={b.label} bucket={b} />)}
+                </div>
+              </div>
+            )}
+
+            {/* Broad vs Quality Index */}
+            {attr.broad_source_only_summary?.broad != null && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-2">Broad-Source vs Quality Index</p>
+                <div className="space-y-1.5">
+                  <AccuracyRow bucket={attr.broad_source_only_summary.broad} />
+                  <AccuracyRow bucket={attr.broad_source_only_summary.non_broad} />
+                </div>
+              </div>
+            )}
+
+            {/* By Source (top 8) */}
+            {attr.by_source.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-2">By Source (≥3 resolved)</p>
+                <div className="space-y-1.5">
+                  {attr.by_source.filter(b => b.resolved >= 3).slice(0, 8).map(b => (
+                    <AccuracyRow key={b.label} bucket={b} />
+                  ))}
+                  {attr.by_source.filter(b => b.resolved >= 3).length === 0 && (
+                    <p className="font-mono text-[10px] text-text-tertiary">Not enough resolved data per source yet.</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* By Governance State */}
+            {attr.by_governance_state && attr.by_governance_state.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary mb-2">By Governance State</p>
+                <div className="space-y-1.5">
+                  {attr.by_governance_state
+                    .slice()
+                    .sort((a, b) => {
+                      const order = ['A_LIST', 'STANDARD', 'PROBATION', 'QUARANTINE', 'unknown']
+                      return (order.indexOf(a.label) ?? 99) - (order.indexOf(b.label) ?? 99)
+                    })
+                    .map(b => <AccuracyRow key={b.label} bucket={b} />)}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Governance Recommendations (TRD-078) */}
+        {govRec && govRec.summary.total_tickers > 0 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Governance Recommendations</p>
+              <span className="font-mono text-[9px] text-text-tertiary">
+                advisory only · {govRec.days}d window · directional accuracy
+              </span>
+            </div>
+
+            {govRec.promote_candidates.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-accent-green mb-2">
+                  Promote to A-List ({govRec.promote_candidates.length})
+                </p>
+                <div className="space-y-1.5">
+                  {govRec.promote_candidates.slice(0, 5).map(e => (
+                    <GovernanceRecRow key={e.ticker} entry={e} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {govRec.probation_candidates.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-accent-yellow mb-2">
+                  Move to Probation ({govRec.probation_candidates.length})
+                </p>
+                <div className="space-y-1.5">
+                  {govRec.probation_candidates.slice(0, 5).map(e => (
+                    <GovernanceRecRow key={e.ticker} entry={e} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {govRec.quarantine_candidates.length > 0 && (
+              <div>
+                <p className="font-mono text-[9px] uppercase tracking-widest text-accent-red mb-2">
+                  Consider Quarantine ({govRec.quarantine_candidates.length})
+                </p>
+                <div className="space-y-1.5">
+                  {govRec.quarantine_candidates.slice(0, 5).map(e => (
+                    <GovernanceRecRow key={e.ticker} entry={e} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {govRec.promote_candidates.length === 0 &&
+             govRec.probation_candidates.length === 0 &&
+             govRec.quarantine_candidates.length === 0 && (
+              <p className="font-mono text-[10px] text-text-tertiary">
+                No actionable recommendations — all tickers in neutral zone or insufficient sample.
+              </p>
+            )}
+
+            <p className="font-mono text-[9px] text-text-tertiary border-t border-border-subtle pt-2">
+              Thresholds: promote ≥{Math.round((govRec.thresholds_used?.promote_min_accuracy ?? 0.7) * 100)}% acc ({govRec.thresholds_used?.promote_min_sample ?? 8}+ resolved) ·
+              probation &lt;{Math.round((govRec.thresholds_used?.probation_max_accuracy ?? 0.45) * 100)}% ·
+              quarantine &lt;{Math.round((govRec.thresholds_used?.quarantine_max_accuracy ?? 0.35) * 100)}%
+            </p>
+          </div>
+        )}
+
+        {hist && hist.rows.length > 1 && (
+          <div className="bg-bg-surface border border-border-subtle rounded p-4">
+            <p className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-3">Recent History</p>
+            <div className="space-y-1.5">
+              {hist.rows.slice(0, 7).map(r => (
+                <div key={r.run_date} className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-[10px] text-text-tertiary">{r.run_date}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] text-text-secondary">
+                      {r.prescreened_count ?? '—'} prescr
+                    </span>
+                    <span className="font-mono text-[10px] text-text-secondary">
+                      {r.ai_selected_count ?? '—'} AI
+                    </span>
+                    <span className="font-mono text-[10px] text-accent-green">
+                      {r.active_thesis_count ?? '—'} AT
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Page ──────────────────────────────────────────────────────────────────────
 
 const TAB_STYLE =
@@ -934,6 +1431,12 @@ export function ScreenersPage() {
               Fundamentals
             </span>
           </Tabs.Trigger>
+          <Tabs.Trigger value="funnel" className={TAB_STYLE}>
+            <span className="flex items-center gap-1.5">
+              <Filter size={11} />
+              Funnel
+            </span>
+          </Tabs.Trigger>
         </Tabs.List>
 
         <Tabs.Content value="squeeze">
@@ -953,6 +1456,9 @@ export function ScreenersPage() {
         </Tabs.Content>
         <Tabs.Content value="fundamentals">
           <FundamentalScreenerTable />
+        </Tabs.Content>
+        <Tabs.Content value="funnel">
+          <FunnelTab />
         </Tabs.Content>
       </Tabs.Root>
     </Shell>

@@ -1,7 +1,7 @@
 # Task: Fix LLM provider routing for stale-refresh workflow
 
 Status: done
-Stage: finished
+Stage: done
 Type: bug
 Priority: P1
 Severity: high

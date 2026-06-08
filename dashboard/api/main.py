@@ -7252,6 +7252,35 @@ async def funnel_history(days: int = Query(14, ge=1, le=90)):
         return {"rows": [], "count": 0}
 
 
+@app.get("/api/outcome/attribution")
+async def outcome_attribution(days: int = Query(90, ge=7, le=365)):
+    """
+    Thesis directional-accuracy aggregated by source, lane, broad_source_only, and direction.
+
+    Metric: directional_accuracy = fraction of theses where claude_correct=1 (thesis direction
+    matched subsequent price action). This is NOT trade P&L win rate. Only rows with a resolved
+    claude_correct verdict are counted; OPEN/pending rows are excluded from the denominator.
+
+    Uses thesis_outcomes joined with thesis_cache (migration 016 attribution columns)
+    and falls back to research_lane_candidates for legacy rows.
+    """
+    cache_key = f"outcome_attribution:{days}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        from utils.supabase_persist import fetch_outcome_attribution
+        data = fetch_outcome_attribution(days=days)
+        _cache.set(cache_key, data, ttl=600)
+        return data
+    except Exception as exc:
+        log.exception("outcome_attribution error")
+        return {
+            "by_source": [], "by_lane": [], "broad_source_only_summary": {},
+            "by_direction": [], "days": days, "total_resolved": 0,
+        }
+
+
 # ==============================================================================
 # SECTION 31: TICKER GOVERNANCE  (TRD-068)
 # ==============================================================================
@@ -7309,3 +7338,32 @@ async def remove_governance(ticker: str):
         return {"ok": True, "ticker": ticker}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/governance/recommendations")
+async def governance_recommendations(days: int = Query(90, ge=7, le=365)):
+    """
+    Evidence-based governance review suggestions derived from historical thesis outcomes.
+
+    Advisory only — does not write or mutate ticker_governance.
+    Metric: directional_accuracy (claude_correct) — NOT trade P&L win rate.
+    Only theses with a resolved claude_correct verdict are counted.
+    """
+    cache_key = f"governance_recommendations:{days}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        from utils.supabase_persist import fetch_governance_recommendations
+        data = fetch_governance_recommendations(days=days)
+        _cache.set(cache_key, data, ttl=600)
+        return data
+    except Exception as exc:
+        log.exception("governance_recommendations error")
+        return {
+            "promote_candidates": [], "probation_candidates": [],
+            "quarantine_candidates": [], "keep_current_state": [],
+            "insufficient_sample": [],
+            "summary": {"total_tickers": 0, "by_recommendation": {}},
+            "thresholds_used": {}, "days": days,
+        }

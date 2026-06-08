@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-TICKER SELECTOR — Priority-based Claude API call budgeting
+TICKER SELECTOR — Priority-based AI synthesis call budgeting
 ================================================================================
 Selects the top N tickers for AI synthesis based on pre-resolved signal quality,
 before any API cost is incurred.
@@ -41,6 +41,23 @@ try:
 except ImportError:
     EVENT_QUEUE_MAX_AI_SLOTS = 3
 
+try:
+    from config import (
+        AI_QUANT_CAPACITY_MIN, AI_QUANT_CAPACITY_MAX,
+        AI_QUANT_SCORE_THRESHOLD_HIGH, AI_QUANT_BEAR_DIRECTION_PENALTY,
+    )
+except ImportError:
+    AI_QUANT_CAPACITY_MIN = 2
+    AI_QUANT_CAPACITY_MAX = 8
+    AI_QUANT_SCORE_THRESHOLD_HIGH = 70.0
+    AI_QUANT_BEAR_DIRECTION_PENALTY = 0.85
+
+try:
+    from config import GOVERNANCE_A_LIST_MULTIPLIER, GOVERNANCE_PROBATION_MULTIPLIER
+except ImportError:
+    GOVERNANCE_A_LIST_MULTIPLIER = 1.15
+    GOVERNANCE_PROBATION_MULTIPLIER = 0.70
+
 
 # ==============================================================================
 # PRIORITY SCORING
@@ -78,7 +95,9 @@ def compute_priority_score(
 
     Returns -1.0 if skip_claude is True.
     """
-    if resolved_signal.get("skip_claude"):
+    # TRD-069: read skip_ai_synthesis (neutral) with fallback to legacy skip_claude
+    _skip = resolved_signal.get("skip_ai_synthesis") or resolved_signal.get("skip_claude")
+    if _skip:
         return -1.0
 
     agreement   = float(resolved_signal.get("signal_agreement_score", 0) or 0)
@@ -107,6 +126,11 @@ def compute_priority_score(
     flags_str = " ".join(str(f) for f in override_flags).lower()
     if "pre_earnings_hold" in flags_str:
         base *= 0.5     # penalize — binary event, Claude can't help much
+
+    # TRD-058: bear direction penalty — bulls fill top slots first at equal strength
+    direction = resolved_signal.get("pre_resolved_direction", "NEUTRAL")
+    if direction == "BEAR":
+        base *= AI_QUANT_BEAR_DIRECTION_PENALTY
 
     return round(base, 2)
 
@@ -233,7 +257,7 @@ def _print_selection_table(
         pos_word    = "position" if n_open == 1 else "positions"
         header_text = f" AI QUANT SELECTION — Top {n_dynamic} dynamic + {n_open} open {pos_word} (high attention)"
     else:
-        header_text = f" AI QUANT SELECTION — Top {n_dynamic} tickers for Claude synthesis"
+        header_text = f" AI QUANT SELECTION — Top {n_dynamic} tickers for AI synthesis"
 
     print()
     print("┌─────────────────────────────────────────────────────────────┐")
@@ -251,11 +275,14 @@ def _print_selection_table(
         eq_str    = (f"#{eq_rank}" if eq_rank else "N/A").ljust(8)
         row = f"│ {i:>4} │ {ticker} │ {priority} │ {agreement} │ {direction} │ {eq_str} │"
         if s.get("_always_include"):
-            row += "  ← high attention — open position"
+            if s.get("open_position_lane_override"):
+                row += "  ← DEGRADED OPEN POS — lane_excluded, review required"
+            else:
+                row += "  ← high attention — open position"
         print(row)
 
     print("└──────┴────────┴──────────┴───────────┴──────────┴──────────┘")
-    print(f"Skipped: {skipped_count} tickers (skip_claude=True or below agreement threshold)")
+    print(f"Skipped: {skipped_count} tickers (ai_synthesis_skipped or below agreement threshold)")
     print(f"Saved: ~{skipped_count} API calls (~€{skipped_count * cost_per_call_eur:.2f} this run)")
     print(f"Estimated cost: ~€{estimated_cost:.2f} for {n} tickers")
     print()
@@ -276,7 +303,9 @@ def select_top_tickers(
     event_queue_max_slots: Optional[int] = None,
 ) -> List[dict]:
     """
-    Returns ordered list of up to max_tickers dicts for Claude synthesis.
+    Returns an adaptively sized list of dicts for Claude synthesis.
+    max_tickers is a hard upper bound; the actual count is driven by signal
+    quality (see adaptive capacity below).
 
     Each dict contains:
       ticker, priority_score, signal_agreement_score, pre_resolved_direction,
@@ -290,8 +319,12 @@ def select_top_tickers(
       4. Load equity_signals CSV for rank/composite_z lookup
       5. Score every remaining ticker via compute_priority_score()
       6. Sort by score descending
-      7. Inject always_include tickers (displace lowest non-always if needed)
-      8. Take top max_tickers
+      7. Inject always_include tickers (open positions, additive on top of normal slots)
+      8. Adaptive capacity: n_slots = max(floor, min(cap, strong_count))
+         where cap   = min(max_tickers, AI_QUANT_CAPACITY_MAX)
+               floor = min(AI_QUANT_CAPACITY_MIN, max_tickers)
+         Weak days select down to floor; strong days expand up to cap.
+         always_include tickers are additive and not bounded by this.
       9. Generate selection_reason for each
      10. Append event_queue tickers (bounded by event_queue_max_slots)
          that are not already selected, even if absent from resolved_signals
@@ -361,7 +394,11 @@ def select_top_tickers(
         return []
 
     total_loaded = len(resolved_all)
-    resolved_all = {t: r for t, r in resolved_all.items() if not r.get("skip_claude")}
+    # TRD-069: accept skip_ai_synthesis (neutral name) or legacy skip_claude
+    resolved_all = {
+        t: r for t, r in resolved_all.items()
+        if not (r.get("skip_ai_synthesis") or r.get("skip_claude"))
+    }
 
     # ── Step 3: Filter by min_agreement or prob_combined ─────────────────────
     # Always-include tickers bypass the agreement filter.
@@ -382,13 +419,100 @@ def select_top_tickers(
         print(f"Filtered {filtered_count} tickers below {min_agreement:.0%} agreement "
               f"and below {PROB_COMBINED_MIN:.0%} prob_combined")
 
-    # ── Step 4: Load equity signals ───────────────────────────────────────────
+    # ── Step 4: Load equity signals + universe lane info ─────────────────────
     eq_path  = equity_signals_path or _find_latest_equity_signals()
     eq_lookup = _load_equity_lookup(eq_path)
 
+    # TRD-068: Load ticker governance (non-STANDARD entries only; degrades gracefully)
+    _governance_lookup: Dict[str, str] = {}
+    try:
+        from utils.supabase_persist import fetch_ticker_governance
+        _governance_lookup = fetch_ticker_governance()
+    except Exception:
+        pass
+    _QUARANTINE_TICKERS: set = {
+        t for t, g in _governance_lookup.items() if g == "QUARANTINE"
+    }
+
+    # TRD-057: load lane assignments from ranked_universe.json if available
+    _lane_lookup: Dict[str, str] = {}
+    try:
+        import os as _os, json as _json
+        _ru_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "ranked_universe.json",
+        )
+        if _os.path.exists(_ru_path):
+            _ru = _json.load(open(_ru_path))
+            _lane_lookup = {t: v.get("lane", "unknown") for t, v in _ru.items()}
+    except Exception:
+        pass
+
+    # ── Lane eligibility and priority multipliers (TRD-065) ──────────────────
+    # lane_excluded  — ticker failed all configured lane thresholds (too cheap,
+    #                  illiquid, or insufficient history).  Hard-gated out.
+    # hard_excluded  — ticker exceeds extreme ATR%/beta ceiling.  Hard-gated out.
+    # Both are excluded from the normal AI selection funnel regardless of signal
+    # strength.  The only override is always_include (open-position force-include),
+    # which is intentional: an open position must always be reviewed even if it has
+    # since fallen below thresholds.  This override is narrow and explicit.
+    _NON_EXECUTION_LANES: set = {"lane_excluded", "hard_excluded"}
+
+    # Execution lanes are full-weight; research_broad gets a significant discount
+    # so execution-core names fill the top slots first at equal base scores.
+    _LANE_PRIORITY_MULTIPLIER: Dict[str, float] = {
+        "execution_core":      1.00,
+        "execution_high_beta": 0.90,
+        "research_broad":      0.60,
+        "unknown":             0.80,   # lane data unavailable — partial discount
+    }
+
     # ── Step 5: Compute priority scores ──────────────────────────────────────
     scored: List[dict] = []
+    _lane_excluded_skipped = 0
+    _governance_skipped = 0
+    _lane_override_count = 0
+    _lane_override_tickers: Dict[str, str] = {}  # ticker → lane, for PM audit trail
+
     for ticker, resolved in resolved_eligible.items():
+        lane = _lane_lookup.get(ticker, "unknown")
+
+        if lane in _NON_EXECUTION_LANES:
+            if ticker not in always_set:
+                # Normal exclusion — ticker is not an open position.
+                _lane_excluded_skipped += 1
+                logger.debug("Lane gate: skipping %s (lane=%s)", ticker, lane)
+                continue
+            if lane == "hard_excluded":
+                # hard_excluded is a PM hard stop — open positions do NOT override it.
+                # This is a classification issue: if a live position becomes hard_excluded,
+                # PM must resolve the discrepancy manually.
+                _lane_excluded_skipped += 1
+                logger.warning(
+                    "Open position %s is hard_excluded — hard gate enforced; "
+                    "review lane classification or clear position from open list",
+                    ticker,
+                )
+                continue
+            # lane_excluded + always_include: allow through for open-position review,
+            # but flag explicitly so PM can act on the degraded name.
+            _lane_override_count += 1
+            _lane_override_tickers[ticker] = lane
+            logger.warning(
+                "Open position override: %s is %s — included for review "
+                "(open_position_lane_override=True, degraded_position_review_required=True)",
+                ticker, lane,
+            )
+
+        # TRD-068: Governance hard gate — QUARANTINE tickers are never AI-selected
+        # (always_include open-position override does NOT apply to QUARANTINE — this
+        # is a PM hard block, not a lane routing decision)
+        gov_state = _governance_lookup.get(ticker, "STANDARD")
+        if gov_state == "QUARANTINE":
+            _governance_skipped += 1
+            logger.debug("Governance gate: skipping %s (QUARANTINE)", ticker)
+            continue
+
         eq_data    = eq_lookup.get(ticker, {})
         eq_rank    = eq_data.get("equity_rank")
         composite_z = eq_data.get("composite_z")
@@ -396,21 +520,51 @@ def select_top_tickers(
             ticker, resolved, equity_rank=eq_rank, composite_z=composite_z
         )
         if score < 0:
-            continue   # skip_claude was set (double-safety)
+            continue   # skip_ai_synthesis / skip_claude was set (double-safety)
+
+        # Apply lane multiplier — always_include tickers are exempt (open positions)
+        if ticker not in always_set:
+            multiplier = _LANE_PRIORITY_MULTIPLIER.get(lane, 0.80)
+            score = score * multiplier
+
+        # TRD-068: Governance priority multipliers (bounded, explainable)
+        if ticker not in always_set:
+            if gov_state == "A_LIST":
+                score = score * GOVERNANCE_A_LIST_MULTIPLIER
+            elif gov_state == "PROBATION":
+                score = score * GOVERNANCE_PROBATION_MULTIPLIER
+
+        _is_lane_override = ticker in _lane_override_tickers
         scored.append({
-            "ticker":                  ticker,
-            "priority_score":          score,
-            "signal_agreement_score":  float(resolved.get("signal_agreement_score", 0) or 0),
-            "prob_combined":           resolved.get("prob_combined"),
-            "pre_resolved_direction":  resolved.get("pre_resolved_direction", "NEUTRAL"),
-            "pre_resolved_confidence": float(resolved.get("pre_resolved_confidence", 0) or 0),
-            "equity_rank":             eq_rank,
-            "composite_z":             composite_z,
-            "override_flags":          list(resolved.get("override_flags", []) or []),
-            "module_votes":            resolved.get("module_votes", {}) or {},
-            "_always_include":         ticker in always_set,
-            "selection_reason":        "",
+            "ticker":                          ticker,
+            "priority_score":                  score,
+            "signal_agreement_score":          float(resolved.get("signal_agreement_score", 0) or 0),
+            "prob_combined":                   resolved.get("prob_combined"),
+            "pre_resolved_direction":          resolved.get("pre_resolved_direction", "NEUTRAL"),
+            "pre_resolved_confidence":         float(resolved.get("pre_resolved_confidence", 0) or 0),
+            "equity_rank":                     eq_rank,
+            "composite_z":                     composite_z,
+            "override_flags":                  list(resolved.get("override_flags", []) or []),
+            "module_votes":                    resolved.get("module_votes", {}) or {},
+            "_always_include":                 ticker in always_set,
+            "selection_reason":                "",
+            "candidate_lane":                  lane,
+            "governance_state":                gov_state,
+            "open_position_lane_override":     _is_lane_override,
+            "degraded_position_review_required": _is_lane_override,
         })
+    if _lane_excluded_skipped:
+        logger.info("Lane gate: excluded %d lane_excluded/hard_excluded tickers from AI selection",
+                    _lane_excluded_skipped)
+    if _governance_skipped:
+        logger.info("Governance gate: excluded %d QUARANTINE tickers from AI selection",
+                    _governance_skipped)
+    if _lane_override_count:
+        logger.info(
+            "Open-position lane overrides: %d — %s",
+            _lane_override_count,
+            ", ".join(f"{t}({v})" for t, v in _lane_override_tickers.items()),
+        )
 
     # ── Step 6: Sort by priority score descending ─────────────────────────────
     scored.sort(key=lambda x: x["priority_score"], reverse=True)
@@ -425,34 +579,78 @@ def select_top_tickers(
     scored_tickers = {s["ticker"] for s in scored}
     for always_t in always_set:
         if always_t not in scored_tickers:
-            # Inject with a minimal entry (the ticker passes agreement bypass above)
+            _ticker_lane = _lane_lookup.get(always_t, "unknown")
+            if _ticker_lane == "hard_excluded":
+                # hard_excluded is a PM hard stop — enforce even on inject path.
+                logger.warning(
+                    "Open position %s is hard_excluded — hard gate enforced (inject path); "
+                    "review lane classification or clear position from open list",
+                    always_t,
+                )
+                continue
+            _is_inject_override = _ticker_lane == "lane_excluded"
+            if _is_inject_override:
+                _lane_override_count += 1
+                _lane_override_tickers[always_t] = _ticker_lane
+                logger.warning(
+                    "Open position override: %s is lane_excluded — included for review "
+                    "(inject path, open_position_lane_override=True)",
+                    always_t,
+                )
             resolved = resolved_all.get(always_t, {})
             eq_data  = eq_lookup.get(always_t, {})
             eq_rank  = eq_data.get("equity_rank")
             cz       = eq_data.get("composite_z")
+            _gov     = _governance_lookup.get(always_t, "STANDARD")
             always_in_scored.append({
-                "ticker":                  always_t,
-                "priority_score":          compute_priority_score(
-                                               always_t,
-                                               resolved or {"signal_agreement_score": 0.0, "skip_claude": False},
-                                               equity_rank=eq_rank,
-                                               composite_z=cz,
-                                           ),
-                "signal_agreement_score":  float(resolved.get("signal_agreement_score", 0) or 0),
-                "prob_combined":           resolved.get("prob_combined"),
-                "pre_resolved_direction":  resolved.get("pre_resolved_direction", "NEUTRAL"),
-                "pre_resolved_confidence": float(resolved.get("pre_resolved_confidence", 0) or 0),
-                "equity_rank":             eq_rank,
-                "composite_z":             cz,
-                "override_flags":          list(resolved.get("override_flags", []) or []),
-                "module_votes":            resolved.get("module_votes", {}) or {},
-                "_always_include":         True,
-                "selection_reason":        "",
+                "ticker":                          always_t,
+                "priority_score":                  compute_priority_score(
+                                                       always_t,
+                                                       resolved or {"signal_agreement_score": 0.0, "skip_claude": False},
+                                                       equity_rank=eq_rank,
+                                                       composite_z=cz,
+                                                   ),
+                "signal_agreement_score":          float(resolved.get("signal_agreement_score", 0) or 0),
+                "prob_combined":                   resolved.get("prob_combined"),
+                "pre_resolved_direction":          resolved.get("pre_resolved_direction", "NEUTRAL"),
+                "pre_resolved_confidence":         float(resolved.get("pre_resolved_confidence", 0) or 0),
+                "equity_rank":                     eq_rank,
+                "composite_z":                     cz,
+                "override_flags":                  list(resolved.get("override_flags", []) or []),
+                "module_votes":                    resolved.get("module_votes", {}) or {},
+                "_always_include":                 True,
+                "selection_reason":                "",
+                "candidate_lane":                  _ticker_lane,
+                "governance_state":                _gov,
+                "open_position_lane_override":     _is_inject_override,
+                "degraded_position_review_required": _is_inject_override,
             })
 
-    # Build final top-N: open positions are additive — always max_tickers fresh
-    # signals plus every open position on top (total = max_tickers + n_open).
-    n_normal_slots = max_tickers
+    # TRD-058: Adaptive capacity — drive count from qualified strong names.
+    # max_tickers is a hard caller cap; adaptive logic operates within it.
+    #
+    # _caller_cap  = min(max_tickers, CAPACITY_MAX)   — hard ceiling
+    # _floor       = min(CAPACITY_MIN, max_tickers)   — minimum, bounded by caller
+    # n_normal_slots = max(_floor, min(_caller_cap, strong_count))
+    #
+    # Result:
+    #   weak day  (strong_count < CAPACITY_MIN): selects _floor
+    #   normal day: selects strong_count, bounded by [_floor, _caller_cap]
+    #   strong day (strong_count ≥ _caller_cap): selects _caller_cap
+    strong_count = sum(
+        1 for s in normal
+        if s.get("priority_score", 0) >= AI_QUANT_SCORE_THRESHOLD_HIGH
+    )
+    _caller_cap = min(max_tickers, AI_QUANT_CAPACITY_MAX)
+    _floor      = min(AI_QUANT_CAPACITY_MIN, max_tickers)
+    n_normal_slots = max(_floor, min(_caller_cap, strong_count))
+    logger.info(
+        "Adaptive capacity: max=%d strong=%d → slots=%d (floor=%d cap=%d)",
+        max_tickers, strong_count, n_normal_slots, _floor, _caller_cap,
+    )
+
+    # Build final top-N: open positions are additive — always n_normal_slots fresh
+    # signals plus every open position on top (total = n_normal_slots + n_open).
     top = normal[:n_normal_slots] + always_in_scored
 
     # ── Step 8: Re-sort by priority; no cap — open positions are additive ─────

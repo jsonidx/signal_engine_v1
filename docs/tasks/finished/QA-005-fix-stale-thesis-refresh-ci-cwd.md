@@ -1,7 +1,7 @@
 # Task: Fix Stale Thesis Refresh CI Working Directory
 
 Status: done
-Stage: finished
+Stage: done
 Type: bug
 Priority: P1
 Severity: high

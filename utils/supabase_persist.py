@@ -2205,13 +2205,23 @@ def fetch_previous_squeeze_score_for_alert(
 
 # ==============================================================================
 # TRD-026: Option Candidate Snapshot Persistence
+# TRD-050: Extended with full feature-store fields
 # ==============================================================================
+
+# Version strings written into every new snapshot row.
+# Bump these when the corresponding algorithm changes materially.
+_ALGO_VERSION            = "2.0"
+_TARGET_ENGINE_VERSION   = "2"     # "delta_only" / "delta_dte_adjusted" branches
+_SCENARIO_ENGINE_VERSION = "1"     # square-root theta decay model
+_RISK_FRAMEWORK_VERSION  = "1"     # Kelly-fraction PM layer (TRD-046)
+_GUARDRAIL_VERSION       = "1"     # fair-value ceiling + freshness gating (TRD-049)
+
 
 def save_option_candidate_snapshot(
     result: "Any",                    # utils.option_candidates.CandidateResult
     thesis_id: int | None = None,
     run_date: str | None = None,
-    thesis_context: dict | None = None,  # extra thesis fields: thesis_date, time_horizon, signal_agreement
+    thesis_context: dict | None = None,  # extra thesis fields; see docstring
 ) -> list[int]:
     """
     Persist a CandidateResult (candidates + suppressed state) to
@@ -2221,10 +2231,15 @@ def save_option_candidate_snapshot(
     result.suppressed is True and no candidates exist.  This preserves no-trade
     decisions for later analytics.
 
-    thesis_context may include:
-        thesis_date       — ISO date string
-        time_horizon      — free text e.g. "2-4 weeks"
-        signal_agreement  — float 0-1
+    thesis_context may include (TRD-050 additions shown with *):
+        thesis_date         — ISO date string
+        time_horizon        — free text e.g. "2-4 weeks"
+        signal_agreement    — float 0-1
+        *entry_low          — thesis entry zone lower bound
+        *entry_high         — thesis entry zone upper bound
+        *days_to_earnings   — int calendar days to next earnings
+        *heat_score         — signal heat score 0-1
+        *expected_move_pct  — expected move % from options market
 
     Column naming:
         iv — the schema column is named ``iv`` (decimal, e.g. 0.35 = 35%).
@@ -2274,12 +2289,24 @@ def save_option_candidate_snapshot(
                     "thesis_date": tc.get("thesis_date"),
                     "time_horizon": tc.get("time_horizon"),
                     "signal_agreement": tc.get("signal_agreement"),
+                    # Thesis enrichment (TRD-050)
+                    "thesis_entry_low":   tc.get("entry_low"),
+                    "thesis_entry_high":  tc.get("entry_high"),
+                    "days_to_earnings":   tc.get("days_to_earnings"),
+                    "heat_score":         tc.get("heat_score"),
+                    "expected_move_pct":  tc.get("expected_move_pct"),
                     # Chain metadata
                     "chain_source": result.chain_source,
                     "underlying_price": result.underlying_price,
                     "suppressed": result.suppressed,
                     "suppression_reason": result.suppression_reason,
                     "rejection_reasons_json": json.dumps(result.rejection_reasons) if result.rejection_reasons else None,
+                    # Algorithm versioning (TRD-050)
+                    "algo_version":            _ALGO_VERSION,
+                    "target_engine_version":   _TARGET_ENGINE_VERSION,
+                    "scenario_engine_version": _SCENARIO_ENGINE_VERSION,
+                    "risk_framework_version":  _RISK_FRAMEWORK_VERSION,
+                    "guardrail_version":       _GUARDRAIL_VERSION,
                 }
 
                 if result.suppressed or not result.candidates:
@@ -2289,6 +2316,20 @@ def save_option_candidate_snapshot(
                         inserted_ids.append(rid)
                 else:
                     for rank, c in enumerate(result.candidates, start=1):
+                        # Compact scenario summary: only the fields needed for cohort analytics
+                        _scenarios = getattr(c, "scenarios", None) or []
+                        _scenarios_compact = [
+                            {
+                                "id":     s.get("scenario_id"),
+                                "ret":    s.get("projected_return_pct"),
+                                "days":   s.get("days_to_resolution"),
+                                "method": s.get("input_method"),
+                                "price":  s.get("projected_option_price"),
+                            }
+                            for s in _scenarios
+                            if s.get("input_method") != "insufficient_inputs"
+                        ] or None
+
                         row_dict = {
                             **base,
                             "strategy_preset": c.strategy_preset,
@@ -2302,11 +2343,17 @@ def save_option_candidate_snapshot(
                             "mid": c.mid,
                             "spread_pct": c.spread_pct,
                             "delta": c.delta,
+                            # Additional Greeks (TRD-050) — IBKR only; NULL for yfinance
+                            "gamma": getattr(c, "gamma", None),
+                            "theta": getattr(c, "theta", None),
+                            "vega":  getattr(c, "vega", None),
                             # Issue #1 fix: schema column is "iv", not "implied_vol"
                             "iv": c.implied_vol,
                             "open_interest": c.open_interest,
                             "volume": c.volume,
                             "breakeven": c.breakeven,
+                            # Per-contract quote time (TRD-050) — IBKR only; NULL for yfinance
+                            "quote_time": getattr(c, "quote_time", None),
                             # Exit plan (TRD-026 mandatory fields)
                             "holding_window_days": c.holding_window_days,
                             "exit_by_date": c.exit_by_date,
@@ -2322,6 +2369,9 @@ def save_option_candidate_snapshot(
                             "rationale": c.rationale,
                             "features_json": json.dumps({
                                 "delta": c.delta,
+                                "gamma": getattr(c, "gamma", None),
+                                "theta": getattr(c, "theta", None),
+                                "vega":  getattr(c, "vega", None),
                                 "iv": c.implied_vol,
                                 "spread_pct": c.spread_pct,
                                 "dte": c.dte,
@@ -2337,6 +2387,39 @@ def save_option_candidate_snapshot(
                             "fill_quality_score":       getattr(c, "fill_quality_score", None),
                             "slippage_risk_label":      getattr(c, "slippage_risk_label", None),
                             "skip_if_spread_above_pct": getattr(c, "skip_if_spread_above_pct", None),
+                            # V2 target engine (TRD-043)
+                            "projected_option_tp1":      getattr(c, "projected_option_tp1", None),
+                            "projected_option_tp2":      getattr(c, "projected_option_tp2", None),
+                            "projected_option_stop":     getattr(c, "projected_option_stop", None),
+                            "projected_tp1_return_pct":  getattr(c, "projected_tp1_return_pct", None),
+                            "projected_tp2_return_pct":  getattr(c, "projected_tp2_return_pct", None),
+                            "projected_stop_return_pct": getattr(c, "projected_stop_return_pct", None),
+                            "target_projection_method":  getattr(c, "target_projection_method", None),
+                            # PM/risk layer (TRD-046)
+                            "risk_allowed":             getattr(c, "risk_allowed", True),
+                            "risk_block_reason":        getattr(c, "risk_block_reason", None),
+                            "max_premium_risk_usd":     getattr(c, "max_premium_risk_usd", None),
+                            "suggested_contract_count": getattr(c, "suggested_contract_count", None),
+                            "position_size_tier":       getattr(c, "position_size_tier", None),
+                            "event_risk_policy":        getattr(c, "event_risk_policy", None),
+                            "iv_regime_label":          getattr(c, "iv_regime_label", None),
+                            "portfolio_concentration_warning": getattr(c, "portfolio_concentration_warning", None),
+                            "exit_hierarchy_json":      json.dumps(getattr(c, "exit_hierarchy", [])) if getattr(c, "exit_hierarchy", None) else None,
+                            "risk_nav_source":          getattr(c, "risk_nav_source", "model"),
+                            # Structure archetype (TRD-048)
+                            "structure_archetype":      getattr(c, "structure_archetype", None),
+                            "structure_policy_reason":  getattr(c, "structure_policy_reason", None),
+                            # Live-entry guardrails (TRD-049 / TRD-050)
+                            "entry_action":          getattr(c, "entry_action", "enter_now"),
+                            "quote_freshness_label": getattr(c, "quote_freshness_label", "unknown"),
+                            "quote_age_seconds":     getattr(c, "quote_age_seconds", None),
+                            "fair_value_entry_low":  getattr(c, "fair_value_entry_low", None),
+                            "fair_value_entry_high": getattr(c, "fair_value_entry_high", None),
+                            "entry_overpay_pct":     getattr(c, "entry_overpay_pct", None),
+                            "market_quality_label":  getattr(c, "market_quality_label", "unknown"),
+                            "live_guardrail_reason": getattr(c, "live_guardrail_reason", "") or None,
+                            # Scenario engine compact summary (TRD-047 / TRD-050)
+                            "scenarios_json": json.dumps(_scenarios_compact) if _scenarios_compact else None,
                         }
                         rid = _insert_row(row_dict)
                         if rid:
@@ -3036,3 +3119,776 @@ def fetch_unresolved_snapshots(
     except Exception as exc:
         logger.warning("fetch_unresolved_snapshots(%s) failed: %s", resolution_type, exc)
         return []
+
+
+# ==============================================================================
+# RESEARCH-LANE CANDIDATE PERSISTENCE (TRD-057)
+# ==============================================================================
+
+_RESEARCH_LANE_DDL = """
+CREATE TABLE IF NOT EXISTS research_lane_candidates (
+    id                BIGSERIAL PRIMARY KEY,
+    date              TEXT        NOT NULL,
+    ticker            TEXT        NOT NULL,
+    rank              INTEGER,
+    total             INTEGER,
+    lane              TEXT,
+    status            TEXT,
+    force_tags        TEXT[],
+    score             REAL,
+    advanced_to_ai    BOOLEAN DEFAULT FALSE,
+    sources           JSONB,
+    broad_source_only BOOLEAN,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (date, ticker)
+);
+"""
+
+
+def persist_research_lane_candidates(
+    ranked_universe: dict,
+    max_candidates: int = None,
+) -> int:
+    """
+    Persist the full prescreened research-lane cohort (from ranked_universe.json)
+    before AI selection narrows the funnel.
+
+    ranked_universe: dict of {ticker: {rank, total, status, force_tags, lane,
+                                       sources, broad_source_only}}
+    Returns the number of rows upserted (0 on failure).
+
+    Idempotent: uses ON CONFLICT(date, ticker) DO UPDATE.
+    Degrades safely on DB unavailability — logs warning and returns 0.
+    """
+    if not ranked_universe:
+        return 0
+
+    if max_candidates is None:
+        try:
+            from config import RESEARCH_LANE_MAX_CANDIDATES
+            max_candidates = RESEARCH_LANE_MAX_CANDIDATES
+        except ImportError:
+            max_candidates = 100
+
+    today = date.today().isoformat()
+
+    # Cap to max_candidates — ranked_universe is already sorted by rank
+    items = sorted(ranked_universe.items(), key=lambda kv: kv[1].get("rank", 9999))
+    items = items[:max_candidates]
+
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_RESEARCH_LANE_DDL)
+                import json as _json
+                rows = 0
+                for ticker, meta in items:
+                    force_tags = meta.get("force_tags") or []
+                    raw_sources = meta.get("sources") or []
+                    sources_json = _json.dumps(raw_sources) if raw_sources else None
+                    broad_only = meta.get("broad_source_only")
+                    cur.execute(
+                        """
+                        INSERT INTO research_lane_candidates
+                            (date, ticker, rank, total, lane, status, force_tags, score,
+                             sources, broad_source_only)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (date, ticker) DO UPDATE SET
+                            rank              = EXCLUDED.rank,
+                            total             = EXCLUDED.total,
+                            lane              = EXCLUDED.lane,
+                            status            = EXCLUDED.status,
+                            force_tags        = EXCLUDED.force_tags,
+                            score             = EXCLUDED.score,
+                            sources           = EXCLUDED.sources,
+                            broad_source_only = EXCLUDED.broad_source_only
+                        """,
+                        (
+                            today,
+                            ticker.upper(),
+                            meta.get("rank"),
+                            meta.get("total"),
+                            meta.get("lane", "research_broad"),
+                            meta.get("status"),
+                            force_tags if force_tags else None,
+                            meta.get("score"),
+                            sources_json,
+                            broad_only,
+                        ),
+                    )
+                    rows += 1
+                conn.commit()
+        return rows
+    except Exception as exc:
+        logger.warning("persist_research_lane_candidates failed: %s", exc)
+        return 0
+
+
+def mark_research_candidate_advanced(ticker: str, run_date: str = None) -> None:
+    """
+    Mark a research-lane candidate as advanced to AI synthesis.
+    Called from ai_quant after a ticker is selected for AI synthesis.
+    Degrades safely on DB unavailability.
+    """
+    today = run_date or date.today().isoformat()
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE research_lane_candidates SET advanced_to_ai=TRUE "
+                    "WHERE date=%s AND ticker=%s",
+                    (today, ticker.upper()),
+                )
+            conn.commit()
+    except Exception as exc:
+        logger.debug("mark_research_candidate_advanced failed for %s: %s", ticker, exc)
+
+
+# ==============================================================================
+# TRD-059: FUNNEL METRICS (daily universe → AI funnel snapshot)
+# ==============================================================================
+
+_FUNNEL_METRICS_DDL = """
+CREATE TABLE IF NOT EXISTS funnel_metrics (
+    run_date                   DATE        NOT NULL PRIMARY KEY,
+    raw_universe_count         INTEGER,
+    hard_excluded_count        INTEGER,
+    lane_excluded_count        INTEGER,
+    execution_core_count       INTEGER,
+    execution_high_beta_count  INTEGER,
+    research_broad_count       INTEGER,
+    prescreened_count          INTEGER,
+    agreement_eligible_count   INTEGER,
+    ai_selected_count          INTEGER,
+    active_thesis_count        INTEGER,
+    watch_only_count           INTEGER,
+    suppressed_count           INTEGER,
+    no_trade_count             INTEGER,
+    bull_count                 INTEGER,
+    bear_count                 INTEGER,
+    neutral_count              INTEGER,
+    excluded_by_source         JSONB,
+    suppression_reasons        JSONB,
+    candidates_by_lane         JSONB,
+    candidates_by_source       JSONB,
+    broad_source_only_candidates INTEGER,
+    ai_selected_by_lane        JSONB,
+    ai_selected_by_source      JSONB,
+    broad_source_only_ai_selected INTEGER,
+    broad_source_health        JSONB,
+    created_at                 TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                 TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+_FUNNEL_ALL_COLUMNS = (
+    "raw_universe_count", "hard_excluded_count", "lane_excluded_count",
+    "execution_core_count", "execution_high_beta_count", "research_broad_count",
+    "prescreened_count", "agreement_eligible_count", "ai_selected_count",
+    "active_thesis_count", "watch_only_count", "suppressed_count",
+    "no_trade_count", "bull_count", "bear_count", "neutral_count",
+    "excluded_by_source", "suppression_reasons",
+    # Source/lane attribution (TRD-075)
+    "candidates_by_lane", "candidates_by_source", "broad_source_only_candidates",
+    "ai_selected_by_lane", "ai_selected_by_source", "broad_source_only_ai_selected",
+    # Broad-source health metadata (TRD-056 hardening)
+    "broad_source_health",
+)
+
+_FUNNEL_JSONB_COLUMNS = frozenset({
+    "excluded_by_source", "suppression_reasons",
+    "candidates_by_lane", "candidates_by_source",
+    "ai_selected_by_lane", "ai_selected_by_source",
+    "broad_source_health",
+})
+
+
+def persist_funnel_metrics(metrics: dict, run_date: str = None) -> None:
+    """
+    Upsert daily funnel metrics row.
+
+    Each call may provide a partial dict — columns not present in the dict
+    are COALESCEd from the existing DB row (so two calls, one from
+    universe_builder and one from ai_quant, build up the same row without
+    clobbering each other).
+
+    Degrades safely on DB unavailability.
+    """
+    if not metrics:
+        return
+    rd = run_date or date.today().isoformat()
+    try:
+        import json as _json
+        from utils.db import managed_connection
+
+        # Only carry the known columns — ignore unknown keys
+        known = {k: metrics[k] for k in _FUNNEL_ALL_COLUMNS if k in metrics}
+        if not known:
+            return
+
+        # Serialise JSONB fields
+        for jsonb_col in _FUNNEL_JSONB_COLUMNS:
+            if jsonb_col in known and isinstance(known[jsonb_col], dict):
+                known[jsonb_col] = _json.dumps(known[jsonb_col])
+
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_FUNNEL_METRICS_DDL)
+                _ensure_table_security(conn, "funnel_metrics")
+
+                col_list  = ", ".join(known.keys())
+                val_list  = ", ".join(["%s"] * len(known))
+                # COALESCE: preserve existing values for cols not in this call
+                update_set = ", ".join(
+                    f"{c} = COALESCE(EXCLUDED.{c}, funnel_metrics.{c})"
+                    for c in known
+                )
+                sql = (
+                    f"INSERT INTO funnel_metrics (run_date, {col_list}, updated_at) "
+                    f"VALUES (%s, {val_list}, NOW()) "
+                    f"ON CONFLICT (run_date) DO UPDATE SET "
+                    f"{update_set}, updated_at = NOW()"
+                )
+                cur.execute(sql, [rd] + list(known.values()))
+            conn.commit()
+        logger.info("funnel_metrics: upserted for %s (%s)", rd, list(known.keys()))
+    except Exception as exc:
+        logger.warning("persist_funnel_metrics failed (non-fatal): %s", exc)
+
+
+def fetch_funnel_metrics(
+    run_date: str = None,
+    history_days: int = 1,
+) -> list[dict]:
+    """
+    Fetch funnel_metrics rows.
+
+    run_date=None → today's row only (history_days ignored).
+    history_days > 1 → last N days ordered newest-first.
+    Returns [] on any DB error.
+    """
+    try:
+        from utils.db import managed_connection
+
+        rd = run_date or date.today().isoformat()
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_FUNNEL_METRICS_DDL)
+                if history_days <= 1:
+                    cur.execute(
+                        "SELECT * FROM funnel_metrics WHERE run_date = %s",
+                        (rd,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT * FROM funnel_metrics "
+                        "WHERE run_date <= %s "
+                        "ORDER BY run_date DESC "
+                        "LIMIT %s",
+                        (rd, history_days),
+                    )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.debug("fetch_funnel_metrics failed: %s", exc)
+        return []
+
+
+def fetch_outcome_attribution(days: int = 90) -> dict:
+    """
+    Aggregate thesis directional-accuracy metrics by source, lane, and broad_source_only status.
+
+    Metric semantics: `directional_accuracy` is based on `claude_correct` (1 = thesis direction
+    matched subsequent price action), NOT on trade P&L or target-hit rate. Only rows where
+    `claude_correct IS NOT NULL` are counted — OPEN/pending rows with no verdict are excluded
+    from the denominator.
+
+    Joins thesis_outcomes with thesis_cache (for attribution columns added in
+    migration 016) and falls back to research_lane_candidates for legacy rows
+    that predate the migration.
+
+    Returns dict with:
+      by_source            — list of {label, resolved, correct_count, directional_accuracy, avg_return_30d}
+      by_lane              — list of same
+      broad_source_only_summary — {broad, non_broad} with same metrics
+      by_direction         — list of same
+      by_governance_state  — list of same; label is A_LIST/STANDARD/PROBATION/QUARANTINE or "unknown"
+      days                 — int (query window)
+      total_resolved       — int (rows where claude_correct IS NOT NULL)
+    """
+    empty = {
+        "by_source": [], "by_lane": [], "broad_source_only_summary": {},
+        "by_direction": [], "by_governance_state": [], "days": days, "total_resolved": 0,
+    }
+    try:
+        import json as _json
+        from utils.db import managed_connection
+
+        _SQL = """
+            WITH latest_cache AS (
+                SELECT DISTINCT ON (ticker, date)
+                    ticker, date, candidate_lane, sources, broad_source_only, governance_state
+                FROM thesis_cache
+                ORDER BY ticker, date, created_at DESC NULLS LAST
+            ),
+            attributed AS (
+                SELECT
+                    o.ticker,
+                    o.thesis_date,
+                    o.direction,
+                    o.outcome,
+                    o.return_30d,
+                    o.claude_correct,
+                    COALESCE(tc.candidate_lane, rlc.lane)                 AS candidate_lane,
+                    COALESCE(tc.sources,        rlc.sources)               AS sources,
+                    COALESCE(tc.broad_source_only, rlc.broad_source_only)  AS broad_source_only,
+                    tc.governance_state                                     AS governance_state
+                FROM thesis_outcomes o
+                LEFT JOIN latest_cache tc
+                       ON tc.ticker = o.ticker AND tc.date = o.thesis_date
+                LEFT JOIN research_lane_candidates rlc
+                       ON rlc.ticker = o.ticker AND rlc.date = o.thesis_date
+                WHERE o.thesis_date::date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+                  AND o.claude_correct IS NOT NULL
+            )
+            SELECT * FROM attributed
+        """
+
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_SQL, (days,))
+                rows = [dict(r) for r in cur.fetchall()]
+
+        if not rows:
+            return {**empty, "days": days}
+
+        # ── Python-side aggregation ────────────────────────────────────────────
+        from collections import defaultdict
+
+        def _make_bucket():
+            return {"resolved": 0, "correct": 0, "returns": []}
+
+        by_source:     dict = defaultdict(_make_bucket)
+        by_lane:       dict = defaultdict(_make_bucket)
+        by_direction:  dict = defaultdict(_make_bucket)
+        by_governance: dict = defaultdict(_make_bucket)
+        broad_bucket   = {"broad": _make_bucket(), "non_broad": _make_bucket()}
+
+        for r in rows:
+            direction    = (r.get("direction") or "UNKNOWN").upper()
+            claude_right = (r.get("claude_correct") or 0) == 1
+            ret30        = r.get("return_30d")
+            sources_raw  = r.get("sources")
+            lane         = r.get("candidate_lane") or "unknown"
+            is_broad     = r.get("broad_source_only") or False
+            gov_state    = r.get("governance_state") or "unknown"
+
+            # Sources: JSONB comes back as list; handle legacy string fallback
+            if isinstance(sources_raw, str):
+                try:
+                    sources_raw = _json.loads(sources_raw)
+                except Exception:
+                    sources_raw = []
+            sources_list = sources_raw or []
+
+            def _acc(bucket):
+                bucket["resolved"] += 1
+                if claude_right:
+                    bucket["correct"] += 1
+                if ret30 is not None:
+                    bucket["returns"].append(float(ret30))
+
+            for src in (sources_list or ["unknown"]):
+                _acc(by_source[src])
+            _acc(by_lane[lane])
+            _acc(by_direction[direction])
+            _acc(by_governance[gov_state])
+            _acc(broad_bucket["broad" if is_broad else "non_broad"])
+
+        def _finalise(d: dict) -> list:
+            out = []
+            for key, b in sorted(d.items(), key=lambda kv: -kv[1]["resolved"]):
+                res = b["resolved"]
+                acc = round(b["correct"] / res, 4) if res else None
+                avg = round(sum(b["returns"]) / len(b["returns"]), 4) if b["returns"] else None
+                out.append({
+                    "label":                key,
+                    "resolved":             res,
+                    "correct_count":        b["correct"],
+                    "directional_accuracy": acc,
+                    "avg_return_30d":       avg,
+                })
+            return out
+
+        def _finalise_one(b: dict, label: str) -> dict:
+            res = b["resolved"]
+            acc = round(b["correct"] / res, 4) if res else None
+            avg = round(sum(b["returns"]) / len(b["returns"]), 4) if b["returns"] else None
+            return {
+                "label":                label,
+                "resolved":             res,
+                "correct_count":        b["correct"],
+                "directional_accuracy": acc,
+                "avg_return_30d":       avg,
+            }
+
+        bso_summary = {
+            "broad":     _finalise_one(broad_bucket["broad"],     "broad_source_only"),
+            "non_broad": _finalise_one(broad_bucket["non_broad"], "quality_index"),
+        }
+
+        return {
+            "by_source":                _finalise(by_source),
+            "by_lane":                  _finalise(by_lane),
+            "by_direction":             _finalise(by_direction),
+            "by_governance_state":      _finalise(by_governance),
+            "broad_source_only_summary": bso_summary,
+            "days":                     days,
+            "total_resolved":           len(rows),
+        }
+
+    except Exception as exc:
+        logger.warning("fetch_outcome_attribution failed: %s", exc)
+        return {**empty, "days": days}
+
+
+# ==============================================================================
+# TRD-068: TICKER GOVERNANCE
+# ==============================================================================
+
+_GOVERNANCE_VALID_STATES = frozenset({"A_LIST", "STANDARD", "PROBATION", "QUARANTINE"})
+
+_GOVERNANCE_DDL = """
+CREATE TABLE IF NOT EXISTS ticker_governance (
+    ticker           TEXT        NOT NULL PRIMARY KEY,
+    governance_state TEXT        NOT NULL DEFAULT 'STANDARD',
+    reason           TEXT,
+    notes            TEXT,
+    set_by           TEXT        DEFAULT 'pm',
+    set_at           TIMESTAMPTZ DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+
+def fetch_ticker_governance(tickers: list[str] = None) -> dict[str, str]:
+    """
+    Return {TICKER: governance_state} for the given tickers (or all non-STANDARD).
+
+    tickers=None → fetch all rows (for bulk loading).
+    Missing tickers default to 'STANDARD'.
+    Returns {} on any DB error.
+    """
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_GOVERNANCE_DDL)
+                if tickers:
+                    upper_tickers = [t.upper() for t in tickers]
+                    placeholders = ",".join(["%s"] * len(upper_tickers))
+                    cur.execute(
+                        f"SELECT ticker, governance_state FROM ticker_governance "
+                        f"WHERE ticker IN ({placeholders})",
+                        upper_tickers,
+                    )
+                else:
+                    cur.execute(
+                        "SELECT ticker, governance_state FROM ticker_governance "
+                        "WHERE governance_state != 'STANDARD'"
+                    )
+                rows = cur.fetchall()
+        return {r["ticker"]: r["governance_state"] for r in rows}
+    except Exception as exc:
+        logger.debug("fetch_ticker_governance failed: %s", exc)
+        return {}
+
+
+def fetch_ticker_governance_full() -> list[dict]:
+    """Return all governance rows with full metadata for PM review."""
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_GOVERNANCE_DDL)
+                cur.execute(
+                    "SELECT ticker, governance_state, reason, notes, set_by, set_at, updated_at "
+                    "FROM ticker_governance "
+                    "ORDER BY governance_state, ticker"
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.debug("fetch_ticker_governance_full failed: %s", exc)
+        return []
+
+
+def set_ticker_governance(
+    ticker: str,
+    state: str,
+    reason: str = None,
+    notes: str = None,
+    set_by: str = "pm",
+) -> bool:
+    """
+    Upsert a governance entry for ticker.
+
+    Returns True on success, False on invalid state or DB error.
+    """
+    state = state.upper()
+    if state not in _GOVERNANCE_VALID_STATES:
+        logger.warning("set_ticker_governance: invalid state %r for %s", state, ticker)
+        return False
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_GOVERNANCE_DDL)
+                _ensure_table_security(conn, "ticker_governance")
+                cur.execute(
+                    """
+                    INSERT INTO ticker_governance
+                        (ticker, governance_state, reason, notes, set_by, set_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (ticker) DO UPDATE SET
+                        governance_state = EXCLUDED.governance_state,
+                        reason           = EXCLUDED.reason,
+                        notes            = EXCLUDED.notes,
+                        set_by           = EXCLUDED.set_by,
+                        set_at           = EXCLUDED.set_at,
+                        updated_at       = NOW()
+                    """,
+                    (ticker.upper(), state, reason, notes, set_by),
+                )
+            conn.commit()
+        logger.info("set_ticker_governance: %s → %s (by %s)", ticker.upper(), state, set_by)
+        return True
+    except Exception as exc:
+        logger.warning("set_ticker_governance failed: %s", exc)
+        return False
+
+
+def remove_ticker_governance(ticker: str) -> bool:
+    """Remove a governance entry (ticker reverts to STANDARD default). Returns True on success."""
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_GOVERNANCE_DDL)
+                cur.execute(
+                    "DELETE FROM ticker_governance WHERE ticker = %s",
+                    (ticker.upper(),),
+                )
+            conn.commit()
+        logger.info("remove_ticker_governance: %s removed", ticker.upper())
+        return True
+    except Exception as exc:
+        logger.warning("remove_ticker_governance failed: %s", exc)
+        return False
+
+
+# ==============================================================================
+# TRD-078: GOVERNANCE RECOMMENDATION / CALIBRATION LAYER
+# ==============================================================================
+
+# Advisory-only: these thresholds drive recommendation text but never auto-write
+# governance state. PM retains full override authority.
+_GOV_REC_THRESHOLDS = {
+    "min_sample":            5,     # rows below this → insufficient_sample
+    "promote_min_sample":    8,     # stronger evidence required for promotion
+    "promote_min_accuracy":  0.70,  # >= 70% directional accuracy → eligible for A_LIST
+    "promote_min_return":    0.03,  # avg_return_30d >= 3% required if return data exists
+    "probation_max_accuracy":0.45,  # < 45% → move_to_probation
+    "quarantine_max_accuracy":0.35, # < 35% → consider_quarantine
+}
+
+# Aggregate per-ticker outcomes over the lookback window.
+# Joined with ticker_governance for current live state.
+_GOV_REC_SQL = """
+    SELECT
+        o.ticker,
+        COUNT(*)                                                     AS resolved,
+        COUNT(*) FILTER (WHERE o.claude_correct = 1)                AS correct_count,
+        ROUND(
+            AVG(o.return_30d) FILTER (WHERE o.return_30d IS NOT NULL)::NUMERIC,
+            4
+        )::FLOAT                                                     AS avg_return_30d,
+        COALESCE(tg.governance_state, 'STANDARD')                   AS current_state
+    FROM thesis_outcomes o
+    LEFT JOIN ticker_governance tg ON tg.ticker = o.ticker
+    WHERE o.thesis_date::date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+      AND o.claude_correct IS NOT NULL
+    GROUP BY o.ticker, tg.governance_state
+    ORDER BY resolved DESC
+"""
+
+
+def _governance_rec_classify(
+    resolved: int,
+    correct_count: int,
+    directional_accuracy: float,
+    avg_return_30d,
+    current_state: str,
+    T: dict,
+) -> tuple[str, str]:
+    """
+    Return (recommendation, reason_summary) for a single ticker.
+
+    Recommendations:
+      promote_to_a_list    — strong positive evidence, currently below A_LIST
+      move_to_probation    — weak negative evidence, currently A_LIST or STANDARD
+      consider_quarantine  — strong negative evidence
+      keep_current_state   — evidence consistent with current classification
+      insufficient_sample  — not enough resolved theses to make a call
+    """
+    da = directional_accuracy
+    ret_str = f", avg return {avg_return_30d:+.1%}" if avg_return_30d is not None else ""
+
+    if resolved < T["min_sample"]:
+        return "insufficient_sample", f"{resolved} resolved (need ≥{T['min_sample']})"
+
+    # Strong negative — quarantine territory
+    if da < T["quarantine_max_accuracy"]:
+        if current_state == "QUARANTINE":
+            return "keep_current_state", (
+                f"{resolved} resolved, {da:.0%} accuracy{ret_str} — quarantine justified"
+            )
+        return "consider_quarantine", (
+            f"{resolved} resolved, {da:.0%} accuracy{ret_str} "
+            f"(threshold: <{T['quarantine_max_accuracy']:.0%})"
+        )
+
+    # Moderate negative — probation territory
+    if da < T["probation_max_accuracy"]:
+        if current_state in ("PROBATION", "QUARANTINE"):
+            return "keep_current_state", (
+                f"{resolved} resolved, {da:.0%} accuracy{ret_str} — restriction appropriate"
+            )
+        return "move_to_probation", (
+            f"{resolved} resolved, {da:.0%} accuracy{ret_str} "
+            f"(threshold: <{T['probation_max_accuracy']:.0%})"
+        )
+
+    # Strong positive — promotion territory
+    if da >= T["promote_min_accuracy"] and resolved >= T["promote_min_sample"]:
+        return_disqualifies = (
+            avg_return_30d is not None and avg_return_30d < T["promote_min_return"]
+        )
+        if return_disqualifies:
+            return "keep_current_state", (
+                f"{resolved} resolved, {da:.0%} accuracy but avg return "
+                f"{avg_return_30d:+.1%} below {T['promote_min_return']:.0%} threshold"
+            )
+        if current_state == "A_LIST":
+            return "keep_current_state", (
+                f"{resolved} resolved, {da:.0%} accuracy{ret_str} — A_LIST justified"
+            )
+        if current_state in ("STANDARD", "PROBATION"):
+            return "promote_to_a_list", (
+                f"{resolved} resolved, {da:.0%} accuracy{ret_str}"
+            )
+        # QUARANTINE — positive signal but manual review required; never auto-promote
+        return "keep_current_state", (
+            f"{resolved} resolved, {da:.0%} accuracy{ret_str} — "
+            "improving but quarantine requires manual PM review"
+        )
+
+    # Neutral zone
+    return "keep_current_state", (
+        f"{resolved} resolved, {da:.0%} accuracy{ret_str} — no change warranted"
+    )
+
+
+def fetch_governance_recommendations(days: int = 90) -> dict:
+    """
+    Generate evidence-based governance review suggestions from historical thesis outcomes.
+
+    Advisory only — does not write to ticker_governance.
+    Uses issuance-time claude_correct verdicts (NOT trade P&L win rate).
+
+    Returns:
+        {
+            "promote_candidates":    list of ticker dicts,
+            "probation_candidates":  list of ticker dicts,
+            "quarantine_candidates": list of ticker dicts,
+            "keep_current_state":    list of ticker dicts,
+            "insufficient_sample":   list of ticker dicts,
+            "summary":               {total_tickers, by_recommendation},
+            "thresholds_used":       _GOV_REC_THRESHOLDS copy,
+            "days":                  int,
+        }
+    """
+    T = _GOV_REC_THRESHOLDS
+    empty = {
+        "promote_candidates":   [],
+        "probation_candidates": [],
+        "quarantine_candidates":[],
+        "keep_current_state":   [],
+        "insufficient_sample":  [],
+        "summary": {"total_tickers": 0, "by_recommendation": {}},
+        "thresholds_used": dict(T),
+        "days": days,
+    }
+    try:
+        from utils.db import managed_connection
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_GOVERNANCE_DDL)  # ensure table exists
+                cur.execute(_GOV_REC_SQL, (days,))
+                rows = cur.fetchall()
+
+        buckets: dict[str, list] = {
+            "promote_to_a_list":    [],
+            "move_to_probation":    [],
+            "consider_quarantine":  [],
+            "keep_current_state":   [],
+            "insufficient_sample":  [],
+        }
+
+        for r in rows:
+            resolved  = int(r["resolved"])
+            correct   = int(r["correct_count"])
+            da        = round(correct / resolved, 4) if resolved > 0 else 0.0
+            avg_ret   = r.get("avg_return_30d")
+            current   = r.get("current_state") or "STANDARD"
+
+            rec, reason = _governance_rec_classify(
+                resolved, correct, da, avg_ret, current, T
+            )
+            entry = {
+                "ticker":                r["ticker"],
+                "current_state":         current,
+                "recommendation":        rec,
+                "reason_summary":        reason,
+                "resolved":              resolved,
+                "correct_count":         correct,
+                "directional_accuracy":  da,
+                "avg_return_30d":        avg_ret,
+                "days":                  days,
+            }
+            buckets[rec].append(entry)
+
+        # Sort each actionable bucket: most resolved first (strongest evidence)
+        for key in buckets:
+            buckets[key].sort(key=lambda x: x["resolved"], reverse=True)
+
+        by_rec = {k: len(v) for k, v in buckets.items()}
+        return {
+            "promote_candidates":   buckets["promote_to_a_list"],
+            "probation_candidates": buckets["move_to_probation"],
+            "quarantine_candidates":buckets["consider_quarantine"],
+            "keep_current_state":   buckets["keep_current_state"],
+            "insufficient_sample":  buckets["insufficient_sample"],
+            "summary": {
+                "total_tickers":    sum(by_rec.values()),
+                "by_recommendation": by_rec,
+            },
+            "thresholds_used": dict(T),
+            "days": days,
+        }
+
+    except Exception as exc:
+        logger.warning("fetch_governance_recommendations failed: %s", exc)
+        return {**empty, "days": days}

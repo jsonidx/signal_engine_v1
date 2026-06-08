@@ -489,6 +489,7 @@ def resolve(signals_dict: dict, regime: str) -> dict:
     vote     = compute_weighted_vote(signals_dict)
     resolved = apply_hard_overrides(vote, signals_dict, regime, ticker=ticker)
 
+    _skip = resolved["skip_claude"]
     result = {
         "pre_resolved_direction":  resolved["net_direction"],
         "pre_resolved_confidence": resolved["confidence"],
@@ -497,7 +498,8 @@ def resolve(signals_dict: dict, regime: str) -> dict:
         "module_votes":            resolved["module_votes"],
         "bull_weight":             resolved["bull_weight"],
         "bear_weight":             resolved["bear_weight"],
-        "skip_claude":             resolved["skip_claude"],
+        "skip_claude":             _skip,             # legacy — kept for backward compat
+        "skip_ai_synthesis":       _skip,             # TRD-069: provider-neutral alias
         "max_conviction_override": resolved.get("max_conviction_override"),
         "position_size_override":  resolved.get("position_size_pct"),
     }

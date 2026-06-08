@@ -1301,9 +1301,12 @@ class TestOptionCandidatesEndpoint:
         ):
             _cache.invalidate("option_candidates:MSFT")
             client.get("/api/ticker/MSFT/option-candidates")
+            count_after_first = db_mock.call_count
             client.get("/api/ticker/MSFT/option-candidates")
-            # DB should only be hit once (second request served from cache)
-            assert db_mock.call_count == 1
+            # Second request must be served from cache — no additional DB calls
+            assert db_mock.call_count == count_after_first, (
+                "Second request should not hit DB (cache hit)"
+            )
 
     def test_thesis_direction_and_conviction_in_response(self):
         """The response must include thesis_direction and thesis_conviction."""
@@ -1393,3 +1396,419 @@ class TestOptionCandidatesEndpoint:
         assert persisted.get("thesis_id") == 42, "thesis_id must come from the DB row id field"
         assert persisted.get("thesis_date") == "2026-05-29", "thesis_date must be set"
         assert persisted.get("signal_agreement") == pytest.approx(0.75)
+
+
+# ==============================================================================
+# TRD-059 — Funnel metrics API endpoints
+# ==============================================================================
+
+class TestFunnelEndpoints:
+    """Tests for /api/funnel/summary and /api/funnel/history."""
+
+    def test_funnel_summary_no_data_returns_200(self):
+        """funnel/summary must return 200 even when no DB rows exist."""
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=[]):
+            resp = client.get("/api/funnel/summary")
+        assert resp.status_code == 200
+
+    def test_funnel_summary_returns_row(self):
+        """funnel/summary returns the most recent row when data is available."""
+        fake_row = {
+            "run_date": "2026-06-07",
+            "raw_universe_count": 1200,
+            "prescreened_count": 200,
+            "ai_selected_count": 5,
+            "active_thesis_count": 3,
+        }
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=[fake_row]):
+            resp = client.get("/api/funnel/summary")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("run_date") == "2026-06-07"
+        assert body.get("raw_universe_count") == 1200
+
+    def test_funnel_history_returns_rows_list(self):
+        """funnel/history wraps rows in a dict with 'rows' and 'count'."""
+        fake_rows = [
+            {"run_date": "2026-06-07", "ai_selected_count": 5},
+            {"run_date": "2026-06-06", "ai_selected_count": 4},
+        ]
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=fake_rows):
+            resp = client.get("/api/funnel/history?days=7")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 2
+        assert len(body["rows"]) == 2
+
+    def test_funnel_history_empty_returns_200(self):
+        """funnel/history must return 200 with empty rows when no data."""
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=[]):
+            resp = client.get("/api/funnel/history")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["rows"] == []
+        assert body["count"] == 0
+
+    def test_funnel_summary_passes_through_reason_dicts(self):
+        """excluded_by_source and suppression_reasons must be present in summary response."""
+        fake_row = {
+            "run_date": "2026-06-07",
+            "raw_universe_count": 1200,
+            "ai_selected_count": 7,
+            "active_thesis_count": 3,
+            "excluded_by_source":  {"hard_excluded": 12, "lane_excluded": 340},
+            "suppression_reasons": {
+                "low_conviction": 1,
+                "pre_earnings_hold": 1,
+                "bear_below_threshold": 1,
+                "no_geometry": 1,
+                "neutral_direction": 1,
+                "no_conviction": 0,
+                "governance_quarantine": 0,
+            },
+        }
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=[fake_row]):
+            resp = client.get("/api/funnel/summary")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("excluded_by_source") == {"hard_excluded": 12, "lane_excluded": 340}
+        sr = body.get("suppression_reasons", {})
+        assert sr.get("low_conviction") == 1
+        assert sr.get("pre_earnings_hold") == 1
+        assert sr.get("no_geometry") == 1
+        assert sr.get("neutral_direction") == 1
+
+    def test_funnel_summary_passes_through_attribution_fields(self):
+        """Source/lane attribution fields must be present and correctly serialised
+        in the funnel/summary response (TRD-075)."""
+        fake_row = {
+            "run_date": "2026-06-07",
+            "raw_universe_count": 1500,
+            "prescreened_count": 160,
+            "ai_selected_count": 6,
+            "active_thesis_count": 4,
+            "candidates_by_lane":   {"execution_core": 40, "execution_high_beta": 20, "research_broad": 100},
+            "candidates_by_source": {"sp500": 90, "nasdaq_broad": 130, "russell1000": 60},
+            "broad_source_only_candidates": 45,
+            "ai_selected_by_lane":   {"execution_core": 4, "research_broad": 2},
+            "ai_selected_by_source": {"sp500": 4, "nasdaq_broad": 3},
+            "broad_source_only_ai_selected": 1,
+            "broad_source_health": {
+                "nasdaq_broad": {
+                    "source": "nasdaq_broad",
+                    "fetch_mode": "live_fetch",
+                    "raw_rows": 4800,
+                    "eligible_count": 3900,
+                    "warning": None,
+                    "fetched_at": "2026-06-07T19:00:00Z",
+                },
+                "nyse_listed": {
+                    "source": "nyse_listed",
+                    "fetch_mode": "stale_cache",
+                    "raw_rows": None,
+                    "eligible_count": 4100,
+                    "warning": "network_unavailable: serving stale cache",
+                    "fetched_at": "2026-06-07T19:00:05Z",
+                },
+            },
+        }
+        with patch("utils.supabase_persist.fetch_funnel_metrics", return_value=[fake_row]):
+            resp = client.get("/api/funnel/summary")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        cbl = body.get("candidates_by_lane")
+        assert isinstance(cbl, dict), "candidates_by_lane must be a dict"
+        assert cbl.get("execution_core") == 40
+        assert cbl.get("research_broad") == 100
+
+        cbs = body.get("candidates_by_source")
+        assert isinstance(cbs, dict), "candidates_by_source must be a dict"
+        assert cbs.get("nasdaq_broad") == 130
+
+        assert body.get("broad_source_only_candidates") == 45
+
+        asl = body.get("ai_selected_by_lane")
+        assert isinstance(asl, dict), "ai_selected_by_lane must be a dict"
+        assert asl.get("execution_core") == 4
+
+        ass_ = body.get("ai_selected_by_source")
+        assert isinstance(ass_, dict), "ai_selected_by_source must be a dict"
+        assert ass_.get("nasdaq_broad") == 3
+
+        assert body.get("broad_source_only_ai_selected") == 1
+
+        # Broad-source health passthrough (TRD-056 hardening)
+        bsh = body.get("broad_source_health")
+        assert isinstance(bsh, dict), "broad_source_health must be a dict"
+        nb = bsh.get("nasdaq_broad")
+        assert nb is not None, "nasdaq_broad entry must be present"
+        assert nb["fetch_mode"] == "live_fetch"
+        assert nb["eligible_count"] == 3900
+        assert nb["raw_rows"] == 4800
+        assert nb["warning"] is None
+        nl = bsh.get("nyse_listed")
+        assert nl is not None, "nyse_listed entry must be present"
+        assert nl["fetch_mode"] == "stale_cache"
+        assert nl["warning"] == "network_unavailable: serving stale cache"
+
+
+# ==============================================================================
+# TRD-068 — Ticker governance API endpoints
+# ==============================================================================
+
+class TestGovernanceEndpoints:
+    """Tests for /api/governance CRUD endpoints."""
+
+    def test_get_governance_returns_list(self):
+        """GET /api/governance returns governance entries."""
+        fake_entries = [
+            {"ticker": "MEME", "governance_state": "QUARANTINE", "reason": "delisted risk",
+             "notes": None, "set_by": "pm", "set_at": "2026-06-01T00:00:00", "updated_at": None},
+        ]
+        with patch("utils.supabase_persist.fetch_ticker_governance_full", return_value=fake_entries):
+            resp = client.get("/api/governance")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 1
+        assert body["governance"][0]["ticker"] == "MEME"
+
+    def test_set_governance_valid_state(self):
+        """POST /api/governance/{ticker} with valid state returns ok=True."""
+        with patch("utils.supabase_persist.set_ticker_governance", return_value=True):
+            resp = client.post("/api/governance/AAPL", json={"governance_state": "PROBATION", "reason": "testing"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    def test_set_governance_invalid_state_returns_400(self):
+        """POST with invalid governance_state returns HTTP 400."""
+        resp = client.post("/api/governance/AAPL", json={"governance_state": "INVALID"})
+        assert resp.status_code == 400
+
+    def test_delete_governance_returns_ok(self):
+        """DELETE /api/governance/{ticker} returns ok=True."""
+        with patch("utils.supabase_persist.remove_ticker_governance", return_value=True):
+            resp = client.delete("/api/governance/AAPL")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+
+# ==============================================================================
+# TRD-077: Outcome Attribution endpoint
+# ==============================================================================
+
+class TestOutcomeAttributionEndpoint:
+    """Tests for GET /api/outcome/attribution."""
+
+    def _fake_attribution(self, total=20):
+        return {
+            "by_source": [
+                {"label": "sp500",        "resolved": 15, "correct_count": 10, "directional_accuracy": 0.6667, "avg_return_30d": 0.08},
+                {"label": "nasdaq_broad", "resolved": 5,  "correct_count": 2,  "directional_accuracy": 0.4,    "avg_return_30d": -0.02},
+            ],
+            "by_lane": [
+                {"label": "execution_core", "resolved": 12, "correct_count": 9, "directional_accuracy": 0.75,  "avg_return_30d": 0.10},
+                {"label": "research_broad", "resolved": 8,  "correct_count": 3, "directional_accuracy": 0.375, "avg_return_30d": -0.01},
+            ],
+            "by_direction": [
+                {"label": "BULL", "resolved": 18, "correct_count": 12, "directional_accuracy": 0.6667, "avg_return_30d": 0.07},
+                {"label": "BEAR", "resolved": 2,  "correct_count": 0,  "directional_accuracy": 0.0,    "avg_return_30d": -0.05},
+            ],
+            "by_governance_state": [
+                {"label": "A_LIST",   "resolved": 10, "correct_count": 8, "directional_accuracy": 0.8,    "avg_return_30d": 0.12},
+                {"label": "STANDARD", "resolved": 8,  "correct_count": 4, "directional_accuracy": 0.5,    "avg_return_30d": 0.03},
+                {"label": "unknown",  "resolved": 2,  "correct_count": 0, "directional_accuracy": 0.0,    "avg_return_30d": None},
+            ],
+            "broad_source_only_summary": {
+                "broad":     {"label": "broad_source_only", "resolved": 5,  "correct_count": 2,  "directional_accuracy": 0.4,    "avg_return_30d": -0.02},
+                "non_broad": {"label": "quality_index",     "resolved": 15, "correct_count": 10, "directional_accuracy": 0.6667, "avg_return_30d": 0.08},
+            },
+            "days": 90,
+            "total_resolved": total,
+        }
+
+    def test_outcome_attribution_returns_200(self):
+        """GET /api/outcome/attribution returns 200 with required shape."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_outcome_attribution",
+                   return_value=self._fake_attribution()):
+            resp = client.get("/api/outcome/attribution")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "by_source" in body
+        assert "by_lane" in body
+        assert "by_direction" in body
+        assert "by_governance_state" in body
+        assert "broad_source_only_summary" in body
+        assert "total_resolved" in body
+        assert "days" in body
+
+    def test_outcome_attribution_by_governance_state_shape(self):
+        """by_governance_state buckets have required fields and expected labels."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_outcome_attribution",
+                   return_value=self._fake_attribution()):
+            resp = client.get("/api/outcome/attribution")
+        body = resp.json()
+        gov_buckets = body["by_governance_state"]
+        assert isinstance(gov_buckets, list)
+        assert len(gov_buckets) > 0
+        labels = {b["label"] for b in gov_buckets}
+        assert "A_LIST" in labels
+        for bucket in gov_buckets:
+            assert "label" in bucket
+            assert "resolved" in bucket
+            assert "correct_count" in bucket
+            assert "directional_accuracy" in bucket
+
+    def test_outcome_attribution_buckets_have_required_fields(self):
+        """Each bucket has label, resolved, correct_count, directional_accuracy."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_outcome_attribution",
+                   return_value=self._fake_attribution()):
+            resp = client.get("/api/outcome/attribution")
+        body = resp.json()
+        for bucket in body["by_source"] + body["by_lane"]:
+            assert "label" in bucket
+            assert "resolved" in bucket
+            assert "correct_count" in bucket
+            assert "directional_accuracy" in bucket
+
+    def test_outcome_attribution_days_param(self):
+        """?days=30 is forwarded to fetch_outcome_attribution."""
+        _cache._store.clear()
+        received_days = []
+
+        def _capture(days=90):
+            received_days.append(days)
+            return self._fake_attribution(total=5)
+
+        with patch("utils.supabase_persist.fetch_outcome_attribution", side_effect=_capture):
+            client.get("/api/outcome/attribution?days=30")
+
+        assert received_days == [30], f"Expected days=30, got {received_days}"
+
+    def test_outcome_attribution_cached_on_second_call(self):
+        """Second call within TTL returns cached result without re-querying."""
+        _cache._store.clear()
+        call_count = [0]
+
+        def _counter(days=90):
+            call_count[0] += 1
+            return self._fake_attribution()
+
+        with patch("utils.supabase_persist.fetch_outcome_attribution", side_effect=_counter):
+            client.get("/api/outcome/attribution")
+            client.get("/api/outcome/attribution")
+
+        assert call_count[0] == 1, "Expected only one DB call due to cache hit"
+
+    def test_outcome_attribution_db_error_returns_empty(self):
+        """DB error returns empty structure with 200 status (degrades gracefully)."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_outcome_attribution",
+                   side_effect=RuntimeError("db down")):
+            resp = client.get("/api/outcome/attribution")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_resolved"] == 0
+        assert body["by_source"] == []
+
+
+class TestGovernanceRecommendationsEndpoint:
+    """Tests for GET /api/governance/recommendations."""
+
+    def _fake_recs(self, days=90):
+        entry = lambda ticker, rec: {
+            "ticker": ticker, "current_state": "STANDARD",
+            "recommendation": rec, "reason_summary": "test",
+            "resolved": 8, "correct_count": 6,
+            "directional_accuracy": 0.75, "avg_return_30d": 0.05,
+            "days": days,
+        }
+        return {
+            "promote_candidates":   [entry("AAPL", "promote_to_a_list")],
+            "probation_candidates": [entry("GME",  "move_to_probation")],
+            "quarantine_candidates":[entry("MEME", "consider_quarantine")],
+            "keep_current_state":   [entry("MSFT", "keep_current_state")],
+            "insufficient_sample":  [],
+            "summary": {
+                "total_tickers": 4,
+                "by_recommendation": {
+                    "promote_to_a_list": 1, "move_to_probation": 1,
+                    "consider_quarantine": 1, "keep_current_state": 1,
+                    "insufficient_sample": 0,
+                },
+            },
+            "thresholds_used": {
+                "min_sample": 5, "promote_min_sample": 8,
+                "promote_min_accuracy": 0.70, "promote_min_return": 0.03,
+                "probation_max_accuracy": 0.45, "quarantine_max_accuracy": 0.35,
+            },
+            "days": days,
+        }
+
+    def test_returns_200_with_required_shape(self):
+        """GET /api/governance/recommendations returns 200 with all required top-level keys."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_governance_recommendations",
+                   return_value=self._fake_recs()):
+            resp = client.get("/api/governance/recommendations")
+        assert resp.status_code == 200
+        body = resp.json()
+        for key in ("promote_candidates", "probation_candidates", "quarantine_candidates",
+                    "keep_current_state", "insufficient_sample", "summary",
+                    "thresholds_used", "days"):
+            assert key in body, f"Missing key: {key}"
+
+    def test_entry_has_required_fields(self):
+        """Each candidate entry contains ticker, recommendation, resolved, directional_accuracy."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_governance_recommendations",
+                   return_value=self._fake_recs()):
+            resp = client.get("/api/governance/recommendations")
+        body = resp.json()
+        entry = body["promote_candidates"][0]
+        for field in ("ticker", "current_state", "recommendation", "reason_summary",
+                      "resolved", "correct_count", "directional_accuracy"):
+            assert field in entry, f"Missing entry field: {field}"
+
+    def test_days_param_forwarded(self):
+        """?days=30 is passed through to fetch_governance_recommendations."""
+        _cache._store.clear()
+        received = []
+
+        def _cap(days=90):
+            received.append(days)
+            return self._fake_recs(days)
+
+        with patch("utils.supabase_persist.fetch_governance_recommendations", side_effect=_cap):
+            client.get("/api/governance/recommendations?days=30")
+
+        assert received == [30]
+
+    def test_cached_on_second_call(self):
+        """Second call within TTL returns cached data without re-querying."""
+        _cache._store.clear()
+        call_count = [0]
+
+        def _counter(days=90):
+            call_count[0] += 1
+            return self._fake_recs()
+
+        with patch("utils.supabase_persist.fetch_governance_recommendations", side_effect=_counter):
+            client.get("/api/governance/recommendations")
+            client.get("/api/governance/recommendations")
+
+        assert call_count[0] == 1
+
+    def test_db_error_degrades_gracefully(self):
+        """DB error returns empty structure with 200 status."""
+        _cache._store.clear()
+        with patch("utils.supabase_persist.fetch_governance_recommendations",
+                   side_effect=RuntimeError("db down")):
+            resp = client.get("/api/governance/recommendations")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["promote_candidates"] == []
+        assert body["summary"]["total_tickers"] == 0

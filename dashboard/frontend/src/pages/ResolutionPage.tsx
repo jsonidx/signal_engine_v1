@@ -348,6 +348,27 @@ function ModelCard({ m, capital }: { m: BenchmarkModelSummary; capital: number }
           </div>
         ))}
       </div>
+      <div className="border-t border-border-subtle/50 pt-2 space-y-1">
+        <div className="font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
+          Data Quality Mix
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-accent-green/40 text-accent-green">
+            High {m.high_quality_count}
+          </span>
+          <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-accent-amber/40 text-accent-amber">
+            Medium {m.medium_quality_count}
+          </span>
+          <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-accent-red/40 text-accent-red">
+            Low {m.low_quality_count}
+          </span>
+          {m.unknown_quality_count > 0 && (
+            <span className="font-mono text-[9px] px-1.5 py-0.5 rounded border border-border-subtle text-text-tertiary">
+              Unknown {m.unknown_quality_count}
+            </span>
+          )}
+        </div>
+      </div>
       {/* Capital forecast */}
       {m.avg_return_30d != null && (
         <div className="border-t border-border-subtle/50 pt-2 space-y-1">
@@ -416,7 +437,7 @@ function BenchmarkOutcomesTable({ rows, modelFilter, setModelFilter, models, cap
           <table className="w-full">
             <thead>
               <tr className="border-b border-border-subtle">
-                {['Date','Ticker','Model','Dir','Conv','Outcome','T1','T2','Stop','7d ret','30d ret',`Profit (30d)`, 'vs T1','Days→T1'].map(h => (
+                {['Date','Ticker','Model','Quality','Dir','Conv','Outcome','T1','T2','Stop','7d ret','30d ret',`Profit (30d)`, 'vs T1','Days→T1'].map(h => (
                   <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary whitespace-nowrap">{h}</th>
                 ))}
               </tr>
@@ -431,6 +452,20 @@ function BenchmarkOutcomesTable({ rows, modelFilter, setModelFilter, models, cap
                   <td className="px-3 py-2">
                     <span className={clsx('font-mono text-[9px] px-1.5 py-0.5 rounded border', modelColor(r.model))}>
                       {modelLabel(r.model)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className={clsx(
+                      'font-mono text-[9px] px-1.5 py-0.5 rounded border',
+                      r.data_quality === 'HIGH'
+                        ? 'border-accent-green/40 text-accent-green'
+                        : r.data_quality === 'MEDIUM'
+                          ? 'border-accent-amber/40 text-accent-amber'
+                          : r.data_quality === 'LOW'
+                            ? 'border-accent-red/40 text-accent-red'
+                            : 'border-border-subtle text-text-tertiary'
+                    )}>
+                      {r.data_quality || '—'}
                     </span>
                   </td>
                   <td className="px-3 py-2">

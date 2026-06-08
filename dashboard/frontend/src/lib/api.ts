@@ -1377,6 +1377,22 @@ export const api = {
   funnelHistory: (days = 14): Promise<FunnelHistoryResponse> =>
     client.get('/api/funnel/history', { params: { days } }).then(r => r.data ?? { rows: [], count: 0 }),
 
+  // Outcome Attribution (TRD-077)
+  outcomeAttribution: (days = 90): Promise<OutcomeAttributionResponse> =>
+    client.get('/api/outcome/attribution', { params: { days } }).then(r => r.data ?? {
+      by_source: [], by_lane: [], by_direction: [], broad_source_only_summary: {},
+      days, total_resolved: 0,
+    }),
+
+  // Governance Recommendations (TRD-078)
+  governanceRecommendations: (days = 90): Promise<GovernanceRecommendationsResponse> =>
+    client.get('/api/governance/recommendations', { params: { days } }).then(r => r.data ?? {
+      promote_candidates: [], probation_candidates: [], quarantine_candidates: [],
+      keep_current_state: [], insufficient_sample: [],
+      summary: { total_tickers: 0, by_recommendation: {} },
+      thresholds_used: {}, days,
+    }),
+
   // Ticker Governance (TRD-068)
   governanceGet: (): Promise<GovernanceResponse> =>
     client.get('/api/governance').then(r => r.data ?? { governance: [], count: 0 }),
@@ -1678,4 +1694,62 @@ export interface GovernanceEntry {
 export interface GovernanceResponse {
   governance: GovernanceEntry[]
   count: number
+}
+
+// ─── Outcome Attribution  (TRD-077) ───────────────────────────────────────────
+
+export interface OutcomeAttributionBucket {
+  label: string
+  resolved: number
+  correct_count: number
+  directional_accuracy: number | null
+  avg_return_30d: number | null
+}
+
+export interface BroadSourceOnlySummary {
+  broad: OutcomeAttributionBucket
+  non_broad: OutcomeAttributionBucket
+}
+
+export interface OutcomeAttributionResponse {
+  by_source: OutcomeAttributionBucket[]
+  by_lane: OutcomeAttributionBucket[]
+  by_direction: OutcomeAttributionBucket[]
+  by_governance_state: OutcomeAttributionBucket[]
+  broad_source_only_summary: BroadSourceOnlySummary
+  days: number
+  total_resolved: number
+}
+
+// Governance Recommendations (TRD-078)
+export interface GovernanceRecommendationEntry {
+  ticker: string
+  current_state: string
+  recommendation: string
+  reason_summary: string
+  resolved: number
+  correct_count: number
+  directional_accuracy: number
+  avg_return_30d: number | null
+  days: number
+}
+
+export interface GovernanceRecommendationThresholds {
+  min_sample: number
+  promote_min_sample: number
+  promote_min_accuracy: number
+  promote_min_return: number
+  probation_max_accuracy: number
+  quarantine_max_accuracy: number
+}
+
+export interface GovernanceRecommendationsResponse {
+  promote_candidates: GovernanceRecommendationEntry[]
+  probation_candidates: GovernanceRecommendationEntry[]
+  quarantine_candidates: GovernanceRecommendationEntry[]
+  keep_current_state: GovernanceRecommendationEntry[]
+  insufficient_sample: GovernanceRecommendationEntry[]
+  summary: { total_tickers: number; by_recommendation: Record<string, number> }
+  thresholds_used: GovernanceRecommendationThresholds
+  days: number
 }

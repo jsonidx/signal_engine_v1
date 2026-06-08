@@ -77,8 +77,20 @@ except ImportError:
 try:
     from config import UNIVERSE_ATR_PCT_MAX, UNIVERSE_BETA_MAX
 except ImportError:
-    UNIVERSE_ATR_PCT_MAX = 6.0   # drop if 20-day ATR% > 6 % (excessively volatile)
-    UNIVERSE_BETA_MAX    = 2.0   # drop if 60-day rolling beta vs SPY > 2.0
+    UNIVERSE_ATR_PCT_MAX = 6.0   # kept as fallback; lane routing is now preferred
+    UNIVERSE_BETA_MAX    = 2.0
+
+
+try:
+    from config import LANE_THRESHOLDS, LANE_HARD_DROP_ATR_PCT, LANE_HARD_DROP_BETA
+except ImportError:
+    LANE_THRESHOLDS = {
+        "execution_core":      {"min_price": 5.0, "min_adv": 10_000_000, "min_history_bars": 252, "atr_pct_max": 5.0,  "beta_max": 1.8},
+        "execution_high_beta": {"min_price": 3.0, "min_adv": 10_000_000, "min_history_bars": 126, "atr_pct_max": 8.0,  "beta_max": 3.5},
+        "research_broad":      {"min_price": 2.0, "min_adv":  5_000_000, "min_history_bars": 126, "atr_pct_max": 12.0, "beta_max": 5.0},
+    }
+    LANE_HARD_DROP_ATR_PCT = 15.0
+    LANE_HARD_DROP_BETA    = 6.0
 
 # Early catalyst momentum gate thresholds — configurable from config.py
 try:
@@ -139,9 +151,31 @@ _INTL_EXCHANGE_SUFFIXES: frozenset = frozenset({
 })
 
 # US preferreds / units / warrants — these dot-suffixes are junk for our purposes.
+# "WI" = when-issued (transient listing, not a final instrument).
 _US_JUNK_SUFFIXES: frozenset = frozenset({
-    "PR", "P", "U", "WS", "W", "R", "RT", "CL",
+    "PR", "P", "U", "WS", "W", "R", "RT", "CL", "WI",
 })
+
+# TRD-056/TRD-063: Shared name-based exclusion terms applied to Security Name fields
+# from FTP-sourced symbol directories (nasdaqlisted.txt, otherlisted.txt).
+# Catches preferreds, warrants, rights, units, notes, closed-end funds, and
+# exchange-traded products that slip through ETF-column filters.
+# Conservative: only exclude explicit non-common-stock patterns, never generic words
+# that appear in legitimate company names (e.g. "fund" alone is too broad).
+_JUNK_NAME_TERMS: tuple = (
+    "WARRANT", " WTS", " WT ",
+    "PREFERRED", " PREF ", " PRF ", " PFD ",
+    " RIGHT ", " RIGHTS",
+    " UNIT ", " UNITS",
+    "EXCHANGE TRADED", "EXCHANGE-TRADED",
+    " ETF", " ETN ", " ETP ",
+    "NOTE DUE", "NOTES DUE", "DEBENTURE",
+    "SENIOR NOTE", "SUBORDINATED",
+    "CLOSED-END",                       # closed-end funds (CEFs) are not common stocks
+)
+
+# Backwards-compat alias — existing code and tests that reference the old name still work.
+_NASDAQ_BROAD_EXCLUDE_NAME_TERMS = _JUNK_NAME_TERMS
 
 # Pre-screen factor weights — must sum to 1.0
 WEIGHT_MOM_20D             = 0.35   # 20-day return cross-sectional rank
@@ -194,6 +228,31 @@ _INDEX_URLS: dict = {
         "https://www.ishares.com/us/products/239763/ISHARES-SP-MIDCAP-400-ETF"
         "/1467271812596.ajax?fileType=csv&fileName=IJH_holdings&dataType=fund"
     ),
+    # TRD-061: S&P Small-Cap 600 (iShares IJR) — used alone and as sp1500 component
+    "sp600": (
+        "https://www.ishares.com/us/products/239765/ISHARES-SP-SMALLCAP-600-ETF"
+        "/1467271812596.ajax?fileType=csv&fileName=IJR_holdings&dataType=fund"
+    ),
+    # sp1500 is a virtual composite (sp500 + sp400 + sp600); no direct URL needed.
+    # Handled as a special case in fetch_index_constituents().
+    "sp1500": "__composite__",
+    # TRD-062: Nasdaq-100 high-liquidity overlay (iShares CNDX UCITS / BlackRock proxy)
+    # nasdaq100: no reliable free iShares endpoint — curated list is the primary source.
+    # The URL below is a placeholder kept only for structure; fetch_index_constituents
+    # returns _NASDAQ100_CORE directly and never reaches this URL.
+    "nasdaq100": "",
+    # TRD-063: Broad Nasdaq common stocks — research-lane discovery source.
+    # Source: Nasdaq Trader FTP symbol directory (pipe-delimited; updated nightly).
+    # Limitation: sorted alphabetically, not by market cap; no float/ADV data in file.
+    # The lane model applies quality gates; poor names end up lane_excluded, not in execution.
+    "nasdaq_broad": "https://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt",
+    # TRD-056: NYSE and other US exchange common stocks — research-lane discovery source.
+    # Source: Nasdaq Trader FTP otherlisted.txt — covers NYSE, NYSE American, NYSE Arca,
+    #         BATS, IEX, and other non-Nasdaq US exchanges (pipe-delimited; updated nightly).
+    # Format differs from nasdaqlisted.txt: no Financial Status column; Exchange code col.
+    # Columns: ACT Symbol | Security Name | Exchange | CQS Symbol | ETF | Round Lot Size |
+    #          Test Issue | NASDAQ Symbol
+    "nyse_listed": "https://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt",
     # ── International / global ────────────────────────────────────────────────
     "iefa": (
         "https://www.ishares.com/us/products/244049/ishares-core-msci-eafe-etf"
@@ -209,14 +268,34 @@ _INDEX_URLS: dict = {
     ),
 }
 
+# TRD-062 — Nasdaq-100 core fallback: used when the network source is unavailable.
+# Updated as of 2026-Q2; covers ~80 of the top 100 Nasdaq names by market cap.
+_NASDAQ100_CORE: list = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
+    "AVGO", "COST", "NFLX", "AMD", "ADBE", "CSCO", "PEP", "TMUS",
+    "QCOM", "BKNG", "TXN", "AMAT", "MRVL", "ISRG", "SBUX", "ADI",
+    "LRCX", "AMGN", "MU", "PANW", "VRTX", "SNPS", "CDNS", "KLAC",
+    "REGN", "ORLY", "MELI", "CRWD", "CEG", "MNST", "ROP", "DXCM",
+    "ODFL", "TTD", "IDXX", "ILMN", "VRSK", "PCAR", "CSGP", "KDP",
+    "FAST", "LULU", "PAYX", "ANSS", "CPRT", "AEP", "XEL", "MCHP",
+    "EA", "TEAM", "ZS", "ABNB", "ON", "DDOG", "DLTR", "ROST",
+    "WDAY", "EXC", "CTAS", "BIIB", "GILD", "FTNT", "NXPI", "INTU",
+    "ARM", "INTC", "GEHC", "WBD", "ZM", "FANG",
+]
+
 _INDEX_PORTFOLIO_IDS: dict = {
     "russell1000": "239707",
     "russell2000": "239710",
     "sp500": "239726",
     "sp400": "239763",
+    "sp600": "239774",   # iShares IJR / Core S&P Small-Cap ETF (TRD-061)
+    # NOTE: iShares product page URL uses id=239765, but the BlackRock fund document
+    # API portfolioId for the same fund is 239774. These two ID spaces are not the same.
     "iefa": "244049",
     "iemg": "244050",
     "acwi": "239600",
+    # sp1500 is virtual composite — no portfolio ID
+    # nasdaq100 falls back to _NASDAQ100_CORE on network failure
 }
 
 # ==============================================================================
@@ -277,6 +356,81 @@ _QUALITY_CACHE: dict = {}
 # Tags: "VOL_BREAKOUT", "VOLATILITY_COMPRESSION"
 # "EARNINGS_WINDOW" is added later by _fetch_earnings_tags()
 _FORCE_TAGS: dict = {}
+
+# Lane assignments populated by _compute_prescreen_scores — {ticker: lane_str}
+# Lanes: "execution_core" | "execution_high_beta" | "research_broad" | "hard_excluded" | "lane_excluded"
+# "lane_excluded" means the ticker passed the hard-drop ceiling but failed all configured lane
+# thresholds (e.g. price too low, ADV too thin, history too short for even research_broad).
+_TICKER_LANES: dict = {}
+
+# TRD-063/064: Source attribution — populated in build_master_universe().
+# Maps ticker → [list of index names that contributed it].
+# e.g. {"AAPL": ["russell1000", "sp500", "nasdaq_broad"]}
+_TICKER_SOURCES: dict = {}
+
+# TRD-063: Sources classified as "broad research only".
+# Tickers whose ENTIRE source set is within this frozenset cannot be promoted
+# to execution lanes — they are clamped to research_broad at lane assignment.
+# Tickers that ALSO appear in a core quality source (sp500, russell1000, etc.)
+# are NOT affected and route normally through classify_ticker_lane().
+_BROAD_RESEARCH_SOURCES: frozenset = frozenset({"nasdaq_broad", "nyse_listed"})
+
+# Source-health tracking for broad FTP sources — populated as a side effect of
+# _fetch_nasdaq_broad() / _fetch_nyse_listed(); read by get_broad_source_health()
+# and included in funnel_metrics at the end of _write_watchlist_from_universe().
+_BROAD_SOURCE_HEALTH: dict = {}
+
+# Sanity thresholds for live-fetch eligible counts.
+# Values are tuned to the historical population of nasdaqlisted.txt (~3,900 common stocks)
+# and otherlisted.txt (~4,300 common stocks).  Adjust here if exchange populations shift.
+_BROAD_SOURCE_MIN_EXPECTED: int = 2_000   # warn if eligible < this on a live fetch
+_BROAD_SOURCE_MAX_EXPECTED: int = 7_000   # warn if eligible > this on a live fetch (parse anomaly)
+
+
+def classify_ticker_lane(
+    ticker: str,
+    price: float,
+    adv: float,
+    bars: int,
+) -> str:
+    """
+    Assign a ticker to a trading lane based on price, ADV, history length,
+    and quality metrics from _QUALITY_CACHE (ATR%, beta).
+
+    Returns one of:
+      "execution_core"      — high-quality, immediately tradeable
+      "execution_high_beta" — momentum names with wider vol/beta tolerance
+      "research_broad"      — passes research_broad thresholds; coverage universe
+      "hard_excluded"       — extreme vol/beta (above LANE_HARD_DROP_*); dropped
+      "lane_excluded"       — below hard-drop ceiling but fails all lane thresholds
+                              (too cheap, too illiquid, or too little history)
+
+    Quality metrics are optional — if absent from _QUALITY_CACHE the ticker
+    is classified using only price/adv/bars (ATR/beta treated as 0/1).
+    """
+    quality  = _QUALITY_CACHE.get(ticker, {})
+    atr_pct  = quality.get("atr_pct", 0.0)
+    beta     = quality.get("beta",    1.0)
+
+    # Hard exclusion: extreme vol/beta — unusable for any lane
+    if atr_pct > LANE_HARD_DROP_ATR_PCT or beta > LANE_HARD_DROP_BETA:
+        return "hard_excluded"
+
+    # Walk from tightest to widest lane; return the first match
+    for lane in ("execution_core", "execution_high_beta", "research_broad"):
+        t = LANE_THRESHOLDS.get(lane, {})
+        if (
+            price >= t.get("min_price",        0.0)
+            and adv  >= t.get("min_adv",          0)
+            and bars >= t.get("min_history_bars",  0)
+            and atr_pct <= t.get("atr_pct_max", 999.0)
+            and beta    <= t.get("beta_max",    999.0)
+        ):
+            return lane
+
+    # Ticker passed hard-drop ceiling but failed every lane threshold.
+    # Do NOT silently label as research_broad — mark explicitly as ineligible.
+    return "lane_excluded"
 
 
 # ==============================================================================
@@ -1026,11 +1180,11 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
       0.15  rel_strength_vs_sector  — 20-day rank within sector peer group
 
     Side-effects:
-      - Populates _QUALITY_CACHE: { ticker: {"atr_pct": float, "beta": float} }
-      - Populates _FORCE_TAGS:    { ticker: set[str] } for swing-trade gates
-        Tags written here: "VOL_BREAKOUT", "VOLATILITY_COMPRESSION"
+      - Populates _QUALITY_CACHE:  { ticker: {"atr_pct": float, "beta": float} }
+      - Populates _FORCE_TAGS:     { ticker: set[str] } for swing-trade gates
+      - Populates _TICKER_LANES:   { ticker: lane_str } for lane routing (TRD-065)
     """
-    global _QUALITY_CACHE, _FORCE_TAGS  # noqa: PLW0603
+    global _QUALITY_CACHE, _FORCE_TAGS, _TICKER_LANES  # noqa: PLW0603
 
     # One batch download: 1 year of OHLCV + SPY for beta calculation
     download_list = list(dict.fromkeys(list(tickers) + ["SPY"]))
@@ -1129,6 +1283,37 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
 
     _QUALITY_CACHE = quality
 
+    # ── Lane classification (TRD-065) ─────────────────────────────────────────
+    # Populate _TICKER_LANES now that _QUALITY_CACHE has been fully built.
+    # We need price and ADV for each ticker — use last available bar from earlier
+    # downloads.  Both _batch_ohlcv results are local to this function, so we
+    # approximate: price from last close, ADV from 30d rolling avg dollar vol.
+    lane_map: dict = {}
+    for t in tickers:
+        c  = all_close.get(t)
+        v  = all_volume.get(t)
+        if c is None or len(c) < 20:
+            # Insufficient data — cannot reliably classify; mark as excluded
+            lane_map[t] = "lane_excluded"
+            continue
+        px    = float(c.iloc[-1])
+        bars  = len(c)
+        adv30 = float((c.iloc[-30:] * v.iloc[-30:]).mean()) if v is not None and len(v) >= 20 else 0.0
+        lane  = classify_ticker_lane(t, price=px, adv=adv30, bars=bars)
+        # TRD-063: broad-source-only policy — clamp to research_broad if the ticker's
+        # entire source set is within _BROAD_RESEARCH_SOURCES (e.g. nasdaq_broad only).
+        # Tickers that also appear in a core quality index are NOT affected.
+        t_sources = set(_TICKER_SOURCES.get(t, []))
+        if (t_sources and t_sources <= _BROAD_RESEARCH_SOURCES
+                and lane in ("execution_core", "execution_high_beta")):
+            logger.debug(
+                "Lane clamp: %s %s → research_broad (sources=%s, broad-research-only policy)",
+                t, lane, t_sources,
+            )
+            lane = "research_broad"
+        lane_map[t] = lane
+    _TICKER_LANES = lane_map
+
     if not returns_20d:
         return {}
 
@@ -1188,13 +1373,26 @@ def _compute_prescreen_scores(tickers: list, batch_size: int = 100) -> dict:
 
 def _apply_quality_gate(candidates: set, protected: set) -> set:
     """
-    Return the subset of *candidates* that FAIL the quality gate:
-      - ATR% > UNIVERSE_ATR_PCT_MAX  (default 6 %)
-      - beta > UNIVERSE_BETA_MAX     (default 2.0)
+    Return the subset of *candidates* that FAIL the hard-drop quality gate.
+
+    With lane-based routing (TRD-065) the threshold is the *hard-exclusion*
+    ceiling — significantly above the old global constants.  Tickers with
+    extreme vol/beta that would previously have been dropped by the
+    execution-core threshold are now routed to a softer lane instead of
+    being hard-dropped here.
+
+    Hard-drop thresholds:
+      - ATR% > LANE_HARD_DROP_ATR_PCT  (default 15 %)
+      - beta > LANE_HARD_DROP_BETA      (default 6.0)
+
+    Legacy fallback: if LANE_HARD_DROP_ATR_PCT is unavailable (shouldn't happen
+    but safe), falls back to UNIVERSE_ATR_PCT_MAX and UNIVERSE_BETA_MAX.
 
     *protected* tickers (Tier 1 pins + persistent favourites) are never dropped.
     If a ticker has no entry in _QUALITY_CACHE it passes through (benefit of doubt).
     """
+    atr_ceil  = LANE_HARD_DROP_ATR_PCT
+    beta_ceil = LANE_HARD_DROP_BETA
     dropped: set = set()
     for t in candidates:
         if t in protected:
@@ -1204,11 +1402,11 @@ def _apply_quality_gate(candidates: set, protected: set) -> set:
             continue
         atr_pct = q.get("atr_pct", 0.0)
         beta    = q.get("beta",    1.0)
-        if atr_pct > UNIVERSE_ATR_PCT_MAX:
-            logger.debug("Quality gate: dropping %s (ATR%% %.1f > %.1f)", t, atr_pct, UNIVERSE_ATR_PCT_MAX)
+        if atr_pct > atr_ceil:
+            logger.debug("Quality gate (hard-drop): dropping %s (ATR%% %.1f > %.1f)", t, atr_pct, atr_ceil)
             dropped.add(t)
-        elif beta > UNIVERSE_BETA_MAX:
-            logger.debug("Quality gate: dropping %s (beta %.2f > %.2f)", t, beta, UNIVERSE_BETA_MAX)
+        elif beta > beta_ceil:
+            logger.debug("Quality gate (hard-drop): dropping %s (beta %.2f > %.2f)", t, beta, beta_ceil)
             dropped.add(t)
     return dropped
 
@@ -1217,12 +1415,299 @@ def _apply_quality_gate(candidates: set, protected: set) -> set:
 # Public API — constituent fetching
 # ==============================================================================
 
+def _record_broad_source_health(
+    source: str,
+    fetch_mode: str,
+    eligible_count: int,
+    raw_rows: "int | None" = None,
+    warning: "str | None" = None,
+) -> None:
+    """Write one entry into _BROAD_SOURCE_HEALTH for *source*.
+
+    This is called as a side effect from each broad-source fetch function so that
+    callers of get_broad_source_health() — including funnel_metrics persistence and
+    tests — can inspect fetch mode, counts, and any warning without touching return
+    values.
+    """
+    from datetime import datetime as _dt
+    _BROAD_SOURCE_HEALTH[source] = {
+        "source":          source,
+        "fetch_mode":      fetch_mode,
+        "raw_rows":        raw_rows,
+        "eligible_count":  eligible_count,
+        "warning":         warning,
+        "fetched_at":      _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if warning:
+        logger.warning("broad-source health [%s]: %s", source, warning)
+
+
+def get_broad_source_health() -> dict:
+    """Return a shallow copy of the broad-source health metadata dict.
+
+    Keys are source names ("nasdaq_broad", "nyse_listed").
+    Each value is a dict with: source, fetch_mode, raw_rows, eligible_count,
+    warning, fetched_at.
+    Returns an empty dict if no broad-source fetches have run yet this process.
+    """
+    return dict(_BROAD_SOURCE_HEALTH)
+
+
+def _fetch_nasdaq_broad() -> list:
+    """
+    Fetch broad Nasdaq-listed common stocks from the Nasdaq Trader FTP symbol directory.
+
+    Source:  https://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt
+    Format:  pipe-delimited, updated nightly by Nasdaq.
+             Columns: Symbol | Security Name | Market Category | Test Issue |
+                      Financial Status | Round Lot Size | ETF | NextShares
+
+    Filters applied (in order):
+      1. ETF == "N"             — exclude exchange-traded funds/products
+      2. Test Issue == "N"      — exclude NASDAQ test listings
+      3. Financial Status == "N"— normal only; exclude deficient/delinquent/bankrupt
+      4. Name-based exclusion   — warrants, preferreds, rights, units, notes, bonds
+                                  (see _NASDAQ_BROAD_EXCLUDE_NAME_TERMS)
+      5. Symbol length <= 5     — exclude abnormally long symbols (usually non-equity)
+
+    Limitation: The FTP file is sorted alphabetically; no market-cap or float data is
+    available without a secondary lookup. The full eligible set is ingested without
+    an arbitrary cap — the downstream liquidity filter and lane model provide the
+    real quality gate. Poor names end up lane_excluded, not execution_core.
+
+    Returns [] on any network or parse failure — this source is additive and
+    non-critical; the pipeline runs normally without it.
+
+    Side effect: updates _BROAD_SOURCE_HEALTH["nasdaq_broad"].
+    """
+    # 1. Fresh cache
+    cached = _load_cache("nasdaq_broad", max_age_hours=UNIVERSE_CACHE_TTL_HOURS)
+    if cached is not None:
+        logger.info("nasdaq_broad: using fresh cache (%d tickers)", len(cached))
+        _record_broad_source_health("nasdaq_broad", "fresh_cache", len(cached))
+        return cached
+
+    # 2. Network fetch
+    url = _INDEX_URLS["nasdaq_broad"]
+    resp = _fetch_with_retry(url)
+    if resp is None:
+        # 3. Stale cache fallback (up to 7 days)
+        stale = _load_cache("nasdaq_broad", max_age_hours=7 * 24)
+        if stale:
+            logger.warning(
+                "nasdaq_broad: network failed — using stale cache (%d tickers)", len(stale)
+            )
+            print(f"  [WARN] nasdaq_broad: network failed — using stale cache ({len(stale)} tickers)")
+            _record_broad_source_health(
+                "nasdaq_broad", "stale_cache", len(stale),
+                warning="network_unavailable: serving stale cache",
+            )
+            return stale
+        # 4. Graceful empty — additive source; pipeline continues without it
+        logger.warning(
+            "nasdaq_broad: network failed and no cache — returning empty (additive source)"
+        )
+        print("  [WARN] nasdaq_broad: network failed, no cache — skipping broad Nasdaq source")
+        _record_broad_source_health(
+            "nasdaq_broad", "empty_fallback", 0,
+            warning="network_unavailable: no cache available",
+        )
+        return []
+
+    raw_rows = 0
+    tickers: list = []
+    for raw_line in resp.text.splitlines():
+        line = raw_line.strip()
+        if not line or "|" not in line:
+            continue
+        if line.startswith("Symbol"):        # header row
+            continue
+
+        parts = line.split("|")
+        if len(parts) < 8:
+            continue
+        raw_rows += 1
+
+        symbol, name, _mkt, test_issue, fin_status, _lot, etf, _next = (
+            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+        )
+
+        # Hard filters: not an ETF, not a test issue, financially normal
+        if etf.strip() != "N":
+            continue
+        if test_issue.strip() != "N":
+            continue
+        if fin_status.strip() != "N":
+            continue
+
+        symbol = symbol.strip().upper()
+        if not symbol or len(symbol) > 5:
+            continue
+
+        # Name-based non-common-stock exclusion
+        name_upper = name.upper()
+        if any(term in name_upper for term in _NASDAQ_BROAD_EXCLUDE_NAME_TERMS):
+            continue
+
+        tickers.append(symbol)
+
+    eligible = len(tickers)
+    warning: "str | None" = None
+    if raw_rows > 0 and eligible == 0:
+        warning = f"zero_eligible_from_{raw_rows}_raw_rows: filter anomaly"
+    elif eligible < _BROAD_SOURCE_MIN_EXPECTED:
+        warning = f"low_count: got {eligible}, expected >= {_BROAD_SOURCE_MIN_EXPECTED}"
+    elif eligible > _BROAD_SOURCE_MAX_EXPECTED:
+        warning = f"high_count: got {eligible}, expected <= {_BROAD_SOURCE_MAX_EXPECTED}"
+
+    _record_broad_source_health(
+        "nasdaq_broad", "live_fetch", eligible,
+        raw_rows=raw_rows, warning=warning,
+    )
+
+    _save_cache("nasdaq_broad", tickers, {})
+    logger.info(
+        "nasdaq_broad: fetched %d eligible from %d raw rows (Nasdaq FTP)", eligible, raw_rows
+    )
+    print(f"  [nasdaq_broad] {eligible} common-stock candidates from {raw_rows} raw rows (Nasdaq FTP)")
+    if warning:
+        print(f"  [WARN] nasdaq_broad health: {warning}")
+    return tickers
+
+
+def _fetch_nyse_listed() -> list:
+    """
+    Fetch common stocks listed on NYSE and other non-Nasdaq US exchanges from the
+    Nasdaq Trader FTP otherlisted.txt symbol directory.
+
+    Source:  https://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt
+    Format:  pipe-delimited, updated nightly.
+             Columns (0-indexed):
+               0: ACT Symbol      — primary trading symbol
+               1: Security Name
+               2: Exchange        — N=NYSE, A=NYSE American, P=NYSE Arca, Z=BATS, V=IEX, etc.
+               3: CQS Symbol
+               4: ETF             — Y/N
+               5: Round Lot Size
+               6: Test Issue      — Y/N
+               7: NASDAQ Symbol
+
+    Filters applied (in order):
+      1. ETF == "N"             — exclude exchange-traded funds/products
+      2. Test Issue == "N"      — exclude test/dummy listings
+      3. Name-based exclusion   — warrants, preferreds, rights, units, notes, closed-end funds
+                                  (see _JUNK_NAME_TERMS)
+      4. Symbol length <= 5     — exclude abnormally long symbols (usually non-equity)
+
+    Note: otherlisted.txt has no Financial Status column (unlike nasdaqlisted.txt).
+    The full eligible set is ingested without a cap — downstream lane model provides
+    quality gates. Poor-quality names end up lane_excluded, not execution_core.
+
+    Returns [] on any network or parse failure — this source is additive and
+    non-critical; the pipeline runs normally without it.
+
+    Side effect: updates _BROAD_SOURCE_HEALTH["nyse_listed"].
+    """
+    # 1. Fresh cache
+    cached = _load_cache("nyse_listed", max_age_hours=UNIVERSE_CACHE_TTL_HOURS)
+    if cached is not None:
+        logger.info("nyse_listed: using fresh cache (%d tickers)", len(cached))
+        _record_broad_source_health("nyse_listed", "fresh_cache", len(cached))
+        return cached
+
+    # 2. Network fetch
+    url = _INDEX_URLS["nyse_listed"]
+    resp = _fetch_with_retry(url)
+    if resp is None:
+        # 3. Stale cache fallback (up to 7 days)
+        stale = _load_cache("nyse_listed", max_age_hours=7 * 24)
+        if stale:
+            logger.warning(
+                "nyse_listed: network failed — using stale cache (%d tickers)", len(stale)
+            )
+            print(f"  [WARN] nyse_listed: network failed — using stale cache ({len(stale)} tickers)")
+            _record_broad_source_health(
+                "nyse_listed", "stale_cache", len(stale),
+                warning="network_unavailable: serving stale cache",
+            )
+            return stale
+        # 4. Graceful empty — additive source; pipeline continues without it
+        logger.warning(
+            "nyse_listed: network failed and no cache — returning empty (additive source)"
+        )
+        print("  [WARN] nyse_listed: network failed, no cache — skipping NYSE source")
+        _record_broad_source_health(
+            "nyse_listed", "empty_fallback", 0,
+            warning="network_unavailable: no cache available",
+        )
+        return []
+
+    raw_rows = 0
+    tickers: list = []
+    for raw_line in resp.text.splitlines():
+        line = raw_line.strip()
+        if not line or "|" not in line:
+            continue
+        if line.startswith("ACT Symbol"):    # header row
+            continue
+
+        parts = line.split("|")
+        if len(parts) < 8:
+            continue
+        raw_rows += 1
+
+        symbol, name, _exchange, _cqs, etf, _lot, test_issue, _nasdaq_sym = (
+            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+        )
+
+        # Hard filters: not an ETF, not a test issue
+        if etf.strip() != "N":
+            continue
+        if test_issue.strip() != "N":
+            continue
+
+        symbol = symbol.strip().upper()
+        if not symbol or len(symbol) > 5:
+            continue
+
+        # Name-based non-common-stock exclusion (shared hygiene constant)
+        name_upper = name.upper()
+        if any(term in name_upper for term in _JUNK_NAME_TERMS):
+            continue
+
+        tickers.append(symbol)
+
+    eligible = len(tickers)
+    warning: "str | None" = None
+    if raw_rows > 0 and eligible == 0:
+        warning = f"zero_eligible_from_{raw_rows}_raw_rows: filter anomaly"
+    elif eligible < _BROAD_SOURCE_MIN_EXPECTED:
+        warning = f"low_count: got {eligible}, expected >= {_BROAD_SOURCE_MIN_EXPECTED}"
+    elif eligible > _BROAD_SOURCE_MAX_EXPECTED:
+        warning = f"high_count: got {eligible}, expected <= {_BROAD_SOURCE_MAX_EXPECTED}"
+
+    _record_broad_source_health(
+        "nyse_listed", "live_fetch", eligible,
+        raw_rows=raw_rows, warning=warning,
+    )
+
+    _save_cache("nyse_listed", tickers, {})
+    logger.info(
+        "nyse_listed: fetched %d eligible from %d raw rows (otherlisted.txt)", eligible, raw_rows
+    )
+    print(f"  [nyse_listed] {eligible} common-stock candidates from {raw_rows} raw rows (otherlisted.txt)")
+    if warning:
+        print(f"  [WARN] nyse_listed health: {warning}")
+    return tickers
+
+
 def fetch_index_constituents(index: str) -> list:
     """
     Return constituent tickers for a named index.
 
     Valid index names:
         'russell1000', 'russell2000', 'sp500', 'sp400',
+        'sp600', 'sp1500', 'nasdaq100', 'nasdaq_broad', 'nyse_listed',
         'iefa', 'iemg', 'acwi'
 
     Fallback chain:
@@ -1237,6 +1722,44 @@ def fetch_index_constituents(index: str) -> list:
         raise ValueError(
             f"Unknown index: {index!r}. Valid options: {sorted(_INDEX_URLS)}"
         )
+
+    # ── TRD-061: sp1500 is a virtual composite of sp500 + sp400 + sp600 ──────
+    if index == "sp1500":
+        combined: list = []
+        for sub in ("sp500", "sp400", "sp600"):
+            combined.extend(fetch_index_constituents(sub))
+        deduped = list(dict.fromkeys(combined))
+        logger.info("sp1500 composite: %d tickers from sp500+sp400+sp600", len(deduped))
+        return deduped
+
+    # ── TRD-062: nasdaq100 uses curated list as primary — no reliable free network source.
+    # A stale disk cache (from a previous run where the list was written) is accepted;
+    # otherwise the curated _NASDAQ100_CORE list is returned directly and logged clearly.
+    if index == "nasdaq100":
+        cached = _load_cache(index, max_age_hours=UNIVERSE_CACHE_TTL_HOURS)
+        if cached is not None:
+            logger.info("nasdaq100: using disk cache (%d tickers)", len(cached))
+            return cached
+        stale = _load_cache(index, max_age_hours=7 * 24)
+        if stale:
+            logger.info("nasdaq100: using stale disk cache (%d tickers)", len(stale))
+            return stale
+        # Primary source: curated snapshot; save to cache so next run gets cache hit
+        logger.info(
+            "nasdaq100: serving curated snapshot (%d tickers) — no reliable free live source",
+            len(_NASDAQ100_CORE),
+        )
+        print(f"  [nasdaq100] Using curated snapshot ({len(_NASDAQ100_CORE)} tickers) — primary source")
+        _save_cache(index, list(_NASDAQ100_CORE), {})
+        return list(_NASDAQ100_CORE)
+
+    # ── TRD-063: nasdaq_broad — broad Nasdaq common-stock research source ─────
+    if index == "nasdaq_broad":
+        return _fetch_nasdaq_broad()
+
+    # ── TRD-056: nyse_listed — NYSE/other exchange common-stock research source ─
+    if index == "nyse_listed":
+        return _fetch_nyse_listed()
 
     # 1. Fresh cache
     cached = _load_cache(index, max_age_hours=UNIVERSE_CACHE_TTL_HOURS)
@@ -1305,12 +1828,22 @@ def build_master_universe(indices: list = None) -> list:
     if indices is None:
         indices = UNIVERSE_INDICES
 
+    global _TICKER_SOURCES  # noqa: PLW0603
+    _source_map: dict = {}
+
     # Seed with curated ADRs, then expand with index constituents
     raw: list = list(LIQUID_ADRS)
+    for t in LIQUID_ADRS:
+        _source_map.setdefault(t.strip().upper(), []).append("liquid_adrs")
     for idx in indices:
         constituents = fetch_index_constituents(idx)
         logger.info("  %s: %d constituents", idx, len(constituents))
+        for t in constituents:
+            t_up = t.strip().upper()
+            if t_up:
+                _source_map.setdefault(t_up, []).append(idx)
         raw.extend(constituents)
+    _TICKER_SOURCES = _source_map
 
     # Deduplicate preserving order.
     # For dot-tickers: keep international exchange suffixes, drop US junk.
@@ -1547,6 +2080,18 @@ def fast_momentum_prescreen(tickers: list, top_n: int = None) -> list:
            f" ({forced_count} force-included)")
     print(f"  {msg}")
     logger.info(msg)
+
+    # ── Lane summary (TRD-065) ────────────────────────────────────────────────
+    if _TICKER_LANES:
+        from collections import Counter
+        lane_counts = Counter(_TICKER_LANES.get(t, "lane_excluded") for t in result)
+        summary = "  Lanes: " + "  ".join(
+            f"{lane.replace('execution_', 'ex_')}: {cnt}"
+            for lane, cnt in sorted(lane_counts.items())
+        )
+        print(summary)
+        logger.info("Lane summary for prescreened tickers: %s", dict(lane_counts))
+
     return result
 
 
@@ -1656,17 +2201,82 @@ def _write_watchlist_from_universe(indices: list = None, top_n: int = None) -> N
             status = "Tier-1"
         else:
             status = "Dynamic only"
-        force_tags = sorted(_FORCE_TAGS.get(t, set()))
+        force_tags        = sorted(_FORCE_TAGS.get(t, set()))
+        lane              = _TICKER_LANES.get(t, "lane_excluded")
+        sources           = _TICKER_SOURCES.get(t, [])
+        broad_source_only = bool(sources) and set(sources) <= _BROAD_RESEARCH_SOURCES
         ranked_universe[t] = {
-            "rank": rank,
-            "total": len(top_tickers),
-            "status": status,
-            "factors": "mom/vol-surge/near-high/earnings/sector-RS",
-            "force_tags": force_tags,
+            "rank":              rank,
+            "total":             len(top_tickers),
+            "status":            status,
+            "factors":           "mom/vol-surge/near-high/earnings/sector-RS",
+            "force_tags":        force_tags,
+            "lane":              lane,
+            "sources":           sources,
+            "broad_source_only": broad_source_only,
         }
     ranked_path = _BASE_DIR / "ranked_universe.json"
     ranked_path.write_text(json.dumps(ranked_universe, indent=2))
     print(f"INFO: Saved ranked_universe.json with {len(ranked_universe)} tickers for AI Quant")
+
+    # TRD-057: Persist research-lane candidates before AI selection narrows the funnel.
+    # Exclude hard_excluded and lane_excluded tickers — they are not valid candidates.
+    try:
+        from utils.supabase_persist import persist_research_lane_candidates
+        _EXCLUDED_LANES = {"hard_excluded", "lane_excluded"}
+        eligible_for_persist = {
+            t: v for t, v in ranked_universe.items()
+            if v.get("lane") not in _EXCLUDED_LANES
+        }
+        persist_research_lane_candidates(eligible_for_persist)
+        print(f"INFO: Research-lane candidates persisted ({len(eligible_for_persist)} eligible tickers)")
+    except Exception as _rl_exc:
+        logger.debug("Research-lane persistence unavailable: %s", _rl_exc)
+
+    # TRD-059: Persist universe/lane funnel metrics for coverage analytics.
+    try:
+        from collections import Counter as _Counter
+        from utils.supabase_persist import persist_funnel_metrics
+        _all_lane_vals = list(_TICKER_LANES.values()) if _TICKER_LANES else []
+        _lc = _Counter(_all_lane_vals)
+        _excl_by_src = {}
+        if _lc.get("hard_excluded", 0):
+            _excl_by_src["hard_excluded"] = _lc["hard_excluded"]
+        if _lc.get("lane_excluded", 0):
+            _excl_by_src["lane_excluded"] = _lc["lane_excluded"]
+        # Attribution metrics: lane/source breakdown for prescreened candidates
+        _cbl: dict = {}   # candidates_by_lane
+        _cbs: dict = {}   # candidates_by_source
+        _bso_cand = 0     # broad_source_only_candidates
+        _EXCL_LANES = {"hard_excluded", "lane_excluded"}
+        for _t, _v in ranked_universe.items():
+            if _v.get("lane") in _EXCL_LANES:
+                continue
+            _ln = _v.get("lane", "unknown")
+            _cbl[_ln] = _cbl.get(_ln, 0) + 1
+            for _src in (_v.get("sources") or []):
+                _cbs[_src] = _cbs.get(_src, 0) + 1
+            if _v.get("broad_source_only"):
+                _bso_cand += 1
+
+        _bsh = get_broad_source_health()
+        persist_funnel_metrics({
+            "raw_universe_count":        len(universe),
+            "hard_excluded_count":       _lc.get("hard_excluded", 0),
+            "lane_excluded_count":       _lc.get("lane_excluded", 0),
+            "execution_core_count":      _lc.get("execution_core", 0),
+            "execution_high_beta_count": _lc.get("execution_high_beta", 0),
+            "research_broad_count":      _lc.get("research_broad", 0),
+            "prescreened_count":         len(top_tickers),
+            "excluded_by_source":        _excl_by_src if _excl_by_src else None,
+            "candidates_by_lane":        _cbl if _cbl else None,
+            "candidates_by_source":      _cbs if _cbs else None,
+            "broad_source_only_candidates": _bso_cand if _bso_cand else None,
+            "broad_source_health":       _bsh if _bsh else None,
+        })
+        print("INFO: Funnel metrics (universe stage) persisted")
+    except Exception as _fm_exc:
+        logger.debug("Funnel metrics persistence unavailable: %s", _fm_exc)
 
     # Sync watchlist to Supabase user_watchlists (replaces stale rows)
     try:

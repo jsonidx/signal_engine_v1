@@ -724,3 +724,259 @@ Navigate to `/rankings` (sidebar shortcut `k`). Click any row to open a side pan
 - SQLite concurrency risk if modules run in parallel
 - Polymarket ticker mappings are manually maintained (92 entries, no auto-update)
 - `watchlist_history.json` is write-only (nothing reads it downstream)
+
+---
+
+## 9b. Lane-Based Universe Routing (TRD-065)
+
+### Lane values
+
+| Lane | Meaning | Selection behavior |
+|---|---|---|
+| `execution_core` | High-quality, immediately tradeable | Full priority weight (1.0×) |
+| `execution_high_beta` | Wider vol/beta tolerance | Slight discount (0.9×) |
+| `research_broad` | Passes research thresholds; coverage universe | Significant discount (0.6×) |
+| `lane_excluded` | Below all lane thresholds (too cheap/illiquid) | Not persisted to research_lane_candidates; **hard-gated out of AI selection** |
+| `hard_excluded` | Extreme ATR% (>15) or beta (>6.0) | Dropped at quality gate; **hard-gated out of AI selection** |
+
+`research_broad` is only assigned when the ticker **actually passes** the `LANE_THRESHOLDS["research_broad"]` thresholds. A ticker that passes the hard-drop ceiling but fails every lane threshold is `lane_excluded`, not `research_broad`.
+
+### Selection eligibility and priority score multipliers
+
+`lane_excluded` and `hard_excluded` tickers are **hard-gated out** of the AI selection funnel in `ticker_selector.py` — they are skipped before scoring, not just discounted.
+
+**Open-position override policy** (implemented in Phase 2 hardening):
+
+| Lane | Non-open-position | Open position (`always_include`) |
+|---|---|---|
+| `lane_excluded` | Hard-gated out | **Allowed** — live positions need review; flagged as `open_position_lane_override=True` and `degraded_position_review_required=True` in selection output; `logger.warning` emitted |
+| `hard_excluded` | Hard-gated out | **Also blocked** — hard_excluded is a PM hard stop; always_include does not override it; `logger.warning` emitted to alert PM to resolve the discrepancy |
+
+Rationale: `lane_excluded` is a routing classification (threshold failure) — the underlying may still have an open position worth reviewing. `hard_excluded` is an extreme-volatility ceiling — trading it is dangerous regardless of open position status. The PM must resolve `hard_excluded` open positions manually.
+
+When `open_position_lane_override=True` is set, the ticker appears in the printed selection table with the label `← DEGRADED OPEN POS — lane_excluded, review required`. The count and ticker list are emitted at `INFO` level after the scoring loop.
+
+For eligible lanes, priority score multipliers are applied after `compute_priority_score`: `always_include` tickers are exempt.
+
+### Nasdaq-100 source (TRD-062)
+
+There is no reliable free live endpoint for Nasdaq-100 constituents. The curated `_NASDAQ100_CORE` list in `universe_builder.py` (updated 2026-Q2, ~80 tickers) is the **primary source**. On first fetch it is written to disk cache and subsequent runs use the cache. This is clearly logged: `"[nasdaq100] Using curated snapshot"`. The list should be refreshed quarterly by checking `https://www.invesco.com/qqq-etf/en/about.html` or the Nasdaq official constituent list.
+
+### S&P SmallCap 600 source (TRD-064)
+
+`sp600` (iShares Core S&P Small-Cap ETF, ticker IJR) is an active entry in `UNIVERSE_INDICES`. It uses the same BlackRock fund-document fetch path as `sp500`, `sp400`, and `russell2000`. The S&P 600 applies quality screens (profitability, liquidity) at index construction time, making it a cleaner small-cap input than undifferentiated small-cap breadth. Tickers proceed through the lane model — the index origin grants no execution bypass. Source label `"sp600"` appears in `_TICKER_SOURCES` and `ranked_universe.json`.
+
+**Portfolio ID note (important):** The iShares product page URL for IJR contains the number `239765` (e.g. `ishares.com/us/products/239765/...`). This is **not** the same as the BlackRock fund-document API `portfolioId`. The correct `portfolioId` for the `get-fund-document` API endpoint is **`239774`** — that is the value set in `_INDEX_PORTFOLIO_IDS["sp600"]`. Using `239765` in the API incorrectly returns the "iShares Core 40/60 Moderate Allocation ETF" (a multi-asset fund with ~32,500 rows including currencies, MBS, and futures). This was identified and fixed during the 2026-06-07 PM validation run.
+
+`sp1500` (virtual composite of sp500+sp400+sp600) remains commented out in `UNIVERSE_INDICES` to avoid double-counting while sp600 is active standalone.
+
+### Broad research sources (TRD-056 / TRD-063)
+
+Two FTP-sourced discovery tiers expand the candidate pool beyond the quality indices:
+
+| Source | FTP file | Exchanges covered |
+|---|---|---|
+| `nasdaq_broad` | `nasdaqlisted.txt` | Nasdaq (all tiers) |
+| `nyse_listed` | `otherlisted.txt` | NYSE, NYSE American, NYSE Arca, BATS, IEX, other non-Nasdaq US |
+
+Both are **additive, research-only discovery sources** — they expand the momentum pre-screen candidate pool but do not bypass the lane model. Both are listed in `_BROAD_RESEARCH_SOURCES`.
+
+**Shared instrument-hygiene constant (`_JUNK_NAME_TERMS`):**  All name-based exclusions use a shared tuple. `_NASDAQ_BROAD_EXCLUDE_NAME_TERMS` is a backwards-compat alias pointing to the same object.
+
+| Term class | Examples |
+|---|---|
+| Warrants | `WARRANT`, ` WTS`, ` WT ` |
+| Preferreds | `PREFERRED`, ` PREF `, ` PRF `, ` PFD ` |
+| Rights/Units | ` RIGHT `, ` RIGHTS`, ` UNIT `, ` UNITS` |
+| Exchange-traded products | `EXCHANGE TRADED`, ` ETF`, ` ETN `, ` ETP ` |
+| Debt instruments | `NOTE DUE`, `NOTES DUE`, `DEBENTURE`, `SENIOR NOTE`, `SUBORDINATED` |
+| Closed-end funds | `CLOSED-END` |
+
+**Filters applied** (in `_fetch_nasdaq_broad` / `_fetch_nyse_listed`):
+
+| Filter | `nasdaqlisted.txt` | `otherlisted.txt` |
+|---|---|---|
+| ETF exclusion | `ETF` col == `"N"` | `ETF` col == `"N"` |
+| Test issue | `Test Issue` col == `"N"` | `Test Issue` col == `"N"` |
+| Financial health | `Financial Status` col == `"N"` | *(column absent — not available)* |
+| Symbol length | ≤ 5 characters | ≤ 5 characters |
+| Name-based exclusion | `_JUNK_NAME_TERMS` applied | `_JUNK_NAME_TERMS` applied |
+
+**Coverage policy:** The full eligible set is ingested — no arbitrary ticker cap. Downstream liquidity filters (`_apply_liquidity_filter`) and lane classification (`classify_ticker_lane`) provide the real quality gate.
+
+**Source-aware lane clamping:** Both sources are declared in `_BROAD_RESEARCH_SOURCES`. In `_compute_prescreen_scores`, if a ticker's entire source set is a subset of `_BROAD_RESEARCH_SOURCES` (i.e. it comes from `nasdaq_broad` and/or `nyse_listed` only), its lane is clamped to `research_broad` even if price/ADV/history would qualify it for `execution_core` or `execution_high_beta`. Tickers that also appear in a core quality index (sp500, russell1000, etc.) are not affected.
+
+**Graceful failure:** Network failure with no cache returns `[]`. Both sources are additive — the pipeline runs normally without them.
+
+**Source attribution:** Tickers contributed by `nasdaq_broad` or `nyse_listed` get those source labels in `_TICKER_SOURCES` and in `ranked_universe.json["sources"]`.
+
+### Source attribution (`_TICKER_SOURCES`)
+
+`universe_builder._TICKER_SOURCES` is a module-level dict populated as a side effect of `build_master_universe()`. It maps `ticker → [list of index names]`, recording every index that contributed the ticker. Used in `ranked_universe.json` as the `sources` field. Example:
+
+```json
+"AAPL": {"lane": "execution_core", "sources": ["russell1000", "sp500", "nasdaq_broad"], ...}
+"SMCX": {"lane": "research_broad", "sources": ["sp600"], ...}
+```
+
+This enables PM-level comparison: which tickers come only from broad Nasdaq vs. established quality indices.
+
+### Issuance states (TRD-066)
+
+| State | Condition |
+|---|---|
+| `ACTIVE_THESIS` | BULL/BEAR direction, conviction ≥ 2, **and** executable geometry present after normalization |
+| `WATCH_ONLY` | Low conviction (1), pre-earnings hold, or geometry missing/non-executable after normalization |
+| `NO_TRADE` | NEUTRAL direction, or conviction 0 |
+| `SUPPRESSED` | `skip_ai_synthesis=True` — no AI call was made |
+
+`_apply_deterministic_geometry` normalizes stop/targets **before** `_get_issuance_state` is called. If geometry cannot be made executable (e.g. all price fields are None), the thesis is downgraded to `WATCH_ONLY` rather than `ACTIVE_THESIS`.
+
+### Research-lane advancement marker (TRD-057)
+
+`research_lane_candidates` records the full prescreened cohort. When a ticker proceeds to actual AI synthesis (not suppressed), `advanced_to_ai=TRUE` is set via `mark_research_candidate_advanced()` in `ai_quant.analyze_ticker()`. The call degrades silently on DB unavailability.
+
+---
+
+## 9c. Universe Coverage and Qualification Analytics (TRD-059)
+
+### Funnel metrics table
+
+`funnel_metrics` (PK: `run_date`) captures a daily snapshot of how many tickers pass each stage of the pipeline:
+
+| Column | Written by | Meaning |
+|---|---|---|
+| `raw_universe_count` | `universe_builder.py` | Total tickers in the built universe before any filtering |
+| `hard_excluded_count` | `universe_builder.py` | Dropped at quality gate (extreme ATR%/beta) |
+| `lane_excluded_count` | `universe_builder.py` | Below all lane thresholds |
+| `execution_core_count` | `universe_builder.py` | Assigned to execution_core lane |
+| `execution_high_beta_count` | `universe_builder.py` | Assigned to execution_high_beta lane |
+| `research_broad_count` | `universe_builder.py` | Assigned to research_broad lane |
+| `prescreened_count` | `universe_builder.py` | Tickers sent forward to screeners (after lane routing) |
+| `agreement_eligible_count` | `ai_quant.py` | Passed min_agreement threshold |
+| `ai_selected_count` | `ai_quant.py` | Tickers that reached AI synthesis (post-gate: QUARANTINE skips not included) |
+| `active_thesis_count` | `ai_quant.py` | Issued as ACTIVE_THESIS |
+| `watch_only_count` | `ai_quant.py` | Issued as WATCH_ONLY |
+| `suppressed_count` | `ai_quant.py` | Suppressed (skip_ai_synthesis) |
+| `no_trade_count` | `ai_quant.py` | Issued as NO_TRADE |
+| `bull_count` / `bear_count` / `neutral_count` | `ai_quant.py` | Direction breakdown of issued theses |
+| `excluded_by_source` | `universe_builder.py` | JSONB — `{"hard_excluded": N, "lane_excluded": N}` breakdown |
+| `suppression_reasons` | `ai_quant.py` | JSONB — per-reason count of non-ACTIVE_THESIS outcomes |
+| `candidates_by_lane` | `universe_builder.py` | JSONB — prescreened candidate count per lane (execution_core, research_broad, …) |
+| `candidates_by_source` | `universe_builder.py` | JSONB — prescreened candidate count per source index; a ticker in N sources contributes to N buckets |
+| `broad_source_only_candidates` | `universe_builder.py` | Count of prescreened candidates whose entire source set is within `_BROAD_RESEARCH_SOURCES` |
+| `ai_selected_by_lane` | `ai_quant.py` | JSONB — post-gate synthesized tickers by lane (excludes QUARANTINE skips) |
+| `ai_selected_by_source` | `ai_quant.py` | JSONB — post-gate synthesized tickers by source (excludes QUARANTINE skips) |
+| `broad_source_only_ai_selected` | `ai_quant.py` | Count of post-gate synthesized tickers that were broad-source-only (excludes QUARANTINE skips) |
+
+`suppression_reasons` keys (all tickers here were in the pre-gate shortlist but did not produce ACTIVE_THESIS):
+- `governance_quarantine` — ticker blocked at synthesis stage by PM governance; counted in pre-gate shortlist but excluded from `ai_selected_count` and all `ai_selected_by_*` fields
+- `skip_ai_synthesis` — `skip_ai_synthesis` / `skip_claude` flag set on resolved signal
+- `neutral_direction` — direction is NEUTRAL → NO_TRADE
+- `no_conviction` — conviction is 0 or missing → NO_TRADE
+- `low_conviction` — conviction ≤ 1 → WATCH_ONLY
+- `pre_earnings_hold` — `pre_earnings_hold` override flag active → WATCH_ONLY
+- `bear_below_threshold` — BEAR with conviction < `BEAR_MIN_CONVICTION` → WATCH_ONLY
+- `no_geometry` — conviction meets threshold but geometry is not executable → WATCH_ONLY
+
+WATCH_ONLY reason classification is done by `_watch_only_reason(thesis, resolved)` in `ai_quant.py`, stored as `thesis["issuance_reason"]` at synthesis time. The reason mirrors `_get_issuance_state()` order exactly so it is always accurate.
+
+### Partial-write COALESCE pattern
+
+Both `universe_builder.py` and `ai_quant.py` call `persist_funnel_metrics()` at different pipeline stages. The upsert uses `COALESCE(EXCLUDED.col, funnel_metrics.col)` so the second write preserves columns set by the first write rather than overwriting them with NULL. Each caller only provides the columns it knows about.
+
+### API endpoints
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/funnel/summary` | Today's funnel row; degrades gracefully if missing |
+| `GET /api/funnel/history?days=N` | Last N days of rows (max 90), newest-first |
+
+### Dashboard
+
+A "Funnel" tab on the Screeners page (`ScreenersPage.tsx`) visualises the daily funnel. It shows raw→prescreened→AI→active flow cards, lane distribution bars, direction/issuance bars, and a 7-day history table.
+
+---
+
+## 9d. AI Qualification Gate Recalibration and Adaptive Capacity (TRD-058)
+
+### Bear direction penalty
+
+Tickers with `pre_resolved_direction == "BEAR"` receive a `AI_QUANT_BEAR_DIRECTION_PENALTY = 0.85` multiplier applied to their `priority_score` in `compute_priority_score()`. This reflects lower structural edge on the short side and reduces their competition for AI slots against bullish signals.
+
+### Adaptive capacity
+
+| Config constant | Default | Meaning |
+|---|---|---|
+| `AI_QUANT_CAPACITY_MIN` | 2 | Floor: never select fewer than this many normal-mode tickers |
+| `AI_QUANT_CAPACITY_MAX` | 8 | Ceiling: cap expanded capacity at this on strong-signal days |
+| `AI_QUANT_SCORE_THRESHOLD_HIGH` | 70.0 | Priority score above which a ticker is counted as "strong" |
+
+Formula in `select_top_tickers()` (Option A — max_tickers as hard cap):
+```
+_caller_cap    = min(max_tickers, CAPACITY_MAX)
+_floor         = min(CAPACITY_MIN, max_tickers)
+n_normal_slots = max(_floor, min(_caller_cap, strong_count))
+```
+
+`max_tickers` is a **hard upper bound**. Adaptive logic operates within `[_floor, _caller_cap]`:
+- weak day (strong_count = 0): selects `_floor` = min(CAPACITY_MIN, max_tickers)
+- normal day: selects `strong_count`, bounded by the range above
+- strong day (strong_count ≥ _caller_cap): selects `_caller_cap` = min(max_tickers, CAPACITY_MAX)
+
+`always_include` (open positions) are additive on top of `n_normal_slots` and are not bounded by the adaptive formula.
+
+---
+
+## 9e. Short-Side PM Operating Policy (TRD-067)
+
+### Direction-specific conviction threshold
+
+BEAR theses are held to a higher conviction bar than BULL theses before issuance as `ACTIVE_THESIS`:
+
+| Direction | `min_conviction` | Below threshold → |
+|---|---|---|
+| BULL | `BULL_MIN_CONVICTION = 2` | `WATCH_ONLY` |
+| BEAR | `BEAR_MIN_CONVICTION = 3` | `WATCH_ONLY` (auto-downgrade) |
+
+Logic lives in `_get_issuance_state()` in `ai_quant.py`. A BEAR thesis with conviction=2 is automatically downgraded to `WATCH_ONLY` even if geometry is otherwise executable. The PM must manually upgrade it by re-running synthesis or overriding.
+
+The issuance state table from TRD-066 is now amended:
+
+| State | BULL condition | BEAR condition |
+|---|---|---|
+| `ACTIVE_THESIS` | direction=BULL, conviction ≥ 2, executable geometry | direction=BEAR, conviction ≥ 3, executable geometry |
+| `WATCH_ONLY` | conviction=1, pre-earnings, or geometry missing | conviction ≤ 2, pre-earnings, or geometry missing |
+
+---
+
+## 9f. Ticker Governance Policy (TRD-068)
+
+### Governance states
+
+| State | Meaning | Effect on AI selection |
+|---|---|---|
+| `A_LIST` | PM-promoted; elevated attention | Priority score × 1.15 (non-open positions only) |
+| `STANDARD` | Default; no adjustment | None |
+| `PROBATION` | PM-flagged for concern; reduced weight | Priority score × 0.70 (non-open positions only) |
+| `QUARANTINE` | Hard gate; explicitly blocked | Excluded from scoring AND from AI synthesis — no `always_include` override |
+
+### Governance vs. lane routing
+
+Lane routing (`hard_excluded`, `lane_excluded`) is a structural data-quality gate — it reflects whether a ticker is too illiquid or volatile to trade. Governance is a PM intent gate — it reflects deliberate trading decisions about specific tickers. The two systems are independent:
+- `lane_excluded` gates can be overridden by `always_include` (open positions) — see open-position override policy above.
+- `hard_excluded` gates **cannot** be overridden by `always_include` — hard_excluded is an extreme-volatility hard stop. See open-position override policy above.
+- `QUARANTINE` **cannot** be overridden by `always_include` — if the PM quarantines a ticker, AI synthesis is blocked even for open positions. This is intentional and explicit.
+
+### Where governance is applied
+
+1. `ticker_selector.py` → `select_top_tickers()`: QUARANTINE tickers are hard-gated before scoring; A_LIST/PROBATION multipliers are applied after lane multiplier, non-open-positions only.
+2. `ai_quant.py` → `_run_top_n_mode()`: QUARANTINE tickers are skipped before API call even if they appeared in the selected list.
+
+### Storage and API
+
+`ticker_governance` table (PK: `ticker`). Managed via:
+- `utils/supabase_persist.py`: `fetch_ticker_governance()`, `set_ticker_governance()`, `remove_ticker_governance()`
+- `GET /api/governance` — all non-STANDARD entries with metadata
+- `POST /api/governance/{ticker}` — set state (accepts `governance_state`, `reason`, `notes`)
+- `DELETE /api/governance/{ticker}` — remove (reverts to STANDARD behavior)
