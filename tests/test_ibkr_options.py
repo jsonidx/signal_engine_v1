@@ -17,6 +17,7 @@ from utils.ibkr_options import (
     OptionChainResult,
     OptionContract,
     _approx_delta,
+    _get_underlying_price_yf,
     _norm_cdf,
     _normalize_yf_row,
     _yfinance_chain,
@@ -563,3 +564,228 @@ class TestGetOptionChain:
         result = get_option_chain("AAPL", force_yfinance=True)
         assert result.source == "yfinance"
         assert len(result.contracts) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-055: No IBKR snapshot usage for underlying price
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNoIBKRSnapshot:
+    """Verify that the IBKR adapter never uses reqMktData with snapshot=True."""
+
+    def test_get_chain_source_contains_no_snapshot_true(self):
+        """
+        The adapter must not call reqMktData with snapshot mode enabled.
+        Checked via source inspection (non-comment lines only) so this
+        always catches a regression even without a live IBKR connection.
+        """
+        import inspect
+        import utils.ibkr_options as mod
+
+        src = inspect.getsource(mod.IBKROptionsAdapter.get_chain)
+        bad_lines = [
+            l for l in src.splitlines()
+            if not l.lstrip().startswith("#") and "snapshot=True" in l
+        ]
+        assert not bad_lines, (
+            "IBKROptionsAdapter.get_chain must not use reqMktData with "
+            "snapshot=True (incurs per-snapshot IBKR entitlement cost).\n"
+            "Offending lines:\n" + "\n".join(bad_lines)
+        )
+
+    def test_no_snapshot_true_in_executable_module_lines(self):
+        """Module-wide guard: no executable code line may use snapshot=True."""
+        import inspect
+        import utils.ibkr_options as mod
+
+        src = inspect.getsource(mod)
+        bad_lines = [
+            l for l in src.splitlines()
+            if not l.lstrip().startswith("#") and "snapshot=True" in l
+        ]
+        assert not bad_lines, (
+            "snapshot=True found in executable code in utils/ibkr_options.py:\n"
+            + "\n".join(bad_lines)
+        )
+
+    def test_option_contract_reqMktData_still_present(self):
+        """
+        The live option-contract market-data path (reqMktData with tick
+        string '100,101,106') must remain intact.
+        """
+        import inspect
+        import utils.ibkr_options as mod
+
+        src = inspect.getsource(mod.IBKROptionsAdapter.get_chain)
+        assert "100,101,106" in src, (
+            "reqMktData tick string '100,101,106' must be preserved for "
+            "option-contract market data."
+        )
+        assert "False, False" in src or "False,False" in src or "snapshot=False" not in src, (
+            "Option-contract reqMktData call should not use snapshot=True."
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-055: _get_underlying_price_yf helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGetUnderlyingPriceYf:
+    """Unit tests for the yfinance underlying-price helper."""
+
+    @patch("utils.ibkr_options.yf.Ticker")
+    def test_returns_last_close_when_history_available(self, mock_ticker):
+        import pandas as pd
+        hist = pd.DataFrame({"Close": [148.0, 149.5, 150.0]})
+        t = MagicMock()
+        t.history.return_value = hist
+        mock_ticker.return_value = t
+
+        price = _get_underlying_price_yf("AAPL")
+        assert price == pytest.approx(150.0)
+        t.history.assert_called_once_with(period="5d")
+
+    @patch("utils.ibkr_options.yf.Ticker")
+    def test_returns_none_when_history_empty(self, mock_ticker):
+        import pandas as pd
+        t = MagicMock()
+        t.history.return_value = pd.DataFrame()
+        mock_ticker.return_value = t
+
+        price = _get_underlying_price_yf("AAPL")
+        assert price is None
+
+    @patch("utils.ibkr_options.yf.Ticker")
+    def test_returns_none_when_yfinance_raises(self, mock_ticker):
+        mock_ticker.side_effect = RuntimeError("network error")
+        price = _get_underlying_price_yf("AAPL")
+        assert price is None
+
+    @patch("utils.ibkr_options.yf.Ticker")
+    def test_returns_none_when_price_is_zero(self, mock_ticker):
+        import pandas as pd
+        hist = pd.DataFrame({"Close": [0.0]})
+        t = MagicMock()
+        t.history.return_value = hist
+        mock_ticker.return_value = t
+
+        price = _get_underlying_price_yf("AAPL")
+        assert price is None
+
+    @patch("utils.ibkr_options.yf.Ticker")
+    def test_returns_none_when_price_is_negative(self, mock_ticker):
+        import pandas as pd
+        hist = pd.DataFrame({"Close": [-1.0]})
+        t = MagicMock()
+        t.history.return_value = hist
+        mock_ticker.return_value = t
+
+        price = _get_underlying_price_yf("AAPL")
+        assert price is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-055: Underlying-price fallback in the IBKR adapter chain flow
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestIBKRAdapterUnderlyingFallback:
+    """
+    Verify that when _get_underlying_price_yf returns None the adapter
+    degrades safely: strike selection falls back to the middle window and
+    the chain result still returns without crashing.
+    """
+
+    def _make_mock_ib(self, strikes, expirations, qualify_ok=True):
+        """Build a minimal ib_insync mock that covers the adapter's call sequence."""
+        ib = MagicMock()
+        ib.isConnected.return_value = True
+
+        # qualifyContracts returns the passed contract (first call = stock, rest = options)
+        ib.qualifyContracts.side_effect = lambda c: [c] if qualify_ok else []
+
+        # reqSecDefOptParams returns one chain-params object
+        chain_params = MagicMock()
+        chain_params.expirations = expirations
+        chain_params.strikes = strikes
+        ib.reqSecDefOptParams.return_value = [chain_params]
+
+        # reqMktData returns an empty ticker (no Greeks, no quotes) — simulates
+        # a fresh connection with no subscriptions
+        td = MagicMock()
+        td.bid = None
+        td.ask = None
+        td.last = None
+        td.optVolume = None
+        td.optOpenInterest = None
+        td.modelGreeks = None
+        td.bidGreeks = None
+        td.askGreeks = None
+        ib.reqMktData.return_value = td
+        ib.ticker.return_value = td
+        ib.sleep.return_value = None
+        return ib
+
+    @patch("utils.ibkr_options._get_underlying_price_yf")
+    def test_none_underlying_price_does_not_crash(self, mock_price):
+        """When yfinance returns None the chain fetch must not raise."""
+        mock_price.return_value = None
+
+        from utils.ibkr_options import IBKROptionsAdapter
+        adapter = IBKROptionsAdapter()
+
+        from datetime import date, timedelta
+        exp = (date.today() + timedelta(days=30)).strftime("%Y%m%d")
+        adapter._ib = self._make_mock_ib(
+            strikes=[140.0, 145.0, 150.0, 155.0, 160.0],
+            expirations=[exp],
+        )
+
+        result = adapter.get_chain("AAPL", max_expiries=1, strikes_around_atm=3)
+        assert result.underlying_price is None
+        assert result.error is None   # graceful, not an error state
+        assert isinstance(result.contracts, list)
+
+    @patch("utils.ibkr_options._get_underlying_price_yf")
+    def test_valid_underlying_price_used_for_strike_selection(self, mock_price):
+        """When yfinance returns a price the adapter uses it to select ATM strikes."""
+        mock_price.return_value = 150.0
+
+        from utils.ibkr_options import IBKROptionsAdapter
+        adapter = IBKROptionsAdapter()
+
+        from datetime import date, timedelta
+        exp = (date.today() + timedelta(days=30)).strftime("%Y%m%d")
+        strikes = [100.0, 120.0, 140.0, 145.0, 148.0, 150.0, 152.0, 155.0, 170.0, 200.0]
+        adapter._ib = self._make_mock_ib(strikes=strikes, expirations=[exp])
+
+        result = adapter.get_chain("AAPL", max_expiries=1, strikes_around_atm=3)
+        assert result.underlying_price == pytest.approx(150.0)
+        # All selected strikes should be near 150.0 (within the ATM window)
+        for c in result.contracts:
+            assert abs(c.strike - 150.0) <= 30.0, f"Strike {c.strike} too far from ATM"
+
+    @patch("utils.ibkr_options._get_underlying_price_yf")
+    def test_adapter_does_not_call_reqMktData_with_snapshot(self, mock_price):
+        """reqMktData must never be called with snapshot=True during get_chain."""
+        mock_price.return_value = 150.0
+
+        from utils.ibkr_options import IBKROptionsAdapter
+        adapter = IBKROptionsAdapter()
+
+        from datetime import date, timedelta
+        exp = (date.today() + timedelta(days=30)).strftime("%Y%m%d")
+        adapter._ib = self._make_mock_ib(
+            strikes=[148.0, 150.0, 152.0],
+            expirations=[exp],
+        )
+
+        adapter.get_chain("AAPL", max_expiries=1, strikes_around_atm=2)
+
+        for call in adapter._ib.reqMktData.call_args_list:
+            kwargs = call.kwargs
+            args = call.args
+            # snapshot could be passed as positional arg[3] or as keyword
+            snapshot_kwarg = kwargs.get("snapshot", False)
+            snapshot_pos = args[3] if len(args) > 3 else False
+            assert not snapshot_kwarg, f"reqMktData called with snapshot=True: {call}"
+            assert not snapshot_pos, f"reqMktData called with positional snapshot=True: {call}"

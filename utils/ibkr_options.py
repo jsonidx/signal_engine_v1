@@ -33,6 +33,27 @@ log = logging.getLogger(__name__)
 # yfinance is a hard project dependency (already used everywhere)
 import yfinance as yf
 
+
+def _get_underlying_price_yf(ticker: str) -> Optional[float]:
+    """
+    Fetch the latest underlying stock price via yfinance.
+
+    Used instead of IBKR snapshot requests (snapshot mode is prohibited because
+    it incurs a per-snapshot entitlement cost on IBKR Pro accounts).
+
+    Returns None when yfinance has no recent data — callers must degrade safely.
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if hist.empty:
+            return None
+        price = float(hist["Close"].iloc[-1])
+        return price if price > 0 else None
+    except Exception as exc:
+        log.debug("yfinance underlying price fetch failed for %s: %s", ticker, exc)
+        return None
+
+
 # ── Optional ib_insync import ─────────────────────────────────────────────────
 
 try:
@@ -111,6 +132,7 @@ class OptionContract:
 
     # Provenance
     source: str = "unknown"   # "ibkr" | "yfinance" | "mock"
+    quote_time: Optional[str] = None   # ISO-8601 UTC; per-contract from IBKR; None for yfinance
 
     # ── Computed helpers ──────────────────────────────────────────────────────
 
@@ -237,15 +259,10 @@ class IBKROptionsAdapter:
                 raise IBKRNoDataError(f"Cannot resolve underlying contract for {sym}")
             stock = resolved[0]
 
-            # ── Current price (best-effort snapshot) ─────────────────────────
-            self._ib.reqMktData(stock, "", snapshot=True)
-            self._ib.sleep(1.5)
-            td_stock = self._ib.ticker(stock)
-            underlying_price: Optional[float] = None
-            if td_stock:
-                p = td_stock.marketPrice()
-                if p and p == p and p > 0:
-                    underlying_price = float(p)
+            # ── Current price via yfinance (no IBKR snapshot) ────────────────
+            # IBKR snapshot-mode requests incur a per-request entitlement cost;
+            # yfinance gives an equivalent last-close price at zero cost.
+            underlying_price: Optional[float] = _get_underlying_price_yf(sym)
 
             # ── Option chain parameters (expiries, strikes) ───────────────────
             chains = self._ib.reqSecDefOptParams(
