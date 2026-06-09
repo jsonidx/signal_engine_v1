@@ -429,6 +429,17 @@ def _make_nasdaq_ftp_text(rows: list, include_header: bool = True) -> str:
     return "\n".join(lines)
 
 
+def _make_nasdaq_ftp_text_alt_header(rows: list) -> str:
+    """Nasdaq FTP fixture with shifted columns and header aliases."""
+    lines = [
+        "NASDAQ Symbol|Security Name|Listing Exchange|ETF|Test Issue|Round Lot Size|Financial Status|NextShares"
+    ]
+    for sym, name, etf, test_issue, fin_status in rows:
+        lines.append(f"{sym}|{name}|Q|{etf}|{test_issue}|100|{fin_status}|N")
+    lines.append("File Creation Time: 0:01am ET 06/07/2026")
+    return "\n".join(lines)
+
+
 class TestNasdaqBroad:
     """TRD-063: broad Nasdaq common-stock research source."""
 
@@ -526,6 +537,44 @@ class TestNasdaqBroad:
         assert "NORM" in result
         assert "DEFQ" not in result
         assert "BNKR" not in result
+
+    def test_fetch_nasdaq_broad_accepts_blank_financial_status(self):
+        """Blank financial status should still be treated as a normal listing."""
+        text = _make_nasdaq_ftp_text_alt_header([
+            ("AAPL", "Apple Inc", "N", "N", ""),
+            ("ETFX", "ETF Product", "Y", "N", ""),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.text = text
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("universe_builder.requests.get", return_value=mock_resp),
+                patch("universe_builder._CACHE_DIR", Path(tmpdir)),
+            ):
+                result = ub._fetch_nasdaq_broad()
+
+        assert "AAPL" in result
+        assert "ETFX" not in result
+
+    def test_fetch_nasdaq_broad_uses_header_aliases_not_fixed_positions(self):
+        """Header-based parsing must survive reordered nasdaqlisted.txt columns."""
+        text = _make_nasdaq_ftp_text_alt_header([
+            ("MSFT", "Microsoft Corp", "N", "N", "N"),
+            ("TSTY", "Test Issue Inc", "N", "Y", "N"),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.text = text
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("universe_builder.requests.get", return_value=mock_resp),
+                patch("universe_builder._CACHE_DIR", Path(tmpdir)),
+            ):
+                result = ub._fetch_nasdaq_broad()
+
+        assert "MSFT" in result
+        assert "TSTY" not in result
 
     def test_fetch_nasdaq_broad_filters_warrant_names(self):
         """Rows with 'WARRANT' in the security name must be excluded."""
@@ -1796,6 +1845,17 @@ def _make_otherlisted_ftp_text(rows: list, include_header: bool = True) -> str:
     return "\n".join(lines)
 
 
+def _make_otherlisted_ftp_text_alt_header(rows: list) -> str:
+    """otherlisted.txt fixture with reordered columns and header aliases."""
+    lines = [
+        "NASDAQ Symbol|Security Name|ETF|Test Issue|Exchange|Round Lot Size|CQS Symbol|ACT Symbol"
+    ]
+    for sym, name, exchange, etf, test_issue in rows:
+        lines.append(f"{sym}|{name}|{etf}|{test_issue}|{exchange}|100|{sym}|{sym}")
+    lines.append("File Creation Time: 0:01am ET 06/07/2026")
+    return "\n".join(lines)
+
+
 class TestNyseListed:
     """TRD-056: NYSE and other exchange common-stock research source (otherlisted.txt)."""
 
@@ -2023,6 +2083,25 @@ class TestNyseListed:
         assert "GS" in result
         assert "XOM" in result
         assert "WMT" in result
+
+    def test_fetch_nyse_listed_uses_header_aliases_not_fixed_positions(self):
+        """Header-based parsing must survive reordered otherlisted.txt columns."""
+        text = _make_otherlisted_ftp_text_alt_header([
+            ("JPM", "JPMorgan Chase", "N", "N", "N"),
+            ("ETFY", "ETF Wrapper", "N", "Y", "N"),
+        ])
+        mock_resp = MagicMock()
+        mock_resp.text = text
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch("universe_builder.requests.get", return_value=mock_resp),
+                patch("universe_builder._CACHE_DIR", Path(tmpdir)),
+            ):
+                result = ub._fetch_nyse_listed()
+
+        assert "JPM" in result
+        assert "ETFY" not in result
 
 
 class TestJunkNameTerms:

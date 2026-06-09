@@ -506,6 +506,33 @@ def _save_cache(index: str, tickers: list, sector_map: dict = None) -> None:
         logger.warning("Failed to write cache for %s: %s", index, exc)
 
 
+def _normalize_pipe_header(name: str) -> str:
+    """Normalize Nasdaq Trader header names for alias-based lookup."""
+    return "".join(ch.lower() for ch in str(name).strip() if ch.isalnum())
+
+
+def _pipe_header_index(parts: list[str], aliases: tuple[str, ...]) -> int | None:
+    """Return the first matching header index for any normalized alias."""
+    normalized = [_normalize_pipe_header(p) for p in parts]
+    alias_set = {_normalize_pipe_header(a) for a in aliases}
+    for idx, col in enumerate(normalized):
+        if col in alias_set:
+            return idx
+    return None
+
+
+def _build_pipe_header_map(parts: list[str], spec: dict[str, tuple[str, ...]]) -> dict[str, int | None]:
+    """Map logical field names to source-column indices using header aliases."""
+    return {field: _pipe_header_index(parts, aliases) for field, aliases in spec.items()}
+
+
+def _safe_pipe_value(parts: list[str], idx: int | None, default: str = "") -> str:
+    """Return a pipe-delimited field value or *default* when absent."""
+    if idx is None or idx < 0 or idx >= len(parts):
+        return default
+    return str(parts[idx]).strip()
+
+
 _LIQUIDITY_CACHE_PATH = _CACHE_DIR / "liquidity_passed.json"
 
 
@@ -1514,30 +1541,52 @@ def _fetch_nasdaq_broad() -> list:
         )
         return []
 
+    header_map: dict[str, int | None] | None = None
+    header_spec = {
+        "symbol": ("Symbol", "NASDAQ Symbol", "ACT Symbol"),
+        "name": ("Security Name", "Company Name", "Issue Name"),
+        "test_issue": ("Test Issue",),
+        "financial_status": ("Financial Status",),
+        "etf": ("ETF",),
+    }
     raw_rows = 0
     tickers: list = []
     for raw_line in resp.text.splitlines():
         line = raw_line.strip()
         if not line or "|" not in line:
             continue
-        if line.startswith("Symbol"):        # header row
+        if line.startswith("File Creation Time:"):
             continue
 
         parts = line.split("|")
-        if len(parts) < 8:
+        if header_map is None and any("symbol" in _normalize_pipe_header(p) for p in parts):
+            header_map = _build_pipe_header_map(parts, header_spec)
             continue
-        raw_rows += 1
 
-        symbol, name, _mkt, test_issue, fin_status, _lot, etf, _next = (
-            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
-        )
+        if len(parts) < 2:
+            continue
+
+        if header_map is not None:
+            symbol = _safe_pipe_value(parts, header_map.get("symbol"))
+            name = _safe_pipe_value(parts, header_map.get("name"))
+            test_issue = _safe_pipe_value(parts, header_map.get("test_issue"), "N")
+            fin_status = _safe_pipe_value(parts, header_map.get("financial_status"), "N")
+            etf = _safe_pipe_value(parts, header_map.get("etf"), "N")
+        else:
+            if len(parts) < 8:
+                continue
+            symbol, name, _mkt, test_issue, fin_status, _lot, etf, _next = (
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+            )
+
+        raw_rows += 1
 
         # Hard filters: not an ETF, not a test issue, financially normal
         if etf.strip() != "N":
             continue
         if test_issue.strip() != "N":
             continue
-        if fin_status.strip() != "N":
+        if fin_status.strip() not in {"", "N"}:
             continue
 
         symbol = symbol.strip().upper()
@@ -1642,23 +1691,42 @@ def _fetch_nyse_listed() -> list:
         )
         return []
 
+    header_map: dict[str, int | None] | None = None
+    header_spec = {
+        "symbol": ("ACT Symbol", "Symbol", "NASDAQ Symbol"),
+        "name": ("Security Name", "Company Name", "Issue Name"),
+        "etf": ("ETF",),
+        "test_issue": ("Test Issue",),
+    }
     raw_rows = 0
     tickers: list = []
     for raw_line in resp.text.splitlines():
         line = raw_line.strip()
         if not line or "|" not in line:
             continue
-        if line.startswith("ACT Symbol"):    # header row
+        if line.startswith("File Creation Time:"):
             continue
 
         parts = line.split("|")
-        if len(parts) < 8:
+        if header_map is None and any("symbol" in _normalize_pipe_header(p) for p in parts):
+            header_map = _build_pipe_header_map(parts, header_spec)
             continue
-        raw_rows += 1
 
-        symbol, name, _exchange, _cqs, etf, _lot, test_issue, _nasdaq_sym = (
-            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
-        )
+        if len(parts) < 2:
+            continue
+
+        if header_map is not None:
+            symbol = _safe_pipe_value(parts, header_map.get("symbol"))
+            name = _safe_pipe_value(parts, header_map.get("name"))
+            etf = _safe_pipe_value(parts, header_map.get("etf"), "N")
+            test_issue = _safe_pipe_value(parts, header_map.get("test_issue"), "N")
+        else:
+            if len(parts) < 8:
+                continue
+            symbol, name, _exchange, _cqs, etf, _lot, test_issue, _nasdaq_sym = (
+                parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+            )
+        raw_rows += 1
 
         # Hard filters: not an ETF, not a test issue
         if etf.strip() != "N":
