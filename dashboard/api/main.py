@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime, timedelta
@@ -77,6 +78,14 @@ log = logging.getLogger("signal_api")
 
 # ─── Add project root to sys.path so config.py is importable ─────────────────
 sys.path.insert(0, str(BASE_DIR))
+
+try:
+    from utils.market_data import get_prices as _md_get_prices, get_history as _md_get_history
+    _MD_AVAILABLE = True
+except ImportError:
+    _MD_AVAILABLE = False
+    _md_get_prices = None   # type: ignore[assignment]
+    _md_get_history = None  # type: ignore[assignment]
 
 try:
     from options_flow import compute_max_pain as _compute_max_pain
@@ -173,12 +182,30 @@ class DataCache:
 
 _cache = DataCache()
 _deepdive_refresh_running = False  # guard against concurrent background refreshes
+_screener_job_running = False      # guard against concurrent screener background runs
 # Module-level executor: avoids ThreadPoolExecutor context-manager shutdown(wait=True) blocking
 _live_price_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="live_prices")
 
 TTL_SHORT  = 300   # 5 min — static outputs (CSVs, ai_quant db)
 TTL_MEDIUM = 900   # 15 min — live prices, portfolio positions
 TTL_LONG   = 3600  # 1 hr  — regime, backtest, universe stats
+
+
+def _db_table_columns(conn, table: str) -> set[str]:
+    """Return the set of column names for *table* in the public schema."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            (table,),
+        ).fetchall()
+        return {r["column_name"] for r in rows}
+    except Exception:
+        return set()
 
 
 def cached(key_fn, ttl: int = TTL_MEDIUM):
@@ -282,9 +309,13 @@ def _safe_int(v, default=None):
 
 
 def _fetch_current_prices(tickers: list[str], cache_ttl: int = TTL_MEDIUM) -> dict[str, float]:
-    """Fetch last-close prices via yfinance (daily bars, no extended hours)."""
+    """Fetch last-close prices. Delegates to market_data shared service when available."""
     if not tickers:
         return {}
+    if _MD_AVAILABLE:
+        return _md_get_prices(tickers)
+
+    # Fallback: direct yfinance (no circuit breaker or coalescing)
     key = "prices:" + ",".join(sorted(tickers))
     cached_prices = _cache.get(key)
     if cached_prices:
@@ -292,7 +323,7 @@ def _fetch_current_prices(tickers: list[str], cache_ttl: int = TTL_MEDIUM) -> di
 
     prices: dict[str, float] = {}
     try:
-        data = yf.download(tickers, period="5d", auto_adjust=True, progress=False, threads=True)
+        data = yf.download(tickers, period="5d", auto_adjust=True, progress=False, threads=True, timeout=8)
         if isinstance(data.columns, pd.MultiIndex):
             close = data["Close"]
         else:
@@ -763,7 +794,14 @@ async def portfolio_sparklines():
 _eur_usd_cache: dict = {"rate": 1.08, "fetched_at": 0.0}
 
 def _get_eur_usd_rate() -> float:
-    """Return current EUR/USD rate (1 EUR = X USD). Cached 10 min."""
+    """Return current EUR/USD rate (1 EUR = X USD). Cached via market_data SWR when available."""
+    if _MD_AVAILABLE:
+        prices = _md_get_prices(["EURUSD=X"])
+        rate = prices.get("EURUSD=X")
+        if rate:
+            return float(rate)
+        return _eur_usd_cache["rate"]
+
     import time
     if time.time() - _eur_usd_cache["fetched_at"] < 600:
         return _eur_usd_cache["rate"]
@@ -1364,7 +1402,7 @@ async def signals_ticker(ticker: str):
         row = conn.execute("""
             SELECT * FROM thesis_cache
             WHERE ticker = %s
-            ORDER BY date DESC LIMIT 1
+            ORDER BY date DESC, created_at DESC LIMIT 1
         """, (ticker,)).fetchone()
         conn.close()
 
@@ -1408,8 +1446,7 @@ async def signals_ticker(ticker: str):
         }
         modules = {k: v for k, v in modules.items() if v is not None}
 
-        # Fetch live price for PriceLadder rendering
-        prices = _fetch_current_prices([ticker])
+        prices = await asyncio.to_thread(_fetch_current_prices, [ticker])
         current_price = prices.get(ticker)
 
         result = {
@@ -1517,7 +1554,7 @@ async def signals_ticker(ticker: str):
         try:
             cs_conn = _db_connect()
             if cs_conn is not None:
-                cs_cols = _columns("catalyst_scores")
+                cs_cols = _db_table_columns(cs_conn, "catalyst_scores")
                 earnings_sel  = "earnings_score"  if "earnings_score"  in cs_cols else "0.0 AS earnings_score"
                 days_sel      = "days_to_earnings" if "days_to_earnings" in cs_cols else "NULL::integer AS days_to_earnings"
                 post_guard_sel= "post_squeeze_guard" if "post_squeeze_guard" in cs_cols else "FALSE AS post_squeeze_guard"
@@ -1573,17 +1610,22 @@ async def signals_ticker(ticker: str):
             log.exception("catalyst_events lookup failed for %s", ticker)
             result["catalyst_events"] = None
 
-        # ── ADV 20d (average daily volume, 20-day) — live yfinance, cached ────
+        # ── ADV 20d (average daily volume, 20-day) — via market_data shared service ──
         adv_cache_key = f"adv_20d:{ticker}"
         adv_cached = _cache.get(adv_cache_key)
         if adv_cached is not None:
             result["adv_20d"] = adv_cached.get("adv_20d")
         else:
-            try:
-                hist = yf.Ticker(ticker).history(period="1mo")
-                adv_20d = int(hist["Volume"].tail(20).mean()) if len(hist) >= 20 else None
-            except Exception:
-                adv_20d = None
+            def _fetch_adv():
+                try:
+                    if _MD_AVAILABLE:
+                        hist = _md_get_history(ticker, "1mo", "1d")
+                    else:
+                        hist = yf.Ticker(ticker).history(period="1mo")
+                    return int(hist["Volume"].tail(20).mean()) if hist is not None and len(hist) >= 20 else None
+                except Exception:
+                    return None
+            adv_20d = await asyncio.get_event_loop().run_in_executor(None, _fetch_adv)
             _cache.set(adv_cache_key, {"adv_20d": adv_20d}, TTL_SHORT)
             result["adv_20d"] = adv_20d
 
@@ -4533,12 +4575,122 @@ async def ticker_action_zones(symbol: str):
     return result
 
 
-# Running analysis jobs: symbol → {"status", "started_at", "pid"}
+# Running analysis jobs: "<SYMBOL>::<LLM>" → {"status", "started_at", "pid"}
 _analysis_jobs: dict = {}
+_analysis_launch_lock = asyncio.Lock()
+MAX_CONCURRENT_ANALYSIS = 3
+_analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
 
 
 class AnalyzeRequest(BaseModel):
     llm: str = "grok-4.3"   # exact model ID; legacy aliases ("grok", "grok-premium", "claude", "chatgpt") still accepted
+
+
+def _analysis_job_key(symbol: str, llm: str) -> str:
+    return f"{symbol.upper()}::{llm}"
+
+
+def _find_symbol_jobs(symbol: str) -> list[dict]:
+    sym = symbol.upper()
+    jobs: list[dict] = []
+    for key, job in _analysis_jobs.items():
+        if key.startswith(f"{sym}::"):
+            jobs.append(job)
+    return jobs
+
+
+def _llm_required_env_var(llm: str) -> str | None:
+    if llm.startswith("grok-") or llm in ("grok", "grok-premium"):
+        return "XAI_API_KEY"
+    if llm.startswith("gpt-") or llm == "chatgpt":
+        return "OPENAI_API_KEY"
+    if llm.startswith("claude-") or llm == "claude":
+        return "ANTHROPIC_API_KEY"
+    return None
+
+
+def _missing_required_llm_env_var(llm: str) -> str | None:
+    env_var = _llm_required_env_var(llm)
+    if not env_var:
+        return None
+    value = (os.getenv(env_var) or "").strip().strip("'\"")
+    return None if value else env_var
+
+
+def _summarize_subprocess_output(stdout: bytes | None, stderr: bytes | None, limit: int = 1200) -> str | None:
+    parts: list[str] = []
+    if stdout:
+        txt = stdout.decode(errors="replace").strip()
+        if txt:
+            parts.append(txt)
+    if stderr:
+        txt = stderr.decode(errors="replace").strip()
+        if txt:
+            parts.append(txt)
+    if not parts:
+        return None
+    merged = "\n".join(parts)
+    merged = merged[-limit:] if len(merged) > limit else merged
+    return merged.strip() or None
+
+
+async def _track_analysis_job(job_key: str, proc: asyncio.subprocess.Process) -> None:
+    """Wait for ai_quant.py to finish and persist exit details for UI polling."""
+    try:
+        stdout, stderr = await proc.communicate()
+        job = _analysis_jobs.get(job_key)
+        if not job:
+            return
+        job["returncode"] = proc.returncode
+        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        job["output_excerpt"] = _summarize_subprocess_output(stdout, stderr)
+        job["status"] = "done" if proc.returncode == 0 else "failed"
+        if proc.returncode != 0:
+            log.warning(
+                "Analysis failed for %s with llm=%s exit=%s",
+                job.get("symbol"),
+                job.get("llm"),
+                proc.returncode,
+            )
+    except Exception:
+        log.exception("analysis job tracker failed for %s", job_key)
+        job = _analysis_jobs.get(job_key)
+        if job:
+            job["status"] = "failed"
+            job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+            job["output_excerpt"] = "Internal error while tracking analysis subprocess"
+
+
+async def _run_queued_analysis(
+    job_key: str, sym: str, llm: str, python_exec, ai_quant_path, sub_env: dict
+) -> None:
+    """Wait for concurrency slot, launch subprocess, track to completion."""
+    async with _analysis_semaphore:
+        job = _analysis_jobs.get(job_key)
+        if not job or job.get("status") not in ("queued",):
+            return  # job was superseded or cancelled before slot opened
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(python_exec), str(ai_quant_path),
+                "--ticker", sym, "--no-cache", "--llm", llm,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(BASE_DIR),
+                env=sub_env,
+            )
+        except Exception as exc:
+            job = _analysis_jobs.get(job_key)
+            if job:
+                job["status"] = "failed"
+                job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+                job["output_excerpt"] = str(exc)
+            log.error("Failed to launch analysis for %s llm=%s: %s", sym, llm, exc)
+            return
+        job["status"] = "running"
+        job["started_at"] = datetime.utcnow().isoformat() + "Z"
+        job["proc"] = proc
+        log.info("Analysis started for %s with llm=%s (pid %s)", sym, llm, proc.pid)
+        await _track_analysis_job(job_key, proc)
 
 
 @app.post("/api/ticker/{symbol}/analyze")
@@ -4552,66 +4704,77 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
     _VALID_LLMS = ("grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
                    "grok", "grok-premium", "claude", "chatgpt")
     llm = req.llm if req.llm in _VALID_LLMS else "grok-4.3"
+    job_key = _analysis_job_key(sym, llm)
 
-    # If already running for the same LLM, return current status
-    job = _analysis_jobs.get(sym)
-    if job and job.get("status") == "running":
-        proc = job.get("proc")
-        if proc and proc.returncode is None:
-            return {"status": "running", "symbol": sym, "started_at": job["started_at"],
-                    "llm": job.get("llm", llm)}
-        else:
-            _analysis_jobs[sym]["status"] = "done"
+    missing_env_var = _missing_required_llm_env_var(llm)
+    if missing_env_var:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{missing_env_var} not set for model {llm}",
+        )
 
     ai_quant_path = BASE_DIR / "ai_quant.py"
     python_exec   = BASE_DIR / ".venv" / "bin" / "python"
     if not python_exec.exists():
         python_exec = sys.executable
 
+    # Estimate model and cost (returned for both queued and immediate responses)
     try:
-        import os as _os
-        sub_env = dict(_os.environ)
-        # Ensure API keys are forwarded to the subprocess
-        for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-            val = _os.environ.get(key)
-            if val:
-                sub_env[key] = val
-        proc = await asyncio.create_subprocess_exec(
-            str(python_exec), str(ai_quant_path),
-            "--ticker", sym, "--no-cache", "--llm", llm,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(BASE_DIR),
-            env=sub_env,
-        )
-        started = datetime.utcnow().isoformat() + "Z"
-        _analysis_jobs[sym] = {"status": "running", "started_at": started, "proc": proc, "llm": llm}
-        log.info(f"Analysis started for {sym} with llm={llm} (pid {proc.pid})")
-        # Estimate model and cost for the chosen LLM
-        try:
-            from config import AI_MODEL_DEFAULT, AI_MODEL_PREMIUM
-            from utils.usage import compute_cost
-            if llm == "claude":
-                est_model = "claude-sonnet-4-6"
-                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
-            elif llm == "grok-premium":
-                est_model = AI_MODEL_PREMIUM
-                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
-            elif llm == "chatgpt":
-                est_model = "o3"
-                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
-            else:
-                est_model = AI_MODEL_DEFAULT
-                est_cost  = round(compute_cost(est_model, 3558, 1300), 4)
-        except Exception:
-            est_model = {"grok-premium": "grok-4.3", "claude": "claude-opus-4-8", "chatgpt": "gpt-5.1"}.get(llm, "grok-4.3")
-            est_cost  = {"grok-premium": 0.027, "claude": 0.015, "chatgpt": 0.020}.get(llm, 0.012)
+        from config import AI_MODEL_PREMIUM
+        from utils.usage import compute_cost
+        est_model = {
+            "grok": "grok-4.3",
+            "grok-premium": AI_MODEL_PREMIUM,
+            "claude": "claude-sonnet-4-6",
+            "chatgpt": "gpt-5.1",
+        }.get(llm, llm)
+        est_cost = round(compute_cost(est_model, 3558, 1300), 4)
+    except Exception:
+        est_model = {"grok-premium": "grok-4.3", "claude": "claude-opus-4-8", "chatgpt": "gpt-5.1"}.get(llm, llm)
+        est_cost  = {"grok-premium": 0.027, "claude": 0.015, "chatgpt": 0.020}.get(llm, 0.012)
+
+    try:
+        async with _analysis_launch_lock:
+            # Dedupe: if this exact job is already queued or actively running, return its current status
+            job = _analysis_jobs.get(job_key)
+            if job:
+                if job.get("status") == "queued":
+                    return {"status": "queued", "symbol": sym, "llm": llm,
+                            "estimated_model": est_model, "estimated_cost": est_cost}
+                if job.get("status") == "running":
+                    proc = job.get("proc")
+                    if proc and proc.returncode is None:
+                        return {"status": "running", "symbol": sym, "started_at": job["started_at"],
+                                "llm": llm, "estimated_model": est_model, "estimated_cost": est_cost}
+
+            import os as _os
+            sub_env = dict(_os.environ)
+            for key in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+                val = _os.environ.get(key)
+                if val:
+                    sub_env[key] = val
+
+            _analysis_jobs[job_key] = {
+                "status": "queued",
+                "queued_at": datetime.utcnow().isoformat() + "Z",
+                "llm": llm,
+                "symbol": sym,
+                "job_key": job_key,
+            }
+            asyncio.create_task(
+                _run_queued_analysis(job_key, sym, llm, python_exec, ai_quant_path, sub_env)
+            )
+            log.info("Analysis queued for %s with llm=%s (%d/%d slots in use)",
+                     sym, llm, MAX_CONCURRENT_ANALYSIS - _analysis_semaphore._value, MAX_CONCURRENT_ANALYSIS)
+
         return {
-            "status": "running", "symbol": sym, "started_at": started, "pid": proc.pid,
-            "estimated_model": est_model, "estimated_cost": est_cost, "llm": llm,
+            "status": "queued", "symbol": sym, "llm": llm,
+            "estimated_model": est_model, "estimated_cost": est_cost,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        log.error(f"Failed to launch analysis for {sym}: {e}")
+        log.error("Failed to enqueue analysis for %s: %s", sym, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -4744,15 +4907,39 @@ def _apply_thesis_calibration(ticker: str, model: str, min_sample: int | None = 
 
 
 @app.get("/api/ticker/{symbol}/analyze/status")
-async def ticker_analyze_status(symbol: str):
+async def ticker_analyze_status(symbol: str, llm: Optional[str] = Query(None)):
     """Poll whether a background analysis job has completed."""
     sym = symbol.upper()
-    job = _analysis_jobs.get(sym)
+    job = _analysis_jobs.get(_analysis_job_key(sym, llm)) if llm else None
+    if job is None and llm is None:
+        symbol_jobs = _find_symbol_jobs(sym)
+        if symbol_jobs:
+            running_job = next(
+                (j for j in symbol_jobs if j.get("status") in ("queued", "running")), None
+            )
+            if running_job:
+                job = running_job
+            else:
+                def _job_ts(j: dict) -> str:
+                    return str(j.get("completed_at") or j.get("started_at") or "")
+                job = max(symbol_jobs, key=_job_ts)
     if not job:
         return {"status": "idle", "symbol": sym}
+    if job.get("status") == "queued":
+        return {"status": "queued", "symbol": sym, "queued_at": job.get("queued_at"), "llm": job.get("llm")}
+    if job.get("status") == "failed":
+        return {
+            "status": "failed",
+            "symbol": sym,
+            "started_at": job.get("started_at"),
+            "completed_at": job.get("completed_at"),
+            "returncode": job.get("returncode"),
+            "error": job.get("output_excerpt"),
+            "llm": job.get("llm"),
+        }
     proc = job.get("proc")
     if proc and proc.returncode is None:
-        return {"status": "running", "symbol": sym, "started_at": job["started_at"]}
+        return {"status": "running", "symbol": sym, "started_at": job["started_at"], "llm": job.get("llm")}
     # Finished — clear cache so fresh thesis is fetched
     _cache._store.pop(f"signals_ticker:{sym}", None)
     _cache._store.pop("deepdive_tickers", None)
@@ -4760,14 +4947,21 @@ async def ticker_analyze_status(symbol: str):
     _cache._store.pop("deepdive_live_zones", None)
     # Pull model + cost from the freshly saved thesis if available
     model_used = cost_usd = None
+    status_model = llm or job.get("llm")
     try:
         from utils.db import get_connection
         conn = get_connection()
         cur  = conn.cursor()
-        cur.execute(
-            "SELECT model_used, cost_usd FROM thesis_cache WHERE ticker=%s ORDER BY created_at DESC LIMIT 1",
-            (sym,)
-        )
+        if status_model:
+            cur.execute(
+                "SELECT model_used, cost_usd FROM thesis_cache WHERE ticker=%s AND model_used=%s ORDER BY created_at DESC LIMIT 1",
+                (sym, status_model),
+            )
+        else:
+            cur.execute(
+                "SELECT model_used, cost_usd FROM thesis_cache WHERE ticker=%s ORDER BY created_at DESC LIMIT 1",
+                (sym,),
+            )
         row = cur.fetchone()
         conn.close()
         if row:
@@ -4787,6 +4981,9 @@ async def ticker_analyze_status(symbol: str):
         "status": "done", "symbol": sym, "started_at": job.get("started_at"),
         "used_model": model_used, "cost_usd": cost_usd,
         "calibration": calibration if calibration else None,
+        "completed_at": job.get("completed_at"),
+        "returncode": job.get("returncode"),
+        "llm": job.get("llm"),
     }
 
 
@@ -5245,8 +5442,11 @@ async def ticker_ohlcv(
     yf_period = period_map.get(period, "3mo")
 
     try:
-        tk = yf.Ticker(sym)
-        hist = tk.history(period=yf_period, interval="1d", auto_adjust=True)
+        if _MD_AVAILABLE:
+            hist = await asyncio.to_thread(_md_get_history, sym, yf_period, "1d")
+        else:
+            tk = yf.Ticker(sym)
+            hist = await asyncio.to_thread(tk.history, period=yf_period, interval="1d", auto_adjust=True)
         if hist is None or hist.empty:
             result = _no_data(f"No OHLCV data available for {sym}")
             _cache.set(cache_key, result, TTL_SHORT)
@@ -6520,7 +6720,7 @@ async def ticker_option_candidates(symbol: str):
                        signals_json
                 FROM thesis_cache
                 WHERE ticker = %s
-                ORDER BY date DESC LIMIT 1
+                ORDER BY date DESC, created_at DESC LIMIT 1
                 """,
                 (sym,),
             )
@@ -6535,9 +6735,8 @@ async def ticker_option_candidates(symbol: str):
     if thesis_row:
         try:
             thesis = _build_thesis_context(thesis_row)
-            # Enrich with live price if thesis lacks it
             if thesis.current_price is None:
-                prices = _fetch_current_prices([sym])
+                prices = await asyncio.to_thread(_fetch_current_prices, [sym])
                 thesis.current_price = prices.get(sym)
         except Exception as exc:
             log.warning("thesis context build failed for %s: %s", sym, exc)
@@ -6675,21 +6874,31 @@ def _fetch_screener_tickers(
     Return a curated set of actionable thesis tickers for the options screener.
     Filters: direction != NEUTRAL, conviction >= min_conviction,
              most recent thesis per ticker, ordered by signal_agreement DESC.
+    ADV pre-filter: excludes tickers with adv_20d < 500_000 (insufficient options
+    liquidity) where adv_20d is available in daily_rankings.
     """
     try:
         conn = _db_connect()
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT ON (ticker)
-                       id, ticker, date, direction, conviction, signal_agreement_score,
-                       entry_low, entry_high, target_1, target_2, stop_loss,
-                       time_horizon, signals_json
-                FROM   thesis_cache
-                WHERE  direction IN ('BULL', 'BEAR')
-                  AND  conviction >= %s
-                  AND  entry_low IS NOT NULL
-                ORDER  BY ticker, date DESC
+                WITH latest_adv AS (
+                    SELECT DISTINCT ON (ticker) ticker, adv_20d
+                    FROM   daily_rankings
+                    ORDER  BY ticker, run_date DESC
+                )
+                SELECT DISTINCT ON (t.ticker)
+                       t.id, t.ticker, t.date, t.direction, t.conviction,
+                       t.signal_agreement_score,
+                       t.entry_low, t.entry_high, t.target_1, t.target_2, t.stop_loss,
+                       t.time_horizon, t.signals_json
+                FROM   thesis_cache t
+                LEFT   JOIN latest_adv la ON la.ticker = t.ticker
+                WHERE  t.direction IN ('BULL', 'BEAR')
+                  AND  t.conviction >= %s
+                  AND  t.entry_low IS NOT NULL
+                  AND  (la.adv_20d IS NULL OR la.adv_20d >= 500000)
+                ORDER  BY t.ticker, t.date DESC
                 """,
                 (min_conviction,),
             )
@@ -6704,19 +6913,190 @@ def _fetch_screener_tickers(
         return []
 
 
+def _write_screener_snapshot(min_conviction: int, result: dict) -> None:
+    """Persist a screener result to options_screener_snapshot."""
+    try:
+        import json as _json
+        conn = _db_connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO options_screener_snapshot
+                    (min_conviction, tickers_evaluated, tickers_completed,
+                     partial, timed_out_tickers, count, data)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    min_conviction,
+                    result.get("tickers_evaluated", 0),
+                    result.get("tickers_completed", 0),
+                    result.get("partial", False),
+                    result.get("timed_out_tickers", []),
+                    result.get("count", 0),
+                    _json.dumps(result.get("data", [])),
+                ),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        log.warning("_write_screener_snapshot failed: %s", exc)
+
+
+def run_options_screener_job(
+    min_conviction: int = 2,
+    max_tickers: int = 20,
+) -> dict:
+    """
+    Run the options screener fan-out and write the result to options_screener_snapshot.
+
+    Called by the daily pipeline (run_master.sh step 13d) and by the manual
+    POST /api/options/screener/refresh endpoint.  Never called on page load.
+    """
+    global _screener_job_running
+    _screener_job_running = True
+    try:
+        thesis_rows = _fetch_screener_tickers(min_conviction, max_tickers)
+
+        if not thesis_rows:
+            result: dict = {
+                "data_available": False,
+                "count": 0,
+                "tickers_evaluated": 0,
+                "tickers_completed": 0,
+                "partial": False,
+                "timed_out_tickers": [],
+                "data": [],
+            }
+            _write_screener_snapshot(min_conviction, result)
+            _cache.invalidate(f"options_screener:{min_conviction}:{max_tickers}")
+            return result
+
+        portfolio_ctx = _build_portfolio_context()
+        _results_for_persist: list[tuple[dict, "CandidateResult"]] = []
+
+        def _run_one(thesis_row: dict) -> tuple[list[dict], "CandidateResult | None"]:
+            try:
+                thesis = _build_thesis_context(thesis_row)
+                if thesis.current_price is None:
+                    prices = _fetch_current_prices([thesis.ticker])
+                    thesis.current_price = prices.get(thesis.ticker)
+                cand_result = get_option_candidates(
+                    thesis.ticker, thesis=thesis, portfolio_context=portfolio_ctx
+                )
+                cand_result.thesis_direction = thesis.direction   # type: ignore[attr-defined]
+                cand_result.thesis_conviction = thesis.conviction  # type: ignore[attr-defined]
+                out = []
+                for rank, c in enumerate(cand_result.candidates, start=1):
+                    out.append({
+                        **_serialize_candidate(c),
+                        "rank_global": 0,
+                        "ticker": c.ticker,
+                        "thesis_direction": thesis.direction,
+                        "thesis_conviction": thesis.conviction,
+                        "thesis_agreement": thesis_row.get("signal_agreement_score"),
+                        "underlying_price": cand_result.underlying_price,
+                        "chain_source": cand_result.chain_source,
+                        "rank_within_ticker": rank,
+                    })
+                return out, cand_result
+            except Exception as exc:
+                log.debug("screener job candidate error for %s: %s", thesis_row.get("ticker"), exc)
+                return [], None
+
+        all_candidates: list[dict] = []
+        use_ibkr = bool(os.getenv("IBKR_PORT"))
+        max_workers = 1 if use_ibkr else 6
+        # Background job: no HTTP request is waiting, so use a generous timeout
+        job_timeout = max(120, len(thesis_rows) * (90 if use_ibkr else 20))
+        timed_out_tickers: list[str] = []
+
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="opt_scrn_job"
+        )
+        try:
+            futures = {pool.submit(_run_one, tr): tr for tr in thesis_rows}
+            done, not_done = concurrent.futures.wait(
+                futures, timeout=job_timeout, return_when=concurrent.futures.ALL_COMPLETED
+            )
+            for f in done:
+                tr = futures[f]
+                try:
+                    rows, cand_result = f.result()
+                    all_candidates.extend(rows)
+                    if cand_result is not None:
+                        _results_for_persist.append((tr, cand_result))
+                except Exception:
+                    pass
+            for f in not_done:
+                timed_out_tickers.append(futures[f].get("ticker", ""))
+                f.cancel()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        for c in all_candidates:
+            conv = c.get("thesis_conviction") or 1
+            c["composite_rank_score"] = round(
+                (c.get("score") or 0) * (1 + (conv - 1) * 0.1), 2
+            )
+        all_candidates.sort(key=lambda c: c["composite_rank_score"], reverse=True)
+        for i, c in enumerate(all_candidates, start=1):
+            c["rank_global"] = i
+
+        result = {
+            "data_available": True,
+            "count": len(all_candidates),
+            "tickers_evaluated": len(thesis_rows),
+            "tickers_completed": len(done),
+            "partial": bool(timed_out_tickers),
+            "timed_out_tickers": [t for t in timed_out_tickers if t],
+            "data": all_candidates,
+        }
+
+        _write_screener_snapshot(min_conviction, result)
+        _cache.invalidate(f"options_screener:{min_conviction}:{max_tickers}")
+
+        # TRD-026: persist candidate snapshots fire-and-forget
+        try:
+            from utils.supabase_persist import save_option_candidate_snapshot as _persist
+
+            def _persist_screener_results():
+                for tr, cr in _results_for_persist:
+                    try:
+                        tc = {
+                            "thesis_date":       tr.get("date"),
+                            "time_horizon":      tr.get("time_horizon"),
+                            "signal_agreement":  tr.get("signal_agreement_score"),
+                            "entry_low":         tr.get("entry_low"),
+                            "entry_high":        tr.get("entry_high"),
+                            "days_to_earnings":  tr.get("days_to_earnings"),
+                            "heat_score":        tr.get("heat_score"),
+                            "expected_move_pct": tr.get("expected_move_pct"),
+                        }
+                        _persist(cr, thesis_id=tr.get("id"), thesis_context=tc)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_persist_screener_results, daemon=True).start()
+        except Exception:
+            pass
+
+        return result
+    finally:
+        _screener_job_running = False
+
+
 @app.get("/api/options/screener")
 async def options_screener(
     min_conviction: int = Query(2, ge=1, le=5),
     max_tickers: int = Query(20, ge=1, le=50),
 ):
     """
-    Cross-ticker options screener.
+    Cross-ticker options screener — snapshot read path (TRD-080).
 
-    Fetches a curated set of thesis-filtered tickers (conviction ≥ min_conviction,
-    direction BULL/BEAR), runs the deterministic option candidate engine for each,
-    and returns a flat ranked list of the best opportunities across the universe.
-
-    Cached 15 minutes.  Do NOT call per-page-load; call from dashboard on mount.
+    Returns the most recent precomputed snapshot for the requested min_conviction.
+    Computation runs via run_options_screener_job() in the daily pipeline or on
+    manual POST /api/options/screener/refresh.  Never fans out to live chain
+    fetches on page load.  Cached 5 minutes.
     """
     cache_key = f"options_screener:{min_conviction}:{max_tickers}"
     hit = _cache.get(cache_key)
@@ -6725,120 +7105,82 @@ async def options_screener(
 
     loop = asyncio.get_event_loop()
 
-    # 1. Get curated ticker list
-    thesis_rows = await loop.run_in_executor(
-        None,
-        lambda: _fetch_screener_tickers(min_conviction, max_tickers),
-    )
+    def _read_snapshot() -> dict | None:
+        try:
+            conn = _db_connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT run_at, tickers_evaluated, tickers_completed,
+                           partial, timed_out_tickers, count, data
+                    FROM   options_screener_snapshot
+                    WHERE  min_conviction = %s
+                    ORDER  BY run_at DESC
+                    LIMIT  1
+                    """,
+                    (min_conviction,),
+                )
+                row = cur.fetchone()
+            conn.close()
+            return dict(row) if row else None
+        except Exception as exc:
+            log.warning("options_screener snapshot read failed: %s", exc)
+            return None
 
-    if not thesis_rows:
-        result = {"data_available": False, "count": 0, "data": [], "generated_at": datetime.utcnow().isoformat()}
-        _cache.set(cache_key, result, 300)
+    row = await loop.run_in_executor(None, _read_snapshot)
+
+    if row is None:
+        result = {
+            "data_available": False,
+            "count": 0,
+            "snapshot_time": None,
+            "data": [],
+            "message": "No screener snapshot available. The pipeline must run first, or use 'Re-run screener' to trigger a background refresh.",
+        }
+        _cache.set(cache_key, result, 60)  # short TTL — user may trigger a refresh
         return result
 
-    # 2. Run candidate engine for each ticker (parallel via thread pool)
-    # Also collect CandidateResult objects for persistence (Issue #2 fix)
-    _results_for_persist: list[tuple[dict, "CandidateResult"]] = []
-
-    # Build portfolio context once for all tickers in this screener run (TRD-046)
-    _screener_portfolio_ctx = _build_portfolio_context()
-
-    def _run_one(thesis_row: dict) -> tuple[list[dict], "CandidateResult | None"]:
-        try:
-            thesis = _build_thesis_context(thesis_row)
-            # Enrich with price if missing
-            if thesis.current_price is None:
-                prices = _fetch_current_prices([thesis.ticker])
-                thesis.current_price = prices.get(thesis.ticker)
-            cand_result = get_option_candidates(
-                thesis.ticker, thesis=thesis, portfolio_context=_screener_portfolio_ctx
-            )
-            # Stamp thesis context onto result for later persistence
-            cand_result.thesis_direction = thesis.direction   # type: ignore[attr-defined]
-            cand_result.thesis_conviction = thesis.conviction  # type: ignore[attr-defined]
-            out = []
-            for rank, c in enumerate(cand_result.candidates, start=1):
-                out.append({
-                    **_serialize_candidate(c),
-                    "rank_global": 0,  # filled in after sorting
-                    "ticker": c.ticker,
-                    "thesis_direction": thesis.direction,
-                    "thesis_conviction": thesis.conviction,
-                    "thesis_agreement": thesis_row.get("signal_agreement_score"),
-                    "underlying_price": cand_result.underlying_price,
-                    "chain_source": cand_result.chain_source,
-                    "rank_within_ticker": rank,
-                })
-            return out, cand_result
-        except Exception as exc:
-            log.debug("screener candidate error for %s: %s", thesis_row.get("ticker"), exc)
-            return [], None
-
-    import concurrent.futures
-    all_candidates: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="opt_scrn") as pool:
-        futures = {pool.submit(_run_one, tr): tr for tr in thesis_rows}
-        for f in concurrent.futures.as_completed(futures, timeout=30):
-            tr = futures[f]
-            try:
-                rows, cand_result = f.result()
-                all_candidates.extend(rows)
-                if cand_result is not None:
-                    _results_for_persist.append((tr, cand_result))
-            except Exception:
-                pass
-
-    # 3. Rank globally by score × conviction weight
-    for c in all_candidates:
-        conv = c.get("thesis_conviction") or 1
-        c["composite_rank_score"] = round(
-            (c.get("score") or 0) * (1 + (conv - 1) * 0.1), 2
-        )
-
-    all_candidates.sort(key=lambda c: c["composite_rank_score"], reverse=True)
-    for i, c in enumerate(all_candidates, start=1):
-        c["rank_global"] = i
+    import json as _json
+    data = row["data"] if isinstance(row["data"], list) else _json.loads(row["data"])
 
     result = {
         "data_available": True,
-        "count": len(all_candidates),
-        "tickers_evaluated": len(thesis_rows),
-        "generated_at": datetime.utcnow().isoformat(),
-        "data": all_candidates,
+        "count": row["count"],
+        "tickers_evaluated": row["tickers_evaluated"],
+        "tickers_completed": row["tickers_completed"],
+        "partial": row["partial"],
+        "timed_out_tickers": row["timed_out_tickers"] or [],
+        "snapshot_time": row["run_at"].isoformat() if hasattr(row["run_at"], "isoformat") else str(row["run_at"]),
+        "data": data,
     }
-    _cache.set(cache_key, result, 15 * 60)  # 15-min cache
-
-    # TRD-026 / Issue #2: persist screener recommendations fire-and-forget
-    # Each per-ticker CandidateResult is persisted with available thesis context.
-    # Suppressed results are included to preserve no-trade decisions.
-    # Deduplication: runs within the same cache TTL window (15 min) will not
-    # re-fetch, so duplicate writes are naturally bounded to one per 15 min.
-    try:
-        from utils.supabase_persist import save_option_candidate_snapshot as _persist
-
-        def _persist_screener_results():
-            for tr, cr in _results_for_persist:
-                try:
-                    tc = {
-                        "thesis_date":       tr.get("date"),
-                        "time_horizon":      tr.get("time_horizon"),
-                        "signal_agreement":  tr.get("signal_agreement_score"),
-                        # TRD-050: thesis enrichment
-                        "entry_low":         tr.get("entry_low"),
-                        "entry_high":        tr.get("entry_high"),
-                        "days_to_earnings":  tr.get("days_to_earnings"),
-                        "heat_score":        tr.get("heat_score"),
-                        "expected_move_pct": tr.get("expected_move_pct"),
-                    }
-                    _persist(cr, thesis_id=tr.get("id"), thesis_context=tc)
-                except Exception:
-                    pass  # per-ticker failure is silenced; never block response
-
-        asyncio.get_event_loop().run_in_executor(None, _persist_screener_results)
-    except Exception:
-        pass
-
+    _cache.set(cache_key, result, TTL_SHORT)  # 5-min cache
     return result
+
+
+@app.post("/api/options/screener/refresh")
+async def options_screener_refresh(
+    min_conviction: int = Query(2, ge=1, le=5),
+    max_tickers: int = Query(20, ge=1, le=50),
+):
+    """
+    Trigger a background options screener re-run.  Fire-and-forget; returns
+    immediately.  Rate-limited to one concurrent run.
+    """
+    global _screener_job_running
+    if _screener_job_running:
+        return {
+            "queued": False,
+            "message": "A screener refresh is already running. Check back in ~60s.",
+        }
+
+    def _run():
+        run_options_screener_job(min_conviction=min_conviction, max_tickers=max_tickers)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {
+        "queued": True,
+        "message": "Screener refresh queued. Check back in ~60–90s.",
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

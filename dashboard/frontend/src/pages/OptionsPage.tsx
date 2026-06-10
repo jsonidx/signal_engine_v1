@@ -21,6 +21,9 @@ import type {
   OptionsCohortRow,
   OptionsFreqRow,
   OptionsAccuracyResponse,
+  OptionsComparatorResponse,
+  ComparatorMethodStats,
+  ComparatorCohort,
 } from '../lib/api'
 import { clsx } from 'clsx'
 
@@ -134,24 +137,62 @@ function ScreenerRow({ row, rank }: { row: OptionsCrossTickerRow; rank: number }
           {row.rationale || '—'}
         </div>
       </td>
+      <td className="px-3 py-2">
+        {row.buy_decision === 'buy_now' ? (
+          <span className="font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded bg-accent-green/10 text-accent-green border border-accent-green/30">
+            BUY NOW
+          </span>
+        ) : (
+          <span className="font-mono text-[9px] px-1.5 py-0.5 rounded bg-bg-elevated text-text-tertiary border border-border-subtle">
+            WAIT
+          </span>
+        )}
+      </td>
     </tr>
   )
 }
 
+function formatSnapshotAge(snapshotTime: string | null): string {
+  if (!snapshotTime) return ''
+  const diffMs = Date.now() - new Date(snapshotTime).getTime()
+  const diffMin = Math.floor(diffMs / 60000)
+  if (diffMin < 1) return 'just now'
+  if (diffMin < 60) return `${diffMin}m ago`
+  const diffH = Math.floor(diffMin / 60)
+  if (diffH < 24) return `${diffH}h ago`
+  return `${Math.floor(diffH / 24)}d ago`
+}
+
 function ScreenerPanel() {
   const [minConv, setMinConv] = useState(2)
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['options_screener', minConv],
     queryFn: () => api.optionsScreener({ minConviction: minConv }),
-    staleTime: 15 * 60 * 1000,
+    staleTime: 5 * 60 * 1000,
     retry: 1,
   })
+
+  async function handleRerun() {
+    setRefreshMsg(null)
+    try {
+      const res = await api.optionsScreenerRefresh({ minConviction: minConv })
+      setRefreshMsg(res.message)
+      if (res.queued) {
+        setTimeout(() => { refetch(); setRefreshMsg(null) }, 75000)
+      }
+    } catch {
+      setRefreshMsg('Refresh request failed.')
+    }
+  }
+
+  const ageLabel = data?.snapshot_time ? formatSnapshotAge(data.snapshot_time) : null
 
   return (
     <div className="space-y-4">
       {/* Controls */}
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-4 flex-wrap">
         <div className="flex items-center gap-2">
           <span className="font-mono text-[10px] text-text-tertiary uppercase">Min Conviction</span>
           <select
@@ -165,17 +206,36 @@ function ScreenerPanel() {
           </select>
         </div>
         <button
-          onClick={() => refetch()}
+          onClick={handleRerun}
           className="font-mono text-[10px] px-2.5 py-1 rounded border border-border-subtle text-text-tertiary hover:text-text-secondary transition-colors"
         >
-          Refresh
+          Re-run screener
         </button>
-        {data && (
+        {data?.data_available && (
           <span className="font-mono text-[10px] text-text-tertiary">
-            {data.count} candidates across {data.tickers_evaluated} tickers
+            {data.count} candidates across {data.tickers_completed ?? data.tickers_evaluated ?? 0} tickers
+          </span>
+        )}
+        {ageLabel && (
+          <span className="font-mono text-[10px] text-text-tertiary">
+            · as of {ageLabel}
           </span>
         )}
       </div>
+
+      {/* Refresh queued toast */}
+      {refreshMsg && (
+        <div className="font-mono text-[10px] text-accent-amber bg-accent-amber/5 border border-accent-amber/20 rounded px-2.5 py-2">
+          {refreshMsg}
+        </div>
+      )}
+
+      {/* Partial result detail (informational, not a warning) */}
+      {data?.partial && data.timed_out_tickers && data.timed_out_tickers.length > 0 && (
+        <div className="font-mono text-[10px] text-text-tertiary">
+          Note: {data.timed_out_tickers.join(', ')} timed out during last screener run.
+        </div>
+      )}
 
       {isLoading && <LoadingSkeleton rows={6} />}
 
@@ -183,16 +243,20 @@ function ScreenerPanel() {
         <EmptyState message="Failed to load options screener. Chain data may be unavailable." />
       )}
 
-      {data && !isLoading && data.count === 0 && (
+      {data && !isLoading && !data.data_available && (
+        <EmptyState message={data.message ?? 'No screener snapshot available. Use "Re-run screener" to generate the first snapshot, or wait for the daily pipeline.'} />
+      )}
+
+      {data && !isLoading && data.data_available && data.count === 0 && (
         <EmptyState message="No option candidates found for current thesis universe. Try lowering the conviction filter or wait for thesis refresh." />
       )}
 
-      {data && data.count > 0 && (
+      {data && data.data_available && data.count > 0 && (
         <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border-subtle bg-bg-elevated">
-                {['#', 'Ticker', 'Preset', 'Contract', 'Mid', 'Entry / Chase', 'Slip', 'Δ', 'Spread', 'Score', 'Hold', 'Rationale'].map(h => (
+                {['#', 'Ticker', 'Preset', 'Contract', 'Mid', 'Entry / Chase', 'Slip', 'Δ', 'Spread', 'Score', 'Hold', 'Rationale', 'Buy'].map(h => (
                   <th key={h} className="px-3 py-2 text-left font-mono text-[9px] uppercase tracking-widest text-text-tertiary">
                     {h}
                   </th>
@@ -346,6 +410,150 @@ function AccuracyPanel() {
   )
 }
 
+// ─── Calibration tab (TRD-044 / TRD-045) ─────────────────────────────────────
+
+function pctOrNA(v: number | null | undefined): string {
+  return v != null ? `${v.toFixed(1)}%` : '—'
+}
+function retColor(v: number | null): string {
+  if (v == null) return 'text-text-tertiary'
+  return v >= 0 ? 'text-accent-green' : 'text-accent-red'
+}
+
+function MethodStatsRow({ label, ms }: { label: string; ms: ComparatorMethodStats }) {
+  return (
+    <tr className="border-b border-border-subtle last:border-0">
+      <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{label}</td>
+      <td className="px-3 py-1.5 font-mono text-xs text-text-tertiary">{ms.n}</td>
+      <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">
+        {ms.sparse ? <span className="text-text-tertiary italic">sparse</span> : pctOrNA(ms.tp1_hit_rate)}
+      </td>
+      <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">
+        {ms.sparse ? '—' : pctOrNA(ms.tp2_hit_rate)}
+      </td>
+      <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">
+        {ms.sparse ? '—' : pctOrNA(ms.stop_hit_rate)}
+      </td>
+      <td className={clsx('px-3 py-1.5 font-mono text-xs', retColor(ms.mean_return_pct))}>
+        {ms.sparse ? '—' : (ms.mean_return_pct != null ? `${ms.mean_return_pct >= 0 ? '+' : ''}${ms.mean_return_pct.toFixed(1)}%` : '—')}
+      </td>
+    </tr>
+  )
+}
+
+function OverallComparatorTable({ data }: { data: OptionsComparatorResponse }) {
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <div className="px-4 py-2 border-b border-border-subtle flex items-center justify-between">
+        <span className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary">Overall — Legacy vs V2 vs Underlying</span>
+        <span className="font-mono text-[9px] text-text-tertiary">{data.total_rows} rows · {data.v2_eligible_rows} v2-eligible · {data.resolution_type}</span>
+      </div>
+      <table className="w-full">
+        <thead>
+          <tr className="border-b border-border-subtle">
+            {['Method', 'N', 'TP1 Hit', 'TP2 Hit', 'Stop Hit', 'Mean Ret 5d'].map(h => (
+              <th key={h} className="px-3 py-1.5 text-left font-mono text-[9px] text-text-tertiary">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          <MethodStatsRow label="Legacy (flat ×)" ms={data.overall_legacy} />
+          <MethodStatsRow label="V2 (Δ-projected)" ms={data.overall_v2} />
+          <MethodStatsRow label="Underlying thesis" ms={data.overall_underlying} />
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function CohortComparatorTable({ title, cohorts }: { title: string; cohorts: ComparatorCohort[] }) {
+  if (!cohorts.length) return null
+  return (
+    <div className="bg-bg-surface border border-border-subtle rounded overflow-hidden">
+      <div className="px-4 py-2 border-b border-border-subtle font-mono text-[10px] uppercase tracking-widest text-text-tertiary">
+        {title}
+      </div>
+      <table className="w-full">
+        <thead>
+          <tr className="border-b border-border-subtle">
+            {['Cohort', 'N', 'Leg TP1', 'V2 TP1', 'Und T1', 'Leg Stop', 'V2 Stop'].map(h => (
+              <th key={h} className="px-3 py-1.5 text-left font-mono text-[9px] text-text-tertiary">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {cohorts.map(cc => (
+            <tr key={cc.cohort_label} className="border-b border-border-subtle last:border-0">
+              <td className="px-3 py-1.5 font-mono text-xs text-text-primary">
+                {cc.cohort_label ?? '—'}
+                {cc.sparse && <span className="ml-1 text-[9px] text-text-tertiary italic">(small)</span>}
+              </td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.n}</td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.sparse ? '—' : pctOrNA(cc.legacy.tp1_hit_rate)}</td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.v2.sparse ? '—' : pctOrNA(cc.v2.tp1_hit_rate)}</td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.sparse ? '—' : pctOrNA(cc.underlying.tp1_hit_rate)}</td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.sparse ? '—' : pctOrNA(cc.legacy.stop_hit_rate)}</td>
+              <td className="px-3 py-1.5 font-mono text-xs text-text-secondary">{cc.v2.sparse ? '—' : pctOrNA(cc.v2.stop_hit_rate)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function CalibrationPanel() {
+  const [days, setDays] = useState(90)
+
+  const { data, isLoading } = useQuery<OptionsComparatorResponse>({
+    queryKey: ['options_comparator', days],
+    queryFn: () => api.optionsComparator(days, '5d'),
+    staleTime: 30 * 60 * 1000,
+    retry: 1,
+  })
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[10px] text-text-tertiary uppercase">Period</span>
+          <select
+            value={days}
+            onChange={e => setDays(Number(e.target.value))}
+            className="bg-bg-elevated border border-border-subtle rounded px-2 py-1 font-mono text-xs text-text-primary"
+          >
+            {[30, 60, 90, 180, 365].map(d => (
+              <option key={d} value={d}>Last {d}d</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {isLoading && <LoadingSkeleton rows={4} />}
+
+      {data && !data.data_available && (
+        <EmptyState message={data.message ?? 'No resolved outcomes available for comparison. Outcomes must be resolved before calibration data appears.'} />
+      )}
+
+      {data && data.data_available && (
+        <div className="space-y-4">
+          <OverallComparatorTable data={data} />
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <CohortComparatorTable title="By Strategy Preset" cohorts={data.by_preset} />
+            <CohortComparatorTable title="By Delta Bucket" cohorts={data.by_delta_bucket} />
+            <CohortComparatorTable title="By DTE Bucket" cohorts={data.by_dte_bucket} />
+          </div>
+          <div className="font-mono text-[9px] text-text-tertiary space-y-1">
+            <div>Legacy = flat multiplier exits (mid × 1.5 / 2.0). V2 = delta-projected exits from underlying thesis levels.</div>
+            <div>Sparse cohorts (n &lt; 5) show "—" to avoid misleading small-sample rates.</div>
+            <div>Option P&L approximated via delta. 5-day resolution window.</div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Tab style — matches ResolutionPage pattern ───────────────────────────────
 
 const tabCls =
@@ -370,6 +578,7 @@ export function OptionsPage() {
         <Tabs.List className="flex border-b border-border-subtle">
           <Tabs.Trigger value="screener" className={tabCls}>Screener</Tabs.Trigger>
           <Tabs.Trigger value="accuracy" className={tabCls}>Accuracy</Tabs.Trigger>
+          <Tabs.Trigger value="calibration" className={tabCls}>Calibration</Tabs.Trigger>
         </Tabs.List>
 
         <Tabs.Content value="screener">
@@ -378,6 +587,10 @@ export function OptionsPage() {
 
         <Tabs.Content value="accuracy">
           <AccuracyPanel />
+        </Tabs.Content>
+
+        <Tabs.Content value="calibration">
+          <CalibrationPanel />
         </Tabs.Content>
       </Tabs.Root>
     </Shell>

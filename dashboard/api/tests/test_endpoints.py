@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -505,6 +505,226 @@ def test_signals_ticker_not_found(tmp_data):
 
 
 # ==============================================================================
+# TRD-072 — Analysis job concurrency gate (asyncio.Semaphore)
+# ==============================================================================
+
+class TestAnalysisGate:
+    """TRD-072: ticker_analyze enqueues jobs; semaphore limits concurrency."""
+
+    def setup_method(self):
+        import asyncio
+        import dashboard.api.main as m
+        m._analysis_jobs.clear()
+        m._analysis_semaphore = asyncio.Semaphore(m.MAX_CONCURRENT_ANALYSIS)
+
+    def test_returns_queued_status(self):
+        """POST /analyze must return status=queued."""
+        with (
+            patch("dashboard.api.main._missing_required_llm_env_var", return_value=None),
+            patch("asyncio.create_task"),
+        ):
+            resp = client.post("/api/ticker/TSLA/analyze", json={"llm": "grok-4.3"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "queued"
+        assert body["symbol"] == "TSLA"
+        assert body["llm"] == "grok-4.3"
+
+    def test_dedupes_already_queued_job(self):
+        """Submitting the same symbol+LLM twice while queued must not create a second task."""
+        task_count = 0
+
+        def count_task(coro):
+            nonlocal task_count
+            task_count += 1
+            coro.close()
+
+        with (
+            patch("dashboard.api.main._missing_required_llm_env_var", return_value=None),
+            patch("asyncio.create_task", side_effect=count_task),
+        ):
+            r1 = client.post("/api/ticker/AMZN/analyze", json={"llm": "grok-4.3"})
+            r2 = client.post("/api/ticker/AMZN/analyze", json={"llm": "grok-4.3"})
+
+        assert r1.json()["status"] == "queued"
+        assert r2.json()["status"] == "queued"
+        assert task_count == 1, "second submit must not spawn a new task for the same queued job"
+
+    def test_status_endpoint_returns_queued(self):
+        """GET /analyze/status returns {status: queued} when job is in queue."""
+        import dashboard.api.main as m
+        m._analysis_jobs["MSFT::grok-4.3"] = {
+            "status": "queued",
+            "queued_at": "2026-06-10T10:00:00Z",
+            "llm": "grok-4.3",
+            "symbol": "MSFT",
+            "job_key": "MSFT::grok-4.3",
+        }
+        resp = client.get("/api/ticker/MSFT/analyze/status?llm=grok-4.3")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "queued"
+        assert body["llm"] == "grok-4.3"
+        assert "queued_at" in body
+
+    def test_different_llm_same_symbol_not_deduped(self):
+        """Two different LLMs for the same symbol each get their own queue slot."""
+        task_count = 0
+
+        def count_task(coro):
+            nonlocal task_count
+            task_count += 1
+            coro.close()
+
+        with (
+            patch("dashboard.api.main._missing_required_llm_env_var", return_value=None),
+            patch("asyncio.create_task", side_effect=count_task),
+        ):
+            client.post("/api/ticker/NVDA/analyze", json={"llm": "grok-4.3"})
+            client.post("/api/ticker/NVDA/analyze", json={"llm": "gpt-5.1"})
+
+        assert task_count == 2, "different LLMs for same symbol must each create a task"
+
+    @pytest.mark.asyncio
+    async def test_semaphore_gate_holds_overflow_and_advances_on_release(self):
+        """Overflow job stays queued while all slots are taken; advances once a slot frees."""
+        import asyncio
+        import dashboard.api.main as m
+
+        # Acquire all slots to simulate MAX_CONCURRENT_ANALYSIS jobs already running
+        for _ in range(m.MAX_CONCURRENT_ANALYSIS):
+            await m._analysis_semaphore.acquire()
+
+        job_key = "GATETEST::grok-4.3"
+        m._analysis_jobs[job_key] = {
+            "status": "queued",
+            "queued_at": "2026-06-10T00:00:00Z",
+            "llm": "grok-4.3",
+            "symbol": "GATETEST",
+            "job_key": job_key,
+        }
+
+        # Stub subprocess so the gate test doesn't actually run ai_quant.py
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"gate test"))
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+            task = asyncio.create_task(
+                m._run_queued_analysis(job_key, "GATETEST", "grok-4.3", "/bin/python", "/dev/null", {})
+            )
+
+            # Yield control so the task can attempt semaphore.acquire (it will block)
+            await asyncio.sleep(0)
+
+            assert m._analysis_jobs[job_key]["status"] == "queued", (
+                "Job must stay queued while all concurrency slots are occupied"
+            )
+
+            # Release one slot — the overflow job should now advance
+            m._analysis_semaphore.release()
+            await asyncio.sleep(0.05)
+
+            final_status = m._analysis_jobs[job_key]["status"]
+            assert final_status != "queued", (
+                f"Job must leave queued state after a slot frees up, got {final_status!r}"
+            )
+
+            await task
+
+        # Restore semaphore to full capacity
+        for _ in range(m.MAX_CONCURRENT_ANALYSIS - 1):
+            m._analysis_semaphore.release()
+
+
+# ==============================================================================
+# BUG-001 — _fetch_current_prices must be offloaded via asyncio.to_thread
+# ==============================================================================
+
+def _make_full_thesis_row(ticker: str = "AAPL") -> dict:
+    signals_json = json.dumps({
+        "options_flow": {"heat_score": 72.5},
+        "fundamentals": {"fundamental_score_pct": 66.0},
+        "squeeze":      {"short_squeeze_score": 20},
+    })
+    return {
+        "ticker": ticker, "date": "2026-03-22", "direction": "BULL",
+        "conviction": 4, "time_horizon": "2-4 weeks",
+        "entry_low": 172.0, "entry_high": 178.0, "stop_loss": 165.0,
+        "target_1": 190.0, "target_2": 205.0, "position_size_pct": 5.0,
+        "thesis": "Test thesis.", "data_quality": "HIGH",
+        "signal_agreement_score": 0.78,
+        "bull_probability": 0.65, "bear_probability": 0.20, "neutral_probability": 0.15,
+        "catalysts_json": "[]", "risks_json": "[]", "signals_json": signals_json,
+        "created_at": "2026-03-22T10:00:00",
+        "key_invalidation": None, "primary_scenario": None, "bear_scenario": None,
+        "prob_combined": None, "prob_technical": None, "prob_options": None,
+        "prob_catalyst": None, "prob_news": None,
+        "model_used": None, "cost_usd": None, "expected_moves_json": None,
+    }
+
+
+def test_signals_ticker_price_fetch_uses_to_thread():
+    """signals_ticker must offload the price fetch via asyncio.to_thread (BUG-001)."""
+    from dashboard.api.main import _fetch_current_prices
+
+    mock_conn = _make_db_conn(fetchone=_make_full_thesis_row())
+    offloaded: list = []
+
+    async def spy_to_thread(fn, *args, **kwargs):
+        offloaded.append(fn)
+        return fn(*args, **kwargs)
+
+    with (
+        patch("dashboard.api.main._db_connect", return_value=mock_conn),
+        patch("dashboard.api.main._md_get_prices", return_value={"AAPL": 180.0}),
+        patch("asyncio.to_thread", side_effect=spy_to_thread),
+    ):
+        resp = client.get("/api/signals/ticker/AAPL")
+
+    assert resp.status_code == 200
+    assert resp.json()["data_available"] is True
+    assert _fetch_current_prices in offloaded, (
+        "signals_ticker must call price fetch via asyncio.to_thread, not inline"
+    )
+
+
+def test_option_candidates_price_fetch_uses_to_thread():
+    """ticker_option_candidates must offload the market-data price fetch via asyncio.to_thread (BUG-001)."""
+    # thesis_row deliberately omits current_price so the endpoint triggers the price fetch
+    thesis_row = {
+        "ticker": "AAPL", "direction": "BULL", "conviction": 4,
+        "entry_low": 145.0, "entry_high": 150.0, "target_1": 165.0,
+        "target_2": None, "stop_loss": 140.0, "time_horizon": None,
+        "signal_agreement_score": None, "signals_json": None,
+        # current_price absent → ThesisContext.current_price will be None → triggers fetch
+    }
+    mock_conn = _make_mock_db_conn(thesis_row=thesis_row)
+    offloaded: list = []
+
+    async def spy_to_thread(fn, *args, **kwargs):
+        offloaded.append(fn)
+        return fn(*args, **kwargs)
+
+    from dashboard.api.main import _fetch_current_prices
+
+    with (
+        patch("dashboard.api.main._db_connect", return_value=mock_conn),
+        patch("dashboard.api.main._md_get_prices", return_value={"AAPL": 148.0}),
+        patch("dashboard.api.main.get_option_candidates",
+              return_value=_make_suppressed_result("AAPL")),
+        patch("asyncio.to_thread", side_effect=spy_to_thread),
+    ):
+        resp = client.get("/api/ticker/AAPL/option-candidates")
+
+    assert resp.status_code == 200
+    assert _fetch_current_prices in offloaded, (
+        "ticker_option_candidates must call price fetch via asyncio.to_thread, not inline"
+    )
+
+
+# ==============================================================================
 # SCREENERS
 # ==============================================================================
 
@@ -538,6 +758,74 @@ def test_screeners_options_from_cache():
     # AAPL has heat_score=72.5 > min_heat=50, must appear
     tickers = [r["ticker"] for r in body["data"]]
     assert "AAPL" in tickers
+
+
+# ==============================================================================
+# TRD-080: OPTIONS SCREENER SNAPSHOT
+# ==============================================================================
+
+def test_options_screener_reads_snapshot():
+    """GET /api/options/screener returns stored snapshot data, not live fan-out."""
+    from datetime import datetime, timezone
+    snapshot_row = {
+        "run_at": datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc),
+        "tickers_evaluated": 5,
+        "tickers_completed": 5,
+        "partial": False,
+        "timed_out_tickers": [],
+        "count": 2,
+        "data": [{"ticker": "AAPL", "score": 75.0}, {"ticker": "MSFT", "score": 70.0}],
+    }
+    mock_conn = _make_db_conn(fetchone=snapshot_row)
+    with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+        resp = client.get("/api/options/screener?min_conviction=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data_available"] is True
+    assert body["count"] == 2
+    assert body["snapshot_time"] is not None
+    assert "2026-06-10" in body["snapshot_time"]
+    assert len(body["data"]) == 2
+    assert body["data"][0]["ticker"] == "AAPL"
+
+
+def test_options_screener_no_snapshot_returns_data_available_false():
+    """GET /api/options/screener with empty snapshot table returns data_available=false."""
+    mock_conn = _make_db_conn(fetchone=None)
+    with patch("dashboard.api.main._db_connect", return_value=mock_conn):
+        resp = client.get("/api/options/screener?min_conviction=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data_available"] is False
+    assert body["snapshot_time"] is None
+    assert "message" in body
+
+
+def test_options_screener_refresh_queues_background_job():
+    """POST /api/options/screener/refresh returns queued=true and starts background thread."""
+    import dashboard.api.main as api_main
+    api_main._screener_job_running = False
+    with patch("threading.Thread") as mock_thread:
+        mock_thread.return_value.start.return_value = None
+        resp = client.post("/api/options/screener/refresh?min_conviction=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["queued"] is True
+    assert "queued" in body["message"].lower() or "refresh" in body["message"].lower()
+    mock_thread.assert_called_once()
+
+
+def test_options_screener_refresh_rate_limited_when_running():
+    """POST /api/options/screener/refresh returns queued=false when a job is already running."""
+    import dashboard.api.main as api_main
+    api_main._screener_job_running = True
+    try:
+        resp = client.post("/api/options/screener/refresh?min_conviction=2")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["queued"] is False
+    finally:
+        api_main._screener_job_running = False
 
 
 # ==============================================================================

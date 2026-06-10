@@ -1,7 +1,7 @@
 import axios from 'axios'
 import { supabase } from './supabase'
 
-const client = axios.create({ baseURL: '/' })
+const client = axios.create({ baseURL: '/', timeout: 15_000 })
 
 // Attach Supabase JWT to every request when logged in
 client.interceptors.request.use(async (config) => {
@@ -630,14 +630,25 @@ export interface ActionZones {
 }
 
 export interface AnalyzeStatus {
-  status: 'idle' | 'running' | 'done'
+  status: 'idle' | 'queued' | 'running' | 'done' | 'failed'
   symbol: string
+  llm?: string
+  queued_at?: string
   started_at?: string
+  completed_at?: string
   pid?: number
   used_model?: string
   estimated_model?: string
   cost_usd?: number
   estimated_cost?: number
+  returncode?: number
+  error?: string
+  calibration?: {
+    model?: string
+    sample_n?: number
+    t1_bias?: number | null
+    t2_bias?: number | null
+  } | null
 }
 
 // ─── Ticker Intelligence ──────────────────────────────────────────────────────
@@ -1252,8 +1263,8 @@ export const api = {
   tickerAnalyze: (symbol: string, llm: string = 'grok-4.3'): Promise<AnalyzeStatus> =>
     client.post(`/api/ticker/${symbol}/analyze`, { llm }).then(r => r.data),
 
-  tickerAnalyzeStatus: (symbol: string): Promise<AnalyzeStatus> =>
-    client.get(`/api/ticker/${symbol}/analyze/status`).then(r => r.data),
+  tickerAnalyzeStatus: (symbol: string, llm?: string): Promise<AnalyzeStatus> =>
+    client.get(`/api/ticker/${symbol}/analyze/status`, { params: llm ? { llm } : undefined }).then(r => r.data),
 
   // Ticker intelligence
   tickerSecFilings: (symbol: string): Promise<SecFiling[]> =>
@@ -1319,12 +1330,20 @@ export const api = {
   tickerOptionCandidates: (symbol: string): Promise<OptionCandidatesResponse> =>
     client.get(`/api/ticker/${symbol.toUpperCase()}/option-candidates`).then(r => r.data),
 
-  // Options Screener (TRD-028)
+  // Options Screener (TRD-028 / TRD-080)
   optionsScreener: (params?: { minConviction?: number; maxTickers?: number }): Promise<OptionsScreenerResponse> =>
     client.get('/api/options/screener', {
       params: {
         min_conviction: params?.minConviction ?? 2,
-        max_tickers:    params?.maxTickers    ?? 20,
+        max_tickers:    params?.maxTickers    ?? 8,
+      },
+    }).then(r => r.data),
+
+  optionsScreenerRefresh: (params?: { minConviction?: number; maxTickers?: number }): Promise<{ queued: boolean; message: string }> =>
+    client.post('/api/options/screener/refresh', null, {
+      params: {
+        min_conviction: params?.minConviction ?? 2,
+        max_tickers:    params?.maxTickers    ?? 8,
       },
     }).then(r => r.data),
 
@@ -1550,8 +1569,12 @@ export interface OptionsCrossTickerRow extends OptionCandidate {
 export interface OptionsScreenerResponse {
   data_available: boolean
   count: number
-  tickers_evaluated: number
-  generated_at: string
+  tickers_evaluated?: number
+  tickers_completed?: number
+  partial?: boolean
+  timed_out_tickers?: string[]
+  snapshot_time: string | null
+  message?: string
   data: OptionsCrossTickerRow[]
 }
 

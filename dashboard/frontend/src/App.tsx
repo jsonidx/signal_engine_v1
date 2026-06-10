@@ -1,20 +1,32 @@
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom'
 import { AuthProvider } from './lib/AuthContext'
 import { PrivateRoute } from './components/PrivateRoute'
-import { LoginPage } from './pages/LoginPage'
-import { HomePage } from './pages/HomePage'
-import { PortfolioPage } from './pages/PortfolioPage'
-import { HeatmapPage } from './pages/HeatmapPage'
-import { DeepDivePage } from './pages/DeepDivePage'
-import { TickerPage } from './pages/TickerPage'
-import { ScreenersPage } from './pages/ScreenersPage'
-import { BacktestPage } from './pages/BacktestPage'
-import { ResolutionPage } from './pages/ResolutionPage'
-import { OptionsPage } from './pages/OptionsPage'
-import { RankingsPage } from './pages/RankingsPage'
-import { SettingsPage } from './pages/SettingsPage'
 import { ErrorBoundary } from './components/ErrorBoundary'
+
+const LoginPage      = lazy(() => import('./pages/LoginPage').then(m => ({ default: m.LoginPage })))
+const HomePage       = lazy(() => import('./pages/HomePage').then(m => ({ default: m.HomePage })))
+const PortfolioPage  = lazy(() => import('./pages/PortfolioPage').then(m => ({ default: m.PortfolioPage })))
+const HeatmapPage    = lazy(() => import('./pages/HeatmapPage').then(m => ({ default: m.HeatmapPage })))
+const DeepDivePage   = lazy(() => import('./pages/DeepDivePage').then(m => ({ default: m.DeepDivePage })))
+const TickerPage     = lazy(() => import('./pages/TickerPage').then(m => ({ default: m.TickerPage })))
+const ScreenersPage  = lazy(() => import('./pages/ScreenersPage').then(m => ({ default: m.ScreenersPage })))
+const BacktestPage   = lazy(() => import('./pages/BacktestPage').then(m => ({ default: m.BacktestPage })))
+const ResolutionPage = lazy(() => import('./pages/ResolutionPage').then(m => ({ default: m.ResolutionPage })))
+const OptionsPage    = lazy(() => import('./pages/OptionsPage').then(m => ({ default: m.OptionsPage })))
+const RankingsPage   = lazy(() => import('./pages/RankingsPage').then(m => ({ default: m.RankingsPage })))
+const SettingsPage   = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })))
+
+function RouteLoadingFallback() {
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-bg-base">
+      <div className="flex flex-col items-center gap-3">
+        <div className="w-5 h-5 border-2 border-accent-blue border-t-transparent rounded-full animate-spin" />
+        <span className="font-mono text-xs text-text-tertiary">Loading…</span>
+      </div>
+    </div>
+  )
+}
 
 // ─── Keyboard shortcut handler (inside router context) ────────────────────────
 
@@ -53,6 +65,7 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <KeyboardShortcuts />
+        <Suspense fallback={<RouteLoadingFallback />}>
         <Routes>
           {/* Public */}
           <Route path="/login" element={<LoginPage />} />
@@ -169,6 +182,7 @@ export default function App() {
             }
           />
         </Routes>
+        </Suspense>
       </AuthProvider>
     </BrowserRouter>
   )

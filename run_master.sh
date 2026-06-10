@@ -273,6 +273,25 @@ except Exception as e:
 step_end "Step 13c: Daily Top-20 ranking"
 echo ""
 
+# ── Step 13d: Options screener snapshot ──────────────────
+# Precomputes options screener results into options_screener_snapshot so the
+# dashboard reads a stored row instead of fanning out on every page load.
+echo "Step 13d: Running options screener snapshot job..."
+step_start
+python3 -c "
+import sys, traceback
+sys.path.insert(0, '.')
+try:
+    from dashboard.api.main import run_options_screener_job
+    result = run_options_screener_job(min_conviction=2, max_tickers=20)
+    print(f'  Options screener snapshot written: {result[\"count\"]} candidates across {result.get(\"tickers_evaluated\",0)} tickers')
+except Exception as e:
+    print(f'  Options screener snapshot failed: {e}', file=sys.stderr)
+    traceback.print_exc()
+"
+step_end "Step 13d: Options screener snapshot"
+echo ""
+
 # ── Step 13b: Thesis outcome checker ─────────────────────
 # Checks if prior Claude predictions (targets / stops) were hit.
 # Updates thesis_outcomes in ai_quant_cache.db — no API cost.

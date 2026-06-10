@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from 'react'
+import { lazy, Suspense, useState, useMemo, useCallback, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { ChevronRight, TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import * as Accordion from '@radix-ui/react-accordion'
@@ -8,11 +8,20 @@ import { ConvictionDots } from '../components/ui/ConvictionDots'
 import { MonoNumber } from '../components/ui/MonoNumber'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
 import { RegimeBadge } from '../components/ui/RegimeBadge'
-import { PriceLadder } from '../components/charts/PriceLadder'
 import { RiskRewardBar } from '../components/RiskRewardBar'
-import { HistoricalAnalogs } from '../components/HistoricalAnalogs'
-import { PriceChart } from '../components/charts/PriceChart'
-import { EarningsReactionModel } from '../components/EarningsReactionModel'
+
+const PriceChart = lazy(() =>
+  import('../components/charts/PriceChart').then(m => ({ default: m.PriceChart }))
+)
+const PriceLadder = lazy(() =>
+  import('../components/charts/PriceLadder').then(m => ({ default: m.PriceLadder }))
+)
+const HistoricalAnalogs = lazy(() =>
+  import('../components/HistoricalAnalogs').then(m => ({ default: m.HistoricalAnalogs }))
+)
+const EarningsReactionModel = lazy(() =>
+  import('../components/EarningsReactionModel').then(m => ({ default: m.EarningsReactionModel }))
+)
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSignalsTicker } from '../hooks/useHeatmap'
 import { useDarkPoolTicker } from '../hooks/useDarkPool'
@@ -1268,102 +1277,232 @@ const LLM_OPTIONS = [
 
 type LLMChoice = typeof LLM_OPTIONS[number]['value']
 
+function formatAnalyzeLaunchError(error: any): string {
+  const status = error?.response?.status as number | undefined
+  const detail = error?.response?.data?.detail
+  const message = error?.message as string | undefined
+
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail.trim()
+  }
+  if (status === 500) {
+    return 'Backend unavailable or restarting. The Vite API proxy could not reach localhost:8000.'
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return 'Backend temporarily unavailable. Retry once the API on localhost:8000 is healthy.'
+  }
+  if (!error?.response) {
+    return 'Network error reaching the local API. Check that the frontend proxy and backend are running.'
+  }
+  return message ?? 'Failed to start analysis'
+}
+
 function AnalyzeButton({ symbol, hasThesis }: { symbol: string; hasThesis: boolean }) {
-  const [job, setJob] = useState<AnalyzeStatus | null>(null)
-  const [llm, setLlm] = useState<LLMChoice>('grok-4.3')
+  const [selectedLlms, setSelectedLlms] = useState<Set<LLMChoice>>(new Set(['grok-4.3' as LLMChoice]))
+  const [jobs, setJobs] = useState<Record<string, AnalyzeStatus>>({})
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
-
-  // Poll for completion when running — auto-refresh ticker data when done
-  const { data: statusData } = useQuery<AnalyzeStatus>({
-    queryKey: ['analyze_status', symbol],
-    queryFn: () => api.tickerAnalyzeStatus(symbol),
-    refetchInterval: job?.status === 'running' ? 5000 : false,
-    enabled: job?.status === 'running',
-  })
+  const runningModels = useMemo(
+    () => Object.entries(jobs)
+      .filter(([, job]) => job.status === 'queued' || job.status === 'running')
+      .map(([llm]) => llm as LLMChoice),
+    [jobs],
+  )
 
   useEffect(() => {
-    if (statusData?.status === 'done' && job?.status === 'running') {
-      setJob(statusData)
-      qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
-      qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
+    if (!runningModels.length) return
+    let cancelled = false
+
+    const poll = async () => {
+      try {
+        const statuses = await Promise.all(
+          runningModels.map(async (llm) => ({ llm, status: await api.tickerAnalyzeStatus(symbol, llm) })),
+        )
+        if (cancelled) return
+
+        let anyDone = false
+        setJobs(prev => {
+          let changed = false
+          const next = { ...prev }
+          statuses.forEach(({ llm, status }) => {
+            if (prev[llm]?.status === 'running' && status.status === 'done') {
+              anyDone = true
+            }
+            if (prev[llm]?.status !== status.status) {
+              next[llm] = status
+              changed = true
+            }
+          })
+          return changed ? next : prev
+        })
+
+        if (anyDone) {
+          qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
+          qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
+        }
+      } catch {
+        // Keep polling; transient status failures should not abort the batch.
+      }
     }
-  }, [statusData?.status])
+
+    poll()
+    const id = window.setInterval(poll, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [runningModels, qc, symbol])
 
   const handleRun = async () => {
     setError(null)
-    try {
-      const res = await api.tickerAnalyze(symbol, llm)
-      setJob(res)
-    } catch (e: any) {
-      const msg = e?.response?.data?.detail ?? e?.message ?? 'Failed to start analysis'
-      setError(msg)
-      console.error(e)
+    const llmsToRun = [...selectedLlms]
+    const settled = await Promise.allSettled(
+      llmsToRun.map(async (llm) => ({ llm, result: await api.tickerAnalyze(symbol, llm) })),
+    )
+    const launchErrors: string[] = []
+    setJobs(prev => {
+      const next = { ...prev }
+      settled.forEach((item, idx) => {
+        const llm = llmsToRun[idx]
+        if (item.status === 'fulfilled') {
+          next[llm] = item.value.result
+        } else {
+          const msg = formatAnalyzeLaunchError(item.reason)
+          next[llm] = { status: 'failed', symbol, llm, error: msg }
+          launchErrors.push(`${LLM_OPTIONS.find(o => o.value === llm)?.label ?? llm}: ${msg}`)
+        }
+      })
+      return next
+    })
+    if (launchErrors.length) {
+      setError(launchErrors.join(' | '))
     }
   }
 
-  const llmLabel = LLM_OPTIONS.find(o => o.value === llm)?.label ?? llm
+  const selectedLabel = [...selectedLlms].map(v => LLM_OPTIONS.find(o => o.value === v)?.label ?? v).join(', ')
+  const orderedJobEntries = Object.entries(jobs)
+    .sort((a, b) => a[0].localeCompare(b[0]))
 
-  if (job?.status === 'running') {
+  const renderJobStatus = (llm: string, job: AnalyzeStatus) => {
+    const label = LLM_OPTIONS.find(o => o.value === llm)?.label ?? llm
+    if (job.status === 'queued') {
+      return (
+        <div key={llm} className="flex items-center gap-2 font-mono text-xs text-text-secondary">
+          <span className="animate-pulse">○</span>
+          <span>{label}: queued…</span>
+        </div>
+      )
+    }
+    if (job.status === 'running') {
+      return (
+        <div key={llm} className="flex items-center gap-2 font-mono text-xs text-accent-amber">
+          <span className="animate-pulse">⬤</span>
+          <span>{label}: running…</span>
+        </div>
+      )
+    }
+    if (job.status === 'done') {
+      const doneModel = job.used_model ?? job.estimated_model ?? label
+      const doneCost = job.cost_usd ?? job.estimated_cost
+      return (
+        <div key={llm} className="flex items-center gap-2 font-mono text-xs text-accent-green">
+          <span>✓ {label}: complete</span>
+          {doneModel && <ModelBadge model={doneModel} cost={doneCost} />}
+          {job.calibration && (() => {
+            const c = job.calibration
+            const model = (c.model ?? '').replace('claude-', 'Claude ').replace('grok-', 'Grok ')
+            const t1 = c.t1_bias != null ? `T1 ${c.t1_bias > 0 ? '+' : ''}${c.t1_bias}%` : null
+            const t2 = c.t2_bias != null ? `T2 ${c.t2_bias > 0 ? '+' : ''}${c.t2_bias}%` : null
+            const biases = [t1, t2].filter(Boolean).join(' · ')
+            return (
+              <span
+                title={`Calibrated using ${c.sample_n} resolved ${model} outcomes`}
+                className="font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-blue/10 text-accent-blue border-accent-blue/30 cursor-help"
+              >
+                ⟳ calibrated via {model} ({biases})
+              </span>
+            )
+          })()}
+        </div>
+      )
+    }
+    const msg = job.error?.split('\n').slice(-2).join(' ').trim() || 'AI analysis failed'
     return (
-      <div className="flex items-center gap-2 font-mono text-xs text-accent-amber">
-        <span className="animate-pulse">⬤</span> Running AI analysis ({llmLabel}) for {symbol}…
-        <span className="text-text-tertiary text-[10px]">auto-refreshes when done (~60s)</span>
-      </div>
-    )
-  }
-  if (job?.status === 'done') {
-    const doneModel = job.used_model ?? job.estimated_model
-    const doneCost  = job.cost_usd ?? job.estimated_cost
-    return (
-      <div className="flex items-center gap-2 font-mono text-xs text-accent-green">
-        ✓ AI analysis complete
-        {doneModel && <ModelBadge model={doneModel} cost={doneCost} />}
-        {(job as any).calibration && (() => {
-          const c = (job as any).calibration
-          const model = (c.model ?? '').replace('claude-','Claude ').replace('grok-','Grok ')
-          const t1 = c.t1_bias != null ? `T1 ${c.t1_bias > 0 ? '+' : ''}${c.t1_bias}%` : null
-          const t2 = c.t2_bias != null ? `T2 ${c.t2_bias > 0 ? '+' : ''}${c.t2_bias}%` : null
-          const biases = [t1, t2].filter(Boolean).join(' · ')
-          return (
-            <span title={`Calibrated using ${c.sample_n} resolved ${model} outcomes`}
-              className="font-mono text-[10px] px-1.5 py-0.5 rounded border bg-accent-blue/10 text-accent-blue border-accent-blue/30 cursor-help">
-              ⟳ calibrated via {model} ({biases})
-            </span>
-          )
-        })()}
+      <div key={llm} className="flex items-center gap-2 font-mono text-xs text-accent-red">
+        <span>✕ {label}: failed</span>
+        {job.returncode != null && <span className="text-[10px] text-text-tertiary">exit {job.returncode}</span>}
+        <span className="text-[10px] text-text-tertiary max-w-[48rem] truncate" title={job.error}>{msg}</span>
       </div>
     )
   }
 
   return (
-    <div className="flex items-center gap-2">
-      {/* LLM picker */}
-      <select
-        value={llm}
-        onChange={e => setLlm(e.target.value as LLMChoice)}
-        className="font-mono text-xs px-2 py-1.5 rounded border border-border-subtle bg-bg-surface text-text-secondary hover:border-border-active focus:outline-none cursor-pointer"
-        title={LLM_OPTIONS.find(o => o.value === llm)?.desc}
-      >
-        {LLM_OPTIONS.map(o => (
-          <option key={o.value} value={o.value} title={o.desc}>{o.label}</option>
-        ))}
-      </select>
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <details className="relative">
+          <summary className="list-none font-mono text-xs px-2 py-1.5 rounded border border-border-subtle bg-bg-surface text-text-secondary hover:border-border-active focus:outline-none cursor-pointer">
+            Model
+          </summary>
+          <div className="absolute z-20 mt-1 min-w-64 rounded border border-border-subtle bg-bg-surface p-2 shadow-xl">
+            <div className="mb-2 font-mono text-[10px] text-text-tertiary">
+              Select one or more LLMs to run in parallel
+            </div>
+            <div className="space-y-1">
+              {LLM_OPTIONS.map(o => (
+                <label key={o.value} className="flex items-start gap-2 rounded px-1 py-1 hover:bg-bg-elevated cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedLlms.has(o.value)}
+                    onChange={() => setSelectedLlms(prev => {
+                      const next = new Set(prev)
+                      if (next.has(o.value)) next.delete(o.value)
+                      else next.add(o.value)
+                      return next
+                    })}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0">
+                    <span className="block font-mono text-xs text-text-primary">{o.label}</span>
+                    <span className="block font-mono text-[10px] text-text-tertiary">{o.desc}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </details>
 
-      {/* Run button */}
-      <button
-        onClick={handleRun}
-        className={clsx(
-          'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
-          hasThesis
-            ? 'border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active'
-            : 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple hover:bg-accent-purple/30'
-        )}
-      >
-        {hasThesis ? '↻ Re-run AI analysis' : '▶ Run AI analysis'}
-      </button>
+        <button
+          onClick={handleRun}
+          disabled={selectedLlms.size === 0}
+          className={clsx(
+            'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+            selectedLlms.size === 0
+              ? 'border-border-subtle text-text-tertiary opacity-40 cursor-not-allowed'
+              : hasThesis
+                ? 'border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active'
+                : 'bg-accent-purple/20 border-accent-purple/40 text-accent-purple hover:bg-accent-purple/30'
+          )}
+        >
+          {hasThesis ? '↻ Re-run AI analysis' : '▶ Run AI analysis'}
+        </button>
 
-      {error && <span className="font-mono text-[10px] text-accent-red">{error}</span>}
+        <span className="font-mono text-[10px] text-text-tertiary truncate max-w-[36rem]" title={selectedLabel}>
+          {selectedLabel}
+        </span>
+      </div>
+
+      {orderedJobEntries.length > 0 && (
+        <div className="space-y-1">
+          {orderedJobEntries.map(([llm, job]) => renderJobStatus(llm, job))}
+          {runningModels.length > 0 && (
+            <div className="font-mono text-[10px] text-text-tertiary">
+              auto-refreshes while any selected model is queued or running
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && <div className="font-mono text-[10px] text-accent-red">{error}</div>}
     </div>
   )
 }
@@ -1376,23 +1515,33 @@ function ModelRerunButton({ symbol, model }: { symbol: string; model: string }) 
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
 
+  const isActive = job?.status === 'queued' || job?.status === 'running'
+
   const { data: statusData } = useQuery<AnalyzeStatus>({
-    queryKey: ['analyze_status', symbol],
-    queryFn: () => api.tickerAnalyzeStatus(symbol),
-    refetchInterval: job?.status === 'running' ? 5000 : false,
-    enabled: job?.status === 'running',
+    queryKey: ['analyze_status', symbol, model],
+    queryFn: () => api.tickerAnalyzeStatus(symbol, model),
+    refetchInterval: isActive ? 5000 : false,
+    enabled: isActive,
   })
 
   useEffect(() => {
-    if (statusData?.status === 'done' && job?.status === 'running') {
-      setJob(statusData)
+    if (!statusData || !isActive) return
+    setJob(statusData)
+    if (statusData.status === 'done') {
       qc.invalidateQueries({ queryKey: ['signals', 'ticker', symbol.toUpperCase()] })
       qc.invalidateQueries({ queryKey: ['ticker', symbol.toUpperCase()] })
     }
-  }, [statusData?.status])
+  }, [statusData, isActive, qc, symbol])
 
   if (!validModel) return null
 
+  if (job?.status === 'queued') {
+    return (
+      <span className="font-mono text-[9px] text-text-secondary animate-pulse flex-shrink-0">
+        ○ queued…
+      </span>
+    )
+  }
   if (job?.status === 'running') {
     return (
       <span className="font-mono text-[9px] text-accent-amber animate-pulse flex-shrink-0">
@@ -1405,6 +1554,16 @@ function ModelRerunButton({ symbol, model }: { symbol: string; model: string }) 
       <span className="font-mono text-[9px] text-accent-green flex-shrink-0">✓ done</span>
     )
   }
+  if (job?.status === 'failed') {
+    return (
+      <span
+        className="font-mono text-[9px] text-accent-red flex-shrink-0"
+        title={job.error ?? 'AI analysis failed'}
+      >
+        ✕ failed
+      </span>
+    )
+  }
 
   return (
     <div className="flex items-center gap-1 flex-shrink-0">
@@ -1415,7 +1574,7 @@ function ModelRerunButton({ symbol, model }: { symbol: string; model: string }) 
             const res = await api.tickerAnalyze(symbol, model)
             setJob(res)
           } catch (e: any) {
-            setError(e?.response?.data?.detail ?? e?.message ?? 'error')
+            setError(formatAnalyzeLaunchError(e))
           }
         }}
         className="font-mono text-[9px] px-2 py-0.5 rounded border border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active transition-colors"
@@ -1840,6 +1999,11 @@ function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
   const r2 = c.projected_tp2_return_pct
   const rs = c.projected_stop_return_pct
 
+  const entry = c.recommended_entry_price ?? c.mid
+  const tp1IsLoss = entry != null && tp1 < entry
+  const tp2IsLoss = tp2 != null && entry != null && tp2 < entry
+  const staleTargets = tp1IsLoss
+
   return (
     <div className="border-t border-border-subtle pt-1.5 space-y-1">
       <div className="flex items-center justify-between">
@@ -1850,18 +2014,23 @@ function ProjectedExitsSection({ c }: { c: OptionCandidate }) {
           </span>
         )}
       </div>
+      {staleTargets && (
+        <div className="font-mono text-[9px] text-accent-red bg-accent-red/10 border border-accent-red/30 rounded px-1.5 py-0.5">
+          Thesis targets below current price — underlying has moved past T1; thesis may be stale
+        </div>
+      )}
       <div className="grid grid-cols-4 gap-2">
         <_EntryCol c={c} />
         <div className="space-y-0.5">
           <div className="font-mono text-[9px] text-text-tertiary uppercase">T1</div>
-          <div className="font-mono text-xs font-semibold text-accent-green">${tp1.toFixed(2)}</div>
-          {r1 != null && <div className="font-mono text-[9px] text-accent-green">+{r1.toFixed(1)}%</div>}
+          <div className={`font-mono text-xs font-semibold ${tp1IsLoss ? 'text-accent-red' : 'text-accent-green'}`}>${tp1.toFixed(2)}</div>
+          {r1 != null && <div className={`font-mono text-[9px] ${tp1IsLoss ? 'text-accent-red' : 'text-accent-green'}`}>{r1 >= 0 ? '+' : ''}{r1.toFixed(1)}%</div>}
         </div>
         {tp2 != null ? (
           <div className="space-y-0.5">
             <div className="font-mono text-[9px] text-text-tertiary uppercase">T2</div>
-            <div className="font-mono text-xs font-semibold text-accent-green">${tp2.toFixed(2)}</div>
-            {r2 != null && <div className="font-mono text-[9px] text-accent-green">+{r2.toFixed(1)}%</div>}
+            <div className={`font-mono text-xs font-semibold ${tp2IsLoss ? 'text-accent-red' : 'text-accent-green'}`}>${tp2.toFixed(2)}</div>
+            {r2 != null && <div className={`font-mono text-[9px] ${tp2IsLoss ? 'text-accent-red' : 'text-accent-green'}`}>{r2 >= 0 ? '+' : ''}{r2.toFixed(1)}%</div>}
           </div>
         ) : <div />}
         {sl != null ? (
@@ -2577,7 +2746,7 @@ function EarningsCard({ data }: { data: EarningsData }) {
 
 export function TickerPage() {
   const { symbol = '' } = useParams()
-  const { data: signal, isLoading } = useSignalsTicker(symbol)
+  const { data: signal, isLoading, isError } = useSignalsTicker(symbol)
   const { data: dpHistory } = useDarkPoolTicker(symbol)
   const { data: heatmapRows } = useHeatmap()
   const { data: secFilings = [] } = useQuery<SecFiling[]>({
@@ -2643,6 +2812,10 @@ export function TickerPage() {
 
       {isLoading ? (
         <LoadingSkeleton rows={10} />
+      ) : isError ? (
+        <div className="font-mono text-sm text-accent-red py-12 text-center">
+          Failed to load {symbol}. The backend may be busy — retry in a moment.
+        </div>
       ) : !signal ? (
         <div className="font-mono text-sm text-text-tertiary py-12 text-center">
           No data for {symbol}. Run <code className="text-accent-amber">./run_master.sh</code> to generate signals.
@@ -3195,47 +3368,53 @@ export function TickerPage() {
                       </span>
                     </div>
                   )}
-                  <PriceLadder
-                    currentPrice={signal.current_price}
-                    target1={signal.target_1}
-                    target2={signal.target_2}
-                    entryLow={signal.entry_low}
-                    entryHigh={signal.entry_high}
-                    stopLoss={signal.stop_loss}
-                    poc={signal.poc}
-                    vwap={signal.vwap}
-                    azBuyLow={actionZones?.buy_zone_low}
-                    azBuyHigh={actionZones?.buy_zone_high}
-                    azStop={actionZones?.stop_loss}
-                    azTarget1={actionZones?.target_1}
-                    azTarget2={actionZones?.target_2}
-                    fxRate={actionZones?.fx_rate}
-                  />
+                  <Suspense fallback={<div className="animate-pulse bg-bg-elevated rounded h-[280px]" />}>
+                    <PriceLadder
+                      currentPrice={signal.current_price}
+                      target1={signal.target_1}
+                      target2={signal.target_2}
+                      entryLow={signal.entry_low}
+                      entryHigh={signal.entry_high}
+                      stopLoss={signal.stop_loss}
+                      poc={signal.poc}
+                      vwap={signal.vwap}
+                      azBuyLow={actionZones?.buy_zone_low}
+                      azBuyHigh={actionZones?.buy_zone_high}
+                      azStop={actionZones?.stop_loss}
+                      azTarget1={actionZones?.target_1}
+                      azTarget2={actionZones?.target_2}
+                      fxRate={actionZones?.fx_rate}
+                    />
+                  </Suspense>
                 </div>
               )
             })()}
 
             {/* Interactive candlestick chart with all key level overlays */}
             {signal.current_price != null && (
-              <PriceChart
-                symbol={symbol}
-                aiEntryLow={signal.entry_low}
-                aiEntryHigh={signal.entry_high}
-                aiTarget1={signal.target_1}
-                aiTarget2={signal.target_2}
-                aiStop={signal.stop_loss}
-                vwap={signal.vwap}
-                azBuyLow={actionZones?.buy_zone_low}
-                azBuyHigh={actionZones?.buy_zone_high}
-                azTarget1={actionZones?.target_1}
-                azTarget2={actionZones?.target_2}
-                azStop={actionZones?.stop_loss}
-                currentPrice={signal.current_price}
-              />
+              <Suspense fallback={<div className="animate-pulse bg-bg-surface border border-border-subtle rounded h-[450px]" />}>
+                <PriceChart
+                  symbol={symbol}
+                  aiEntryLow={signal.entry_low}
+                  aiEntryHigh={signal.entry_high}
+                  aiTarget1={signal.target_1}
+                  aiTarget2={signal.target_2}
+                  aiStop={signal.stop_loss}
+                  vwap={signal.vwap}
+                  azBuyLow={actionZones?.buy_zone_low}
+                  azBuyHigh={actionZones?.buy_zone_high}
+                  azTarget1={actionZones?.target_1}
+                  azTarget2={actionZones?.target_2}
+                  azStop={actionZones?.stop_loss}
+                  currentPrice={signal.current_price}
+                />
+              </Suspense>
             )}
 
             {/* Historical Analogs — similar past setups with win rate / expectancy stats */}
-            <HistoricalAnalogs symbol={symbol} />
+            <Suspense fallback={<div className="animate-pulse bg-bg-surface border border-border-subtle rounded h-[200px]" />}>
+              <HistoricalAnalogs symbol={symbol} />
+            </Suspense>
 
             {/* Expected Moves */}
             {signal.current_price != null && (() => {
@@ -3526,11 +3705,13 @@ export function TickerPage() {
             )}
 
             {/* Earnings Reaction Model — historical move distribution + implied vs actual */}
-            <EarningsReactionModel
-              symbol={symbol}
-              earningsData={earningsData}
-              impliedMove={signal.expected_move_pct}
-            />
+            <Suspense fallback={<div className="animate-pulse bg-bg-surface border border-border-subtle rounded h-[320px]" />}>
+              <EarningsReactionModel
+                symbol={symbol}
+                earningsData={earningsData}
+                impliedMove={signal.expected_move_pct}
+              />
+            </Suspense>
 
             {/* Analyst consensus */}
             {signal.target_mean != null && (
