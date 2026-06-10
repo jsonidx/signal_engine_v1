@@ -1,6 +1,12 @@
-name: Manual Signal Pipeline (with AI cost)
+name: Daily Signal Pipeline (with AI cost)
 
 on:
+  # GitHub Actions cron is UTC-only. We schedule both 02:00 UTC and 03:00 UTC,
+  # then gate execution to 04:00 Europe/Berlin so the workflow runs once per day
+  # at 04:00 local time across DST changes.
+  schedule:
+    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       confirm:
@@ -16,7 +22,25 @@ env:
   ENABLE_NEWS_CATALYST_SCANNER: "true"
 
 jobs:
+  berlin-schedule-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.berlin-time.outputs.should_run }}
+
+    steps:
+      - name: Check Berlin local time
+        id: berlin-time
+        run: |
+          BERLIN_HOUR=$(TZ=Europe/Berlin date +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$BERLIN_HOUR" = "04" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   run-pipeline:
+    needs: berlin-schedule-guard
+    if: ${{ needs.berlin-schedule-guard.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -58,7 +82,7 @@ jobs:
 
       - name: Upload report to Supabase
         if: always()
-        run: python3 scripts/upload_pipeline_report.py --run-id "${{ github.run_id }}" --conclusion "${{ job.status }}" --workflow "Manual Signal Pipeline (AI)"
+        run: python3 scripts/upload_pipeline_report.py --run-id "${{ github.run_id }}" --conclusion "${{ job.status }}" --workflow "Daily Signal Pipeline (AI)"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
@@ -67,7 +91,7 @@ jobs:
         run: |
           python3 scripts/notify_pipeline_result.py \
             --status "${{ job.status }}" \
-            --workflow "Manual Signal Pipeline (AI)" \
+            --workflow "Daily Signal Pipeline (AI)" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --duration-min "$(echo "scale=1; ($(date +%s) - ${PIPELINE_START:-$(date +%s)}) / 60" | bc)"
         env:
