@@ -243,8 +243,8 @@ def fetch_catalyst_watch_candidates(conn) -> list[dict]:
     return rows_out
 
 
-def fetch_top10_rankings(conn) -> list[dict]:
-    """Return today's top-10 from daily_rankings (latest run_date)."""
+def fetch_latest_rankings(conn) -> list[dict]:
+    """Return all rows from daily_rankings for the latest run_date, ordered by rank."""
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -253,12 +253,11 @@ def fetch_top10_rankings(conn) -> list[dict]:
                    hold_days, agreement_score, is_open_position
             FROM   daily_rankings
             WHERE  run_date = (SELECT MAX(run_date) FROM daily_rankings)
-              AND  rank <= 10
             ORDER  BY rank ASC
         """)
         return [dict(r) for r in cur.fetchall()]
     except Exception as exc:
-        print(f"[notify] fetch_top10 failed: {exc}", file=sys.stderr)
+        print(f"[notify] fetch_latest_rankings failed: {exc}", file=sys.stderr)
         return []
 
 
@@ -386,11 +385,12 @@ def build_header(status: str, workflow: str, run_url: str, duration_min: float) 
     return "\n".join(lines)
 
 
-def build_top10_section(rows: list[dict]) -> str:
+def build_rankings_section(rows: list[dict]) -> str:
     if not rows:
         return "⚠️ No ranking data for today."
 
-    lines = ["\n<b>── TOP 10 RANKINGS ──</b>"]
+    n = len(rows)
+    lines = [f"\n<b>── RANKINGS ({n}) ──</b>"]
     for r in rows:
         rank     = r.get("rank", "?")
         ticker   = r.get("ticker", "?")
@@ -630,8 +630,8 @@ def main() -> None:
     squeeze_alerts_section = ""
 
     if conn:
-        top10 = fetch_top10_rankings(conn)
-        rankings_section = build_top10_section(top10)
+        rankings = fetch_latest_rankings(conn)
+        rankings_section = build_rankings_section(rankings)
 
         if not args.skip_ai:
             _run_id = os.environ.get("PIPELINE_RUN_ID", "").strip() or None

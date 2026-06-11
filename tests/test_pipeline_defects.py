@@ -1618,5 +1618,149 @@ class TestRunScopedThesisAttribution(unittest.TestCase):
                       "PIPELINE_RUN_ID env value must reach the scoped query bind params")
 
 
+# ==============================================================================
+# BUG-003 — Remove fixed Top-N caps from Telegram pipeline summary
+# ==============================================================================
+
+class TestRankingsSectionUncapped(unittest.TestCase):
+    """
+    Tests for the count-agnostic rankings section in notify_pipeline_result.py.
+    Verifies that the Telegram notifier shows ALL rows from the latest run,
+    not a hard-capped subset.
+    """
+
+    def _make_ranking_rows(self, n: int) -> list:
+        return [
+            {
+                "rank":           i + 1,
+                "ticker":         f"T{i + 1:02d}",
+                "direction":      "BULL",
+                "prob_combined":  0.65,
+                "prob_t1":        0.60,
+                "ev_t1_pct":      8.5,
+                "t1_price":       120.0,
+                "t2_price":       135.0,
+                "stop_price":     90.0,
+                "hold_days":      14,
+                "agreement_score": 0.75,
+                "is_open_position": False,
+            }
+            for i in range(n)
+        ]
+
+    # ── build_rankings_section ────────────────────────────────────────────────
+
+    def test_no_top10_label_in_section(self):
+        """'TOP 10' must not appear anywhere in the rankings section output."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        rows = self._make_ranking_rows(10)
+        result = build_rankings_section(rows)
+        self.assertNotIn("TOP 10", result, "Stale 'TOP 10' label must not appear")
+
+    def test_no_top5_label_in_section(self):
+        """'TOP 5' must not appear anywhere in the rankings section output."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        rows = self._make_ranking_rows(5)
+        result = build_rankings_section(rows)
+        self.assertNotIn("TOP 5", result, "Stale 'TOP 5' label must not appear")
+
+    def test_section_header_shows_count(self):
+        """Section header must reflect the actual row count, not a fixed N."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        rows = self._make_ranking_rows(7)
+        result = build_rankings_section(rows)
+        self.assertIn("7", result, "Actual row count must appear in section header")
+
+    def test_all_rows_appear_when_more_than_10(self):
+        """15 ranking rows → all 15 tickers appear (not capped at 10)."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        rows = self._make_ranking_rows(15)
+        result = build_rankings_section(rows)
+        for row in rows:
+            self.assertIn(row["ticker"], result,
+                          f"Ticker {row['ticker']} must appear in rankings section")
+
+    def test_rows_ordered_by_rank(self):
+        """Rows must appear in ascending rank order."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        rows = self._make_ranking_rows(5)
+        result = build_rankings_section(rows)
+        positions = [result.index(row["ticker"]) for row in rows]
+        self.assertEqual(positions, sorted(positions), "Tickers must appear in rank order")
+
+    def test_empty_rows_returns_no_data_message(self):
+        """Empty rows list returns the no-data warning (not a crash or empty string)."""
+        from scripts.notify_pipeline_result import build_rankings_section
+        result = build_rankings_section([])
+        self.assertIn("No ranking data", result)
+
+    def test_section_chunks_safely_for_20_rows(self):
+        """20 ranking rows must split cleanly — no chunk exceeds TG_LIMIT."""
+        from scripts.notify_pipeline_result import build_rankings_section, TG_LIMIT, tg_send_chunked
+        rows = self._make_ranking_rows(20)
+        section = build_rankings_section(rows)
+
+        chunks: list[str] = []
+        with patch("scripts.notify_pipeline_result.tg_send",
+                   side_effect=lambda text, **_: chunks.append(text)):
+            tg_send_chunked(section)
+
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), TG_LIMIT,
+                                 f"Chunk too long: {len(chunk)} > TG_LIMIT={TG_LIMIT}")
+
+    # ── fetch_latest_rankings (mocked DB) ─────────────────────────────────────
+
+    def _make_mock_conn(self, rows):
+        conn = MagicMock()
+        cur  = MagicMock()
+        conn.cursor.return_value = cur
+        cur.fetchall.return_value = rows
+        return conn
+
+    def test_fetch_returns_all_rows_no_rank_cap(self):
+        """fetch_latest_rankings must return all DB rows — no rank <= N filter."""
+        from scripts.notify_pipeline_result import fetch_latest_rankings
+        db_rows = [{"rank": i + 1, "ticker": f"T{i + 1:02d}"} for i in range(15)]
+        conn = self._make_mock_conn(db_rows)
+        result = fetch_latest_rankings(conn)
+        self.assertEqual(len(result), 15, "All 15 DB rows must be returned")
+
+    def test_fetch_sql_does_not_contain_rank_cap(self):
+        """The SQL issued by fetch_latest_rankings must not contain 'rank <='."""
+        from scripts.notify_pipeline_result import fetch_latest_rankings
+        conn = self._make_mock_conn([])
+        fetch_latest_rankings(conn)
+        cur = conn.cursor.return_value
+        sql = cur.execute.call_args[0][0]
+        self.assertNotIn("rank <=", sql, "SQL must not cap by rank")
+        self.assertNotIn("rank<=", sql,  "SQL must not cap by rank")
+
+    def test_fetch_returns_empty_on_db_error(self):
+        """DB exception must return empty list without crashing."""
+        from scripts.notify_pipeline_result import fetch_latest_rankings
+        conn = MagicMock()
+        conn.cursor.side_effect = Exception("DB down")
+        result = fetch_latest_rankings(conn)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 0)
+
+    def test_old_function_name_removed(self):
+        """fetch_top10_rankings must no longer exist in the module."""
+        import scripts.notify_pipeline_result as npr
+        self.assertFalse(
+            hasattr(npr, "fetch_top10_rankings"),
+            "fetch_top10_rankings must be removed — use fetch_latest_rankings",
+        )
+
+    def test_old_section_builder_removed(self):
+        """build_top10_section must no longer exist in the module."""
+        import scripts.notify_pipeline_result as npr
+        self.assertFalse(
+            hasattr(npr, "build_top10_section"),
+            "build_top10_section must be removed — use build_rankings_section",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -204,7 +204,7 @@ else
   step_end "Step 13: AI Quant synthesis"
   echo "Step 13 complete — theses saved to ai_quant_cache.db"
 
-  # ── Step 13d: Refresh stale theses (>7 days old, not in today's top-20) ──────
+  # ── Step 13d: Refresh stale theses (>7 days old, not in today's rankings) ──────
   echo ""
   echo "Step 13d: Refreshing stale theses (older than 7 days)..."
   step_start
@@ -245,10 +245,10 @@ except Exception as e:
 step_end "Step 13a: Candidate snapshot archive"
 echo ""
 
-# ── Step 13c: Daily Top-20 ranking ───────────────────────
-# Loads yesterday's top-20 from Supabase, generates today's ranking,
-# and upserts 20 rows into daily_rankings. No API cost.
-echo "Step 13c: Generating daily Top-20 ranking and saving to Supabase..."
+# ── Step 13c: Daily rankings ──────────────────────────────
+# Loads yesterday's rankings from Supabase, generates today's ranking,
+# and upserts rows into daily_rankings. No API cost.
+echo "Step 13c: Generating daily rankings and saving to Supabase..."
 step_start
 python3 -c "
 from utils.ticker_selector import select_top_tickers
@@ -268,12 +268,12 @@ try:
         event_queue=event_queue or None,
     )
     top20 = run_daily_top20_pipeline(candidates, open_positions=open_pos)
-    print(f'  Top-20 ranking complete ({len(top20)} names)')
+    print(f'  Rankings complete ({len(top20)} names)')
 except Exception as e:
-    print(f'  Top-20 ranking skipped: {e}', file=sys.stderr)
+    print(f'  Rankings skipped: {e}', file=sys.stderr)
     traceback.print_exc()
 "
-step_end "Step 13c: Daily Top-20 ranking"
+step_end "Step 13c: Daily rankings"
 echo ""
 
 # ── Step 13d: Options screener snapshot ──────────────────
