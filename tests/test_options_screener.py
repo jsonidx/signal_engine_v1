@@ -30,6 +30,19 @@ def clear_cache():
     _cache._store.clear()
 
 
+@pytest.fixture(autouse=True)
+def _block_live_persist():
+    # Prevent any test in this file from writing to the live Supabase DB.
+    # The screener endpoint imports save_option_candidate_snapshot inside its
+    # function body, so patching the module attribute here intercepts it at
+    # call time — before the fire-and-forget executor thread captures the binding.
+    # TestScreenerPersistence tests that need a real mock supply their own
+    # `with patch(...)` block; that inner patch stacks on top of this one and
+    # takes precedence for the duration of the with block.
+    with patch("utils.supabase_persist.save_option_candidate_snapshot", return_value=[]):
+        yield
+
+
 def _expiry(days: int) -> str:
     return (date.today() + timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -215,9 +228,12 @@ class TestOptionsScreenerEndpoint:
         ):
             _cache.invalidate("options_screener:2:20")
             client.get("/api/options/screener")
+            count_after_first = db_mock.call_count
+            # First request must hit the DB at least once (screener tickers + portfolio context)
+            assert count_after_first >= 1
             client.get("/api/options/screener")
-            # DB should only be hit once (second request served from cache)
-            assert db_mock.call_count == 1
+            # Second request must be served from cache — no additional DB calls
+            assert db_mock.call_count == count_after_first
 
     def test_higher_conviction_prefers_filter(self):
         high_conv = [r for r in _make_thesis_rows(4) if r["conviction"] >= 3]

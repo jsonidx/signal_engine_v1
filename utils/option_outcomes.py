@@ -112,6 +112,9 @@ def resolve_snapshot(
 
     Returns list of outcome dicts (one per resolution_type), ready for
     save_option_candidate_outcome().
+
+    TRD-044: each outcome now carries target_projection_method and v2 hit
+    markers (hit_v2_tp1/tp2/stop) so legacy and v2 accuracy can be compared.
     """
     ticker = snapshot.get("ticker", "")
     run_date_val = snapshot.get("run_date") or snapshot.get("created_at")
@@ -120,6 +123,11 @@ def resolve_snapshot(
     opt_tp1 = snapshot.get("option_take_profit_1")
     opt_tp2 = snapshot.get("option_take_profit_2")
     opt_sl = snapshot.get("option_stop_loss")
+    # V2 projected targets (from TRD-043)
+    v2_tp1 = snapshot.get("projected_option_tp1")
+    v2_tp2 = snapshot.get("projected_option_tp2")
+    v2_stop = snapshot.get("projected_option_stop")
+    target_projection_method = snapshot.get("target_projection_method")
     und_t1 = snapshot.get("underlying_target_1")
     und_t2 = snapshot.get("underlying_target_2")
     und_stop = snapshot.get("underlying_stop")
@@ -185,14 +193,26 @@ def resolve_snapshot(
                 hit_t2 = (und_t2 is not None and und_px <= und_t2)
                 hit_stop = (und_stop is not None and und_px >= und_stop)
 
-        # Option target/stop hit markers (approx)
+        # Legacy option target/stop hit markers (flat multiplier targets)
         hit_opt_tp1 = (new_opt_mid is not None and opt_tp1 is not None and new_opt_mid >= opt_tp1)
         hit_opt_tp2 = (new_opt_mid is not None and opt_tp2 is not None and new_opt_mid >= opt_tp2)
         hit_opt_stop = (new_opt_mid is not None and opt_sl is not None and new_opt_mid <= opt_sl)
 
+        # V2 hit markers (projected delta-based targets — TRD-044)
+        hit_v2_tp1: Optional[bool] = None
+        hit_v2_tp2: Optional[bool] = None
+        hit_v2_stop: Optional[bool] = None
+        if new_opt_mid is not None:
+            if v2_tp1 is not None:
+                hit_v2_tp1 = new_opt_mid >= v2_tp1
+            if v2_tp2 is not None:
+                hit_v2_tp2 = new_opt_mid >= v2_tp2
+            if v2_stop is not None:
+                hit_v2_stop = new_opt_mid <= v2_stop
+
         hit_target = hit_t1 or hit_opt_tp1 or False
 
-        # Exit reason (first triggered)
+        # Exit reason (first triggered; legacy targets drive live exit decisions)
         exit_reason = None
         if hit_opt_tp2:
             exit_reason = "tp2"
@@ -226,6 +246,11 @@ def resolve_snapshot(
         outcome["hit_underlying_t2"] = hit_t2
         outcome["hit_underlying_stop"] = hit_stop
         outcome["hit_target"] = hit_target
+        # TRD-044: v2 comparator fields
+        outcome["target_projection_method"] = target_projection_method
+        outcome["hit_v2_tp1"]  = hit_v2_tp1
+        outcome["hit_v2_tp2"]  = hit_v2_tp2
+        outcome["hit_v2_stop"] = hit_v2_stop
         outcome["expired_itm"] = None   # Populated only at expiry resolution
         outcome["notes"] = f"Delta-approx resolution at {rt} window"
 

@@ -49,6 +49,7 @@ vi.mock('../../lib/api', () => ({
     tickerOHLCV:            vi.fn().mockResolvedValue(null),
     tickerEarningsReactions:vi.fn().mockResolvedValue(null),
     tickerAnalogs:          vi.fn().mockResolvedValue(null),
+    tickerAnalyze:          vi.fn().mockResolvedValue({ status: 'idle', symbol: 'AAPL' }),
     tickerAnalyzeStatus:    vi.fn().mockResolvedValue({ status: 'idle', symbol: 'AAPL' }),
     darkpoolTicker:         vi.fn().mockResolvedValue([]),
     signalsHeatmap:         vi.fn().mockResolvedValue([]),
@@ -1017,5 +1018,97 @@ describe('OptionCandidatesCard — Buy Decision Badge (TRD-054)', () => {
     expect(
       screen.getByText('Do not buy: blocked by both portfolio risk policy and entry quality.')
     ).toBeInTheDocument()
+  })
+})
+
+// ─── Tests: Primary query error state (BUG-001) ───────────────────────────────
+
+describe('TickerPage — primary query error state (BUG-001)', () => {
+  it('renders an explicit error message when signalsTicker rejects', async () => {
+    vi.mocked(api.signalsTicker).mockRejectedValue(new Error('network timeout'))
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(null as any)
+    renderTickerPage()
+
+    expect(
+      await screen.findByText(/failed to load aapl/i)
+    ).toBeInTheDocument()
+  })
+
+  it('does not render the loading skeleton after signalsTicker rejects', async () => {
+    vi.mocked(api.signalsTicker).mockRejectedValue(new Error('backend busy'))
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(null as any)
+    renderTickerPage()
+
+    await screen.findByText(/failed to load/i)
+    // Once the error state is shown the loading skeleton must be gone
+    expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument()
+  })
+})
+
+describe('AnalyzeButton — queued state (TRD-072)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal() as any)
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(makeCandidatesResponse() as any)
+  })
+
+  it('renders "queued…" indicator when tickerAnalyze returns status=queued', async () => {
+    vi.mocked(api.tickerAnalyze).mockResolvedValue({
+      status: 'queued', symbol: 'AAPL', llm: 'grok-4.3',
+    } as any)
+    // Keep status as queued so the 5-second poll does not overwrite the UI state
+    vi.mocked(api.tickerAnalyzeStatus).mockResolvedValue({
+      status: 'queued', symbol: 'AAPL', llm: 'grok-4.3', queued_at: '2026-06-10T00:00:00Z',
+    } as any)
+
+    renderTickerPage()
+    await screen.findByText(/ai analysis/i)
+    await userEvent.click(screen.getByRole('button', { name: /ai analysis/i }))
+
+    expect(await screen.findByText(/grok 4\.3: queued/i)).toBeInTheDocument()
+  })
+})
+
+describe('ModelRerunButton — queued state (TRD-072)', () => {
+  beforeEach(() => {
+    vi.mocked(api.signalsTicker).mockResolvedValue(makeSignal({
+      latest_theses_by_model: [
+        { model_used: 'grok-4.3', direction: 'BULL', date: '2026-06-10' },
+      ],
+    }) as any)
+    vi.mocked(api.tickerOptionCandidates).mockResolvedValue(makeCandidatesResponse() as any)
+  })
+
+  it('renders "○ queued…" indicator when tickerAnalyze returns status=queued', async () => {
+    vi.mocked(api.tickerAnalyze).mockResolvedValue({
+      status: 'queued', symbol: 'AAPL', llm: 'grok-4.3',
+    } as any)
+    vi.mocked(api.tickerAnalyzeStatus).mockResolvedValue({
+      status: 'queued', symbol: 'AAPL', llm: 'grok-4.3', queued_at: '2026-06-10T00:00:00Z',
+    } as any)
+
+    renderTickerPage()
+    // Use exact button text to distinguish from AnalyzeButton ("↻ Re-run AI analysis")
+    const rerunButton = await screen.findByRole('button', { name: '↻ re-run' })
+    await userEvent.click(rerunButton)
+
+    expect(await screen.findByText(/○ queued…/i)).toBeInTheDocument()
+  })
+
+  it('shows running when the initial status poll returns running', async () => {
+    vi.mocked(api.tickerAnalyze).mockResolvedValue({
+      status: 'queued', symbol: 'AAPL', llm: 'grok-4.3',
+    } as any)
+    // The initial (immediate) status fetch returns running — simulates slot opening before first poll
+    vi.mocked(api.tickerAnalyzeStatus).mockResolvedValue({
+      status: 'running', symbol: 'AAPL', llm: 'grok-4.3', started_at: '2026-06-10T00:00:00Z',
+    } as any)
+
+    renderTickerPage()
+    // Use exact button text to distinguish from AnalyzeButton ("↻ Re-run AI analysis")
+    const rerunButton = await screen.findByRole('button', { name: '↻ re-run' })
+    await userEvent.click(rerunButton)
+
+    // tickerAnalyze returned queued, so polling starts; first poll returns running immediately
+    expect(await screen.findByText(/⬤ running…/i)).toBeInTheDocument()
   })
 })

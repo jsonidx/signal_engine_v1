@@ -22,8 +22,10 @@ from Black-Scholes using the chain's implied-vol field).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, List, Optional
@@ -32,6 +34,9 @@ log = logging.getLogger(__name__)
 
 # yfinance is a hard project dependency (already used everywhere)
 import yfinance as yf
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _get_underlying_price_yf(ticker: str) -> Optional[float]:
@@ -205,6 +210,13 @@ class IBKROptionsAdapter:
                 "IB Gateway or TWS is running"
             )
         try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    asyncio.get_event_loop()
+                except RuntimeError:
+                    asyncio.set_event_loop(asyncio.new_event_loop())
             self._ib = IB()
             self._ib.connect(self.host, self.port, clientId=self.client_id, timeout=10)
             if not self._ib.isConnected():
@@ -678,9 +690,9 @@ def get_option_chain(
     max_dte: int = 180,
     max_expiries: int = 4,
     strikes_around_atm: int = 8,
-    ibkr_host: str = "127.0.0.1",
-    ibkr_port: int = 7497,
-    ibkr_client_id: int = 10,
+    ibkr_host: Optional[str] = None,
+    ibkr_port: Optional[int] = None,
+    ibkr_client_id: Optional[int] = None,
     force_yfinance: bool = False,
 ) -> OptionChainResult:
     """
@@ -692,17 +704,51 @@ def get_option_chain(
     Args:
         force_yfinance: Skip IBKR entirely, useful in tests.
     """
+    if ibkr_host is None:
+        ibkr_host = os.getenv("IBKR_HOST", "127.0.0.1")
+
+    if ibkr_port is None:
+        try:
+            ibkr_port = int(os.getenv("IBKR_PORT", "7497"))
+        except ValueError:
+            ibkr_port = 7497
+
+    if ibkr_client_id is None:
+        try:
+            ibkr_client_id = int(os.getenv("IBKR_CLIENT_ID", "10"))
+        except ValueError:
+            ibkr_client_id = 10
+
     if not force_yfinance and _IB_AVAILABLE:
         adapter = IBKROptionsAdapter(ibkr_host, ibkr_port, ibkr_client_id)
         try:
             adapter.connect()
-            return adapter.get_chain(
+            ibkr_result = adapter.get_chain(
                 ticker,
                 min_dte=min_dte,
                 max_dte=max_dte,
                 max_expiries=max_expiries,
                 strikes_around_atm=strikes_around_atm,
             )
+            usable_quotes = any(
+                c.mid is not None and c.mid >= 0.01
+                for c in ibkr_result.contracts
+            )
+            if ibkr_result.contracts and usable_quotes:
+                return ibkr_result
+            if ibkr_result.contracts and not usable_quotes:
+                log.warning(
+                    "IBKR returned %d contracts for %s but no usable option quotes; "
+                    "falling back to yfinance",
+                    len(ibkr_result.contracts),
+                    ticker.upper(),
+                )
+            elif ibkr_result.error:
+                log.warning(
+                    "IBKR returned no usable contracts for %s (%s); falling back to yfinance",
+                    ticker.upper(),
+                    ibkr_result.error,
+                )
         except IBKRAuthError as exc:
             log.warning("IBKR unavailable (%s) — falling back to yfinance", exc)
         except IBKRNoDataError:

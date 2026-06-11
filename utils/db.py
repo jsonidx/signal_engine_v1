@@ -73,6 +73,7 @@ def get_connection() -> psycopg2.extensions.connection:
     return psycopg2.connect(
         _get_dsn(),
         cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=10,
     )
 
 

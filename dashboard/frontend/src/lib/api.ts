@@ -1365,6 +1365,25 @@ export const api = {
   optionsScoringReview: (days = 90) =>
     client.get('/api/options/scoring-review', { params: { days } }).then(r => r.data),
 
+  // Deep Dive
+  deepdiveTickers: <T = unknown>(): Promise<T[]> =>
+    client.get('/api/deepdive/tickers').then(r => (r.data?.data ?? []) as T[]),
+
+  deepdiveLiveZones: <T = Record<string, unknown>>(): Promise<T> =>
+    client.get('/api/deepdive/live-zones').then(r => (r.data?.zones ?? {}) as T),
+
+  deepdivePremarketPrices: (): Promise<Record<string, number>> =>
+    client.get('/api/deepdive/premarket-prices').then(r => r.data?.prices ?? {}),
+
+  blacklistGet: (): Promise<{ ticker: string }[]> =>
+    client.get('/api/blacklist').then(r => r.data.blacklist ?? []),
+
+  blacklistAdd: (ticker: string): Promise<void> =>
+    client.post(`/api/blacklist/${ticker}`).then(() => undefined),
+
+  blacklistRemove: (ticker: string): Promise<void> =>
+    client.delete(`/api/blacklist/${ticker}`).then(() => undefined),
+
   // Universe
   universeStats: (): Promise<UniverseStats> =>
     client.get('/api/universe/stats').then(r => {

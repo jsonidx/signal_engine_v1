@@ -274,18 +274,11 @@ AI_PREMIUM_THRESHOLD = 0.85                       # signal_agreement_score ≥ t
 # ============================================================
 # AI QUANT API CALL LIMITS
 # ============================================================
-AI_QUANT_MAX_TICKERS = 5            # Baseline AI call budget per run (adaptive floor)
+AI_QUANT_MAX_TICKERS = 5            # Force-mode arg default only — not a selection cap
 AI_QUANT_MIN_AGREEMENT = 0.60       # Minimum signal_agreement_score to qualify
 AI_QUANT_MIN_CONVICTION_SCORE = 13  # Minimum composite catalyst score to qualify
 AI_QUANT_ALWAYS_INCLUDE: list = []  # Populated at runtime from trade_journal open positions
 
-# ── TRD-058: Adaptive AI capacity controls ────────────────────────────────────
-# On strong signal days (many tickers scoring above SCORE_THRESHOLD_HIGH), the
-# selection expands up to CAPACITY_MAX.  Weak days stay at MAX_TICKERS floor.
-# Never drops below CAPACITY_MIN even when very few tickers qualify.
-AI_QUANT_CAPACITY_MIN: int   = 2     # Absolute floor (skip only if nothing qualifies)
-AI_QUANT_CAPACITY_MAX: int   = 8     # Absolute ceiling
-AI_QUANT_SCORE_THRESHOLD_HIGH: float = 70.0  # Priority score above this = strong qualifier
 # BEAR direction gets a modest priority penalty so bulls fill top slots first at equal strength
 AI_QUANT_BEAR_DIRECTION_PENALTY: float = 0.85
 

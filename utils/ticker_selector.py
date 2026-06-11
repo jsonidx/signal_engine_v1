@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-TICKER SELECTOR — Priority-based AI synthesis call budgeting
+TICKER SELECTOR — Priority-based AI synthesis selection
 ================================================================================
-Selects the top N tickers for AI synthesis based on pre-resolved signal quality,
-before any API cost is incurred.
+Selects all filter-qualified tickers for AI synthesis based on pre-resolved
+signal quality, before any API cost is incurred.  No static ceiling limits the
+selected set — every ticker that passes the agreement/prob_combined and lane/
+governance gates is included.
 
 The selection runs on output from conflict_resolver.py (data/resolved_signals.json)
 and signal_engine.py (signals_output/equity_signals_YYYYMMDD.csv).
@@ -42,14 +44,8 @@ except ImportError:
     EVENT_QUEUE_MAX_AI_SLOTS = 3
 
 try:
-    from config import (
-        AI_QUANT_CAPACITY_MIN, AI_QUANT_CAPACITY_MAX,
-        AI_QUANT_SCORE_THRESHOLD_HIGH, AI_QUANT_BEAR_DIRECTION_PENALTY,
-    )
+    from config import AI_QUANT_BEAR_DIRECTION_PENALTY
 except ImportError:
-    AI_QUANT_CAPACITY_MIN = 2
-    AI_QUANT_CAPACITY_MAX = 8
-    AI_QUANT_SCORE_THRESHOLD_HIGH = 70.0
     AI_QUANT_BEAR_DIRECTION_PENALTY = 0.85
 
 try:
@@ -239,8 +235,8 @@ def _print_selection_table(
     Print the AI QUANT SELECTION summary table to stdout.
 
     Layout:
-      - Top N dynamic tickers ranked by priority (open positions excluded from rank)
-      - Open positions appended after the dynamic rows, re-sorted by priority
+      - All filter-qualified tickers ranked by priority (open positions excluded from rank)
+      - Open positions appended after the qualified set, re-sorted by priority
       - Each open position row gets an inline flag: ← high attention — open position
     """
     cost_per_call_eur = 0.03
@@ -255,9 +251,9 @@ def _print_selection_table(
     # Build header text — fits within the 61-char inner box width
     if n_open:
         pos_word    = "position" if n_open == 1 else "positions"
-        header_text = f" AI QUANT SELECTION — Top {n_dynamic} dynamic + {n_open} open {pos_word} (high attention)"
+        header_text = f" AI QUANT SELECTION — {n_dynamic} filter-qualified + {n_open} open {pos_word} (high attention)"
     else:
-        header_text = f" AI QUANT SELECTION — Top {n_dynamic} tickers for AI synthesis"
+        header_text = f" AI QUANT SELECTION — {n_dynamic} filter-qualified tickers for AI synthesis"
 
     print()
     print("┌─────────────────────────────────────────────────────────────┐")
@@ -303,9 +299,9 @@ def select_top_tickers(
     event_queue_max_slots: Optional[int] = None,
 ) -> List[dict]:
     """
-    Returns an adaptively sized list of dicts for Claude synthesis.
-    max_tickers is a hard upper bound; the actual count is driven by signal
-    quality (see adaptive capacity below).
+    Returns all filter-qualified tickers as a list of dicts for AI synthesis.
+    No static ceiling caps the result — every ticker that passes the filters is
+    returned.  max_tickers is only honoured in force_tickers mode.
 
     Each dict contains:
       ticker, priority_score, signal_agreement_score, pre_resolved_direction,
@@ -314,17 +310,14 @@ def select_top_tickers(
 
     Selection order:
       1. force_tickers (CLI override) → skip all scoring, return exactly those
-      2. Load resolved_signals.json, filter skip_claude=True
-      3. Filter signal_agreement_score < min_agreement
+      2. Load resolved_signals.json, filter skip_ai_synthesis/skip_claude=True
+      3. Filter signal_agreement_score < min_agreement AND prob_combined < 0.55
       4. Load equity_signals CSV for rank/composite_z lookup
-      5. Score every remaining ticker via compute_priority_score()
+      5. Score every remaining ticker via compute_priority_score(); apply lane
+         and governance multipliers; hard-gate lane_excluded/hard_excluded/QUARANTINE
       6. Sort by score descending
-      7. Inject always_include tickers (open positions, additive on top of normal slots)
-      8. Adaptive capacity: n_slots = max(floor, min(cap, strong_count))
-         where cap   = min(max_tickers, AI_QUANT_CAPACITY_MAX)
-               floor = min(AI_QUANT_CAPACITY_MIN, max_tickers)
-         Weak days select down to floor; strong days expand up to cap.
-         always_include tickers are additive and not bounded by this.
+      7. Inject always_include tickers (open positions) — additive, not capped
+      8. All filter-qualified normal tickers are selected; no truncation
       9. Generate selection_reason for each
      10. Append event_queue tickers (bounded by event_queue_max_slots)
          that are not already selected, even if absent from resolved_signals
@@ -332,7 +325,7 @@ def select_top_tickers(
 
     event_queue: optional list of event candidate dicts from utils/event_queue.py.
                  Each must have at least "ticker" and "reason".  Tickers already
-                 in the normal top selection are de-duplicated and not added twice.
+                 in the normal selection are de-duplicated and not added twice.
     event_queue_max_slots: max additional AI synthesis slots for event candidates
                            (default EVENT_QUEUE_MAX_AI_SLOTS = 3).
     """
@@ -626,32 +619,13 @@ def select_top_tickers(
                 "degraded_position_review_required": _is_inject_override,
             })
 
-    # TRD-058: Adaptive capacity — drive count from qualified strong names.
-    # max_tickers is a hard caller cap; adaptive logic operates within it.
-    #
-    # _caller_cap  = min(max_tickers, CAPACITY_MAX)   — hard ceiling
-    # _floor       = min(CAPACITY_MIN, max_tickers)   — minimum, bounded by caller
-    # n_normal_slots = max(_floor, min(_caller_cap, strong_count))
-    #
-    # Result:
-    #   weak day  (strong_count < CAPACITY_MIN): selects _floor
-    #   normal day: selects strong_count, bounded by [_floor, _caller_cap]
-    #   strong day (strong_count ≥ _caller_cap): selects _caller_cap
-    strong_count = sum(
-        1 for s in normal
-        if s.get("priority_score", 0) >= AI_QUANT_SCORE_THRESHOLD_HIGH
-    )
-    _caller_cap = min(max_tickers, AI_QUANT_CAPACITY_MAX)
-    _floor      = min(AI_QUANT_CAPACITY_MIN, max_tickers)
-    n_normal_slots = max(_floor, min(_caller_cap, strong_count))
+    # All filter-qualified normal tickers are selected — no static ceiling.
+    # always_include (open positions) are additive on top of the full qualified set.
     logger.info(
-        "Adaptive capacity: max=%d strong=%d → slots=%d (floor=%d cap=%d)",
-        max_tickers, strong_count, n_normal_slots, _floor, _caller_cap,
+        "Filter-driven selection: %d qualified normal + %d open positions = %d total",
+        len(normal), len(always_in_scored), len(normal) + len(always_in_scored),
     )
-
-    # Build final top-N: open positions are additive — always n_normal_slots fresh
-    # signals plus every open position on top (total = n_normal_slots + n_open).
-    top = normal[:n_normal_slots] + always_in_scored
+    top = normal + always_in_scored
 
     # ── Step 8: Re-sort by priority; no cap — open positions are additive ─────
     top.sort(key=lambda x: x["priority_score"], reverse=True)

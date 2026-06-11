@@ -156,6 +156,44 @@ class TestSuppression:
         suppressed, _ = _should_suppress(thesis)
         assert not suppressed
 
+    def test_bull_t1_below_current_is_suppressed(self):
+        """BULL thesis where underlying has rallied past T1 — stale thesis."""
+        thesis = ThesisContext(
+            ticker="CRDO", direction="BULL", conviction=3,
+            current_price=225.0, target_1=211.60, target_2=226.54,
+        )
+        suppressed, reason = _should_suppress(thesis)
+        assert suppressed
+        assert reason is not None and "stale" in reason.lower()
+
+    def test_bull_t1_above_current_not_suppressed(self):
+        """BULL thesis with valid targets above current price."""
+        thesis = ThesisContext(
+            ticker="AAPL", direction="BULL", conviction=3,
+            current_price=148.0, target_1=160.0, target_2=175.0,
+        )
+        suppressed, _ = _should_suppress(thesis)
+        assert not suppressed
+
+    def test_bear_t1_above_current_is_suppressed(self):
+        """BEAR thesis where underlying has dropped past T1 — stale thesis."""
+        thesis = ThesisContext(
+            ticker="AAPL", direction="BEAR", conviction=3,
+            current_price=130.0, target_1=145.0, target_2=160.0,
+        )
+        suppressed, reason = _should_suppress(thesis)
+        assert suppressed
+        assert reason is not None and "stale" in reason.lower()
+
+    def test_stale_check_skipped_when_no_current_price(self):
+        """No current_price → stale check cannot fire; not suppressed by it."""
+        thesis = ThesisContext(
+            ticker="AAPL", direction="BULL", conviction=3,
+            current_price=None, target_1=160.0, target_2=175.0,
+        )
+        suppressed, _ = _should_suppress(thesis)
+        assert not suppressed
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Score contract (hard filters)

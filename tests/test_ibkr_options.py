@@ -565,6 +565,63 @@ class TestGetOptionChain:
         assert result.source == "yfinance"
         assert len(result.contracts) > 0
 
+    def test_falls_back_to_yfinance_when_ibkr_has_no_usable_quotes(self):
+        """A non-empty IBKR chain with no valid mids must degrade to yfinance."""
+        import utils.ibkr_options as mod
+
+        ibkr_result = OptionChainResult(
+            ticker="AAPL",
+            underlying_price=150.0,
+            fetch_time="2026-06-08T12:00:00",
+            contracts=[
+                OptionContract(
+                    ticker="AAPL",
+                    expiry=_future_expiry(21),
+                    strike=150.0,
+                    right="C",
+                    dte=21,
+                    bid=None,
+                    ask=None,
+                    mid=None,
+                    source="ibkr",
+                )
+            ],
+            expiries=[_future_expiry(21)],
+            source="ibkr",
+        )
+        yf_result = OptionChainResult(
+            ticker="AAPL",
+            underlying_price=150.0,
+            fetch_time="2026-06-08T12:00:01",
+            contracts=[
+                OptionContract(
+                    ticker="AAPL",
+                    expiry=_future_expiry(21),
+                    strike=150.0,
+                    right="C",
+                    dte=21,
+                    bid=4.0,
+                    ask=4.2,
+                    mid=4.1,
+                    source="yfinance",
+                )
+            ],
+            expiries=[_future_expiry(21)],
+            source="yfinance",
+            partial=True,
+        )
+
+        with patch.object(mod, "_IB_AVAILABLE", True), \
+             patch.object(mod.IBKROptionsAdapter, "connect"), \
+             patch.object(mod.IBKROptionsAdapter, "disconnect"), \
+             patch.object(mod.IBKROptionsAdapter, "get_chain", return_value=ibkr_result), \
+             patch.object(mod, "_yfinance_chain", return_value=yf_result):
+            result = get_option_chain("AAPL")
+
+        assert result.source == "yfinance"
+        assert len(result.contracts) == 1
+        assert result.contracts[0].mid == pytest.approx(4.1)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TRD-055: No IBKR snapshot usage for underlying price

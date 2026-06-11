@@ -509,3 +509,178 @@ class TestThesisContextPersisted:
         sql = inserts[0]
         for col in ("thesis_date", "time_horizon", "signal_agreement"):
             assert col in sql, f"Column '{col}' missing from INSERT SQL"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRD-048: Structure archetype fields persisted (structure_archetype, structure_policy_reason)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStructureArchetypePersisted:
+    """
+    Verifies that structure_archetype and structure_policy_reason from TRD-048
+    are written to option_candidate_snapshots as first-class columns,
+    not buried in features_json or omitted entirely.
+    """
+
+    def _capture(self, candidate: OptionCandidate) -> tuple[list[str], list]:
+        """Run save and return (list_of_sql_strings, flat_param_list)."""
+        captured_sql: list[str] = []
+        captured_params: list[list] = []
+
+        mock_cur = MagicMock()
+        mock_cur.fetchone.side_effect = [
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 1},
+        ]
+
+        def capture(sql, params=None):
+            captured_sql.append(sql)
+            if params:
+                captured_params.append(list(params))
+
+        mock_cur.execute.side_effect = capture
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn = MagicMock()
+        conn.cursor.return_value = ctx
+        cctx = MagicMock()
+        cctx.__enter__ = MagicMock(return_value=conn)
+        cctx.__exit__ = MagicMock(return_value=False)
+
+        result = CandidateResult(
+            ticker="AAPL", generated_at="2026-06-06T12:00:00",
+            suppressed=False, candidates=[candidate],
+            rejection_reasons=[], underlying_price=148.0, chain_source="yfinance",
+        )
+        with patch("utils.db.managed_connection", return_value=cctx):
+            save_option_candidate_snapshot(result, run_date="2026-06-06")
+
+        flat_params = [p for ps in captured_params for p in ps]
+        return captured_sql, flat_params
+
+    def _candidate_with_archetype(
+        self,
+        archetype: str = "medium_swing",
+        reason: str = "Medium swing (2–6-week horizon): standard option range",
+    ) -> OptionCandidate:
+        c = _candidate()
+        object.__setattr__(c, "structure_archetype", archetype)
+        object.__setattr__(c, "structure_policy_reason", reason)
+        return c
+
+    def test_structure_archetype_in_insert_sql(self):
+        """structure_archetype column must appear in the INSERT statement."""
+        c = self._candidate_with_archetype()
+        sqls, _ = self._capture(c)
+        insert_sqls = [s for s in sqls if "INSERT INTO option_candidate_snapshots" in s]
+        assert insert_sqls, "No INSERT found"
+        assert "structure_archetype" in insert_sqls[0]
+
+    def test_structure_policy_reason_in_insert_sql(self):
+        """structure_policy_reason column must appear in the INSERT statement."""
+        c = self._candidate_with_archetype()
+        sqls, _ = self._capture(c)
+        insert_sqls = [s for s in sqls if "INSERT INTO option_candidate_snapshots" in s]
+        assert insert_sqls, "No INSERT found"
+        assert "structure_policy_reason" in insert_sqls[0]
+
+    def test_archetype_value_in_insert_params(self):
+        """The archetype string value must be passed as a parameter (not hardcoded in SQL)."""
+        c = self._candidate_with_archetype(archetype="short_breakout")
+        _, params = self._capture(c)
+        assert "short_breakout" in params, (
+            "structure_archetype value 'short_breakout' must appear in INSERT params"
+        )
+
+    def test_policy_reason_value_in_insert_params(self):
+        """The policy reason string must be passed as a parameter."""
+        reason = "Short-term breakout/momentum (≤14-day horizon)"
+        c = self._candidate_with_archetype(archetype="short_breakout", reason=reason)
+        _, params = self._capture(c)
+        assert reason in params, (
+            f"structure_policy_reason value must appear in INSERT params"
+        )
+
+    def test_null_archetype_written_as_none(self):
+        """A candidate without structure_archetype set must write NULL (not crash)."""
+        c = _candidate()  # no structure_archetype set — falls back to getattr default
+        sqls, params = self._capture(c)
+        insert_sqls = [s for s in sqls if "INSERT INTO option_candidate_snapshots" in s]
+        assert insert_sqls, "No INSERT found"
+        # Column must still be present in SQL even when value is None
+        assert "structure_archetype" in insert_sqls[0]
+
+    def test_all_five_archetypes_round_trip(self):
+        """Each known archetype label persists without error."""
+        archetypes = [
+            "short_breakout", "medium_swing", "slow_macro",
+            "event_sensitive", "default_swing",
+        ]
+        for archetype in archetypes:
+            c = self._candidate_with_archetype(archetype=archetype)
+            _, params = self._capture(c)
+            assert archetype in params, f"Archetype '{archetype}' not found in INSERT params"
+
+    def test_structure_fields_not_in_features_json(self):
+        """
+        structure_archetype must be a first-class column, not buried in features_json.
+        This test guards against accidentally moving it to the JSON blob.
+        """
+        c = self._candidate_with_archetype(archetype="slow_macro")
+        _, params = self._capture(c)
+        json_blobs = [p for p in params if isinstance(p, str) and p.startswith("{")]
+        for blob in json_blobs:
+            try:
+                parsed = json.loads(blob)
+                assert "structure_archetype" not in parsed, (
+                    "structure_archetype must not be inside features_json blob"
+                )
+            except json.JSONDecodeError:
+                pass  # not JSON — fine
+
+    def test_suppressed_row_does_not_include_archetype_columns(self):
+        """
+        Suppression rows use the base dict only — structure_archetype is
+        per-candidate and must not appear in a suppressed-only insert.
+        The base dict does NOT contain structure_archetype, so the INSERT
+        must omit it (NULL by DB default).
+        """
+        captured_sql: list[str] = []
+
+        mock_cur = MagicMock()
+        mock_cur.fetchone.side_effect = [
+            {"tbl": "option_candidate_snapshots"},
+            {"id": 99},
+        ]
+
+        def capture(sql, params=None):
+            captured_sql.append(sql)
+
+        mock_cur.execute.side_effect = capture
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_cur)
+        ctx.__exit__ = MagicMock(return_value=False)
+        conn = MagicMock()
+        conn.cursor.return_value = ctx
+        cctx = MagicMock()
+        cctx.__enter__ = MagicMock(return_value=conn)
+        cctx.__exit__ = MagicMock(return_value=False)
+
+        suppressed = CandidateResult(
+            ticker="MSFT", generated_at="2026-06-06T12:00:00",
+            suppressed=True, suppression_reason="Conviction too low",
+            candidates=[], rejection_reasons=[],
+            underlying_price=None, chain_source="unknown",
+        )
+        with patch("utils.db.managed_connection", return_value=cctx):
+            save_option_candidate_snapshot(suppressed, run_date="2026-06-06")
+
+        insert_sqls = [s for s in captured_sql if "INSERT INTO option_candidate_snapshots" in s]
+        assert insert_sqls, "Expected suppression INSERT"
+        # Suppression row's INSERT must not include structure_archetype
+        # (base dict only — the column stays NULL by default in the DB)
+        assert "structure_archetype" not in insert_sqls[0], (
+            "structure_archetype should not appear in suppression-row INSERT "
+            "(no per-candidate data available)"
+        )

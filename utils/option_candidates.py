@@ -283,6 +283,36 @@ def _should_suppress(thesis: ThesisContext) -> Tuple[bool, Optional[str]]:
             "IV crush risk is high; wait until after the report"
         )
 
+    # Stale-thesis suppression: underlying has already moved past thesis targets
+    cur = thesis.current_price
+    if cur is not None and cur > 0:
+        t1 = thesis.target_1
+        t2 = thesis.target_2
+        if direction == "BULL":
+            # Both targets below current price → no upside left in thesis
+            if t1 is not None and t2 is not None and t1 < cur and t2 < cur:
+                return True, (
+                    f"Underlying (${cur:.2f}) has moved past both thesis targets "
+                    f"(T1 ${t1:.2f}, T2 ${t2:.2f}) — thesis is stale; refresh before screening options"
+                )
+            # T1 is below current price → the primary target is already exceeded or invalid
+            if t1 is not None and t1 < cur:
+                return True, (
+                    f"Underlying (${cur:.2f}) has moved past thesis T1 (${t1:.2f}) — "
+                    "thesis targets are stale; refresh before screening options"
+                )
+        elif direction == "BEAR":
+            if t1 is not None and t2 is not None and t1 > cur and t2 > cur:
+                return True, (
+                    f"Underlying (${cur:.2f}) has moved past both thesis targets "
+                    f"(T1 ${t1:.2f}, T2 ${t2:.2f}) — thesis is stale; refresh before screening options"
+                )
+            if t1 is not None and t1 > cur:
+                return True, (
+                    f"Underlying (${cur:.2f}) has moved past thesis T1 (${t1:.2f}) — "
+                    "thesis targets are stale; refresh before screening options"
+                )
+
     return False, None
 
 

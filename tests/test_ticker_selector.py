@@ -3,9 +3,9 @@
 Tests for utils/ticker_selector.py
 
 Tests 1-7 as specified in the task:
-  1. Basic selection — returns top N sorted by priority_score
+  1. Basic selection — returns all filter-qualified tickers sorted by priority_score
   2. skip_claude filtering — skip_claude=True tickers excluded
-  3. always_include — low-ranked ticker forced into top N, count stays at N
+  3. always_include — low-ranked ticker forced in, additive on top of qualified set
   4. force_tickers override — exact tickers returned, no scoring
   5. min_agreement filter — tickers below threshold excluded
   6. no_limit path — all non-skipped tickers processed (no select_top_tickers call)
@@ -120,39 +120,36 @@ def _build_strong_ticker_resolved(n: int = 20) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Test 1 — Basic selection: returns top 10 sorted by priority_score descending
+# Test 1 — Basic selection: returns ALL filter-qualified tickers, sorted by
+#           priority_score descending, with no static ceiling
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestBasicSelection(unittest.TestCase):
-    def test_weak_day_selects_capacity_min(self):
-        """On a weak day (no strong signals), selection shrinks to CAPACITY_MIN."""
-        from config import AI_QUANT_CAPACITY_MIN
-        resolved = _build_20_ticker_resolved()   # all scores < 70
+    def test_all_qualified_tickers_selected(self):
+        """All tickers that pass the agreement filter are returned — no cap."""
+        resolved = _build_20_ticker_resolved()   # 20 tickers, min_agreement=0.0
         with tempfile.TemporaryDirectory() as tmp:
             rpath = _write_resolved_json(tmp, resolved)
             result = select_top_tickers(
                 resolved_signals_path=rpath,
                 equity_signals_path=None,
-                max_tickers=10,
+                max_tickers=10,  # should have no effect on normal mode
                 min_agreement=0.0,
                 always_include=[],
             )
 
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MIN,
-                         "Weak day: should select exactly CAPACITY_MIN tickers")
+        self.assertEqual(len(result), 20,
+                         "All 20 qualified tickers must be selected; no cap applies")
 
         scores = [r["priority_score"] for r in result]
         self.assertEqual(scores, sorted(scores, reverse=True),
                          "Results must be sorted by priority_score descending")
 
-    def test_strong_day_selects_up_to_capacity_max(self):
-        """On a strong day (many signals above threshold), selection expands to CAPACITY_MAX."""
-        from config import AI_QUANT_CAPACITY_MAX
+    def test_strong_day_selects_all_qualified(self):
+        """On a strong day with 20 signals all selected — no CAPACITY_MAX ceiling."""
         resolved = _build_strong_ticker_resolved(20)
         with tempfile.TemporaryDirectory() as tmp:
             rpath = _write_resolved_json(tmp, resolved)
-            # Equity rank bonus pushes scores above 70 even with 0.80 unknown-lane multiplier.
-            # Lowest: rank=20, cz=1.5 → raw ≈ 85+5+7.5=97.5 → *0.8=78 > 70 ✓
             equity_rows = [(f"S{i:02d}", 21 - i, 1.5) for i in range(1, 21)]
             epath = _write_equity_csv(tmp, equity_rows)
             result = select_top_tickers(
@@ -163,8 +160,8 @@ class TestBasicSelection(unittest.TestCase):
                 always_include=[],
             )
 
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MAX,
-                         "Strong day: should select exactly CAPACITY_MAX tickers")
+        self.assertEqual(len(result), 20,
+                         "Strong day: all 20 qualified tickers must be selected")
 
         scores = [r["priority_score"] for r in result]
         self.assertEqual(scores, sorted(scores, reverse=True),
@@ -215,12 +212,10 @@ class TestSkipClaudeFiltering(unittest.TestCase):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestAlwaysInclude(unittest.TestCase):
-    def test_always_include_forced_in_on_weak_day(self):
-        """always_include ticker is added on top of the adaptive normal-slot selection."""
-        from config import AI_QUANT_CAPACITY_MIN
-        resolved = _build_20_ticker_resolved()   # all weak — normal slots = CAPACITY_MIN
-
-        # Give T01 a very low score so it would not be selected by adaptive logic alone
+    def test_always_include_forced_in_when_below_agreement(self):
+        """always_include ticker bypasses agreement filter and appears even with low score."""
+        # Give T01 a very low agreement so it would be filtered by min_agreement
+        resolved = _build_20_ticker_resolved()
         resolved["T01"]["signal_agreement_score"] = 0.10
         resolved["T01"]["pre_resolved_confidence"] = 0.05
         resolved["T01"]["bull_weight"] = 0.01
@@ -231,16 +226,16 @@ class TestAlwaysInclude(unittest.TestCase):
                 resolved_signals_path=rpath,
                 equity_signals_path=None,
                 max_tickers=10,
-                min_agreement=0.0,
+                min_agreement=0.50,   # T01 agreement=0.10 would normally be filtered out
                 always_include=["T01"],
             )
 
         returned_tickers = {r["ticker"] for r in result}
         self.assertIn("T01", returned_tickers,
-                      "always_include ticker T01 must appear in results")
-        # Open positions are additive on top of adaptive normal slots
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MIN + 1,
-                         f"Total = CAPACITY_MIN({AI_QUANT_CAPACITY_MIN}) + 1 always_include")
+                      "always_include ticker T01 must appear even if below min_agreement")
+        # All other tickers with agreement >= 0.50 must also be present
+        self.assertGreater(len(result), 1,
+                           "Result must include T01 plus other qualifying tickers")
 
     def test_always_include_selection_reason(self):
         resolved = _build_20_ticker_resolved()
@@ -443,18 +438,12 @@ class TestNoLimitPath(unittest.TestCase):
 
 class TestCostEstimateAccuracy(unittest.TestCase):
     def test_cost_estimate_strong_day(self):
-        """
-        With many strong signals, adaptive capacity expands to CAPACITY_MAX.
-        Cost output must match the actual selected count.
-        """
-        from config import AI_QUANT_CAPACITY_MAX
-        # 15 tickers all scoring > 70 → adaptive selects min(CAPACITY_MAX, 15) = CAPACITY_MAX
+        """All 15 strong signals are selected; cost output must match the full count."""
         resolved = _build_strong_ticker_resolved(15)
 
         captured = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             rpath = _write_resolved_json(tmp, resolved)
-            # Equity rank bonus ensures scores exceed 70 after the 0.80 unknown-lane multiplier
             equity_rows = [(f"S{i:02d}", 16 - i, 1.5) for i in range(1, 16)]
             epath = _write_equity_csv(tmp, equity_rows)
             with patch("sys.stdout", captured):
@@ -471,7 +460,7 @@ class TestCostEstimateAccuracy(unittest.TestCase):
         self.assertIn("Estimated cost:", output)
         self.assertIn(expected_cost, output,
                       f"Cost estimate should match {len(result)} tickers × €0.03")
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MAX)
+        self.assertEqual(len(result), 15, "All 15 qualified tickers must be selected")
 
     def test_cost_estimate_matches_count(self):
         """Cost estimate = len(result) × 0.03 EUR."""
@@ -1427,11 +1416,14 @@ class TestSkipAiSynthesisAndLane(unittest.TestCase):
 
 
 # ==============================================================================
-# TRD-058 — Adaptive capacity and bear direction penalty
+# BUG-004 + TRD-058 — Uncapped filter-driven selection and bear direction penalty
 # ==============================================================================
 
 class TestAdaptiveCapacity(unittest.TestCase):
-    """Tests for TRD-058 adaptive AI selection capacity."""
+    """
+    Tests for filter-driven AI selection (BUG-004) and bear direction penalty.
+    Replaces the old adaptive-capacity tests that asserted CAPACITY_MIN/MAX ceilings.
+    """
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
@@ -1467,41 +1459,114 @@ class TestAdaptiveCapacity(unittest.TestCase):
         self.assertGreater(bull_score, bear_score,
                            "BULL ticker must outscore identical BEAR ticker due to penalty")
 
-    def test_weak_day_shrinks_to_capacity_min(self):
-        """On a weak day (no strong signals), selection shrinks to CAPACITY_MIN floor."""
-        from config import AI_QUANT_CAPACITY_MIN
-        # 10 tickers all scoring < 70 (agreement=0.65 → score ~54)
+    def test_zero_qualified_tickers_returns_empty(self):
+        """When no ticker passes the agreement filter, return is empty (no force-fill)."""
+        resolved = {
+            f"T{i}": _make_resolved(f"T{i}", agreement=0.30)
+            for i in range(10)
+        }
+        # Use min_agreement=0.60 explicitly so all 0.30-agreement tickers are filtered
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        result = select_top_tickers(
+            resolved_signals_path=rpath,
+            max_tickers=999,
+            min_agreement=0.60,
+            always_include=[],
+        )
+        self.assertEqual(len(result), 0,
+                         "0 qualified tickers → empty result, no force-fill")
+
+    def test_three_qualified_tickers_returns_three(self):
+        """3 qualifying tickers → exactly 3 returned (no floor expansion)."""
+        resolved = {
+            "A": _make_resolved("A", agreement=0.80),
+            "B": _make_resolved("B", agreement=0.80),
+            "C": _make_resolved("C", agreement=0.80),
+        }
+        result = self._select(resolved, max_tickers=999)
+        self.assertEqual(len(result), 3)
+
+    def test_eight_qualified_tickers_returns_eight(self):
+        """8 qualifying tickers → exactly 8 returned (old CAPACITY_MAX was 8; no longer caps)."""
+        resolved = {f"T{i}": _make_resolved(f"T{i}", agreement=0.80) for i in range(8)}
+        result = self._select(resolved, max_tickers=999)
+        self.assertEqual(len(result), 8)
+
+    def test_25_qualified_tickers_returns_25(self):
+        """25 qualifying tickers → all 25 returned (beyond all former caps)."""
+        resolved = {f"T{i:02d}": _make_resolved(f"T{i:02d}", agreement=0.80)
+                    for i in range(25)}
+        result = self._select(resolved, max_tickers=999)
+        self.assertEqual(len(result), 25,
+                         "25 qualified tickers must all be selected with no ceiling")
+
+    def test_25_qualified_plus_open_positions_all_returned(self):
+        """25 normal + 2 always_include open positions → 27 total."""
+        resolved = {f"T{i:02d}": _make_resolved(f"T{i:02d}", agreement=0.80)
+                    for i in range(25)}
+        resolved["OPEN1"] = _make_resolved("OPEN1", agreement=0.80)
+        resolved["OPEN2"] = _make_resolved("OPEN2", agreement=0.80)
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        import json as _json
+        ru_dict = {t: {"ticker": t, "lane": "execution_core"} for t in resolved}
+        ru_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "ranked_universe.json")
+        with open(ru_path, "w") as f:
+            _json.dump(ru_dict, f)
+        try:
+            result = select_top_tickers(
+                resolved_signals_path=rpath,
+                max_tickers=999,
+                min_agreement=0.0,
+                always_include=["OPEN1", "OPEN2"],
+            )
+        finally:
+            if os.path.exists(ru_path):
+                os.remove(ru_path)
+        tickers = {r["ticker"] for r in result}
+        self.assertEqual(len(result), 27,
+                         "25 normal + 2 open positions = 27 total")
+        self.assertIn("OPEN1", tickers)
+        self.assertIn("OPEN2", tickers)
+
+    def test_25_qualified_plus_event_queue_appended(self):
+        """25 normal qualifiers + event-queue candidates beyond that count."""
+        resolved = {f"T{i:02d}": _make_resolved(f"T{i:02d}", agreement=0.80)
+                    for i in range(25)}
+        rpath = _write_resolved_json(self._tmpdir, resolved)
+        import json as _json
+        ru_dict = {t: {"ticker": t, "lane": "execution_core"} for t in resolved}
+        ru_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "ranked_universe.json")
+        with open(ru_path, "w") as f:
+            _json.dump(ru_dict, f)
+        eq = [{"ticker": "EQ1", "reason": "CATALYST", "score": 0.9}]
+        try:
+            result = select_top_tickers(
+                resolved_signals_path=rpath,
+                max_tickers=999,
+                min_agreement=0.0,
+                event_queue=eq,
+                event_queue_max_slots=3,
+            )
+        finally:
+            if os.path.exists(ru_path):
+                os.remove(ru_path)
+        tickers = {r["ticker"] for r in result}
+        self.assertEqual(len(result), 26,
+                         "25 normal + 1 event-queue = 26 total")
+        self.assertIn("EQ1", tickers)
+
+    def test_weak_day_with_no_agreement_returns_all_qualifiers(self):
+        """Weak day (all scores below old threshold): all still returned since no floor/cap."""
+        # 10 tickers, scores will be ~54 (below old SCORE_THRESHOLD_HIGH=70)
         resolved = {
             f"T{i}": _make_resolved(f"T{i}", agreement=0.65, confidence=0.55)
             for i in range(10)
         }
         result = self._select(resolved, max_tickers=10)
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MIN,
-                         "Weak day: must shrink to CAPACITY_MIN regardless of max_tickers")
-
-    def test_strong_day_expands_to_capacity_max_when_caller_allows(self):
-        """On a strong day, expands up to CAPACITY_MAX when max_tickers ≥ CAPACITY_MAX."""
-        from config import AI_QUANT_CAPACITY_MAX
-        resolved = {
-            f"S{i}": _make_resolved(f"S{i}", agreement=1.0, confidence=1.0, bull_weight=1.0)
-            for i in range(20)
-        }
-        # max_tickers > CAPACITY_MAX: adaptive ceiling takes effect
-        result = self._select(resolved, max_tickers=20)
-        self.assertEqual(len(result), AI_QUANT_CAPACITY_MAX,
-                         "Strong day with large max_tickers: must cap at CAPACITY_MAX")
-
-    def test_caller_cap_respected_on_strong_day(self):
-        """max_tickers is a hard upper bound even when strong signals exceed it."""
-        from config import AI_QUANT_CAPACITY_MAX
-        resolved = {
-            f"S{i}": _make_resolved(f"S{i}", agreement=1.0, confidence=1.0, bull_weight=1.0)
-            for i in range(20)
-        }
-        caller_max = AI_QUANT_CAPACITY_MAX - 2   # e.g., 6 when CAPACITY_MAX=8
-        result = self._select(resolved, max_tickers=caller_max)
-        self.assertLessEqual(len(result), caller_max,
-                             "max_tickers must be respected as a hard cap")
+        self.assertEqual(len(result), 10,
+                         "All 10 qualifying tickers must be returned regardless of score magnitude")
 
     def test_governance_quarantine_excluded(self):
         """QUARANTINE tickers must be hard-gated out of selection."""
