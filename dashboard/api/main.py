@@ -270,6 +270,24 @@ def _no_data(reason: str = "data not available") -> dict:
     return {"data_available": False, "reason": reason, "data": []}
 
 
+# ==============================================================================
+# TRD-082: SNAPSHOT READ HELPER
+# ==============================================================================
+
+def _read_snapshot(segment: str, key: str) -> "dict | None":
+    """Read a persisted dashboard segment snapshot from Supabase.
+
+    Returns the envelope dict (payload, created_at, is_stale, …) or None on
+    any failure.  This is the L2 read layer — the in-process _cache is L1.
+    """
+    try:
+        from utils.supabase_persist import fetch_dashboard_snapshot
+        return fetch_dashboard_snapshot(segment, key)
+    except Exception as exc:
+        log.debug("_read_snapshot(%s, %s) failed: %s", segment, key, exc)
+        return None
+
+
 def get_latest_signals_file(date: str = None) -> Optional[Path]:
     """Return the most recent equity_signals_*.csv, optionally filtered by date."""
     pattern = str(SIGNALS_DIR / "equity_signals_*.csv")
@@ -1416,13 +1434,45 @@ async def signals_heatmap():
 
 @app.get("/api/signals/ticker/{ticker}")
 async def signals_ticker(ticker: str):
-    """Full detail for one ticker: AI thesis + all module signals."""
+    """Full detail for one ticker: AI thesis + all module signals.
+
+    Read path (PERF-006):
+      L1 — in-process TTL cache (_cache)
+      L2 — persisted segment snapshot (dashboard_segment_snapshots, written by ai_quant)
+      L3 — request-time assembly from thesis_cache + live enrichment (fallback)
+
+    Snapshot-backed responses include snapshot_time and snapshot_source metadata.
+    current_price is always overlaid live from L1 cache (no forced yfinance call).
+    """
     ticker = ticker.upper()
     cache_key = f"signals_ticker:{ticker}"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
 
+    # ── L2: try persisted snapshot ────────────────────────────────────────────
+    snap = await asyncio.to_thread(_read_snapshot, "ticker_detail", ticker)
+    if snap is not None and not snap.get("is_stale", True):
+        payload = dict(snap["payload"])
+        # Overlay signal_engine composite_z (always from latest CSV — fast local read)
+        se_z = _equity_signals_composite_z(ticker)
+        if se_z is not None:
+            modules = dict(payload.get("modules") or {})
+            modules["signal_engine"] = se_z
+            payload["modules"] = modules
+        # Overlay current_price from L1 only (no fresh yfinance call on this path)
+        cached_prices = _cache.get("prices:" + ticker)
+        if cached_prices and isinstance(cached_prices, dict):
+            payload["current_price"] = cached_prices.get(ticker)
+        elif _cache.get(f"live_prices:{ticker}"):
+            payload["current_price"] = _cache.get(f"live_prices:{ticker}", {}).get(ticker)
+        payload["snapshot_time"]   = snap.get("created_at")
+        payload["snapshot_source"] = snap.get("source_step") or "ai_quant"
+        result = _json_safe(payload)
+        _cache.set(cache_key, result, TTL_SHORT)
+        return result
+
+    # ── L3: request-time assembly (fallback when no snapshot exists) ──────────
     try:
         conn = _db_connect()
     except Exception as exc:
@@ -1765,6 +1815,9 @@ async def signals_ticker(ticker: str):
             log.exception("consensus_14d failed for %s", ticker)
             result["consensus_14d"] = None
 
+        # L3 path: no persisted snapshot — mark as request-time assembled
+        result["snapshot_time"]   = None
+        result["snapshot_source"] = "request_time"
         result = _json_safe(result)
         _cache.set(cache_key, result, TTL_SHORT)
         return result
@@ -1970,24 +2023,97 @@ async def _refresh_deepdive_cache() -> None:
 
 @app.get("/api/deepdive/tickers")
 async def deepdive_tickers():
-    """All universe tickers for the Deep Dive list. Claude-analyzed tickers have has_thesis=True;
-    unanalyzed tickers from the fundamental CSV appear with has_thesis=False."""
-    # Hot cache hit — return immediately
+    """All universe tickers for the Deep Dive list.
+
+    Read path (PERF-006):
+      L1 — in-process TTL cache (300 s hot, 600 s stale)
+      L2 — persisted segment snapshot (dashboard_segment_snapshots, written post-run)
+      L3 — request-time build (fallback; also seeds snapshot for next request)
+
+    Snapshot responses include snapshot_time and snapshot_source metadata.
+    """
+    # L1 hot cache
     hit = _cache.get("deepdive_tickers")
     if hit is not None:
         return hit
 
-    # Stale-while-revalidate: if we have a previous payload, return it now and refresh in background
+    # L1 stale-while-revalidate
     stale = _cache.get("deepdive_tickers:stale")
     if stale is not None:
         asyncio.create_task(_refresh_deepdive_cache())
         return {**stale, "stale": True}
 
-    # First-ever load: build synchronously so both caches get seeded
+    # L2: try persisted snapshot
+    snap = await asyncio.to_thread(_read_snapshot, "deepdive_list", "all")
+    if snap is not None and not snap.get("is_stale", True):
+        payload = dict(snap["payload"])
+        payload["snapshot_time"]   = snap.get("created_at")
+        payload["snapshot_source"] = snap.get("source_step") or "post_run"
+        _cache.set("deepdive_tickers", payload, 300)
+        _cache.set("deepdive_tickers:stale", payload, 600)
+        return payload
+
+    # L3: build synchronously, seed both caches, and save snapshot for next time
     result = await _build_deepdive_payload()
+    result["snapshot_time"]   = None
+    result["snapshot_source"] = "request_time"
     _cache.set("deepdive_tickers", result, 300)
     _cache.set("deepdive_tickers:stale", result, 600)
+    # Persist so subsequent loads skip request-time assembly
+    asyncio.create_task(_save_deepdive_snapshot_async(result))
     return result
+
+
+async def _save_deepdive_snapshot_async(payload: dict) -> None:
+    """Background task: persist the deepdive list payload to dashboard_segment_snapshots."""
+    try:
+        from utils.supabase_persist import save_dashboard_snapshot
+        from datetime import date as _date
+        save_dashboard_snapshot(
+            segment="deepdive_list",
+            snapshot_key="all",
+            payload=payload,
+            run_date=str(_date.today()),
+            source_step="request_time",
+            stale_after_hours=26,
+        )
+    except Exception as exc:
+        log.debug("_save_deepdive_snapshot_async failed: %s", exc)
+
+
+def save_deepdive_snapshot_sync() -> None:
+    """Producer-side: build the deepdive list payload and persist it.
+
+    Called from run_master.sh post-run step (PERF-006).  Builds the full
+    payload (uses close prices from the last pipeline data fetch) and writes
+    it to dashboard_segment_snapshots so cold page loads read from the snapshot
+    instead of rebuilding the full payload at request time.
+    """
+    try:
+        import asyncio as _asyncio
+        from datetime import date as _date
+        from utils.supabase_persist import save_dashboard_snapshot
+
+        loop = _asyncio.new_event_loop()
+        try:
+            payload = loop.run_until_complete(_build_deepdive_payload())
+        finally:
+            loop.close()
+
+        payload["snapshot_time"]   = datetime.utcnow().isoformat() + "Z"
+        payload["snapshot_source"] = "post_run"
+
+        save_dashboard_snapshot(
+            segment="deepdive_list",
+            snapshot_key="all",
+            payload=payload,
+            run_date=str(_date.today()),
+            source_step="post_run",
+            stale_after_hours=26,
+        )
+        log.info("save_deepdive_snapshot_sync: snapshot saved (%d tickers)", payload.get("count", 0))
+    except Exception as exc:
+        log.warning("save_deepdive_snapshot_sync failed (non-fatal): %s", exc)
 
 
 @app.get("/api/deepdive/live-zones")
@@ -3263,31 +3389,6 @@ def _hot_entry_rankings_sync() -> dict:
                 rank_change = f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "—")
             records.append({**row, "rank": i, "rank_change": rank_change, "run_date": str(today)})
 
-        # ── 8. Snapshot to DB once per day ────────────────────────────────────
-        existing = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM hot_entry_rankings WHERE run_date = %s", (today,)
-        ).fetchone()
-        if existing["cnt"] == 0 and records:
-            for rec in records:
-                conn.execute("""
-                    INSERT INTO hot_entry_rankings
-                        (run_date, rank, ticker, hot_score, status, is_hot,
-                         current_price, entry_low, entry_high,
-                         t1_median, t2_median, prob_t1, prob_t2,
-                         t1_upside_pct, rr, conviction, equity_rank, rank_change)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (run_date, ticker) DO NOTHING
-                """, (
-                    today, rec["rank"], rec["ticker"], rec["hot_score"],
-                    rec["status"], rec["is_hot"], rec["current_price"],
-                    rec["entry_low"], rec["entry_high"],
-                    rec["t1_median"], rec["t2_median"],
-                    rec["prob_t1"], rec["prob_t2"],
-                    rec["t1_upside_pct"], rec["rr"],
-                    rec["conviction"], rec["equity_rank"], rec["rank_change"]
-                ))
-            conn.commit()
-
         conn.close()
 
         result = {
@@ -3304,6 +3405,136 @@ def _hot_entry_rankings_sync() -> dict:
         return _no_data("hot_entry_rankings failed")
 
 
+def save_hot_entry_daily_sync() -> None:
+    """Producer-side: compute hot-entry rankings with close prices and persist to DB.
+
+    Called from run_master.sh post-run step (PERF-007).  Writes today's ranking
+    rows to hot_entry_rankings so rank-change history is built from pipeline data
+    rather than from GET-handler side-effects.
+    """
+    try:
+        from datetime import date as _date, timedelta as _td
+        today = _date.today()
+        conn = _db_connect()
+
+        tc_rows = conn.execute("""
+            SELECT tc.ticker, tc.direction, tc.conviction,
+                   tc.entry_low, tc.entry_high, tc.target_1, tc.target_2, tc.stop_loss,
+                   ss.rank AS equity_rank
+            FROM thesis_cache tc
+            LEFT JOIN (
+                SELECT ticker, rank FROM screener_signals
+                WHERE date = (SELECT MAX(date) FROM screener_signals)
+            ) ss ON ss.ticker = tc.ticker
+            WHERE tc.ticker NOT IN (
+                SELECT ticker FROM blacklist
+                WHERE expires_at IS NULL OR expires_at > NOW()
+            )
+              AND tc.entry_low IS NOT NULL AND tc.entry_high IS NOT NULL
+            ORDER BY tc.date DESC, tc.created_at DESC
+        """).fetchall()
+
+        seen: set = set()
+        theses: list = []
+        for r in tc_rows:
+            t = r["ticker"]
+            if t not in seen:
+                seen.add(t)
+                theses.append(dict(r))
+
+        rk_rows = conn.execute("""
+            SELECT ticker, prob_t1, prob_t2, t1_price, t2_price
+            FROM daily_rankings
+            WHERE run_date = (SELECT MAX(run_date) FROM daily_rankings)
+        """).fetchall()
+        rk_map = {r["ticker"]: r for r in rk_rows}
+
+        tickers_needed = [t["ticker"] for t in theses]
+        fund_map = _fetch_current_prices(tickers_needed) if tickers_needed else {}
+
+        yesterday = today - timedelta(days=1)
+        prev_rows = conn.execute(
+            "SELECT ticker, rank FROM hot_entry_rankings WHERE run_date = %s", (yesterday,)
+        ).fetchall()
+        prev_rank = {r["ticker"]: r["rank"] for r in prev_rows}
+
+        existing = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM hot_entry_rankings WHERE run_date = %s", (today,)
+        ).fetchone()
+
+        if existing["cnt"] > 0:
+            conn.close()
+            log.info("save_hot_entry_daily_sync: rows already exist for %s, skipping", today)
+            return
+
+        records = []
+        for i, t in enumerate(theses, 1):
+            price = fund_map.get(t["ticker"])
+            el, eh = t["entry_low"], t["entry_high"]
+            if el is None or eh is None or price is None:
+                continue
+            if not (el <= price <= eh):
+                continue
+            rk = rk_map.get(t["ticker"], {})
+            entry_mid = (el + eh) / 2
+            t1 = t["target_1"]
+            t2 = t["target_2"]
+            stop = t["stop_loss"]
+            t1_live = rk.get("t1_price") if rk else None
+            t2_live = rk.get("t2_price") if rk else None
+            t1_med  = (t1 + t1_live) / 2 if t1 and t1_live else (t1 or t1_live)
+            t2_med  = (t2 + t2_live) / 2 if t2 and t2_live else (t2 or t2_live)
+            t1_up   = ((t1_med - entry_mid) / entry_mid * 100) if t1_med else None
+            sp_pct  = abs((stop - entry_mid) / entry_mid * 100) if stop else None
+            rr_val  = (abs(t1_up) / sp_pct) if t1_up and sp_pct and sp_pct > 0 else None
+            prob_t1 = float(rk.get("prob_t1") or 0) if rk else 0.0
+            conv    = int(t.get("conviction") or 0)
+            score   = prob_t1 * abs(t1_up) * 2 if prob_t1 and t1_up else 0.0
+            if rr_val:
+                score += min(rr_val, 3) * 3
+            score += conv
+            prev = prev_rank.get(t["ticker"])
+            rank_change = "NEW" if prev is None else (
+                f"+{prev - i}" if prev - i > 0 else (str(prev - i) if prev - i < 0 else "—")
+            )
+            records.append({
+                "run_date": str(today), "rank": i, "ticker": t["ticker"],
+                "hot_score": round(score, 2), "status": "IN_ZONE", "is_hot": False,
+                "current_price": price, "entry_low": el, "entry_high": eh,
+                "t1_median": round(t1_med, 2) if t1_med else None,
+                "t2_median": round(t2_med, 2) if t2_med else None,
+                "prob_t1": prob_t1 or None, "prob_t2": None,
+                "t1_upside_pct": round(t1_up, 2) if t1_up else None,
+                "rr": round(rr_val, 2) if rr_val else None,
+                "conviction": conv, "equity_rank": t.get("equity_rank"),
+                "rank_change": rank_change,
+            })
+
+        for rec in records:
+            conn.execute("""
+                INSERT INTO hot_entry_rankings
+                    (run_date, rank, ticker, hot_score, status, is_hot,
+                     current_price, entry_low, entry_high,
+                     t1_median, t2_median, prob_t1, prob_t2,
+                     t1_upside_pct, rr, conviction, equity_rank, rank_change)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (run_date, ticker) DO NOTHING
+            """, (
+                rec["run_date"], rec["rank"], rec["ticker"], rec["hot_score"],
+                rec["status"], rec["is_hot"], rec["current_price"],
+                rec["entry_low"], rec["entry_high"],
+                rec["t1_median"], rec["t2_median"],
+                rec["prob_t1"], rec["prob_t2"],
+                rec["t1_upside_pct"], rec["rr"],
+                rec["conviction"], rec["equity_rank"], rec["rank_change"]
+            ))
+        conn.commit()
+        conn.close()
+        log.info("save_hot_entry_daily_sync: saved %d rows for %s", len(records), today)
+    except Exception as exc:
+        log.warning("save_hot_entry_daily_sync failed (non-fatal): %s", exc)
+
+
 @app.get("/api/hot-entry/rankings")
 async def hot_entry_rankings():
     """
@@ -3312,8 +3543,8 @@ async def hot_entry_rankings():
     Scoring formula (higher = better buy today):
       score = is_hot_bonus(50) + prob_t1 * t1_upside_pct * 2 + min(rr,3)*3 + conviction
 
-    Saves a daily snapshot to hot_entry_rankings on first call of the day.
-    Returns ranked rows with rank numbers and rank_change vs yesterday.
+    Daily snapshot is written by run_master.sh post-run (PERF-007) rather than
+    on first GET of the day.  Returns ranked rows with rank_change vs yesterday.
     """
     return await asyncio.to_thread(_hot_entry_rankings_sync)
 
@@ -4771,7 +5002,7 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
     Returns immediately. Poll /analyze/status to see when the job completes.
     """
     sym = symbol.upper()
-    _VALID_LLMS = ("grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
+    _VALID_LLMS = ("grok-4.3", "grok-4.20", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
                    "grok", "grok-premium", "claude", "chatgpt")
     llm = req.llm if req.llm in _VALID_LLMS else "grok-4.3"
     job_key = _analysis_job_key(sym, llm)
@@ -4801,7 +5032,8 @@ async def ticker_analyze(symbol: str, req: AnalyzeRequest = AnalyzeRequest()):
         est_cost = round(compute_cost(est_model, 3558, 1300), 4)
     except Exception:
         est_model = {"grok-premium": "grok-4.3", "claude": "claude-opus-4-8", "chatgpt": "gpt-5.1"}.get(llm, llm)
-        est_cost  = {"grok-premium": 0.027, "claude": 0.015, "chatgpt": 0.020}.get(llm, 0.012)
+        # Grok fallback: $1.25/M in · $2.50/M out × (3558 in + 1300 out) ≈ 0.0077 (June 2026)
+        est_cost  = {"grok-premium": 0.0077, "claude": 0.015, "chatgpt": 0.020}.get(llm, 0.0077)
 
     try:
         async with _analysis_launch_lock:
@@ -6276,13 +6508,13 @@ SETTINGS_SCHEMA = [
     # ── AI Analysis ───────────────────────────────────────────────────────────
     ("ai_model_default",       "Default LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for all standard ai_quant runs",
-     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
+     ["grok-4.3", "grok-4.20", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_model_premium",       "Premium LLM",              "AI Analysis",   "select",  "grok-4.3",
      "Model used for high-conviction / manual deep-dive re-runs",
-     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
+     ["grok-4.3", "grok-4.20", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_model_fallback",      "Fallback LLM",             "AI Analysis",   "select",  "grok-4.3",
      "Retry model if primary call fails",
-     ["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
+     ["grok-4.3", "grok-4.20", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8"]),
     ("ai_min_conviction_score","Min Conviction Score",     "AI Analysis",   "number",  "13",
      "Minimum composite catalyst score for a ticker to qualify for AI analysis (0–100)"),
     # ── Calibration ───────────────────────────────────────────────────────────

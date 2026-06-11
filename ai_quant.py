@@ -611,8 +611,140 @@ def save_thesis(thesis: dict) -> None:
                 raise
         conn.commit()
         conn.close()
+        _save_ticker_detail_snapshot(thesis)
     except Exception as e:
         print(f"  [cache] WARNING: Could not save to cache: {e}")
+
+
+def _safe_float_snap(v):
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _save_ticker_detail_snapshot(thesis: dict) -> None:
+    """Save a base ticker-detail snapshot to dashboard_segment_snapshots (TRD-082/PERF-006).
+
+    Contains the stable thesis fields. The API overlays current_price at read time.
+    Non-fatal — any failure is logged and silently swallowed.
+    """
+    try:
+        from utils.supabase_persist import save_dashboard_snapshot
+
+        ticker = (thesis.get("ticker") or "").strip().upper()
+        if not ticker:
+            return
+
+        signals = thesis.get("signals") or {}
+        if isinstance(signals, str):
+            try:
+                signals = json.loads(signals)
+            except Exception:
+                signals = {}
+
+        of  = signals.get("options_flow") or {}
+        dp  = signals.get("dark_pool_flow") or signals.get("dark_pool") or {}
+        sq  = signals.get("squeeze") or signals.get("catalyst") or {}
+        vp  = signals.get("volume_profile") or {}
+
+        # Normalise module scores to [-1,1] (same logic as the API endpoint)
+        sq_raw   = _safe_float_snap(sq.get("squeeze_score_100") or sq.get("short_squeeze_score"))
+        sq_score = round((sq_raw - 50) / 50, 3) if sq_raw is not None else None
+        fu_raw   = signals.get("fundamentals") or {}
+        fu_pct   = _safe_float_snap(fu_raw.get("fundamental_score_pct") or fu_raw.get("composite_score"))
+        fu_score = round((fu_pct - 50) / 50, 3) if fu_pct is not None else None
+
+        modules = {k: v for k, v in {"squeeze": sq_score, "fundamentals": fu_score}.items()
+                   if v is not None}
+
+        catalysts = thesis.get("catalysts")
+        risks     = thesis.get("risks")
+
+        payload = {
+            "data_available":         True,
+            "ticker":                 ticker,
+            "last_updated":           datetime.now().isoformat(),
+            "as_of":                  datetime.now().strftime("%Y-%m-%d"),
+            # AI thesis core
+            "direction":              thesis.get("direction"),
+            "conviction":             thesis.get("conviction"),
+            "signal_agreement_score": thesis.get("signal_agreement_score"),
+            "ai_synthesis":           thesis.get("thesis"),
+            "thesis":                 thesis.get("thesis"),
+            "primary_scenario":       thesis.get("primary_scenario"),
+            "bear_scenario":          thesis.get("bear_scenario"),
+            "key_invalidation":       thesis.get("key_invalidation"),
+            "bull_probability":       thesis.get("bull_probability"),
+            "bear_probability":       thesis.get("bear_probability"),
+            "neutral_probability":    thesis.get("neutral_probability"),
+            "prob_combined":          thesis.get("prob_combined"),
+            "prob_technical":         thesis.get("prob_technical"),
+            "prob_options":           thesis.get("prob_options"),
+            "prob_catalyst":          thesis.get("prob_catalyst"),
+            "prob_news":              thesis.get("prob_news"),
+            "time_horizon":           thesis.get("time_horizon"),
+            "data_quality":           thesis.get("data_quality"),
+            "model_used":             thesis.get("model_used"),
+            "cost_usd":               thesis.get("cost_usd"),
+            # Price levels
+            "entry_low":              thesis.get("entry_low"),
+            "entry_high":             thesis.get("entry_high"),
+            "stop_loss":              thesis.get("stop_loss"),
+            "target_1":               thesis.get("target_1"),
+            "target_2":               thesis.get("target_2"),
+            "position_size_pct":      thesis.get("position_size_pct"),
+            "expected_moves":         thesis.get("expected_moves") or [],
+            "poc":                    _safe_float_snap(vp.get("poc")),
+            "vwap":                   _safe_float_snap(vp.get("vwap_20d")),
+            # Squeeze
+            "squeeze_score":          _safe_float_snap(sq.get("score")),
+            "float_short_pct":        _safe_float_snap(sq.get("short_float_pct") or sq.get("float_short_pct")),
+            "days_to_cover":          _safe_float_snap(sq.get("days_to_cover")),
+            "volume_surge":           _safe_float_snap(sq.get("volume_surge")),
+            "recent_squeeze":         sq.get("recent_squeeze"),
+            "ftd_shares":             sq.get("ftd_shares"),
+            # Options
+            "heat_score":             _safe_float_snap(of.get("heat_score")),
+            "iv_rank":                _safe_float_snap(of.get("iv_rank")),
+            "iv_source":              of.get("iv_source"),
+            "iv_history_days":        of.get("iv_history_days"),
+            "expected_move_pct":      _safe_float_snap(of.get("expected_move_pct")),
+            "put_call_ratio":         _safe_float_snap(of.get("pc_ratio") or of.get("put_call_ratio")),
+            # Dark pool
+            "dark_pool_score":        _safe_float_snap(dp.get("dark_pool_score") or dp.get("score")),
+            # Module scores
+            "modules":                modules,
+            "regime":                 (signals.get("regime") or {}).get("regime"),
+            # Nested compat (kept for backward compat with TickerDetail shape)
+            "ai_thesis": {
+                "direction":              thesis.get("direction"),
+                "conviction":             thesis.get("conviction"),
+                "thesis":                 thesis.get("thesis"),
+                "signal_agreement_score": thesis.get("signal_agreement_score"),
+            },
+            "entry_zone":  {"low": thesis.get("entry_low"), "high": thesis.get("entry_high")},
+            "targets":     [thesis.get("target_1"), thesis.get("target_2")],
+            "signals":     signals,
+            "dark_pool":   dp,
+            "squeeze":     sq,
+            "volume_profile": vp,
+            "options_heat": of,
+            "catalysts":   catalysts if isinstance(catalysts, list) else None,
+            "risks":       risks     if isinstance(risks, list)     else None,
+        }
+
+        save_dashboard_snapshot(
+            segment="ticker_detail",
+            snapshot_key=ticker,
+            payload=payload,
+            run_date=datetime.now().strftime("%Y-%m-%d"),
+            source_step="ai_quant",
+            stale_after_hours=26,
+        )
+    except Exception as exc:
+        logger.debug("_save_ticker_detail_snapshot(%s) failed (non-fatal): %s",
+                     thesis.get("ticker", "?"), exc)
 
 
 def print_cache_table(days: int = 7) -> None:
@@ -1900,8 +2032,13 @@ def _run_top_n_mode(args, use_cache: bool) -> None:
       1. Determine ticker pool (watchlist TIER 1+2, or force list from --tickers)
       2. If --no-limit: use all non-skipped tickers (no priority scoring)
       3. Otherwise: generate data/resolved_signals.json, call select_top_tickers()
+         which returns ALL filter-qualified tickers (no static ceiling)
       4. If --dry-run: print table + cost estimate, exit without calling Claude
       5. Run analyze_ticker() on selected tickers only
+
+    Note: --top-n N is retained as a trigger flag and as a guard for force-ticker
+    mode (--tickers).  In normal (non-force) mode it has no effect on selection
+    count — all filter-qualified tickers are analyzed.
     """
     from utils.ticker_selector import select_top_tickers
 
@@ -4314,7 +4451,7 @@ def main():
     )
     parser.add_argument(
         "--llm", type=str, default=None,
-        choices=["grok-4.3", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
+        choices=["grok-4.3", "grok-4.20", "gpt-5.1", "gpt-5.5", "gpt-5.5-pro", "claude-sonnet-4-6", "claude-opus-4-8",
                  "grok", "grok-premium", "claude", "chatgpt"],
         help="LLM backend override (default: uses ai_model_default from strategy_config DB). Options: grok-4.3, claude-sonnet-4-6, gpt-5.5, etc.",
     )

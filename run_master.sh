@@ -4,10 +4,10 @@
 #   Daily  06:00 Berlin — com.signalengine.skipai.daily    (--skip-ai, €0.00)
 #   Monday 14:45 Berlin — com.signalengine.master.monday   (full run, ~€0.03–0.05)
 #
-# COST ESTIMATE (ai_quant.py --top-n 20):
-#   ~20 Grok API calls × ~$0.009–0.027 = ~$0.18–0.54 per run (grok-4-1-fast-reasoning)
-#   2 runs/week = ~$1.44–4.32/month
-#   Full universe (no cap): python3 ai_quant.py --no-limit  ← WARNING: high cost
+# COST ESTIMATE:
+#   Varies by day — all filter-qualified tickers are analyzed (no fixed cap).
+#   Typical range: 3–25 tickers × ~$0.009–0.027 per call (grok-4-1-fast-reasoning)
+#   Use python3 ai_quant.py --dry-run to preview selected count before a live run.
 #
 # USAGE:
 #   bash run_master.sh             → full run including Grok API (~$0.18–0.54)
@@ -196,7 +196,7 @@ if [ "$SKIP_AI" = true ]; then
   python3 ai_quant.py --backfill-agreement
   step_end "Step 13: AI Quant (synthesis skipped; 13a/13b/13c/13d still run)"
 else
-  echo "Step 13: AI Quant synthesis (top 20 tickers — sonnet-4-6 + thinking)..."
+  echo "Step 13: AI Quant synthesis (all filter-qualified tickers — sonnet-4-6 + thinking)..."
   python3 ai_quant.py --top-n 20
   step_end "Step 13: AI Quant synthesis"
   echo "Step 13 complete — theses saved to ai_quant_cache.db"
@@ -372,6 +372,30 @@ if [ "$INVALIDATE_HTTP" = "200" ]; then
 else
     echo "  WARNING: cache invalidation failed (HTTP $INVALIDATE_HTTP). Dashboard may show stale data until cache expires."
 fi
+
+# ── Post-run: persist deepdive list snapshot (PERF-006) ───────────────────────
+echo "Saving deepdive list snapshot..."
+python3 -c "
+import sys; sys.path.insert(0, '.')
+try:
+    from dashboard.api.main import save_deepdive_snapshot_sync
+    save_deepdive_snapshot_sync()
+    print('  deepdive snapshot saved.')
+except Exception as e:
+    print(f'  WARNING: deepdive snapshot failed (non-fatal): {e}')
+" || true
+
+# ── Post-run: persist hot-entry daily snapshot (PERF-007) ────────────────────
+echo "Saving hot-entry daily snapshot..."
+python3 -c "
+import sys; sys.path.insert(0, '.')
+try:
+    from dashboard.api.main import save_hot_entry_daily_sync
+    save_hot_entry_daily_sync()
+    print('  hot-entry snapshot saved.')
+except Exception as e:
+    print(f'  WARNING: hot-entry snapshot failed (non-fatal): {e}')
+" || true
 
 # ── Timing summary ────────────────────────────────────────
 PIPELINE_END=$(date +%s)

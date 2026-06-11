@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -965,6 +965,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS filing_catalysts_uq
                          COALESCE(accession_number, ''));
 """)
         _ensure_table_security(conn, "filing_catalysts")
+        # Commit DDL separately so concurrent subprocesses don't deadlock on the
+        # index creation lock while also holding a row-exclusive lock for the upsert.
+        conn.commit()
 
         today = _date.today().isoformat()
         rows = []
@@ -3892,3 +3895,182 @@ def fetch_governance_recommendations(days: int = 90) -> dict:
     except Exception as exc:
         logger.warning("fetch_governance_recommendations failed: %s", exc)
         return {**empty, "days": days}
+
+
+# ==============================================================================
+# TRD-082: DASHBOARD SEGMENT SNAPSHOTS
+# ==============================================================================
+# Generic persisted snapshot store for dashboard payload segments.
+# Producer-time writes (ai_quant, post-run pipeline steps) feed this table;
+# GET handlers read from it as L2 behind the in-process L1 cache.
+#
+# Columns:
+#   segment       — logical grouping key, e.g. 'ticker_detail', 'deepdive_list'
+#   snapshot_key  — row discriminator, e.g. ticker symbol or 'all'
+#   run_date      — ISO date of the pipeline/AI run that produced this payload
+#   source_step   — producer step name, e.g. 'ai_quant', 'post_run'
+#   payload_json  — full JSON payload
+#   created_at    — when the snapshot was written
+#   stale_after   — explicit freshness deadline (NULL = never expires)
+#   version       — payload schema version for forward compatibility
+#   meta_json     — optional extra metadata (e.g. ticker count, model_used)
+# ==============================================================================
+
+_DASHBOARD_SEGMENT_SNAPSHOTS_DDL = """
+CREATE TABLE IF NOT EXISTS dashboard_segment_snapshots (
+    segment       TEXT        NOT NULL,
+    snapshot_key  TEXT        NOT NULL,
+    run_date      TEXT,
+    source_step   TEXT,
+    payload_json  JSONB       NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    stale_after   TIMESTAMPTZ,
+    version       INTEGER     DEFAULT 1,
+    meta_json     JSONB,
+    PRIMARY KEY (segment, snapshot_key)
+);
+CREATE INDEX IF NOT EXISTS dss_segment_created_idx
+    ON dashboard_segment_snapshots (segment, created_at DESC);
+"""
+
+
+def save_dashboard_snapshot(
+    segment: str,
+    snapshot_key: str,
+    payload: dict,
+    run_date: str | None = None,
+    source_step: str | None = None,
+    stale_after_hours: int = 26,
+    version: int = 1,
+    meta: dict | None = None,
+) -> None:
+    """
+    Upsert a dashboard segment snapshot into dashboard_segment_snapshots.
+
+    Parameters
+    ----------
+    segment          : logical grouping key, e.g. 'ticker_detail', 'deepdive_list'
+    snapshot_key     : row discriminator, e.g. ticker symbol or 'all'
+    payload          : full JSON-serialisable payload dict
+    run_date         : ISO date of the producing pipeline/AI run
+    source_step      : producer step name, e.g. 'ai_quant', 'post_run'
+    stale_after_hours: hours until the snapshot is considered stale (default 26h)
+    version          : schema version for payload_json (default 1)
+    meta             : optional extra metadata dict
+    """
+    try:
+        run_date = run_date or _today()
+        stale_after_dt = datetime.utcnow() + timedelta(hours=stale_after_hours)
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_DASHBOARD_SEGMENT_SNAPSHOTS_DDL)
+        _ensure_table_security(conn, "dashboard_segment_snapshots")
+        cur.execute(
+            """
+            INSERT INTO dashboard_segment_snapshots
+                (segment, snapshot_key, run_date, source_step,
+                 payload_json, created_at, stale_after, version, meta_json)
+            VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+            ON CONFLICT (segment, snapshot_key) DO UPDATE SET
+                run_date     = EXCLUDED.run_date,
+                source_step  = EXCLUDED.source_step,
+                payload_json = EXCLUDED.payload_json,
+                created_at   = NOW(),
+                stale_after  = EXCLUDED.stale_after,
+                version      = EXCLUDED.version,
+                meta_json    = EXCLUDED.meta_json
+            """,
+            (
+                segment,
+                snapshot_key,
+                run_date,
+                source_step,
+                json.dumps(payload),
+                stale_after_dt.isoformat() + "Z",
+                version,
+                json.dumps(meta) if meta else None,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        logger.info(
+            "dashboard_segment_snapshots: upserted segment=%s key=%s",
+            segment, snapshot_key,
+        )
+    except Exception as exc:
+        logger.warning("save_dashboard_snapshot failed (non-fatal): %s", exc)
+
+
+def fetch_dashboard_snapshot(segment: str, snapshot_key: str) -> "dict | None":
+    """
+    Fetch the latest persisted snapshot for (segment, snapshot_key).
+
+    Returns a dict with:
+      payload      : the original payload dict
+      created_at   : ISO timestamp string of when the snapshot was written
+      run_date     : run date string (may be None)
+      source_step  : producer step name (may be None)
+      stale_after  : ISO timestamp string (may be None)
+      version      : int schema version
+      is_stale     : bool — True if stale_after is in the past
+
+    Returns None when no row exists or on any DB error.
+    """
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(_DASHBOARD_SEGMENT_SNAPSHOTS_DDL)
+        _ensure_table_security(conn, "dashboard_segment_snapshots")
+        cur.execute(
+            """
+            SELECT segment, snapshot_key, run_date, source_step,
+                   payload_json, created_at, stale_after, version
+            FROM dashboard_segment_snapshots
+            WHERE segment = %s AND snapshot_key = %s
+            """,
+            (segment, snapshot_key),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row is None:
+            return None
+        row = dict(row)
+
+        created_at  = row.get("created_at")
+        stale_after = row.get("stale_after")
+
+        is_stale = False
+        if stale_after is not None:
+            try:
+                sa = stale_after.replace(tzinfo=None) if hasattr(stale_after, "replace") else \
+                     datetime.fromisoformat(str(stale_after).rstrip("Z"))
+                is_stale = datetime.utcnow() > sa
+            except Exception:
+                pass
+
+        payload = row.get("payload_json")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+
+        def _ts(v):
+            if v is None:
+                return None
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+        return {
+            "payload":     payload or {},
+            "created_at":  _ts(created_at),
+            "run_date":    row.get("run_date"),
+            "source_step": row.get("source_step"),
+            "stale_after": _ts(stale_after),
+            "version":     row.get("version", 1),
+            "is_stale":    is_stale,
+        }
+    except Exception as exc:
+        logger.debug(
+            "fetch_dashboard_snapshot(%s, %s) failed: %s", segment, snapshot_key, exc
+        )
+        return None

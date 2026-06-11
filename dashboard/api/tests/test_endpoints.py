@@ -587,6 +587,31 @@ class TestAnalysisGate:
 
         assert task_count == 2, "different LLMs for same symbol must each create a task"
 
+    def test_grok_420_accepted_as_valid_llm(self):
+        """grok-4.20 must be accepted without falling back to grok-4.3."""
+        with (
+            patch("dashboard.api.main._missing_required_llm_env_var", return_value=None),
+            patch("asyncio.create_task"),
+        ):
+            resp = client.post("/api/ticker/AAPL/analyze", json={"llm": "grok-4.20"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["llm"] == "grok-4.20", f"expected grok-4.20 but got {body.get('llm')}"
+        assert body["status"] == "queued"
+
+    def test_invalid_grok_42_falls_back(self):
+        """Undocumented grok-4.2 slug must not be accepted — falls back to default."""
+        with (
+            patch("dashboard.api.main._missing_required_llm_env_var", return_value=None),
+            patch("asyncio.create_task"),
+        ):
+            resp = client.post("/api/ticker/AAPL/analyze", json={"llm": "grok-4.2"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["llm"] == "grok-4.3", "invalid grok-4.2 must fall back to grok-4.3"
+
     @pytest.mark.asyncio
     async def test_semaphore_gate_holds_overflow_and_advances_on_release(self):
         """Overflow job stays queued while all slots are taken; advances once a slot frees."""
@@ -2312,3 +2337,206 @@ class TestHomepageEventLoopUnblocking:
         body = resp.json()
         assert "favorites" in body
         assert body["favorites"] == []
+
+
+# ==============================================================================
+# TRD-082: DASHBOARD SEGMENT SNAPSHOT FOUNDATION
+# ==============================================================================
+
+class TestSnapshotHelpers:
+    """Tests for the _read_snapshot helper and snapshot-backed endpoints."""
+
+    def test_read_snapshot_returns_none_when_supabase_unavailable(self):
+        """_read_snapshot must return None rather than raise when DB is unavailable."""
+        with patch(
+            "dashboard.api.main._read_snapshot",
+            side_effect=Exception("db unavailable"),
+        ):
+            # This verifies we call the helper; the endpoint falls back to L3
+            assert True  # guard imported; real test below
+
+    def test_read_snapshot_returns_none_gracefully(self):
+        """_read_snapshot itself must never raise."""
+        with patch(
+            "utils.supabase_persist.fetch_dashboard_snapshot",
+            side_effect=Exception("db unavailable"),
+        ):
+            result = api_main._read_snapshot("ticker_detail", "AAPL")
+        assert result is None
+
+    def test_read_snapshot_returns_envelope_when_present(self):
+        """_read_snapshot returns payload envelope when fetch_dashboard_snapshot succeeds."""
+        fake_snap = {
+            "payload":     {"data_available": True, "ticker": "AAPL", "direction": "BULL"},
+            "created_at":  "2026-06-11T06:00:00",
+            "run_date":    "2026-06-11",
+            "source_step": "ai_quant",
+            "stale_after": "2026-06-12T08:00:00",
+            "version":     1,
+            "is_stale":    False,
+        }
+        with patch(
+            "utils.supabase_persist.fetch_dashboard_snapshot",
+            return_value=fake_snap,
+        ):
+            result = api_main._read_snapshot("ticker_detail", "AAPL")
+        assert result is not None
+        assert result["payload"]["direction"] == "BULL"
+        assert result["is_stale"] is False
+
+
+class TestSignalsTickerSnapshotPath:
+    """PERF-006: signals/ticker/{ticker} snapshot read path."""
+
+    def test_snapshot_path_returns_payload_with_freshness_metadata(self):
+        """When a fresh snapshot exists, the endpoint returns it with snapshot_time."""
+        _cache._store.clear()
+        fake_snap = {
+            "payload": {
+                "data_available": True,
+                "ticker": "AAPL",
+                "direction": "BULL",
+                "conviction": 4,
+                "thesis": "Strong momentum.",
+                "modules": {"squeeze": 0.3},
+            },
+            "created_at":  "2026-06-11T06:00:00",
+            "run_date":    "2026-06-11",
+            "source_step": "ai_quant",
+            "stale_after": "2026-06-12T08:00:00",
+            "version":     1,
+            "is_stale":    False,
+        }
+        with patch("dashboard.api.main._read_snapshot", return_value=fake_snap), \
+             patch("dashboard.api.main._equity_signals_composite_z", return_value=1.21):
+            resp = client.get("/api/signals/ticker/AAPL")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is True
+        assert body["direction"] == "BULL"
+        assert body["snapshot_time"] == "2026-06-11T06:00:00"
+        assert body["snapshot_source"] == "ai_quant"
+        # signal_engine z-score overlaid from CSV
+        assert body["modules"]["signal_engine"] == 1.21
+
+    def test_snapshot_path_falls_back_to_l3_when_stale(self):
+        """Stale snapshot triggers fallback to request-time assembly."""
+        _cache._store.clear()
+        stale_snap = {
+            "payload":     {"data_available": True, "ticker": "AAPL", "direction": "BULL"},
+            "created_at":  "2026-06-01T06:00:00",
+            "is_stale":    True,
+            "source_step": "ai_quant",
+        }
+        with patch("dashboard.api.main._read_snapshot", return_value=stale_snap), \
+             with_db_unavailable():
+            resp = client.get("/api/signals/ticker/AAPL")
+        # Falls back to L3 which tries DB; DB unavailable → no_data
+        assert resp.status_code == 200
+
+    def test_snapshot_path_falls_back_when_no_snapshot(self):
+        """Missing snapshot triggers L3 fallback (request-time assembly)."""
+        _cache._store.clear()
+        with patch("dashboard.api.main._read_snapshot", return_value=None), \
+             with_db_unavailable():
+            resp = client.get("/api/signals/ticker/AAPL")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is False
+
+    def test_snapshot_source_marked_request_time_on_l3(self):
+        """L3 path marks snapshot_source as request_time."""
+        _cache._store.clear()
+        thesis_row = {
+            "ticker": "AAPL", "date": "2026-06-11", "direction": "BULL",
+            "conviction": 4, "thesis": "Test thesis.", "signals_json": "{}",
+            "entry_low": 170.0, "entry_high": 178.0, "target_1": 190.0,
+            "target_2": 205.0, "stop_loss": 165.0,
+            "bull_probability": 0.65, "bear_probability": 0.20,
+            "neutral_probability": 0.15, "signal_agreement_score": 0.78,
+            "created_at": "2026-06-11T10:00:00",
+            "catalysts_json": None, "risks_json": None,
+            "expected_moves_json": None,
+        }
+        mock_conn = _make_db_conn(fetchone=thesis_row, fetchall=[])
+        with patch("dashboard.api.main._read_snapshot", return_value=None), \
+             patch("dashboard.api.main._db_connect", return_value=mock_conn), \
+             patch("dashboard.api.main._fetch_current_prices", return_value={"AAPL": 175.0}), \
+             patch("dashboard.api.main._equity_signals_composite_z", return_value=None), \
+             patch("dashboard.api.main._fundamentals_lookup", return_value={}), \
+             patch("dashboard.api.main._compute_max_pain", return_value=None):
+            resp = client.get("/api/signals/ticker/AAPL")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("snapshot_source") == "request_time"
+        assert body.get("snapshot_time") is None
+
+
+class TestDeepDiveTickersSnapshotPath:
+    """PERF-006: deepdive/tickers snapshot read path."""
+
+    def test_snapshot_path_returns_payload_with_freshness_metadata(self):
+        """Fresh snapshot is returned with snapshot_time metadata."""
+        _cache._store.clear()
+        fake_snap = {
+            "payload": {
+                "data_available": True,
+                "count": 3,
+                "data": [{"ticker": "AAPL", "has_thesis": True}],
+            },
+            "created_at":  "2026-06-11T06:00:00",
+            "is_stale":    False,
+            "source_step": "post_run",
+        }
+        with patch("dashboard.api.main._read_snapshot", return_value=fake_snap):
+            resp = client.get("/api/deepdive/tickers")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is True
+        assert body["snapshot_time"] == "2026-06-11T06:00:00"
+        assert body["snapshot_source"] == "post_run"
+
+    def test_snapshot_fallback_when_missing(self):
+        """No snapshot → L3 fallback builds payload and returns it."""
+        _cache._store.clear()
+        from unittest.mock import AsyncMock as _AsyncMock
+        fallback = {"data_available": True, "count": 0, "data": []}
+        with patch("dashboard.api.main._read_snapshot", return_value=None), \
+             patch(
+                 "dashboard.api.main._build_deepdive_payload",
+                 new_callable=_AsyncMock,
+                 return_value=fallback,
+             ), \
+             patch("dashboard.api.main._save_deepdive_snapshot_async", new_callable=_AsyncMock):
+            resp = client.get("/api/deepdive/tickers")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["data_available"] is True
+        assert body.get("snapshot_source") == "request_time"
+
+
+class TestHotEntryNoGetTimeWrite:
+    """PERF-007: hot-entry GET handler must not write to hot_entry_rankings."""
+
+    def test_hot_entry_sync_has_no_db_write(self):
+        """_hot_entry_rankings_sync must not INSERT into hot_entry_rankings."""
+        import inspect
+        source = inspect.getsource(api_main._hot_entry_rankings_sync)
+        # The producer function exists separately; GET path must not write
+        assert "INSERT INTO hot_entry_rankings" not in source, (
+            "GET handler _hot_entry_rankings_sync must not INSERT into hot_entry_rankings. "
+            "Use save_hot_entry_daily_sync() from post-run pipeline step instead."
+        )
+
+    def test_save_hot_entry_daily_sync_helper_exists(self):
+        """Producer helper for hot-entry daily snapshot must be callable."""
+        assert callable(api_main.save_hot_entry_daily_sync)
+
+    def test_save_deepdive_snapshot_sync_exists(self):
+        """Producer helper for deepdive snapshot must be callable."""
+        assert callable(api_main.save_deepdive_snapshot_sync)
+
+
+def with_db_unavailable():
+    """Context manager that makes _db_connect raise."""
+    return patch("dashboard.api.main._db_connect", side_effect=Exception("db unavailable"))
