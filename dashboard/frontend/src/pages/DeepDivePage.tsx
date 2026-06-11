@@ -1,12 +1,11 @@
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Shell } from '../components/layout/Shell'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { ConvictionDots } from '../components/ui/ConvictionDots'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
-import { api } from '../lib/api'
-import axios from 'axios'
+import { api, type AnalyzeStatus } from '../lib/api'
 import { clsx } from 'clsx'
 
 interface DeepDiveTicker {
@@ -44,7 +43,17 @@ function priceSessionLabel(): 'PM' | 'AH' | null {
   return null
 }
 
-type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR' | 'IN_ENTRY' | 'ZONE_OVERLAP'
+type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_RR' | 'IN_ENTRY' | 'ZONE_OVERLAP' | 'IDEAL_BEAR'
+type DeepDivePreset = 'NONE' | 'PM_REGIME'
+const LLM_OPTIONS = [
+  { value: 'grok-4.3',          label: 'Grok 4.3',           desc: 'xAI Grok 4.3' },
+  { value: 'gpt-5.1',           label: 'GPT-5.1',            desc: 'OpenAI GPT-5.1' },
+  { value: 'gpt-5.5',           label: 'GPT-5.5',            desc: 'OpenAI GPT-5.5' },
+  { value: 'gpt-5.5-pro',       label: 'GPT-5.5 Pro',        desc: 'OpenAI GPT-5.5 Pro' },
+  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6',  desc: 'Anthropic Claude Sonnet 4.6' },
+  { value: 'claude-opus-4-8',   label: 'Claude Opus 4.8',    desc: 'Anthropic Claude Opus 4.8' },
+] as const
+type LLMChoice = typeof LLM_OPTIONS[number]['value']
 
 interface LiveZoneMap {
   [ticker: string]: { buy_zone_low: number; buy_zone_high: number }
@@ -76,8 +85,7 @@ function computeRR(t: DeepDiveTicker): number | null {
 function useDeepDiveTickers() {
   return useQuery({
     queryKey: ['deepdive', 'tickers'],
-    queryFn: () =>
-      axios.get('/api/deepdive/tickers').then(r => (r.data?.data ?? []) as DeepDiveTicker[]),
+    queryFn: () => api.deepdiveTickers<DeepDiveTicker>(),
     staleTime: 2 * 60 * 1000, // 2-min stale — server caches live prices for 5 min
   })
 }
@@ -85,8 +93,7 @@ function useDeepDiveTickers() {
 function useDeepDiveLiveZones() {
   return useQuery({
     queryKey: ['deepdive', 'live-zones'],
-    queryFn: () =>
-      axios.get('/api/deepdive/live-zones').then(r => (r.data?.zones ?? {}) as LiveZoneMap),
+    queryFn: () => api.deepdiveLiveZones<LiveZoneMap>(),
     staleTime: 5 * 60 * 1000,
   })
 }
@@ -106,7 +113,7 @@ function useBlacklist() {
   const queryClient = useQueryClient()
   const { data: blacklistData } = useQuery({
     queryKey: ['blacklist'],
-    queryFn: () => axios.get('/api/blacklist').then(r => r.data.blacklist as { ticker: string }[]),
+    queryFn: () => api.blacklistGet(),
     staleTime: 5 * 60 * 1000,
   })
   const blacklistSet = useMemo(
@@ -116,9 +123,9 @@ function useBlacklist() {
   const toggle = useCallback(async (ticker: string) => {
     try {
       if (blacklistSet.has(ticker)) {
-        await axios.delete(`/api/blacklist/${ticker}`)
+        await api.blacklistRemove(ticker)
       } else {
-        await axios.post(`/api/blacklist/${ticker}`)
+        await api.blacklistAdd(ticker)
       }
     } catch (err) {
       console.error(`[blacklist] ${ticker} failed:`, err)
@@ -221,6 +228,16 @@ function buildSorter(modes: SortMode[]) {
   }
 }
 
+const IDEAL_BEAR_HORIZONS = new Set(['1-2 weeks', '2-4 weeks'])
+function isIdealBear(t: DeepDiveTicker): boolean {
+  return (
+    t.direction === 'BEAR' &&
+    (t.conviction ?? 0) >= 3 &&
+    (t.bear_probability ?? 0) >= 0.50 &&
+    IDEAL_BEAR_HORIZONS.has(t.time_horizon ?? '')
+  )
+}
+
 function isInAiEntryZone(t: DeepDiveTicker): boolean {
   if (t.current_price == null || t.entry_low == null || t.entry_high == null) return false
   return t.current_price >= t.entry_low && t.current_price <= t.entry_high
@@ -234,6 +251,27 @@ function hasZoneOverlap(t: DeepDiveTicker, liveZones: LiveZoneMap): boolean {
   const inAi   = t.current_price >= t.entry_low && t.current_price <= t.entry_high
   const inLive = t.current_price >= lz.buy_zone_low && t.current_price <= lz.buy_zone_high
   return inAi && inLive
+}
+
+function t1DistancePct(t: DeepDiveTicker): number | null {
+  if (t.target_1 == null) return null
+  const entry =
+    t.entry_low != null && t.entry_high != null
+      ? (t.entry_low + t.entry_high) / 2
+      : t.entry_low ?? t.entry_high
+  if (entry == null || entry === 0) return null
+  return Math.abs((t.target_1 - entry) / entry)
+}
+
+function matchesPreset(t: DeepDiveTicker, preset: DeepDivePreset): boolean {
+  if (preset === 'NONE') return true
+
+  return (
+    t.direction === 'BULL' &&
+    (t.conviction ?? 0) >= 3 &&
+    (t.signal_agreement_score ?? 0) >= 0.5 &&
+    (t.prob_combined ?? 0) >= 0.55
+  )
 }
 
 function AgreementBar({ score }: { score: number | null }) {
@@ -572,7 +610,7 @@ function Section({
   )
 }
 
-const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
+const FILTER_OPTIONS: { value: DirectionFilter; label: string; title?: string }[] = [
   { value: 'ALL',          label: 'All' },
   { value: 'ANALYZED',     label: 'Analyzed' },
   { value: 'BULL',         label: 'Bull' },
@@ -581,6 +619,7 @@ const FILTER_OPTIONS: { value: DirectionFilter; label: string }[] = [
   { value: 'HIGH_RR',      label: 'R:R ≥2' },
   { value: 'IN_ENTRY',     label: 'In Entry Zone' },
   { value: 'ZONE_OVERLAP', label: 'Hot Entry' },
+  { value: 'IDEAL_BEAR',   label: 'Ideal Bear', title: 'Bear · conviction ≥3 · bear_prob ≥50% · explicit time horizon — 52% win rate historically' },
 ]
 
 // Strip injected LLM instructions from user-supplied text (prompt injection defense)
@@ -678,10 +717,34 @@ function buildLLMPrompt(
 
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
+  const [preset, setPreset] = useState<DeepDivePreset>('NONE')
   const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
   const [copied, setCopied] = useState(false)
   const [copyFetching, setCopyFetching] = useState(false)
   const [bullOnlyCopy, setBullOnlyCopy] = useState(false)
+  const [bulkLlm, setBulkLlm] = useState<LLMChoice>('grok-4.3')
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [bulkRun, setBulkRun] = useState<{
+    status: 'idle' | 'running' | 'polling' | 'done'
+    total: number
+    started: number
+    completed: number
+    failed: number
+    llm: string
+    tickers: string[]
+    results: AnalyzeStatus[]
+    failures: string[]
+  }>({
+    status: 'idle',
+    total: 0,
+    started: 0,
+    completed: 0,
+    failed: 0,
+    llm: 'grok-4.3',
+    tickers: [],
+    results: [],
+    failures: [],
+  })
   const toggleSort = (mode: SortMode) =>
     setSortModes(prev =>
       prev.includes(mode)
@@ -692,10 +755,11 @@ export function DeepDivePage() {
   const { data: openTickers = [] } = useOpenPositionTickers()
   const { data: liveZones = {} } = useDeepDiveLiveZones()
   const { blacklistSet, toggle: toggleBlacklist } = useBlacklist()
+  const qc = useQueryClient()
 
   const openSet = useMemo(() => new Set(openTickers), [openTickers])
 
-  const { analyzedRows, universeRows, blacklistedRows } = useMemo(() => {
+  const { analyzedRows, universeRows, blacklistedRows, presetMatchCount } = useMemo(() => {
     const all = tickers ?? []
 
     // Separate blacklisted tickers first
@@ -707,7 +771,7 @@ export function DeepDivePage() {
     const universe = active.filter(t => !t.has_thesis)
 
     // Apply direction/quality filter to analyzed tickers
-    const filteredAnalyzed =
+    const baseFilteredAnalyzed =
       filter === 'ALL' || filter === 'ANALYZED'
         ? analyzed
         : filter === 'HIGH_RR'
@@ -716,10 +780,15 @@ export function DeepDivePage() {
             ? analyzed.filter(isInAiEntryZone)
             : filter === 'ZONE_OVERLAP'
               ? analyzed.filter(t => hasZoneOverlap(t, liveZones))
-              : analyzed.filter(t => t.direction === filter)
+              : filter === 'IDEAL_BEAR'
+                ? analyzed.filter(isIdealBear)
+                : analyzed.filter(t => t.direction === filter)
 
-    // Universe tickers: show when filter is ALL only (hide for direction/RR filters)
-    const filteredUniverse = filter === 'ALL' ? universe : []
+    const filteredAnalyzed = baseFilteredAnalyzed.filter(t => matchesPreset(t, preset))
+    const presetMatches = analyzed.filter(t => matchesPreset(t, preset)).length
+
+    // Universe tickers: show when filter is ALL only and no preset is active
+    const filteredUniverse = filter === 'ALL' && preset === 'NONE' ? universe : []
 
     // Sort analyzed section
     const sorter = buildSorter(sortModes)
@@ -733,25 +802,219 @@ export function DeepDivePage() {
       return a.ticker.localeCompare(b.ticker)
     })
 
-    return { analyzedRows: sortedAnalyzed, universeRows: sortedUniverse, blacklistedRows: blacklisted }
-  }, [tickers, filter, sortModes, openSet, liveZones, blacklistSet])
+    return {
+      analyzedRows: sortedAnalyzed,
+      universeRows: sortedUniverse,
+      blacklistedRows: blacklisted,
+      presetMatchCount: presetMatches,
+    }
+  }, [tickers, filter, sortModes, openSet, liveZones, blacklistSet, preset])
 
   const totalShown = analyzedRows.length + universeRows.length
+  const rerunRows = useMemo(
+    () => [...analyzedRows, ...universeRows],
+    [analyzedRows, universeRows],
+  )
+  const rerunTickers = useMemo(
+    () => rerunRows.map(t => t.ticker),
+    [rerunRows],
+  )
+  const bulkLlmLabel = LLM_OPTIONS.find(o => o.value === bulkLlm)?.label ?? bulkLlm
+  const confirmPreview = rerunTickers.slice(0, 8)
+
+  useEffect(() => {
+    if (bulkRun.status !== 'polling' || bulkRun.tickers.length === 0) return
+
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const statuses = await Promise.all(
+          bulkRun.tickers.map((ticker) => api.tickerAnalyzeStatus(ticker)),
+        )
+        if (cancelled) return
+
+        const completed = statuses.filter((s) => s.status !== 'running').length
+        if (completed === statuses.length) {
+          qc.invalidateQueries({ queryKey: ['deepdive', 'tickers'] })
+          qc.invalidateQueries({ queryKey: ['deepdive', 'live-zones'] })
+          setBulkRun(prev => ({
+            ...prev,
+            status: 'done',
+            completed,
+          }))
+          return
+        }
+
+        setBulkRun(prev => ({
+          ...prev,
+          completed,
+        }))
+      } catch {
+        // Keep polling; transient status failures should not abort the batch.
+      }
+    }
+
+    poll()
+    const id = window.setInterval(poll, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [bulkRun.status, bulkRun.tickers, qc])
+
+  const runBulkRerun = async () => {
+    const uniqueTickers = Array.from(new Set(rerunTickers))
+    if (!uniqueTickers.length) {
+      setConfirmOpen(false)
+      return
+    }
+
+    setConfirmOpen(false)
+    setBulkRun({
+      status: 'running',
+      total: uniqueTickers.length,
+      started: 0,
+      completed: 0,
+      failed: 0,
+      llm: bulkLlm,
+      tickers: [],
+      results: [],
+      failures: [],
+    })
+
+    const settled = await Promise.allSettled(
+      uniqueTickers.map(async (ticker) => api.tickerAnalyze(ticker, bulkLlm)),
+    )
+
+    const results: AnalyzeStatus[] = []
+    const startedTickers: string[] = []
+    const failures: string[] = []
+
+    for (let i = 0; i < settled.length; i += 1) {
+      const item = settled[i]
+      if (item.status === 'fulfilled') {
+        results.push(item.value)
+        startedTickers.push(uniqueTickers[i])
+      } else {
+        const err = item.reason as { response?: { data?: { detail?: string } }; message?: string } | undefined
+        const reason = err?.response?.data?.detail ?? err?.message ?? 'launch failed'
+        failures.push(`${uniqueTickers[i]}: ${reason}`)
+      }
+    }
+
+    setBulkRun({
+      status: startedTickers.length > 0 ? 'polling' : 'done',
+      total: uniqueTickers.length,
+      started: results.length,
+      completed: 0,
+      failed: failures.length,
+      llm: bulkLlm,
+      tickers: startedTickers,
+      results,
+      failures,
+    })
+  }
 
   return (
     <Shell title="Deep Dive">
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-xl rounded-lg border border-border-active bg-bg-surface p-5 shadow-2xl">
+            <div className="space-y-3">
+              <div>
+                <div className="font-mono text-[10px] uppercase tracking-widest text-accent-amber">
+                  Confirm Bulk LLM Re-run
+                </div>
+                <div className="mt-2 font-mono text-sm text-text-primary leading-relaxed">
+                  Re-run AI analysis for <span className="text-accent-amber">{rerunTickers.length}</span> ticker{rerunTickers.length !== 1 ? 's' : ''} currently shown in Deep Dive using <span className="text-text-primary">{bulkLlmLabel}</span>?
+                </div>
+              </div>
+
+              <div className="font-mono text-[11px] text-text-tertiary leading-relaxed">
+                Filter: {filter} · Preset: {preset === 'NONE' ? 'none' : 'PM Regime'}
+              </div>
+
+              {confirmPreview.length > 0 && (
+                <div className="rounded border border-border-subtle bg-bg-elevated p-3">
+                  <div className="font-mono text-[10px] uppercase tracking-widest text-text-tertiary mb-2">
+                    Tickers
+                  </div>
+                  <div className="font-mono text-xs text-text-secondary leading-relaxed">
+                    {confirmPreview.join(', ')}
+                    {rerunTickers.length > confirmPreview.length && ` … +${rerunTickers.length - confirmPreview.length} more`}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setConfirmOpen(false)}
+                  className="font-mono text-xs px-3 py-1.5 rounded border border-border-subtle text-text-tertiary hover:text-text-secondary hover:border-border-active transition-colors"
+                >
+                  No
+                </button>
+                <button
+                  onClick={runBulkRerun}
+                  className="font-mono text-xs px-3 py-1.5 rounded border bg-accent-amber/20 border-accent-amber/40 text-accent-amber hover:bg-accent-amber/30 transition-colors"
+                >
+                  Yes
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Filter + sort bar */}
       <div className="flex items-center gap-2 mb-5 flex-wrap">
-        {FILTER_OPTIONS.map(({ value, label }) => (
+        <div className="flex items-center gap-2 mr-2">
+          <span className="font-mono text-[10px] text-text-tertiary">preset:</span>
+          <button
+            onClick={() => setPreset('NONE')}
+            className={clsx(
+              'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+              preset === 'NONE'
+                ? 'bg-bg-elevated text-text-primary border-border-active'
+                : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+            )}
+          >
+            None
+          </button>
+          <button
+            onClick={() => {
+              setPreset('PM_REGIME')
+              setFilter('ANALYZED')
+            }}
+            title="BULL, conviction ≥ 3, agreement ≥ 50%, prob ≥ 55%"
+            className={clsx(
+              'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+              preset === 'PM_REGIME'
+                ? 'bg-accent-amber/20 text-accent-amber border-accent-amber/40'
+                : 'text-accent-amber/60 border-accent-amber/20 hover:text-accent-amber hover:border-accent-amber/40'
+            )}
+          >
+            PM Regime
+          </button>
+          {preset === 'PM_REGIME' && (
+            <span className="font-mono text-[10px] text-accent-amber/80">
+              {presetMatchCount} match{presetMatchCount !== 1 ? 'es' : ''}
+            </span>
+          )}
+        </div>
+
+        <div className="w-px h-4 bg-border-subtle mx-1" />
+
+        {FILTER_OPTIONS.map(({ value, label, title }) => (
           <button
             key={value}
             onClick={() => setFilter(value)}
+            title={title}
             className={clsx(
               'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
               filter === value
                 ? value === 'BULL'
                   ? 'bg-accent-green/20 text-accent-green border-accent-green/40'
-                  : value === 'BEAR'
+                  : value === 'BEAR' || value === 'IDEAL_BEAR'
                     ? 'bg-accent-red/20 text-accent-red border-accent-red/40'
                     : value === 'NEUTRAL'
                       ? 'bg-text-tertiary/20 text-text-secondary border-text-tertiary/30'
@@ -762,7 +1025,9 @@ export function DeepDivePage() {
                           : 'bg-bg-elevated text-text-primary border-border-active'
                 : value === 'ZONE_OVERLAP'
                   ? 'text-accent-amber/60 border-accent-amber/20 hover:text-accent-amber hover:border-accent-amber/40'
-                  : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
+                  : value === 'IDEAL_BEAR'
+                    ? 'text-accent-red/60 border-accent-red/20 hover:text-accent-red hover:border-accent-red/40'
+                    : 'text-text-tertiary border-border-subtle hover:text-text-secondary hover:border-border-active'
             )}
           >
             {label}
@@ -802,8 +1067,41 @@ export function DeepDivePage() {
           {totalShown} ticker{totalShown !== 1 ? 's' : ''}
         </span>
 
+        {preset === 'PM_REGIME' && (
+          <span className="font-mono text-[10px] text-text-tertiary">
+            Hint: T1 above 6% has had lower hit rates so far. Keep 6% in mind as the strongest hit-rate zone, not a hard filter.
+          </span>
+        )}
+
         {/* LLM prompt copy controls */}
         <div className="ml-auto flex items-center gap-1.5 flex-shrink-0">
+          <select
+            value={bulkLlm}
+            onChange={e => setBulkLlm(e.target.value as LLMChoice)}
+            className="font-mono text-xs px-2 py-1.5 rounded border border-border-subtle bg-bg-surface text-text-secondary hover:border-border-active focus:outline-none cursor-pointer"
+            title={LLM_OPTIONS.find(o => o.value === bulkLlm)?.desc}
+          >
+            {LLM_OPTIONS.map(o => (
+              <option key={o.value} value={o.value} title={o.desc}>{o.label}</option>
+            ))}
+          </select>
+          <button
+            onClick={() => setConfirmOpen(true)}
+            disabled={rerunTickers.length === 0 || bulkRun.status === 'running'}
+            className={clsx(
+              'font-mono text-xs px-3 py-1.5 rounded border transition-colors',
+              rerunTickers.length === 0 || bulkRun.status === 'running'
+                ? 'border-border-subtle text-text-tertiary opacity-50 cursor-not-allowed'
+                : 'border-accent-amber/30 text-accent-amber/80 hover:text-accent-amber hover:border-accent-amber/50'
+            )}
+            title={
+              rerunTickers.length === 0
+                ? 'No tickers currently shown'
+                : `Re-run ${rerunTickers.length} shown ticker${rerunTickers.length !== 1 ? 's' : ''} with ${bulkLlmLabel}`
+            }
+          >
+            ↻ Re-run shown tickers
+          </button>
           <button
             onClick={() => setBullOnlyCopy(v => !v)}
             title="Filter copied prompt to BULL tickers with conviction ≥ 3"
@@ -822,8 +1120,7 @@ export function DeepDivePage() {
               setCopyFetching(true)
               let premarketPrices: Record<string, number> = {}
               try {
-                const r = await axios.get('/api/deepdive/premarket-prices')
-                premarketPrices = r.data?.prices ?? {}
+                premarketPrices = await api.deepdivePremarketPrices()
               } catch {
                 // silently fall back to close prices
               }
@@ -847,6 +1144,45 @@ export function DeepDivePage() {
           </button>
         </div>
       </div>
+
+      {bulkRun.status === 'running' && (
+        <div className="mb-4 font-mono text-xs text-accent-amber flex items-center gap-2">
+          <span className="animate-pulse">⬤</span>
+          Starting AI analysis for {bulkRun.total} ticker{bulkRun.total !== 1 ? 's' : ''} with {bulkLlmLabel}…
+        </div>
+      )}
+
+      {bulkRun.status === 'polling' && (
+        <div className="mb-4 font-mono text-xs text-accent-amber flex items-center gap-2">
+          <span className="animate-pulse">⬤</span>
+          Re-run in progress: {bulkRun.completed}/{bulkRun.started} finished · auto-refreshing Deep Dive when complete
+        </div>
+      )}
+
+      {bulkRun.status === 'done' && (
+        <div className="mb-4 rounded border border-border-subtle bg-bg-elevated px-3 py-2">
+          <div className="font-mono text-xs text-text-secondary">
+            Bulk re-run finished: <span className="text-accent-green">{bulkRun.started} started</span>
+            {bulkRun.started > 0 && (
+              <span className="text-text-tertiary"> · {bulkRun.completed || bulkRun.started} completed</span>
+            )}
+            {bulkRun.failed > 0 && (
+              <span className="text-accent-red"> · {bulkRun.failed} failed</span>
+            )}
+            <span className="text-text-tertiary"> · model {LLM_OPTIONS.find(o => o.value === bulkRun.llm)?.label ?? bulkRun.llm}</span>
+          </div>
+          {bulkRun.failed > 0 && (
+            <div className="mt-1 space-y-0.5">
+              {bulkRun.failures.slice(0, 8).map((f, idx) => (
+                <div key={idx} className="font-mono text-[10px] text-accent-red/80">{f}</div>
+              ))}
+              {bulkRun.failures.length > 8 && (
+                <div className="font-mono text-[10px] text-accent-red/60">… +{bulkRun.failures.length - 8} more</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {loadingTickers ? (
         <LoadingSkeleton rows={8} />

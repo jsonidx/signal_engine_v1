@@ -12,6 +12,14 @@ PROJECT_ROOT="$SCRIPT_DIR"
 API_DIR="$PROJECT_ROOT/dashboard/api"
 FRONTEND_DIR="$PROJECT_ROOT/dashboard/frontend"
 
+# Load .env so API process inherits keys (XAI_API_KEY, ANTHROPIC_API_KEY, etc.)
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
 # Activate venv if present
 VENV="$PROJECT_ROOT/venv/bin/activate"
 if [ -f "$VENV" ]; then
