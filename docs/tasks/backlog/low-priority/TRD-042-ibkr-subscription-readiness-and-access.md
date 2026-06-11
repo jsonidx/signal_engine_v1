@@ -3,7 +3,7 @@
 Status: proposed
 Stage: ready
 Type: chore
-Priority: P0
+Priority: P3
 Severity: high
 Owner: Human
 Reviewer: Human
@@ -11,7 +11,7 @@ Product Area: infra
 Category: automation
 Risk: secrets
 Effort: S
-Target Release: before TRD-021
+Target Release: backlog
 Due Date: TBD
 Dependencies: none
 Blocked By: none

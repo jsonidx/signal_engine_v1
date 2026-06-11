@@ -3,7 +3,7 @@
 Status: proposed
 Stage: discovery
 Type: feature
-Priority: P1
+Priority: P3
 Severity: high
 Owner: Claude Code
 Reviewer: Human

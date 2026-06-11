@@ -3,7 +3,7 @@
 Status: proposed
 Stage: discovery
 Type: research
-Priority: P1
+Priority: P3
 Severity: medium
 Owner: Human
 Reviewer: Human
