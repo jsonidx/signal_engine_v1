@@ -4,12 +4,12 @@ utils/usage.py — API usage tracker.
 Logs every AI API call to the Supabase api_usage table.
 Used for cost monitoring and per-user billing when the product launches.
 
-Cost reference (as of April 2026):
-    grok-4-1-fast-reasoning       input=$1.00/M  output=$4.00/M   ← default
-    grok-4-1-fast-non-reasoning   input=$0.20/M  output=$0.80/M
-    grok-4.20-0309-reasoning      input=$3.00/M  output=$12.00/M  ← premium
-    claude-sonnet-4-6             input=$3.00/M  output=$15.00/M  (legacy)
-    claude-opus-4-6               input=$15.00/M output=$75.00/M  (legacy)
+Cost reference (as of June 2026, https://docs.x.ai/developers/pricing):
+    grok-4.3, grok-4.20, grok-4.20-0309-*  input=$1.25/M  output=$2.50/M
+    grok-4-1-fast-reasoning                 input=$1.00/M  output=$4.00/M
+    grok-4-1-fast-non-reasoning             input=$0.20/M  output=$0.80/M
+    claude-sonnet-4-6                       input=$3.00/M  output=$15.00/M  (legacy)
+    claude-opus-4-6                         input=$15.00/M output=$75.00/M  (legacy)
 """
 
 import logging
@@ -20,14 +20,17 @@ logger = logging.getLogger(__name__)
 
 # Cost per 1M tokens (USD)
 _MODEL_COSTS: dict = {
-    # xAI Grok (April 2026)
+    # xAI Grok — current models (June 2026, docs.x.ai/developers/pricing)
+    "grok-4.3":                      {"input": 1.25,  "output": 2.50},
+    "grok-4.20":                     {"input": 1.25,  "output": 2.50},  # alias of grok-4.20-0309-reasoning
+    "grok-4.20-0309-reasoning":      {"input": 1.25,  "output": 2.50},
+    "grok-4.20-0309-non-reasoning":  {"input": 1.25,  "output": 2.50},
+    "grok-4-0709":                   {"input": 1.25,  "output": 2.50},
+    # xAI Grok — retired fast models (kept for historical cost lookups)
     "grok-4-1-fast-reasoning":      {"input": 1.00,  "output": 4.00},
     "grok-4-1-fast-non-reasoning":  {"input": 0.20,  "output": 0.80},
     "grok-4-fast-reasoning":        {"input": 1.00,  "output": 4.00},
     "grok-4-fast-non-reasoning":    {"input": 0.20,  "output": 0.80},
-    "grok-4.20-0309-reasoning":     {"input": 3.00,  "output": 12.00},
-    "grok-4.20-0309-non-reasoning": {"input": 3.00,  "output": 12.00},
-    "grok-4-0709":                  {"input": 3.00,  "output": 12.00},
     "grok-3":                       {"input": 1.00,  "output": 4.00},
     "grok-3-mini":                  {"input": 0.20,  "output": 0.80},
     # Anthropic Claude (legacy)

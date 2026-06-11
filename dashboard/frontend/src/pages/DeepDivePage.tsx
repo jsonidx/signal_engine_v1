@@ -47,6 +47,7 @@ type DirectionFilter = 'ALL' | 'BULL' | 'BEAR' | 'NEUTRAL' | 'ANALYZED' | 'HIGH_
 type DeepDivePreset = 'NONE' | 'PM_REGIME'
 const LLM_OPTIONS = [
   { value: 'grok-4.3',          label: 'Grok 4.3',           desc: 'xAI Grok 4.3' },
+  { value: 'grok-4.20',         label: 'Grok 4.20',          desc: 'xAI Grok 4.20' },
   { value: 'gpt-5.1',           label: 'GPT-5.1',            desc: 'OpenAI GPT-5.1' },
   { value: 'gpt-5.5',           label: 'GPT-5.5',            desc: 'OpenAI GPT-5.5' },
   { value: 'gpt-5.5-pro',       label: 'GPT-5.5 Pro',        desc: 'OpenAI GPT-5.5 Pro' },
