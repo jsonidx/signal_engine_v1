@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS thesis_cache (
     prob_options            FLOAT,
     prob_catalyst           FLOAT,
     prob_news               FLOAT,
+    pipeline_run_id         TEXT,
     UNIQUE (ticker, date)
 );
 

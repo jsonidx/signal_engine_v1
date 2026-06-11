@@ -371,6 +371,18 @@ def _migrate_governance_state_column(cur, conn) -> None:
             pass
 
 
+def _migrate_pipeline_run_id_column(cur, conn) -> None:
+    """Add pipeline_run_id column to thesis_cache if not already present (migration 020)."""
+    try:
+        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS pipeline_run_id TEXT")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def save_thesis(thesis: dict) -> None:
     """Upsert a thesis result into the cache for today."""
     try:
@@ -387,6 +399,8 @@ def save_thesis(thesis: dict) -> None:
         _migrate_attribution_columns(cur, conn)
         # Ensure governance_state column exists (migration 017).
         _migrate_governance_state_column(cur, conn)
+        # Ensure pipeline_run_id column exists (migration 020).
+        _migrate_pipeline_run_id_column(cur, conn)
 
         _base_params = (
             thesis.get("ticker", "").upper(),
@@ -610,6 +624,25 @@ def save_thesis(thesis: dict) -> None:
             else:
                 raise
         conn.commit()
+
+        # Stamp pipeline_run_id so the Telegram notifier can filter by run (migration 020).
+        # Silent fallback: if the column is absent the UPDATE raises and we rollback cleanly.
+        _run_id = os.environ.get("PIPELINE_RUN_ID", "").strip() or None
+        if _run_id:
+            try:
+                _rc = conn.cursor()
+                _rc.execute(
+                    "UPDATE thesis_cache SET pipeline_run_id = %s"
+                    " WHERE ticker = %s AND date = %s",
+                    (_run_id, thesis.get("ticker", "").upper(), date),
+                )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
         conn.close()
         _save_ticker_detail_snapshot(thesis)
     except Exception as e:

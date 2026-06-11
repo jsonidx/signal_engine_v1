@@ -25,16 +25,39 @@ jobs:
   berlin-schedule-guard:
     runs-on: ubuntu-latest
     outputs:
-      should_run: ${{ steps.berlin-time.outputs.should_run }}
+      should_run: ${{ steps.guard.outputs.should_run }}
 
     steps:
-      - name: Check Berlin local time
-        id: berlin-time
+      - name: Determine whether this trigger should run
+        id: guard
         run: |
-          BERLIN_HOUR=$(TZ=Europe/Berlin date +%H)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$BERLIN_HOUR" = "04" ]; then
+          EVENT="${{ github.event_name }}"
+          SCHEDULE="${{ github.event.schedule }}"
+          # +0200 = CEST (summer), +0100 = CET (winter)
+          BERLIN_OFFSET=$(TZ=Europe/Berlin date +%z)
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Trigger: manual dispatch — running unconditionally"
             echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+          elif [ "$EVENT" = "schedule" ]; then
+            # 0 2 * * * is the CEST cron (02:00 UTC = 04:00 UTC+2)
+            # 0 3 * * * is the CET  cron (03:00 UTC = 04:00 UTC+1)
+            # Only the cron that matches the current Berlin DST offset should run;
+            # the other one is suppressed to prevent double-execution on the same day.
+            if [ "$SCHEDULE" = "0 2 * * *" ] && [ "$BERLIN_OFFSET" = "+0200" ]; then
+              echo "Trigger: schedule 0 2 * * * (CEST, offset $BERLIN_OFFSET) — running"
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            elif [ "$SCHEDULE" = "0 3 * * *" ] && [ "$BERLIN_OFFSET" = "+0100" ]; then
+              echo "Trigger: schedule 0 3 * * * (CET, offset $BERLIN_OFFSET) — running"
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Trigger: schedule $SCHEDULE suppressed (Berlin offset $BERLIN_OFFSET — wrong DST mode for this cron)"
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+            fi
+
           else
+            echo "Trigger: unknown event '$EVENT' — suppressing"
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -75,10 +98,11 @@ jobs:
           echo "Running full pipeline with AI synthesis (~€0.03)"
           bash run_master.sh 2>&1 | tee logs/pipeline_report.txt
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          XAI_API_KEY:          ${{ secrets.XAI_API_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          EXA_API_KEY:          ${{ secrets.EXA_API_KEY }}
+          PIPELINE_RUN_ID:      ${{ github.run_id }}
 
       - name: Upload report to Supabase
         if: always()
@@ -98,6 +122,7 @@ jobs:
           DATABASE_URL:         ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          PIPELINE_RUN_ID:      ${{ github.run_id }}
 
       - name: Upload logs
         if: always()

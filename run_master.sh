@@ -43,6 +43,9 @@ mkdir -p "logs"
 
 # ── Timing helpers ────────────────────────────────────────
 PIPELINE_START=$(date +%s)
+# Run ID for thesis attribution (migration 020).  In GitHub Actions this is
+# overridden by PIPELINE_RUN_ID=${{ github.run_id }} in the workflow env.
+export PIPELINE_RUN_ID="${PIPELINE_RUN_ID:-$(date +%Y%m%d_%H%M%S)_local}"
 _timings=()
 
 step_start() {

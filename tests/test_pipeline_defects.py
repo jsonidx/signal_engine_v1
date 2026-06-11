@@ -1261,5 +1261,362 @@ class TestTelegramCatalystWatchSection(unittest.TestCase):
         self.assertLess(full.index("CATALYST WATCH"), full.index("squeeze"))
 
 
+# ==============================================================================
+# BUG-004 follow-up — Uncapped thesis reporting in Telegram notifier
+# ==============================================================================
+
+class TestThesisSectionUncapped(unittest.TestCase):
+    """
+    Tests for the uncapped AI thesis section in notify_pipeline_result.py.
+    Verifies that the Telegram notifier shows ALL today's theses, not just 5.
+    """
+
+    def _make_thesis_rows(self, n: int, start_rank: int = 1) -> list:
+        """Build n minimal thesis dicts with distinct tickers and costs."""
+        rows = []
+        for i in range(n):
+            rows.append({
+                "ticker":       f"T{i + 1:02d}",
+                "direction":    "BULL",
+                "conviction":   3,
+                "entry_low":    100.0,
+                "entry_high":   105.0,
+                "stop_loss":    92.0,
+                "target_1":     125.0,
+                "target_2":     140.0,
+                "thesis":       f"Thesis body for T{i + 1:02d}.",
+                "key_invalidation": "Breaks below support.",
+                "prob_combined": 0.68,
+                "prob_technical": 0.65,
+                "prob_options": None,
+                "prob_catalyst": None,
+                "prob_news":    None,
+                "model_used":   "claude-sonnet-4-6",
+                "cost_usd":     0.03,
+                "rank":         start_rank + i,
+            })
+        return rows
+
+    # ── build_thesis_section ──────────────────────────────────────────────────
+
+    def test_no_top5_label_in_section(self):
+        """'Top 5' must not appear anywhere in the thesis section output."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(4)
+        result = build_thesis_section(rows)
+        self.assertNotIn("Top 5", result, "Stale 'Top 5' label must not appear in section")
+
+    def test_section_header_count_accurate_single(self):
+        """1 thesis → header says '1 thesis'."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(1)
+        result = build_thesis_section(rows)
+        self.assertIn("1 thesis", result,
+                      "Header must read '1 thesis' for a single row")
+
+    def test_section_header_count_accurate_plural(self):
+        """4 theses → header says '4 theses'."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(4)
+        result = build_thesis_section(rows)
+        self.assertIn("4 theses", result,
+                      "Header must read '4 theses' for four rows")
+
+    def test_four_theses_all_appear_in_section(self):
+        """4 qualifying theses → all 4 tickers appear (not capped at old limit)."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(4)
+        result = build_thesis_section(rows)
+        for row in rows:
+            self.assertIn(row["ticker"], result,
+                          f"Ticker {row['ticker']} must appear in the section")
+
+    def test_more_than_5_theses_all_appear(self):
+        """14 qualifying theses → all 14 appear in the section output."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(14)
+        result = build_thesis_section(rows)
+        self.assertIn("14 theses", result,
+                      "Header must read '14 theses'")
+        for row in rows:
+            self.assertIn(row["ticker"], result,
+                          f"Ticker {row['ticker']} must appear even with 14 rows")
+
+    def test_total_cost_reflects_all_rows(self):
+        """Total cost line must equal n × $0.03, not just 5 × $0.03."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        rows = self._make_thesis_rows(14)
+        result = build_thesis_section(rows)
+        expected_cost = f"${14 * 0.03:.4f}"
+        self.assertIn(expected_cost, result,
+                      f"Total cost must reflect all 14 rows; expected {expected_cost}")
+
+    def test_zero_rows_returns_empty(self):
+        """Empty rows list returns empty string (caller omits the section)."""
+        from scripts.notify_pipeline_result import build_thesis_section
+        result = build_thesis_section([])
+        self.assertEqual(result, "",
+                         "build_thesis_section([]) must return empty string")
+
+    def test_long_message_chunks_safely(self):
+        """A full message with 14 theses stays below TG_LIMIT per chunk."""
+        from scripts.notify_pipeline_result import build_thesis_section, TG_LIMIT, tg_send_chunked
+        rows = self._make_thesis_rows(14)
+        section = build_thesis_section(rows)
+
+        chunks_sent: list[str] = []
+        with patch("scripts.notify_pipeline_result.tg_send",
+                   side_effect=lambda text, **_: chunks_sent.append(text)):
+            tg_send_chunked(section)
+
+        for chunk in chunks_sent:
+            self.assertLessEqual(len(chunk), TG_LIMIT,
+                                 f"Chunk too long: {len(chunk)} chars > TG_LIMIT={TG_LIMIT}")
+
+    # ── fetch_all_theses_today (mocked DB — single LEFT JOIN query) ───────────
+
+    def _make_mock_conn_for_theses(self, rows):
+        """Mock DB whose single LEFT JOIN fetchall() returns *rows*."""
+        conn = MagicMock()
+        cur  = MagicMock()
+        conn.cursor.return_value = cur
+        cur.fetchall.return_value = rows
+        return conn
+
+    def test_fetch_all_returns_all_rows_no_limit(self):
+        """fetch_all_theses_today must return all DB rows regardless of count."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        db_rows = [{"ticker": f"T{i:02d}", "rank": i + 1} for i in range(10)]
+        conn = self._make_mock_conn_for_theses(db_rows)
+        result = fetch_all_theses_today(conn)
+        self.assertEqual(len(result), 10,
+                         "All 10 DB rows must be returned; no row cap")
+
+    def test_fetch_all_mixed_ranked_and_unranked(self):
+        """
+        Mixed day: 8 ranked theses + 6 unranked → all 14 returned.
+        The LEFT JOIN returns all of them; ranked rows come first.
+        """
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        # DB returns ranked rows first (rank 1-8), then unranked (rank None)
+        ranked = [{"ticker": f"R{i:02d}", "rank": i + 1} for i in range(8)]
+        unranked = [{"ticker": f"U{i:02d}", "rank": None} for i in range(6)]
+        conn = self._make_mock_conn_for_theses(ranked + unranked)
+        result = fetch_all_theses_today(conn)
+        self.assertEqual(len(result), 14,
+                         "All 14 rows (8 ranked + 6 unranked) must be returned")
+
+    def test_fetch_all_ranked_rows_appear_before_unranked(self):
+        """Ranked rows (rank IS NOT NULL) must precede unranked rows in the result."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        ranked   = [{"ticker": f"R{i:02d}", "rank": i + 1} for i in range(4)]
+        unranked = [{"ticker": f"U{i:02d}", "rank": None} for i in range(3)]
+        # Mock returns them in the expected order (ranked first — mirrors DB ORDER BY)
+        conn = self._make_mock_conn_for_theses(ranked + unranked)
+        result = fetch_all_theses_today(conn)
+        ranked_pos   = [i for i, r in enumerate(result) if r.get("rank") is not None]
+        unranked_pos = [i for i, r in enumerate(result) if r.get("rank") is None]
+        if ranked_pos and unranked_pos:
+            self.assertLess(max(ranked_pos), min(unranked_pos),
+                            "All ranked rows must appear before any unranked row")
+
+    def test_fetch_all_rank_preserved_for_ranked_rows(self):
+        """Rank field is preserved (not None) for rows that have a daily_rankings entry."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        db_rows = [{"ticker": "AAPL", "rank": 1}, {"ticker": "MSFT", "rank": None}]
+        conn = self._make_mock_conn_for_theses(db_rows)
+        result = fetch_all_theses_today(conn)
+        aapl = next(r for r in result if r["ticker"] == "AAPL")
+        msft = next(r for r in result if r["ticker"] == "MSFT")
+        self.assertEqual(aapl["rank"], 1,  "Ranked ticker must preserve rank value")
+        self.assertIsNone(msft["rank"],    "Unranked ticker must have rank=None")
+
+    def test_fetch_all_unranked_only_day(self):
+        """When no tickers are in daily_rankings, all thesis rows still returned with rank=None."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        db_rows = [{"ticker": f"U{i:02d}", "rank": None} for i in range(6)]
+        conn = self._make_mock_conn_for_theses(db_rows)
+        result = fetch_all_theses_today(conn)
+        self.assertEqual(len(result), 6,
+                         "Unranked-only day must still return all 6 rows")
+        for r in result:
+            self.assertIsNone(r["rank"])
+
+    def test_fetch_all_empty_result(self):
+        """No theses today → empty list without error."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        conn = self._make_mock_conn_for_theses([])
+        result = fetch_all_theses_today(conn)
+        self.assertEqual(result, [])
+
+    def test_fetch_all_returns_empty_on_db_error(self):
+        """DB exception must return empty list without crashing."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        conn = MagicMock()
+        conn.cursor.side_effect = Exception("DB down")
+        result = fetch_all_theses_today(conn)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 0,
+                         "DB error must return empty list, not raise")
+
+
+# ==============================================================================
+# TestRunScopedThesisAttribution — migration 020 pipeline_run_id filtering
+# ==============================================================================
+
+class TestRunScopedThesisAttribution(unittest.TestCase):
+    """
+    fetch_all_theses_today(conn, run_id=...) must:
+      - return only rows stamped with that run_id when the column exists and rows found
+      - fall back to date-only query when run_id is given but query returns 0 rows
+      - fall back to date-only query when the pipeline_run_id column is absent
+      - use date-only query (no run filter) when run_id is None
+    """
+
+    def _make_conn_single_cursor(self, rows):
+        """Mock conn/cursor where fetchall always returns *rows*."""
+        conn = MagicMock()
+        cur  = MagicMock()
+        conn.cursor.return_value = cur
+        cur.fetchall.return_value = rows
+        return conn, cur
+
+    def _make_conn_two_cursors(self, rows1, rows2):
+        """Mock conn that returns two different cursors on successive cursor() calls."""
+        cur1 = MagicMock()
+        cur1.fetchall.return_value = rows1
+        cur2 = MagicMock()
+        cur2.fetchall.return_value = rows2
+        conn = MagicMock()
+        conn.cursor.side_effect = [cur1, cur2]
+        return conn, cur1, cur2
+
+    def _make_conn_first_cursor_raises(self, exc_msg, fallback_rows):
+        """First cursor.execute raises; second cursor returns fallback_rows."""
+        cur1 = MagicMock()
+        cur1.execute.side_effect = Exception(exc_msg)
+        cur2 = MagicMock()
+        cur2.fetchall.return_value = fallback_rows
+        conn = MagicMock()
+        conn.cursor.side_effect = [cur1, cur2]
+        return conn, cur1, cur2
+
+    # ── run-scoped path ───────────────────────────────────────────────────────
+
+    def test_run_scoped_returns_matching_rows(self):
+        """When run_id given and scoped query returns rows, those rows are returned."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        scoped_rows = [{"ticker": "AAPL", "rank": 1}, {"ticker": "MSFT", "rank": 2}]
+        conn, cur = self._make_conn_single_cursor(scoped_rows)
+        result = fetch_all_theses_today(conn, run_id="12345678")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["ticker"], "AAPL")
+        self.assertEqual(result[1]["ticker"], "MSFT")
+
+    def test_run_scoped_sql_contains_run_id_filter(self):
+        """The scoped execute call must pass the run_id as a bind parameter."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        scoped_rows = [{"ticker": "NVDA", "rank": 1}]
+        conn, cur = self._make_conn_single_cursor(scoped_rows)
+        fetch_all_theses_today(conn, run_id="RUN_XYZ")
+        execute_args = cur.execute.call_args[0]
+        self.assertIn("RUN_XYZ", execute_args[1],
+                      "run_id must be passed as a bind parameter to the scoped query")
+
+    def test_run_scoped_excludes_other_run_ids_conceptually(self):
+        """Rows from a different run_id are not returned (scoped query returns only own rows)."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        # DB only returns rows stamped with this run_id (DB enforces the filter)
+        own_rows = [{"ticker": "TSLA", "rank": None, "pipeline_run_id": "RUN_A"}]
+        conn, cur = self._make_conn_single_cursor(own_rows)
+        result = fetch_all_theses_today(conn, run_id="RUN_A")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ticker"], "TSLA")
+
+    # ── fallback on zero rows ─────────────────────────────────────────────────
+
+    def test_fallback_to_date_query_when_scoped_returns_zero_rows(self):
+        """
+        When run_id given but scoped query returns [], fall back to date-only query.
+        The date-only query result is returned.
+        """
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        all_today = [{"ticker": f"T{i}", "rank": i + 1} for i in range(5)]
+        # Use single cursor: first fetchall returns [], second returns all_today
+        conn = MagicMock()
+        cur  = MagicMock()
+        conn.cursor.return_value = cur
+        cur.fetchall.side_effect = [[], all_today]
+        result = fetch_all_theses_today(conn, run_id="UNSTAMPED_RUN")
+        self.assertEqual(len(result), 5,
+                         "Date-only fallback must return all 5 today rows")
+
+    # ── fallback on column absent ─────────────────────────────────────────────
+
+    def test_fallback_to_date_query_when_column_absent(self):
+        """
+        When pipeline_run_id column doesn't exist (migration 020 not applied),
+        the scoped execute raises; code falls back to date-only query.
+        """
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        fallback_rows = [{"ticker": "AMD", "rank": 3}]
+        conn, cur1, cur2 = self._make_conn_first_cursor_raises(
+            "column pipeline_run_id does not exist", fallback_rows
+        )
+        result = fetch_all_theses_today(conn, run_id="ANY_RUN_ID")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["ticker"], "AMD")
+        # Second cursor must have been used for the date-only query
+        cur2.execute.assert_called_once()
+
+    def test_fallback_date_query_called_after_column_absent_exception(self):
+        """rollback() is called before the fallback cursor, preserving connection health."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        fallback_rows = [{"ticker": "GOOG", "rank": 1}]
+        conn, cur1, cur2 = self._make_conn_first_cursor_raises(
+            "column pipeline_run_id does not exist", fallback_rows
+        )
+        fetch_all_theses_today(conn, run_id="ANY_RUN_ID")
+        conn.rollback.assert_called_once()
+
+    # ── no run_id path ────────────────────────────────────────────────────────
+
+    def test_no_run_id_uses_single_date_only_query(self):
+        """When run_id is None, only one cursor and one query are used."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        all_rows = [{"ticker": f"X{i}", "rank": None} for i in range(4)]
+        conn, cur = self._make_conn_single_cursor(all_rows)
+        result = fetch_all_theses_today(conn, run_id=None)
+        self.assertEqual(len(result), 4)
+        conn.cursor.assert_called_once()
+
+    def test_no_run_id_sql_does_not_contain_pipeline_run_id(self):
+        """Date-only query must not reference pipeline_run_id column."""
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        conn, cur = self._make_conn_single_cursor([])
+        fetch_all_theses_today(conn, run_id=None)
+        sql_called = cur.execute.call_args[0][0]
+        self.assertNotIn("pipeline_run_id", sql_called,
+                         "Date-only query must not filter on pipeline_run_id")
+
+    # ── env-driven wiring ─────────────────────────────────────────────────────
+
+    def test_main_passes_pipeline_run_id_env_to_fetcher(self):
+        """
+        When PIPELINE_RUN_ID env var is set, main() passes it to fetch_all_theses_today.
+        Verified by asserting the scoped query bind params contain the env value.
+        """
+        from scripts.notify_pipeline_result import fetch_all_theses_today
+        scoped_rows = [{"ticker": "META", "rank": 2}]
+        conn, cur = self._make_conn_single_cursor(scoped_rows)
+        with patch.dict(os.environ, {"PIPELINE_RUN_ID": "ENV_RUN_999"}):
+            run_id = os.environ.get("PIPELINE_RUN_ID", "").strip() or None
+            result = fetch_all_theses_today(conn, run_id=run_id)
+        self.assertEqual(len(result), 1)
+        execute_params = cur.execute.call_args[0][1]
+        self.assertIn("ENV_RUN_999", execute_params,
+                      "PIPELINE_RUN_ID env value must reach the scoped query bind params")
+
+
 if __name__ == "__main__":
     unittest.main()

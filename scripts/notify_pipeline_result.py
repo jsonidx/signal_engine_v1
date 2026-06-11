@@ -262,49 +262,69 @@ def fetch_top10_rankings(conn) -> list[dict]:
         return []
 
 
-def fetch_top5_thesis(conn) -> list[dict]:
-    """Return today's AI theses, up to 5, ordered by priority from daily_rankings."""
+_THESIS_SELECT = """
+    SELECT t.ticker, t.direction, t.conviction,
+           t.entry_low, t.entry_high, t.stop_loss,
+           t.target_1, t.target_2,
+           t.thesis, t.key_invalidation,
+           t.prob_combined, t.prob_technical, t.prob_options,
+           t.prob_catalyst, t.prob_news,
+           t.model_used, t.cost_usd,
+           dr.rank
+    FROM   thesis_cache t
+    LEFT JOIN daily_rankings dr
+           ON dr.ticker  = t.ticker
+          AND dr.run_date = (SELECT MAX(run_date) FROM daily_rankings)
+"""
+_THESIS_ORDER = """
+    ORDER  BY (dr.rank IS NULL) ASC,
+              dr.rank ASC,
+              t.created_at DESC
+"""
+
+
+def fetch_all_theses_today(conn, run_id: Optional[str] = None) -> list[dict]:
+    """
+    Return all AI theses written today.
+
+    Uses a LEFT JOIN so unranked tickers (not in daily_rankings) are still
+    included.  Ranked rows sort first by dr.rank ASC; unranked rows follow in
+    deterministic created_at DESC order.
+
+    If *run_id* is provided (requires migration 020 pipeline_run_id column),
+    returns only theses stamped with that run ID.  Falls back to date-only
+    query when the column is absent or the scoped query returns 0 rows.
+    """
     try:
         today = date.today().isoformat()
-        cur = conn.cursor()
-        # Join with daily_rankings to get only ranked tickers in rank order
-        cur.execute("""
-            SELECT t.ticker, t.direction, t.conviction,
-                   t.entry_low, t.entry_high, t.stop_loss,
-                   t.target_1, t.target_2,
-                   t.thesis, t.key_invalidation,
-                   t.prob_combined, t.prob_technical, t.prob_options,
-                   t.prob_catalyst, t.prob_news,
-                   t.model_used, t.cost_usd,
-                   dr.rank
-            FROM   thesis_cache t
-            JOIN   daily_rankings dr ON dr.ticker = t.ticker
-                   AND dr.run_date = (SELECT MAX(run_date) FROM daily_rankings)
-            WHERE  t.date = %s
-            ORDER  BY dr.rank ASC
-            LIMIT  5
-        """, (today,))
-        rows = [dict(r) for r in cur.fetchall()]
-        if rows:
-            return rows
-        # Fallback: no rank join — just return today's theses by date
-        cur.execute("""
-            SELECT ticker, direction, conviction,
-                   entry_low, entry_high, stop_loss,
-                   target_1, target_2,
-                   thesis, key_invalidation,
-                   prob_combined, prob_technical, prob_options,
-                   prob_catalyst, prob_news,
-                   model_used, cost_usd,
-                   NULL AS rank
-            FROM   thesis_cache
-            WHERE  date = %s
-            ORDER  BY created_at DESC
-            LIMIT  5
-        """, (today,))
+        cur   = conn.cursor()
+
+        if run_id:
+            try:
+                cur.execute(
+                    _THESIS_SELECT + "    WHERE  t.date = %s AND t.pipeline_run_id = %s\n" + _THESIS_ORDER,
+                    (today, run_id),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                if rows:
+                    return rows
+                # 0 rows: column exists but run_id not stamped (e.g. local run without env var)
+                # fall through to date-only query
+            except Exception:
+                # pipeline_run_id column absent (migration 020 not yet applied)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                cur = conn.cursor()
+
+        cur.execute(
+            _THESIS_SELECT + "    WHERE  t.date = %s\n" + _THESIS_ORDER,
+            (today,),
+        )
         return [dict(r) for r in cur.fetchall()]
     except Exception as exc:
-        print(f"[notify] fetch_top5_thesis failed: {exc}", file=sys.stderr)
+        print(f"[notify] fetch_all_theses_today failed: {exc}", file=sys.stderr)
         return []
 
 
@@ -400,8 +420,10 @@ def build_thesis_section(rows: list[dict]) -> str:
         return ""
 
     total_cost = sum(_safe_float(r.get("cost_usd")) or 0.0 for r in rows)
+    n = len(rows)
+    thesis_word = "thesis" if n == 1 else "theses"
 
-    lines = ["\n<b>── AI DEEP DIVE — Top 5 ──</b>"]
+    lines = [f"\n<b>── AI DEEP DIVE — {n} {thesis_word} ──</b>"]
     for r in rows:
         rank      = r.get("rank")
         ticker    = r.get("ticker", "?")
@@ -612,9 +634,10 @@ def main() -> None:
         rankings_section = build_top10_section(top10)
 
         if not args.skip_ai:
-            top5_thesis = fetch_top5_thesis(conn)
-            if top5_thesis:
-                thesis_section = build_thesis_section(top5_thesis)
+            _run_id = os.environ.get("PIPELINE_RUN_ID", "").strip() or None
+            all_theses = fetch_all_theses_today(conn, run_id=_run_id)
+            if all_theses:
+                thesis_section = build_thesis_section(all_theses)
             else:
                 thesis_section = "\n<i>No AI theses written today (AI skipped or no qualifying tickers).</i>"
         else:
