@@ -531,14 +531,13 @@ async def portfolio_summary():
         open_pos = 0
         deployed_eur = 0.0
         tj_conn = _db_connect()
-        if tj_conn:
-            row = tj_conn.execute(
-                "SELECT COUNT(*) as cnt, COALESCE(SUM(size_eur), 0) as total"
-                " FROM trades WHERE action='BUY' AND status='open'"
-            ).fetchone()
-            open_pos = row["cnt"] if row else 0
-            deployed_eur = float(row["total"]) if row else 0.0
-            tj_conn.close()
+        row = tj_conn.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(size_eur), 0) as total"
+            " FROM trades WHERE action='BUY' AND status='open'"
+        ).fetchone()
+        open_pos = row["cnt"] if row else 0
+        deployed_eur = float(row["total"]) if row else 0.0
+        tj_conn.close()
 
         # Real NAV = cash on hand + deployed capital (entry values of open positions)
         cash_eur, _ = _get_cash_eur(conn)
@@ -631,12 +630,11 @@ async def portfolio_history(weeks: int = Query(52, ge=1, le=260)):
         # Position count per snapshot
         conn2 = _db_connect()
         pos_counts = {}
-        if conn2:
-            rows = conn2.execute(
-                "SELECT snapshot_id, COUNT(*) as cnt FROM equity_positions GROUP BY snapshot_id"
-            ).fetchall()
-            pos_counts = {r["snapshot_id"]: r["cnt"] for r in rows}
-            conn2.close()
+        rows2 = conn2.execute(
+            "SELECT snapshot_id, COUNT(*) as cnt FROM equity_positions GROUP BY snapshot_id"
+        ).fetchall()
+        pos_counts = {r["snapshot_id"]: r["cnt"] for r in rows2}
+        conn2.close()
 
         records = []
         for _, row in df.iterrows():
@@ -663,9 +661,11 @@ async def portfolio_positions():
     Open positions from trade_journal.db enriched with current prices via yfinance.
     Prices are cached 15 min.
     """
-    conn = _db_connect()
-    if conn is None:
-        return {"data_available": True, "data": []}
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("portfolio_positions: DB connect failed: %s", exc)
+        return _no_data("database unavailable")
 
     try:
         rows = conn.execute("""
@@ -746,8 +746,10 @@ async def portfolio_sparklines():
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("portfolio_sparklines: DB connect failed: %s", exc)
         return {}
 
     try:
@@ -875,7 +877,11 @@ async def add_position(req: AddPositionRequest):
         raise HTTPException(status_code=400, detail="entry_price and size_eur must be > 0")
     if req.currency not in ("EUR", "USD"):
         raise HTTPException(status_code=400, detail="currency must be EUR or USD")
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("add_position: DB connect failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
     try:
         _ensure_trades_table(conn)
         eur_usd   = _get_eur_usd_rate()
@@ -918,7 +924,11 @@ async def sell_position(ticker: str, req: SellPositionRequest):
         raise HTTPException(status_code=400, detail="sell_price must be > 0")
     if req.currency not in ("EUR", "USD"):
         raise HTTPException(status_code=400, detail="currency must be EUR or USD")
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("sell_position: DB connect failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
     try:
         _ensure_trades_table(conn)
         sym = ticker.upper().strip()
@@ -1004,7 +1014,11 @@ async def sell_position(ticker: str, req: SellPositionRequest):
 @app.delete("/api/portfolio/positions/{ticker}")
 async def close_position(ticker: str):
     """Mark the most recent open position as closed (no P&L recorded)."""
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("close_position: DB connect failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
     try:
         result = conn.execute(
             "UPDATE trades SET status = 'closed' WHERE ticker = %s AND action = 'BUY' AND status = 'open'",
@@ -1026,9 +1040,11 @@ async def close_position(ticker: str):
 @app.get("/api/portfolio/trades")
 async def get_trades():
     """Return all trades (open + closed) with P&L for the trades dashboard."""
-    conn = _db_connect()
-    if conn is None:
-        return {"data_available": True, "data": []}
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("get_trades: DB connect failed: %s", exc)
+        return _no_data("database unavailable")
     try:
         rows = conn.execute(
             "SELECT * FROM trades WHERE action = 'BUY' ORDER BY date DESC, id DESC"
@@ -1085,7 +1101,11 @@ def _get_cash_eur(conn) -> tuple[float, str | None]:
 @app.get("/api/portfolio/cash")
 async def get_cash():
     """Return the manually-set cash balance from Supabase portfolio_settings."""
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("get_cash: DB connect failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
     try:
         cash, updated_at = _get_cash_eur(conn)
         return {"cash_eur": round(cash, 2), "updated_at": updated_at}
@@ -1112,7 +1132,11 @@ async def update_cash(req: CashUpdateRequest):
     if req.amount < 0:
         raise HTTPException(status_code=400, detail="amount must be >= 0")
 
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("update_cash: DB connect failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
     try:
         _ensure_cash_table(conn)
         current_cash, _ = _get_cash_eur(conn)
@@ -1270,8 +1294,8 @@ async def signals_heatmap():
 
         # ── 3. Claude cache: per-ticker module signals_json ───────────────────
         claude_cache: dict = {}   # ticker → {direction, conviction, agreement, sigs}
-        conn = _db_connect()
-        if conn:
+        try:
+            conn = _db_connect()
             rows = conn.execute("""
                 SELECT ticker, direction, conviction, signal_agreement_score, signals_json
                 FROM thesis_cache ORDER BY date DESC
@@ -1287,6 +1311,8 @@ async def signals_heatmap():
                         "agreement":  r["signal_agreement_score"],
                         "sigs":       sigs,
                     }
+        except Exception:
+            pass  # DB unavailable — heatmap degrades to CSV-only data
 
         # ── 4. Dark pool lookup ────────────────────────────────────────────────
         dp_data = _load_dark_pool() or {}
@@ -1394,9 +1420,11 @@ async def signals_ticker(ticker: str):
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
-        return _no_data("ai_quant_cache.db not found")
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("signals_ticker: DB connect failed for %s: %s", ticker, exc)
+        return _no_data("database unavailable")
 
     try:
         row = conn.execute("""
@@ -1766,7 +1794,11 @@ async def _build_deepdive_payload() -> dict:
         except Exception:
             pass
 
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("_build_deepdive_payload: DB connect failed: %s", exc)
+        conn = None
     seen: set = set()
     tickers = []
 
@@ -1828,7 +1860,11 @@ async def _build_deepdive_payload() -> dict:
             log.exception("deepdive_tickers: thesis_cache read error")
 
     # ── Always include open positions from trade_journal ─────────────────────────
-    tj_conn = _db_connect()
+    try:
+        tj_conn = _db_connect()
+    except Exception as exc:
+        log.warning("_build_deepdive_payload: trade_journal connect failed: %s", exc)
+        tj_conn = None
     if tj_conn is not None:
         try:
             open_rows = tj_conn.execute(
@@ -1962,7 +1998,11 @@ async def deepdive_live_zones():
     if not _HAS_ACTION_ZONES:
         return {"data_available": False, "zones": {}}
 
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("deepdive_live_zones: DB connect failed: %s", exc)
+        conn = None
     analyzed: list[str] = []
     if conn is not None:
         try:
@@ -2015,7 +2055,11 @@ async def deepdive_premarket_prices():
     Latest price including pre-market/after-hours for all analyzed tickers.
     Thin wrapper around _fetch_live_prices — used by the frontend copy-prompt flow.
     """
-    conn = _db_connect()
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("deepdive_premarket_prices: DB connect failed: %s", exc)
+        conn = None
     tickers: list[str] = []
     if conn is not None:
         try:
@@ -2043,9 +2087,11 @@ async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
-        result = _no_data("ai_quant_cache.db not found")
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("signals_outcomes: DB connect failed: %s", exc)
+        result = _no_data("database unavailable")
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 
@@ -2138,9 +2184,11 @@ async def signals_accuracy():
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
-        result = _no_data("ai_quant_cache.db not found")
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("signals_accuracy: DB connect failed: %s", exc)
+        result = _no_data("database unavailable")
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 
@@ -2578,9 +2626,11 @@ async def screeners_options(min_heat: float = Query(50.0, ge=0.0)):
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
-        result = _no_data("ai_quant_cache.db not found")
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("screeners_options: DB connect failed: %s", exc)
+        result = _no_data("database unavailable")
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 
@@ -5300,9 +5350,11 @@ async def ticker_analogs(symbol: str, limit: int = Query(12, ge=1, le=50)):
     if hit is not None:
         return hit
 
-    conn = _db_connect()
-    if conn is None:
-        result = _no_data("ai_quant_cache.db not found")
+    try:
+        conn = _db_connect()
+    except Exception as exc:
+        log.warning("ticker_analogs: DB connect failed: %s", exc)
+        result = _no_data("database unavailable")
         _cache.set(cache_key, result, TTL_SHORT)
         return result
 

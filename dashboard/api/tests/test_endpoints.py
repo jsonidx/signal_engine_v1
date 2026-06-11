@@ -443,9 +443,10 @@ def test_signals_heatmap_normalised(tmp_data):
 
 
 def test_signals_heatmap_missing_db():
-    """Returns data_available=False when both signals CSV and DB are unavailable."""
+    """Returns data_available=False when signals CSV, watchlist, and DB are all unavailable."""
     with (
         patch("dashboard.api.main.SIGNALS_DIR", Path("/nope/signals_output")),
+        patch("dashboard.api.main.BASE_DIR", Path("/nope")),
         _db_conn_raises(),
     ):
         resp = client.get("/api/signals/heatmap")
@@ -663,6 +664,16 @@ def _make_full_thesis_row(ticker: str = "AAPL") -> dict:
         "prob_catalyst": None, "prob_news": None,
         "model_used": None, "cost_usd": None, "expected_moves_json": None,
     }
+
+
+def test_signals_ticker_db_connect_failure_returns_no_data():
+    """signals_ticker must return data_available:false (not 500) when DB connect raises."""
+    with patch("dashboard.api.main._db_connect", side_effect=Exception("connection refused")):
+        resp = client.get("/api/signals/ticker/CRDO")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["data_available"] is False
+    assert "database" in body.get("reason", "").lower()
 
 
 def test_signals_ticker_price_fetch_uses_to_thread():
@@ -2100,3 +2111,96 @@ class TestGovernanceRecommendationsEndpoint:
         body = resp.json()
         assert body["promote_candidates"] == []
         assert body["summary"]["total_tickers"] == 0
+
+
+# ==============================================================================
+# QA-002: _db_connect() failure handling across endpoint types
+# ==============================================================================
+
+class TestDbConnectFailure:
+    """QA-002: All covered endpoints must return a controlled response (not 500)
+    when _db_connect() raises — matching the fix applied in this sprint."""
+
+    def test_portfolio_positions_db_failure(self):
+        with _db_conn_raises():
+            resp = client.get("/api/portfolio/positions")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
+        assert "database" in resp.json().get("reason", "").lower()
+
+    def test_portfolio_sparklines_db_failure(self):
+        with _db_conn_raises():
+            resp = client.get("/api/portfolio/sparklines")
+        assert resp.status_code == 200
+        # Returns {} on DB failure — empty but not a 500
+        assert isinstance(resp.json(), dict)
+
+    def test_get_trades_db_failure(self):
+        with _db_conn_raises():
+            resp = client.get("/api/portfolio/trades")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
+
+    def test_add_position_db_failure(self):
+        with _db_conn_raises():
+            resp = client.post("/api/portfolio/positions", json={
+                "ticker": "AAPL", "entry_price": 150.0, "size_eur": 1000.0
+            })
+        assert resp.status_code == 503
+        assert "database" in resp.json()["detail"].lower()
+
+    def test_sell_position_db_failure(self):
+        with _db_conn_raises():
+            resp = client.post("/api/portfolio/positions/AAPL/sell", json={
+                "sell_price": 160.0
+            })
+        assert resp.status_code == 503
+        assert "database" in resp.json()["detail"].lower()
+
+    def test_close_position_db_failure(self):
+        with _db_conn_raises():
+            resp = client.delete("/api/portfolio/positions/AAPL")
+        assert resp.status_code == 503
+        assert "database" in resp.json()["detail"].lower()
+
+    def test_get_cash_db_failure(self):
+        with _db_conn_raises():
+            resp = client.get("/api/portfolio/cash")
+        assert resp.status_code == 503
+        assert "database" in resp.json()["detail"].lower()
+
+    def test_update_cash_db_failure(self):
+        with _db_conn_raises():
+            resp = client.post("/api/portfolio/cash", json={"action": "set", "amount": 5000.0})
+        assert resp.status_code == 503
+        assert "database" in resp.json()["detail"].lower()
+
+    def test_signals_outcomes_db_failure(self):
+        _cache._store.clear()
+        with _db_conn_raises():
+            resp = client.get("/api/signals/outcomes")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
+        assert "database" in resp.json().get("reason", "").lower()
+
+    def test_signals_accuracy_db_failure(self):
+        _cache._store.clear()
+        with _db_conn_raises():
+            resp = client.get("/api/signals/accuracy")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
+        assert "database" in resp.json().get("reason", "").lower()
+
+    def test_screeners_options_db_failure(self):
+        _cache._store.clear()
+        with _db_conn_raises():
+            resp = client.get("/api/screeners/options")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
+
+    def test_ticker_analogs_db_failure(self):
+        _cache._store.clear()
+        with _db_conn_raises():
+            resp = client.get("/api/ticker/AAPL/analogs")
+        assert resp.status_code == 200
+        assert resp.json()["data_available"] is False
