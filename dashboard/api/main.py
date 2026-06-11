@@ -507,18 +507,15 @@ async def startup_event():
 # SECTION 4: PORTFOLIO ENDPOINTS
 # ==============================================================================
 
-@app.get("/api/portfolio/summary")
-async def portfolio_summary():
-    """
-    Aggregate performance summary from paper_trades.db.
-    Returns NAV, weekly return, SPY benchmark, Sharpe, drawdown, hit rate.
-    """
+def _portfolio_summary_sync() -> dict:
     try:
         conn = _db_connect()
-        # Weekly returns
+    except Exception as e:
+        log.warning("portfolio_summary: DB connect failed: %s", e)
+        return _no_data(str(e))
+    try:
         df = pd.read_sql("SELECT * FROM weekly_returns ORDER BY week_ending ASC", conn)
 
-        # Regime
         regime = "UNKNOWN"
         regime_score = 0
         if REGIME_CACHE.exists():
@@ -527,9 +524,6 @@ async def portfolio_summary():
             regime = rc.get("market_regime", {}).get("regime", "UNKNOWN")
             regime_score = rc.get("market_regime", {}).get("score", 0)
 
-        # Open positions count + deployed capital
-        open_pos = 0
-        deployed_eur = 0.0
         tj_conn = _db_connect()
         row = tj_conn.execute(
             "SELECT COUNT(*) as cnt, COALESCE(SUM(size_eur), 0) as total"
@@ -539,7 +533,6 @@ async def portfolio_summary():
         deployed_eur = float(row["total"]) if row else 0.0
         tj_conn.close()
 
-        # Real NAV = cash on hand + deployed capital (entry values of open positions)
         cash_eur, _ = _get_cash_eur(conn)
         real_nav = cash_eur + deployed_eur if (cash_eur + deployed_eur) > 0 else PORTFOLIO_NAV
 
@@ -559,28 +552,23 @@ async def portfolio_summary():
                 "as_of": datetime.utcnow().isoformat() + "Z",
             }
 
-        # Last week's returns
         last = df.iloc[-1]
         weekly_ret = float(last["portfolio_return"] or 0)
         bench_ret  = float(last["benchmark_return"] or 0)
 
-        # Cumulative
         cum_port = (1 + df["portfolio_return"]).cumprod()
         total_ret = float(cum_port.iloc[-1] - 1)
         total_value = real_nav
 
-        # Annualised Sharpe
         n_weeks = len(df)
         vol = float(df["portfolio_return"].std()) * np.sqrt(52) if n_weeks > 1 else 0
         cagr = (1 + total_ret) ** (52 / n_weeks) - 1 if n_weeks > 0 else 0
         sharpe = cagr / vol if vol > 0 else 0.0
 
-        # Max drawdown
         cummax = cum_port.cummax()
         dd = (cum_port - cummax) / cummax
         max_dd = float(dd.min())
 
-        # Hit rate
         hit_rate = float((df["portfolio_return"] > 0).mean() * 100)
 
         conn.close()
@@ -604,6 +592,15 @@ async def portfolio_summary():
         except Exception:
             pass
         return _no_data(str(e))
+
+
+@app.get("/api/portfolio/summary")
+async def portfolio_summary():
+    """
+    Aggregate performance summary from paper_trades.db.
+    Returns NAV, weekly return, SPY benchmark, Sharpe, drawdown, hit rate.
+    """
+    return await asyncio.to_thread(_portfolio_summary_sync)
 
 
 @app.get("/api/portfolio/history")
@@ -655,12 +652,7 @@ async def portfolio_history(weeks: int = Query(52, ge=1, le=260)):
         return _no_data(str(e))
 
 
-@app.get("/api/portfolio/positions")
-async def portfolio_positions():
-    """
-    Open positions from trade_journal.db enriched with current prices via yfinance.
-    Prices are cached 15 min.
-    """
+def _portfolio_positions_sync() -> dict:
     try:
         conn = _db_connect()
     except Exception as exc:
@@ -695,14 +687,12 @@ async def portfolio_positions():
             entry_date = r["entry_date"] or ""
             conviction = _safe_float(r["conviction"])
 
-            # Days held
             try:
                 d = datetime.strptime(entry_date[:10], "%Y-%m-%d").date()
                 days_held = (today - d).days
             except Exception:
                 days_held = 0
 
-            # P&L
             if entry_px > 0 and cur_px > 0 and size_eur > 0:
                 qty = size_eur / entry_px
                 unrealized_pnl_eur = (cur_px - entry_px) * qty
@@ -732,6 +722,15 @@ async def portfolio_positions():
     except Exception as e:
         log.exception("portfolio_positions error")
         return _no_data(str(e))
+
+
+@app.get("/api/portfolio/positions")
+async def portfolio_positions():
+    """
+    Open positions from trade_journal.db enriched with current prices via yfinance.
+    Prices are cached 15 min.
+    """
+    return await asyncio.to_thread(_portfolio_positions_sync)
 
 
 @app.get("/api/portfolio/sparklines")
@@ -1248,15 +1247,7 @@ async def signals_latest(date: Optional[str] = Query(None)):
         return _no_data(str(e))
 
 
-@app.get("/api/signals/heatmap")
-async def signals_heatmap():
-    """
-    Module-level signal matrix — sourced from equity_signals CSV (all watchlist
-    tickers), enriched with Claude cache, dark pool, squeeze, and fundamentals.
-    Each row: ticker × {signal_engine, squeeze, options_flow, dark_pool,
-                         fundamentals, cross_asset}
-    All scores normalised to [-1, +1].
-    """
+def _signals_heatmap_sync() -> dict:
     cache_key = "signals_heatmap"
     hit = _cache.get(cache_key)
     if hit is not None:
@@ -1409,6 +1400,18 @@ async def signals_heatmap():
     except Exception as e:
         log.exception("signals_heatmap error")
         return _no_data(str(e))
+
+
+@app.get("/api/signals/heatmap")
+async def signals_heatmap():
+    """
+    Module-level signal matrix — sourced from equity_signals CSV (all watchlist
+    tickers), enriched with Claude cache, dark pool, squeeze, and fundamentals.
+    Each row: ticker × {signal_engine, squeeze, options_flow, dark_pool,
+                         fundamentals, cross_asset}
+    All scores normalised to [-1, +1].
+    """
+    return await asyncio.to_thread(_signals_heatmap_sync)
 
 
 @app.get("/api/signals/ticker/{ticker}")
@@ -2022,14 +2025,19 @@ async def deepdive_live_zones():
     loop = asyncio.get_event_loop()
 
     async def _zone_for(ticker: str):
+        import math
         ck = f"action_zones_{ticker}"
         cached = _cache.get(ck)
         if cached and cached.get("data_available") and "buy_zone_low" in cached:
-            return ticker, float(cached["buy_zone_low"]), float(cached["buy_zone_high"])
+            low, high = float(cached["buy_zone_low"]), float(cached["buy_zone_high"])
+            if math.isfinite(low) and math.isfinite(high):
+                return ticker, low, high
         try:
             z = await loop.run_in_executor(None, _compute_action_zones, ticker)
             if z:
-                return ticker, float(z["buy_zone_low"]), float(z["buy_zone_high"])
+                low, high = float(z["buy_zone_low"]), float(z["buy_zone_high"])
+                if math.isfinite(low) and math.isfinite(high):
+                    return ticker, low, high
         except Exception:
             pass
         return ticker, None, None
@@ -3109,17 +3117,7 @@ async def rankings_history(
         return _no_data(str(e))
 
 
-@app.get("/api/hot-entry/rankings")
-async def hot_entry_rankings():
-    """
-    Ranked hot-entry candidates for today.
-
-    Scoring formula (higher = better buy today):
-      score = is_hot_bonus(50) + prob_t1 * t1_upside_pct * 2 + min(rr,3)*3 + conviction
-
-    Saves a daily snapshot to hot_entry_rankings on first call of the day.
-    Returns ranked rows with rank numbers and rank_change vs yesterday.
-    """
+def _hot_entry_rankings_sync() -> dict:
     cache_key = "hot_entry_rankings"
     hit = _cache.get(cache_key)
     if hit is not None:
@@ -3306,6 +3304,20 @@ async def hot_entry_rankings():
         return _no_data("hot_entry_rankings failed")
 
 
+@app.get("/api/hot-entry/rankings")
+async def hot_entry_rankings():
+    """
+    Ranked hot-entry candidates for today.
+
+    Scoring formula (higher = better buy today):
+      score = is_hot_bonus(50) + prob_t1 * t1_upside_pct * 2 + min(rr,3)*3 + conviction
+
+    Saves a daily snapshot to hot_entry_rankings on first call of the day.
+    Returns ranked rows with rank numbers and rank_change vs yesterday.
+    """
+    return await asyncio.to_thread(_hot_entry_rankings_sync)
+
+
 @app.get("/api/hot-entry/history")
 async def hot_entry_history(
     ticker: str = Query(..., description="Ticker symbol"),
@@ -3349,40 +3361,7 @@ async def hot_entry_history(
 # /api/watch-setup  — TRD-004 Accumulation/Catalyst Setup Alert
 # ==============================================================================
 
-@app.get("/api/watch-setup")
-async def watch_setup_alerts():
-    """
-    Returns tickers with accumulation/catalyst setup evidence that are worth
-    watching before a move.  Distinct from Hot Entry (not inside entry zone)
-    and distinct from short squeeze (does not require high short interest).
-
-    Designed to surface cases like SNOW May 2026: strong pre-earnings setup
-    with unusual call activity and improving momentum, but no Hot Entry signal.
-
-    Structured reasons allow the frontend to explain each alert clearly.
-    This is a WATCH/SETUP signal, NOT an immediate buy signal.
-
-    Response shape:
-        {
-          "data_available": true,
-          "run_date": "YYYY-MM-DD",
-          "alerts": [
-            {
-              "ticker": "SNOW",
-              "alert_type": "catalyst_setup",
-              "label": "Catalyst Setup",
-              "reasons": ["earnings_beat_streak_4", "call_demand_elevated", ...],
-              "days_to_earnings": 2,
-              "dark_pool_signal": "NEUTRAL",
-              "pre_earnings_breakout": true,
-              "peb_confidence": "medium",
-              "composite": 51.4,
-              "price": 168.5,
-              "note": "Watch/setup alert — not a buy signal"
-            }
-          ]
-        }
-    """
+def _watch_setup_alerts_sync() -> dict:
     cache_key = "watch_setup_alerts"
     hit = _cache.get(cache_key)
     if hit is not None:
@@ -3513,27 +3492,48 @@ async def watch_setup_alerts():
         return _no_data("watch_setup_alerts failed")
 
 
+@app.get("/api/watch-setup")
+async def watch_setup_alerts():
+    """
+    Returns tickers with accumulation/catalyst setup evidence that are worth
+    watching before a move.  Distinct from Hot Entry (not inside entry zone)
+    and distinct from short squeeze (does not require high short interest).
+
+    Designed to surface cases like SNOW May 2026: strong pre-earnings setup
+    with unusual call activity and improving momentum, but no Hot Entry signal.
+
+    Structured reasons allow the frontend to explain each alert clearly.
+    This is a WATCH/SETUP signal, NOT an immediate buy signal.
+
+    Response shape:
+        {
+          "data_available": true,
+          "run_date": "YYYY-MM-DD",
+          "alerts": [
+            {
+              "ticker": "SNOW",
+              "alert_type": "catalyst_setup",
+              "label": "Catalyst Setup",
+              "reasons": ["earnings_beat_streak_4", "call_demand_elevated", ...],
+              "days_to_earnings": 2,
+              "dark_pool_signal": "NEUTRAL",
+              "pre_earnings_breakout": true,
+              "peb_confidence": "medium",
+              "composite": 51.4,
+              "price": 168.5,
+              "note": "Watch/setup alert — not a buy signal"
+            }
+          ]
+        }
+    """
+    return await asyncio.to_thread(_watch_setup_alerts_sync)
+
+
 # ==============================================================================
 # /api/pattern-watch  — TRD-017 Pattern Watch (SNOW/CRSR/DELL archetypes)
 # ==============================================================================
 
-@app.get("/api/pattern-watch")
-async def pattern_watch():
-    """
-    Pattern Watch — TRD-017.
-
-    Aggregates current catalyst_scores and candidate_snapshots rows, then scores
-    each ticker against three historical breakout archetypes:
-      - SNOW: pre-earnings catalyst re-rating
-      - CRSR: early catalyst momentum / product-news breakout
-      - DELL: large-cap early momentum continuation
-
-    Probabilities and upside figures are case-based estimates from n=1 examples
-    per archetype.  This is NOT a statistically validated model.
-
-    Returns data_available:true with an empty list when no ticker matches;
-    never returns 404.  Works without AI synthesis.
-    """
+def _pattern_watch_sync() -> dict:
     cache_key = "pattern_watch"
     hit = _cache.get(cache_key)
     if hit is not None:
@@ -3697,6 +3697,26 @@ async def pattern_watch():
         log.exception("pattern_watch error")
         _cache.set(cache_key, empty_envelope, TTL_SHORT)
         return empty_envelope
+
+
+@app.get("/api/pattern-watch")
+async def pattern_watch():
+    """
+    Pattern Watch — TRD-017.
+
+    Aggregates current catalyst_scores and candidate_snapshots rows, then scores
+    each ticker against three historical breakout archetypes:
+      - SNOW: pre-earnings catalyst re-rating
+      - CRSR: early catalyst momentum / product-news breakout
+      - DELL: large-cap early momentum continuation
+
+    Probabilities and upside figures are case-based estimates from n=1 examples
+    per archetype.  This is NOT a statistically validated model.
+
+    Returns data_available:true with an empty list when no ticker matches;
+    never returns 404.  Works without AI synthesis.
+    """
+    return await asyncio.to_thread(_pattern_watch_sync)
 
 
 @app.get("/api/screeners/crypto")
@@ -4990,10 +5010,9 @@ async def ticker_analyze_status(symbol: str, llm: Optional[str] = Query(None)):
     proc = job.get("proc")
     if proc and proc.returncode is None:
         return {"status": "running", "symbol": sym, "started_at": job["started_at"], "llm": job.get("llm")}
-    # Finished — clear cache so fresh thesis is fetched
+    # Finished — clear hot cache so fresh thesis is fetched; preserve stale cache for SWR fallback
     _cache._store.pop(f"signals_ticker:{sym}", None)
     _cache._store.pop("deepdive_tickers", None)
-    _cache._store.pop("deepdive_tickers:stale", None)
     _cache._store.pop("deepdive_live_zones", None)
     # Pull model + cost from the freshly saved thesis if available
     model_used = cost_usd = None
@@ -5889,8 +5908,11 @@ async def get_favorites():
     """Return all user-pinned favorite tickers."""
     try:
         conn = _db_connect()
-        if conn is None:
-            return {"favorites": []}
+    except Exception as exc:
+        log.warning("get_favorites: DB connect failed: %s", exc)
+        return {"favorites": []}
+
+    try:
         _ensure_favorites_table(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT symbol, added_at, notes FROM user_favorites ORDER BY added_at")
@@ -5901,7 +5923,8 @@ async def get_favorites():
             for r in rows
         ]}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        log.warning("get_favorites: query failed: %s", exc)
+        return {"favorites": []}
 
 
 @app.post("/api/favorites/{symbol}")

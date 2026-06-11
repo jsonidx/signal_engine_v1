@@ -2204,3 +2204,111 @@ class TestDbConnectFailure:
             resp = client.get("/api/ticker/AAPL/analogs")
         assert resp.status_code == 200
         assert resp.json()["data_available"] is False
+
+
+# ==============================================================================
+# EVENT-LOOP UNBLOCKING — homepage hot-path endpoints use asyncio.to_thread
+# ==============================================================================
+
+class TestHomepageEventLoopUnblocking:
+    """
+    Verifies that homepage endpoints delegate their synchronous bodies to a
+    thread pool via asyncio.to_thread, keeping the FastAPI event loop free.
+    Each test confirms: (a) the sync helper is called inside to_thread, and
+    (b) the endpoint still returns a well-formed response.
+    """
+
+    def _assert_to_thread_called(self, mock_to_thread):
+        """to_thread must have been awaited exactly once per request."""
+        mock_to_thread.assert_awaited_once()
+        first_arg = mock_to_thread.call_args[0][0]
+        assert callable(first_arg), "first arg to to_thread must be a callable"
+
+    # ── portfolio/summary ─────────────────────────────────────────────────────
+
+    def test_portfolio_summary_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "total_value_eur": 99999.0, "regime": "TEST"}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/portfolio/summary")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+        assert resp.json()["total_value_eur"] == 99999.0
+
+    def test_portfolio_summary_sync_helper_exists(self):
+        assert callable(api_main._portfolio_summary_sync)
+
+    # ── portfolio/positions ───────────────────────────────────────────────────
+
+    def test_portfolio_positions_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "data": []}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/portfolio/positions")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+
+    def test_portfolio_positions_sync_helper_exists(self):
+        assert callable(api_main._portfolio_positions_sync)
+
+    # ── signals/heatmap ───────────────────────────────────────────────────────
+
+    def test_signals_heatmap_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "count": 0, "data": []}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/signals/heatmap")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+
+    def test_signals_heatmap_sync_helper_exists(self):
+        assert callable(api_main._signals_heatmap_sync)
+
+    # ── hot-entry/rankings ────────────────────────────────────────────────────
+
+    def test_hot_entry_rankings_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "count": 0, "data": []}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/hot-entry/rankings")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+
+    def test_hot_entry_rankings_sync_helper_exists(self):
+        assert callable(api_main._hot_entry_rankings_sync)
+
+    # ── watch-setup ───────────────────────────────────────────────────────────
+
+    def test_watch_setup_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "alerts": [], "count": 0}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/watch-setup")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+
+    def test_watch_setup_sync_helper_exists(self):
+        assert callable(api_main._watch_setup_alerts_sync)
+
+    # ── pattern-watch ─────────────────────────────────────────────────────────
+
+    def test_pattern_watch_offloaded(self):
+        _cache._store.clear()
+        sentinel = {"data_available": True, "count": 0, "data": []}
+        with patch("asyncio.to_thread", new_callable=AsyncMock, return_value=sentinel) as m:
+            resp = client.get("/api/pattern-watch")
+        assert resp.status_code == 200
+        self._assert_to_thread_called(m)
+
+    def test_pattern_watch_sync_helper_exists(self):
+        assert callable(api_main._pattern_watch_sync)
+
+    # ── get_favorites: DB failure returns [] not 500 ──────────────────────────
+
+    def test_get_favorites_db_failure_returns_empty_not_500(self):
+        with _db_conn_raises():
+            resp = client.get("/api/favorites")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "favorites" in body
+        assert body["favorites"] == []
