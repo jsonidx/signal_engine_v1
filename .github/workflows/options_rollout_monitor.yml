@@ -1,0 +1,77 @@
+name: Options Rollout Monitor
+
+on:
+  schedule:
+    # 07:00 Berlin CEST (05:00 UTC), Mon–Sat — morning health check
+    - cron: '0 5 * * 1-6'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Look-back window in days'
+        required: false
+        default: '7'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run options monitor (text)
+        id: monitor
+        run: |
+          python scripts/options_rollout_monitor.py --days "$DAYS" > monitor_report.txt
+          EXIT=$?
+          cat monitor_report.txt
+          exit $EXIT
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DAYS: ${{ github.event.inputs.days || '7' }}
+
+      - name: Run options monitor (JSON)
+        if: always()
+        run: |
+          python scripts/options_rollout_monitor.py --days "$DAYS" --json \
+            > monitor_report.json || true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DAYS: ${{ github.event.inputs.days || '7' }}
+
+      - name: Upload monitor report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: options-monitor-${{ github.run_id }}
+          path: |
+            monitor_report.txt
+            monitor_report.json
+          retention-days: 14
+
+      - name: Notify Telegram on warning/failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          python3 scripts/notify_pipeline_result.py \
+            --status "failure" \
+            --workflow "Options Rollout Monitor" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --duration-min "0"
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
