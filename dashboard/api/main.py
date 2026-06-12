@@ -7954,3 +7954,183 @@ async def governance_recommendations(days: int = Query(90, ge=7, le=365)):
             "summary": {"total_tickers": 0, "by_recommendation": {}},
             "thresholds_used": {}, "days": days,
         }
+
+
+# ==============================================================================
+# SECTION: HEDGE FUND 13F MONITOR  (TRD-083)
+# ==============================================================================
+
+@app.get("/api/hedge-funds")
+async def hedge_funds_list():
+    """List tracked funds with their latest filed period and position count."""
+    cache_key = "hedge_funds_list"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        config_path = _Path(__file__).resolve().parent.parent.parent / "config" / "hedge_funds.json"
+        funds_config = _json.loads(config_path.read_text()) if config_path.exists() else []
+
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        result = []
+        for f in funds_config:
+            cur.execute("""
+                SELECT period, filed_at, COUNT(*) AS position_count,
+                       SUM(value_usd) AS total_value_usd
+                FROM hedge_fund_positions
+                WHERE fund_slug = %s
+                GROUP BY period, filed_at
+                ORDER BY period DESC LIMIT 1
+            """, (f["slug"],))
+            row = cur.fetchone()
+            result.append({
+                "slug":            f["slug"],
+                "name":            f["name"],
+                "cik":             f["cik"],
+                "latest_period":   str(row["period"]) if row else None,
+                "filed_at":        str(row["filed_at"]) if row and row["filed_at"] else None,
+                "position_count":  row["position_count"] if row else 0,
+                "total_value_usd": int(row["total_value_usd"] or 0) * 1000 if row else 0,
+            })
+        conn.close()
+        _cache.set(cache_key, result, TTL_LONG)
+        return result
+    except Exception as exc:
+        log.exception("hedge_funds_list error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/hedge-funds/{slug}/positions")
+async def hedge_fund_positions(
+    slug: str,
+    period: Optional[str] = Query(None, description="ISO date e.g. 2026-03-31"),
+    change_type: Optional[str] = Query(None, description="new|added|trimmed|closed|unchanged"),
+    instrument: Optional[str] = Query(None, description="equity|put|call"),
+):
+    """
+    Return positions for a tracked fund.
+    Optionally filter by quarter (period), change_type, or instrument type.
+    """
+    cache_key = f"hf_positions:{slug}:{period}:{change_type}:{instrument}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Resolve period: use latest if not specified
+        if period:
+            target_period = period
+        else:
+            cur.execute(
+                "SELECT MAX(period) AS p FROM hedge_fund_positions WHERE fund_slug=%s",
+                (slug,)
+            )
+            row = cur.fetchone()
+            if not row or not row["p"]:
+                conn.close()
+                return {"fund_slug": slug, "period": None, "positions": []}
+            target_period = str(row["p"])
+
+        filters = ["fund_slug = %s", "period = %s"]
+        params: list = [slug, target_period]
+
+        if change_type:
+            filters.append("change_type = %s")
+            params.append(change_type)
+
+        if instrument == "equity":
+            filters.append("put_call IS NULL")
+        elif instrument in ("put", "call"):
+            filters.append("put_call = %s")
+            params.append(instrument.capitalize())
+
+        where = " AND ".join(filters)
+        cur.execute(f"""
+            SELECT ticker, cusip, name_of_issuer, shares, value_usd,
+                   put_call, change_type, shares_delta, value_delta_usd,
+                   period, filed_at
+            FROM hedge_fund_positions
+            WHERE {where}
+            ORDER BY value_usd DESC NULLS LAST
+        """, params)
+
+        rows = cur.fetchall()
+        conn.close()
+
+        positions = [
+            {
+                "ticker":          r["ticker"],
+                "cusip":           r["cusip"],
+                "name_of_issuer":  r["name_of_issuer"],
+                "shares":          r["shares"],
+                "value_usd":       (r["value_usd"] or 0) * 1000,
+                "put_call":        r["put_call"],
+                "change_type":     r["change_type"],
+                "shares_delta":    r["shares_delta"],
+                "value_delta_usd": (r["value_delta_usd"] or 0) * 1000 if r["value_delta_usd"] is not None else None,
+                "period":          str(r["period"]),
+                "filed_at":        str(r["filed_at"]) if r["filed_at"] else None,
+            }
+            for r in rows
+        ]
+
+        result = {"fund_slug": slug, "period": target_period, "positions": positions}
+        _cache.set(cache_key, result, TTL_LONG)
+        return result
+    except Exception as exc:
+        log.exception("hedge_fund_positions error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/hedge-funds/{slug}/history/{cusip}")
+async def hedge_fund_position_history(slug: str, cusip: str, put_call: Optional[str] = Query(None)):
+    """Return all quarterly snapshots for a single position (for sparkline)."""
+    cache_key = f"hf_history:{slug}:{cusip}:{put_call}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        from utils.db import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+
+        params: list = [slug, cusip]
+        pc_filter = ""
+        if put_call:
+            pc_filter = "AND put_call = %s"
+            params.append(put_call.capitalize())
+        else:
+            pc_filter = "AND put_call IS NULL"
+
+        cur.execute(f"""
+            SELECT period, shares, value_usd, change_type, filed_at
+            FROM hedge_fund_positions
+            WHERE fund_slug = %s AND cusip = %s {pc_filter}
+            ORDER BY period ASC
+        """, params)
+
+        rows = cur.fetchall()
+        conn.close()
+
+        history = [
+            {
+                "period":      str(r["period"]),
+                "shares":      r["shares"],
+                "value_usd":   (r["value_usd"] or 0) * 1000,
+                "change_type": r["change_type"],
+            }
+            for r in rows
+        ]
+        result = {"fund_slug": slug, "cusip": cusip, "history": history}
+        _cache.set(cache_key, result, TTL_LONG)
+        return result
+    except Exception as exc:
+        log.exception("hedge_fund_position_history error")
+        raise HTTPException(status_code=500, detail=str(exc))

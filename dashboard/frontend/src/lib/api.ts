@@ -1795,3 +1795,58 @@ export interface GovernanceRecommendationsResponse {
   thresholds_used: GovernanceRecommendationThresholds
   days: number
 }
+
+// ─── Hedge Fund 13F Monitor (TRD-083) ─────────────────────────────────────────
+
+export interface HedgeFund {
+  slug: string
+  name: string
+  cik: string
+  latest_period: string | null
+  filed_at: string | null
+  position_count: number
+  total_value_usd: number
+}
+
+export interface HedgeFundPosition {
+  ticker: string | null
+  cusip: string | null
+  name_of_issuer: string | null
+  shares: number | null
+  value_usd: number
+  put_call: 'Put' | 'Call' | null
+  change_type: 'new' | 'added' | 'trimmed' | 'closed' | 'unchanged'
+  shares_delta: number | null
+  value_delta_usd: number | null
+  period: string
+  filed_at: string | null
+}
+
+export interface HedgeFundPositionsResponse {
+  fund_slug: string
+  period: string | null
+  positions: HedgeFundPosition[]
+}
+
+export interface HedgeFundHistoryPoint {
+  period: string
+  shares: number | null
+  value_usd: number
+  change_type: string
+}
+
+export const fetchHedgeFunds = (): Promise<HedgeFund[]> =>
+  client.get('/api/hedge-funds').then(r => r.data ?? [])
+
+export const fetchHedgeFundPositions = (
+  slug: string,
+  params?: { period?: string; change_type?: string; instrument?: string }
+): Promise<HedgeFundPositionsResponse> =>
+  client.get(`/api/hedge-funds/${slug}/positions`, { params }).then(r => r.data)
+
+export const fetchHedgeFundHistory = (
+  slug: string,
+  cusip: string,
+  put_call?: string
+): Promise<{ fund_slug: string; cusip: string; history: HedgeFundHistoryPoint[] }> =>
+  client.get(`/api/hedge-funds/${slug}/history/${cusip}`, { params: put_call ? { put_call } : {} }).then(r => r.data)

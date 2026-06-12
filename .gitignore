@@ -59,6 +59,7 @@ dashboard/frontend/dist/
 !.vscode/
 !.vscode/*.json
 # Allow frontend config files (overrides *.json rule above)
+!config/hedge_funds.json
 !dashboard/frontend/package.json
 !dashboard/frontend/package-lock.json
 !dashboard/frontend/tsconfig.json

@@ -16,6 +16,7 @@ const ResolutionPage = lazy(() => import('./pages/ResolutionPage').then(m => ({ 
 const OptionsPage    = lazy(() => import('./pages/OptionsPage').then(m => ({ default: m.OptionsPage })))
 const RankingsPage   = lazy(() => import('./pages/RankingsPage').then(m => ({ default: m.RankingsPage })))
 const SettingsPage   = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })))
+const HedgeFundPage  = lazy(() => import('./pages/HedgeFundPage').then(m => ({ default: m.HedgeFundPage })))
 
 function RouteLoadingFallback() {
   return (
@@ -49,6 +50,7 @@ function KeyboardShortcuts() {
         case 'b': navigate('/backtest'); break
         case 'r': navigate('/resolution'); break
         case 'k': navigate('/rankings'); break
+        case 'f': navigate('/hedge-funds'); break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -177,6 +179,16 @@ export default function App() {
               <PrivateRoute>
                 <ErrorBoundary pageName="Settings">
                   <SettingsPage />
+                </ErrorBoundary>
+              </PrivateRoute>
+            }
+          />
+          <Route
+            path="/hedge-funds"
+            element={
+              <PrivateRoute>
+                <ErrorBoundary pageName="Hedge Fund Monitor">
+                  <HedgeFundPage />
                 </ErrorBoundary>
               </PrivateRoute>
             }
