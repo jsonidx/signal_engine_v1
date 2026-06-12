@@ -47,6 +47,7 @@ CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TG_BASE   = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 EDGAR_BASE       = "https://data.sec.gov"
+EDGAR_ARCHIVES   = "https://www.sec.gov"
 EDGAR_HEADERS    = {"User-Agent": "signal-engine/1.0 setiabudi.jason@gmail.com"}
 RATE_SLEEP       = 0.15   # seconds between EDGAR requests
 
@@ -105,38 +106,45 @@ def fetch_13f_filings(cik: str) -> list[dict]:
 
 def fetch_infotable(cik: str, accession_number: str) -> list[dict]:
     """Download and parse the infotable.xml from a 13F-HR filing."""
-    padded = _pad_cik(cik)
+    import re as _re
+    padded    = _pad_cik(cik)
+    cik_int   = int(padded)
     acc_clean = accession_number.replace("-", "")
-    index_url = f"{EDGAR_BASE}/Archives/edgar/data/{int(padded)}/{acc_clean}/{accession_number}-index.htm"
+    base_dir  = f"{EDGAR_ARCHIVES}/Archives/edgar/data/{cik_int}/{acc_clean}"
 
-    # Get filing index to find infotable filename
+    # Get directory listing (most reliable — works for all filing formats)
     try:
-        idx_resp = _get(index_url)
-        idx_text = idx_resp.text
+        idx_text = _get(f"{base_dir}/").text
     except Exception:
-        # Try alternate index URL format
-        index_url = f"{EDGAR_BASE}/Archives/edgar/data/{int(padded)}/{acc_clean}/"
-        idx_text = _get(index_url).text
+        try:
+            idx_text = _get(f"{base_dir}/{accession_number}-index.htm").text
+        except Exception as exc:
+            print(f"  [WARN] Could not fetch filing index for {accession_number}: {exc}", file=sys.stderr)
+            return []
 
-    # Find infotable filename (typically informationtable.xml or similar)
-    infotable_name = None
-    for candidate in ["informationtable.xml", "infotable.xml", "form13fInfoTable.xml"]:
-        if candidate.lower() in idx_text.lower():
-            infotable_name = candidate
-            break
+    # Find all XML hrefs in the listing; exclude primary_doc.xml (cover sheet)
+    xml_hrefs = _re.findall(r'href="([^"]+\.xml)"', idx_text, _re.IGNORECASE)
+    candidates = [
+        href.split("/")[-1] for href in xml_hrefs
+        if href.split("/")[-1].lower() not in ("primary_doc.xml",)
+        and "/Archives/" in href
+    ]
 
-    if infotable_name is None:
-        # Try to extract from index HTML
-        import re
-        match = re.search(r'href="([^"]*(?:information|infotable)[^"]*\.xml)"', idx_text, re.IGNORECASE)
-        if match:
-            infotable_name = match.group(1).split("/")[-1]
+    # Prefer names that look like infotables; fall back to whatever remains
+    def _infotable_priority(name: str) -> int:
+        n = name.lower()
+        if any(k in n for k in ("information", "infotable", "13f", "holding", "position")):
+            return 0
+        return 1
 
-    if infotable_name is None:
-        print(f"  [WARN] Could not find infotable XML in {accession_number}", file=sys.stderr)
+    candidates.sort(key=_infotable_priority)
+
+    if not candidates:
+        print(f"  [WARN] No infotable XML found in {accession_number}", file=sys.stderr)
         return []
 
-    xml_url = f"{EDGAR_BASE}/Archives/edgar/data/{int(padded)}/{acc_clean}/{infotable_name}"
+    infotable_name = candidates[0]
+    xml_url  = f"{base_dir}/{infotable_name}"
     xml_resp = _get(xml_url)
     return _parse_infotable_xml(xml_resp.text)
 
@@ -157,8 +165,9 @@ def _parse_infotable_xml(xml_text: str) -> list[dict]:
     rows = []
     for entry in root.findall(f"{ns}infoTable"):
         def _txt(tag: str) -> Optional[str]:
-            # Search direct children first, then full subtree (handles nested shrsOrPrnAmt)
-            el = entry.find(f"{ns}{tag}") or entry.find(f".//{ns}{tag}")
+            el = entry.find(f"{ns}{tag}")
+            if el is None:
+                el = entry.find(f".//{ns}{tag}")
             return el.text.strip() if el is not None and el.text else None
 
         def _int(tag: str) -> Optional[int]:
@@ -180,40 +189,83 @@ def _parse_infotable_xml(xml_text: str) -> list[dict]:
     return rows
 
 
-# Minimal CUSIP→ticker cache to avoid redundant lookups within a run
+# Per-run caches
 _ticker_cache: dict[str, Optional[str]] = {}
+_sec_name_to_ticker: dict[str, str] = {}   # normalised_name → ticker
+
+_LEGAL_SUFFIXES = (
+    " TECHNOLOGIES", " TECHNOLOGY", " INTERNATIONAL", " HOLDINGS",
+    " SOLUTIONS", " SYSTEMS", " SERVICES", " ENTERPRISES",
+    " CORPORATION", " CORP", " GROUP", " GLOBAL", " DIGITAL",
+    " CAPITAL", " PARTNERS", " INVESTMENTS", " FINANCIAL",
+    " ENERGY", " THERAPEUTICS", " BIOSCIENCES", " PHARMA",
+    " INC", " LTD", " LLC", " LP", " PLC", " CO",
+)
+
+
+def _normalize_name(name: str) -> str:
+    n = name.upper().strip()
+    changed = True
+    while changed:
+        changed = False
+        for sfx in _LEGAL_SUFFIXES:
+            if n.endswith(sfx):
+                n = n[: -len(sfx)].strip().rstrip(",").strip()
+                changed = True
+    return n
+
+
+def _load_sec_tickers() -> None:
+    global _sec_name_to_ticker
+    if _sec_name_to_ticker:
+        return
+    try:
+        r = requests.get(
+            f"{EDGAR_ARCHIVES}/files/company_tickers_exchange.json",
+            headers=EDGAR_HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        # Format: {"fields": ["cik","name","ticker","exchange"], "data": [[cik,name,ticker,exch],...]}
+        payload = r.json()
+        fields  = payload.get("fields", [])
+        rows    = payload.get("data", [])
+        if not fields or not rows:
+            # Fallback: older dict-of-dicts format
+            for entry in payload.values() if isinstance(payload, dict) else []:
+                if isinstance(entry, dict):
+                    _sec_name_to_ticker[_normalize_name(entry.get("name", ""))] = entry.get("ticker", "")
+        else:
+            name_idx   = fields.index("name")
+            ticker_idx = fields.index("ticker")
+            for row in rows:
+                raw_name = row[name_idx] or ""
+                ticker   = row[ticker_idx] or ""
+                if raw_name and ticker:
+                    _sec_name_to_ticker[_normalize_name(raw_name)] = ticker
+        print(f"  [13f] Loaded {len(_sec_name_to_ticker):,} SEC ticker mappings", file=sys.stderr)
+    except Exception as exc:
+        print(f"  [WARN] Could not load SEC tickers JSON: {exc}", file=sys.stderr)
+
 
 def _resolve_ticker(cusip: Optional[str], issuer_name: Optional[str]) -> Optional[str]:
-    """Attempt to resolve CUSIP to ticker via EDGAR CUSIP map, fallback None."""
+    """Map issuer name → ticker using SEC's company_tickers_exchange.json."""
     if not cusip:
         return None
     if cusip in _ticker_cache:
         return _ticker_cache[cusip]
 
-    # Try EDGAR company search by issuer name as a quick heuristic
-    ticker = None
-    if issuer_name:
-        try:
-            name_clean = issuer_name.split()[0]  # first word often the company name
-            resp = requests.get(
-                f"{EDGAR_BASE}/submissions/",
-                params={"company": name_clean, "type": "13F", "action": "getcompany"},
-                headers=EDGAR_HEADERS,
-                timeout=10,
-            )
-            # This endpoint is HTML — skip full parsing, just note the attempt
-        except Exception:
-            pass
+    _load_sec_tickers()
 
-    # Try yfinance CUSIP lookup (graceful fail)
-    try:
-        import yfinance as yf
-        if issuer_name:
-            # Strip common suffixes for cleaner search
-            clean = issuer_name.upper().replace(" CORP", "").replace(" INC", "").replace(" LTD", "").strip()
-            ticker = clean.split()[0] if clean else None
-    except Exception:
-        pass
+    ticker = None
+    if issuer_name and _sec_name_to_ticker:
+        norm = _normalize_name(issuer_name)
+        ticker = _sec_name_to_ticker.get(norm)
+
+        # If no exact match, try the normalised name without the last word
+        if not ticker and " " in norm:
+            short = norm.rsplit(" ", 1)[0]
+            ticker = _sec_name_to_ticker.get(short)
 
     _ticker_cache[cusip] = ticker
     return ticker
@@ -354,7 +406,8 @@ def _tg_send(text: str) -> None:
 
 
 def build_alert(fund: dict, period: date, filed_at: Optional[date], rows: list[dict]) -> str:
-    total_value = sum((r.get("value_usd") or 0) for r in rows) * 1000  # convert thousands → USD
+    # value_usd is stored as-filed — some funds use thousands, others raw USD
+    total_value = sum((r.get("value_usd") or 0) for r in rows)
     n_positions = len([r for r in rows if r.get("change_type") != "closed"])
 
     def _names(ct: str) -> list[str]:
@@ -394,6 +447,9 @@ def process_fund(fund: dict, dry_run: bool, conn) -> None:
 
     filings = fetch_13f_filings(fund["cik"])
     print(f"  Found {len(filings)} 13F-HR filings on EDGAR")
+
+    # Process oldest-first so Q-o-Q diffs are computed against already-inserted prior quarters
+    filings = sorted(filings, key=lambda f: f.get("period", ""))
 
     for filing in filings:
         period_str = filing["period"]

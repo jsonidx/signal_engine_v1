@@ -225,7 +225,7 @@ class TestBuildAlert:
 
     def test_alert_value_formatted_in_billions(self):
         rows = [{"change_type": "new", "ticker": "NVDA", "name_of_issuer": "NVIDIA",
-                 "value_usd": 1_600_000, "put_call": "Put"}]
+                 "value_usd": 2_500_000_000, "put_call": "Put"}]
         msg = build_alert(self._fund(), date(2026, 3, 31), date(2026, 5, 18), rows)
         assert "B" in msg  # billions
 
