@@ -104,6 +104,15 @@ jobs:
           EXA_API_KEY:          ${{ secrets.EXA_API_KEY }}
           PIPELINE_RUN_ID:      ${{ github.run_id }}
 
+      - name: Sync hedge fund 13F filings
+        continue-on-error: true
+        timeout-minutes: 5
+        run: python3 scripts/fetch_13f.py
+        env:
+          DATABASE_URL:       ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
       - name: Upload report to Supabase
         if: always()
         run: python3 scripts/upload_pipeline_report.py --run-id "${{ github.run_id }}" --conclusion "${{ job.status }}" --workflow "Daily Signal Pipeline (AI)"
