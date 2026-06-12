@@ -41,7 +41,6 @@ warnings.filterwarnings("ignore")
 # ─── Import config ────────────────────────────────────────────────────────────
 try:
     from config import (
-        PORTFOLIO_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION, CASH_BUFFER,
         EQUITY_WATCHLIST, CUSTOM_WATCHLIST, CRYPTO_TICKERS,
         EQUITY_FACTORS, CRYPTO_PARAMS, RISK_PARAMS,
         OUTPUT_DIR, CSV_EXPORT, CONSOLE_PRINT, DATA_LOOKBACK_DAYS,
@@ -50,24 +49,6 @@ except ImportError:
     print("ERROR: config.py not found. Place it in the same directory.")
     sys.exit(1)
 
-
-def _load_saved_nav() -> float | None:
-    """
-    Read cash_eur saved via the dashboard from Supabase portfolio_settings.
-    Returns the value as the NAV override, or None if not set.
-    """
-    try:
-        from utils.db import get_connection
-        con = get_connection()
-        cur = con.cursor()
-        cur.execute("SELECT value FROM portfolio_settings WHERE key='cash_eur'")
-        row = cur.fetchone()
-        con.close()
-        if row and float(row['value']) > 0:
-            return float(row['value'])
-    except Exception:
-        pass
-    return None
 
 
 # ─── Fundamentals cache (optional — degrades gracefully if unavailable) ───────
@@ -767,82 +748,6 @@ def compute_crypto_signals(prices: pd.DataFrame) -> pd.DataFrame:
 # SECTION 4: POSITION SIZING & RISK MANAGEMENT
 # ==============================================================================
 
-def compute_position_sizes(
-    signals: pd.DataFrame,
-    prices: pd.DataFrame,
-    asset_type: str,  # "equity" or "crypto"
-    total_allocation_eur: float,
-    regime_multiplier: float = 1.0,
-) -> pd.DataFrame:
-    """
-    Kelly-fractional position sizing with risk constraints.
-
-    For equities: Top N by composite score, inverse-vol weighted.
-    For crypto: Only BUY signals, vol-adjusted sizing.
-    """
-    rp = RISK_PARAMS
-
-    if asset_type == "equity":
-        max_positions = rp["max_equity_positions"]
-        max_pct = rp["max_position_equity_pct"]
-        cost_bps = rp["equity_cost_bps"]
-        # Take top N
-        top = signals.head(max_positions).copy()
-        tickers = top.index.tolist()
-    else:
-        max_positions = rp["max_crypto_positions"]
-        max_pct = rp["max_position_crypto_pct"]
-        cost_bps = rp["crypto_cost_bps"]
-        # Only BUY signals
-        buy_signals = signals[signals["action"] == "BUY"].head(max_positions)
-        if buy_signals.empty:
-            return pd.DataFrame()
-        tickers = buy_signals["ticker"].tolist()
-        top = buy_signals.set_index("ticker")
-
-    # Compute inverse-volatility weights
-    vol_data = {}
-    for t in tickers:
-        if t in prices.columns:
-            log_ret = np.log(prices[t] / prices[t].shift(1)).dropna()
-            vol = log_ret.iloc[-63:].std() * ANNUALIZATION_FACTOR
-            vol_data[t] = vol if vol > 0 else np.nan
-
-    vol_series = pd.Series(vol_data)
-    inv_vol = 1.0 / vol_series.dropna()
-    weights_raw = inv_vol / inv_vol.sum()
-
-    # Apply Kelly fraction
-    weights_kelly = weights_raw * rp["kelly_fraction"]
-
-    # Cap individual positions
-    weights_capped = weights_kelly.clip(upper=max_pct)
-
-    # Renormalize so total = kelly_fraction
-    if weights_capped.sum() > 0:
-        weights_final = weights_capped * (rp["kelly_fraction"] / weights_capped.sum())
-        # But don't exceed total allocation
-        weights_final = weights_final.clip(upper=max_pct)
-
-    # Convert to EUR and apply regime multiplier (1.0 = normal, 0.7 = transitional, 0.4 = risk-off)
-    position_eur = weights_final * total_allocation_eur * regime_multiplier
-
-    # Filter out positions below minimum size
-    position_eur = position_eur[position_eur >= rp["min_position_eur"]]
-
-    # Estimate transaction cost
-    cost_eur = position_eur * (cost_bps / 10_000) * 2  # Round-trip
-
-    result = pd.DataFrame({
-        "weight_pct": (weights_final * 100).round(2),
-        "position_eur": position_eur.round(0),
-        "annual_vol": (vol_series * 100).round(1),
-        "est_round_trip_cost_eur": cost_eur.round(2),
-    })
-    result = result[result["position_eur"].notna()]
-    result = result.sort_values("position_eur", ascending=False)
-
-    return result
 
 
 # ==============================================================================
@@ -888,8 +793,6 @@ def print_header():
     """Print engine header."""
     print("\n" + "█" * 60)
     print("  WEEKLY SIGNAL ENGINE — Run Date: " + SIGNAL_DATE)
-    print("  Portfolio: €{:,.0f} | Equity: {:.0%} | Crypto: {:.0%} | Cash: {:.0%}".format(
-        PORTFOLIO_NAV, EQUITY_ALLOCATION, CRYPTO_ALLOCATION, CASH_BUFFER))
     print("█" * 60)
 
 
@@ -937,18 +840,6 @@ def print_equity_report(signals: pd.DataFrame, positions: pd.DataFrame):
         name = row.name if isinstance(row.name, str) else str(row.name)
         print(f"  {int(row['rank']):<6}{name:<10}{row['composite_z']:>10.3f}")
 
-    # Position sizing
-    if not positions.empty:
-        print(f"\n  RECOMMENDED POSITION SIZES (Quarter-Kelly, €{PORTFOLIO_NAV * EQUITY_ALLOCATION:,.0f} equity allocation):\n")
-        print(f"  {'Ticker':<10}{'Weight%':>10}{'EUR':>12}{'AnnVol%':>10}{'Cost€':>10}")
-        print("  " + "─" * 52)
-        for ticker, row in positions.iterrows():
-            print(f"  {ticker:<10}{row['weight_pct']:>10.1f}%"
-                  f"{row['position_eur']:>11,.0f}"
-                  f"{row['annual_vol']:>10.1f}%"
-                  f"{row['est_round_trip_cost_eur']:>10.2f}")
-        print(f"\n  Total allocated: €{positions['position_eur'].sum():,.0f} "
-              f"| Total est. costs: €{positions['est_round_trip_cost_eur'].sum():,.2f}")
 
 
 def print_crypto_report(signals: pd.DataFrame, positions: pd.DataFrame):
@@ -987,61 +878,7 @@ def print_crypto_report(signals: pd.DataFrame, positions: pd.DataFrame):
         print(f"  ⚠️  HIGH VOL ({len(high)} assets): "
               f"{', '.join(high['ticker'].tolist())} — HALF SIZE")
 
-    # Position sizing
-    if not positions.empty:
-        print(f"\n  RECOMMENDED CRYPTO POSITIONS (€{PORTFOLIO_NAV * CRYPTO_ALLOCATION:,.0f} allocation):\n")
-        print(f"  {'Ticker':<12}{'Weight%':>10}{'EUR':>12}{'AnnVol%':>10}{'Cost€':>10}")
-        print("  " + "─" * 54)
-        for ticker, row in positions.iterrows():
-            print(f"  {ticker:<12}{row['weight_pct']:>10.1f}%"
-                  f"{row['position_eur']:>11,.0f}"
-                  f"{row['annual_vol']:>10.1f}%"
-                  f"{row['est_round_trip_cost_eur']:>10.2f}")
-        print(f"\n  Total allocated: €{positions['position_eur'].sum():,.0f} "
-              f"| Total est. costs: €{positions['est_round_trip_cost_eur'].sum():,.2f}")
 
-
-def print_portfolio_summary(eq_pos: pd.DataFrame, cr_pos: pd.DataFrame):
-    """Print consolidated portfolio summary."""
-    print("\n" + "═" * 60)
-    print("  📋 PORTFOLIO SUMMARY")
-    print("═" * 60)
-
-    eq_total = eq_pos["position_eur"].sum() if not eq_pos.empty else 0
-    cr_total = cr_pos["position_eur"].sum() if not cr_pos.empty else 0
-    invested = eq_total + cr_total
-    cash = PORTFOLIO_NAV - invested
-
-    print(f"\n  NAV:             €{PORTFOLIO_NAV:>12,.0f}")
-    print(f"  Equity exposure: €{eq_total:>12,.0f}  ({eq_total/PORTFOLIO_NAV*100:.1f}%)")
-    print(f"  Crypto exposure: €{cr_total:>12,.0f}  ({cr_total/PORTFOLIO_NAV*100:.1f}%)")
-    print(f"  Cash:            €{cash:>12,.0f}  ({cash/PORTFOLIO_NAV*100:.1f}%)")
-
-    total_costs = 0
-    if not eq_pos.empty:
-        total_costs += eq_pos["est_round_trip_cost_eur"].sum()
-    if not cr_pos.empty:
-        total_costs += cr_pos["est_round_trip_cost_eur"].sum()
-
-    print(f"\n  Est. rebalance cost: €{total_costs:,.2f} "
-          f"({total_costs/PORTFOLIO_NAV*10000:.1f} bps of NAV)")
-
-    # Concentration warnings
-    print(f"\n  RISK CHECKS:")
-    n_eq = len(eq_pos) if not eq_pos.empty else 0
-    n_cr = len(cr_pos) if not cr_pos.empty else 0
-    print(f"  ✓ Equity positions: {n_eq} (max {RISK_PARAMS['max_equity_positions']})")
-    print(f"  ✓ Crypto positions: {n_cr} (max {RISK_PARAMS['max_crypto_positions']})")
-
-    if not eq_pos.empty and eq_pos["weight_pct"].max() > RISK_PARAMS["max_position_equity_pct"] * 100:
-        print(f"  ⚠️ Max equity position exceeds {RISK_PARAMS['max_position_equity_pct']*100}% limit!")
-    else:
-        print(f"  ✓ Max equity position within limits")
-
-    if cash / PORTFOLIO_NAV < CASH_BUFFER * 0.5:
-        print(f"  ⚠️ Cash buffer below {CASH_BUFFER*50:.0f}% minimum!")
-    else:
-        print(f"  ✓ Cash buffer adequate")
 
 
 def export_to_csv(
@@ -1192,19 +1029,11 @@ def run_equity_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     if not signals.empty:
         signals["market_regime"] = market_regime
 
-    # Compute positions (apply regime size multiplier)
-    positions = pd.DataFrame()
-    if not signals.empty:
-        equity_eur = PORTFOLIO_NAV * EQUITY_ALLOCATION
-        positions  = compute_position_sizes(
-            signals, prices, "equity", equity_eur, regime_multiplier=regime_mult
-        )
-
     # Report
     if CONSOLE_PRINT:
-        print_equity_report(signals, positions)
+        print_equity_report(signals, pd.DataFrame())
 
-    return signals, positions
+    return signals, pd.DataFrame()
 
 
 def run_crypto_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1240,17 +1069,11 @@ def run_crypto_module() -> Tuple[pd.DataFrame, pd.DataFrame]:
     print("\n  Computing trend/momentum signals...")
     signals = compute_crypto_signals(prices)
 
-    # Compute positions
-    positions = pd.DataFrame()
-    if not signals.empty:
-        crypto_eur = PORTFOLIO_NAV * CRYPTO_ALLOCATION
-        positions = compute_position_sizes(signals, prices, "crypto", crypto_eur)
-
     # Report
     if CONSOLE_PRINT:
-        print_crypto_report(signals, positions)
+        print_crypto_report(signals, pd.DataFrame())
 
-    return signals, positions
+    return signals, pd.DataFrame()
 
 
 def main():
@@ -1258,18 +1081,7 @@ def main():
     parser.add_argument("--equity-only", action="store_true", help="Run equity module only")
     parser.add_argument("--crypto-only", action="store_true", help="Run crypto module only")
     parser.add_argument("--watchlist", type=str, help="Comma-separated custom tickers to add")
-    parser.add_argument("--nav", type=float, help="Override portfolio NAV (EUR)")
     args = parser.parse_args()
-
-    # Override config if CLI args provided
-    global PORTFOLIO_NAV
-    if args.nav:
-        PORTFOLIO_NAV = args.nav
-    else:
-        saved = _load_saved_nav()
-        if saved is not None:
-            print(f"  [cash] Using dashboard-saved cash balance as NAV: €{saved:,.0f}")
-            PORTFOLIO_NAV = saved
 
     if args.watchlist:
         extra = [t.strip().upper() for t in args.watchlist.split(",")]
@@ -1286,10 +1098,6 @@ def main():
 
     if not args.equity_only:
         cr_signals, cr_positions = run_crypto_module()
-
-    # Portfolio summary
-    if CONSOLE_PRINT:
-        print_portfolio_summary(eq_positions, cr_positions)
 
     # Export
     if CSV_EXPORT:
