@@ -80,11 +80,16 @@ log = logging.getLogger("signal_api")
 sys.path.insert(0, str(BASE_DIR))
 
 try:
-    from utils.market_data import get_prices as _md_get_prices, get_history as _md_get_history
+    from utils.market_data import (
+        get_prices as _md_get_prices,
+        get_prices_if_cached as _md_get_prices_if_cached,
+        get_history as _md_get_history,
+    )
     _MD_AVAILABLE = True
 except ImportError:
     _MD_AVAILABLE = False
-    _md_get_prices = None   # type: ignore[assignment]
+    _md_get_prices = None           # type: ignore[assignment]
+    _md_get_prices_if_cached = None # type: ignore[assignment]
     _md_get_history = None  # type: ignore[assignment]
 
 try:
@@ -3244,152 +3249,85 @@ async def rankings_history(
 
 
 def _hot_entry_rankings_sync() -> dict:
+    """Read today's pre-computed hot-entry snapshot and overlay live prices.
+
+    The snapshot is written by save_hot_entry_daily_sync() (called from
+    run_master.sh post-run).  This GET handler never fetches all thesis-cache
+    tickers — it only fetches live prices for the N tickers already in the
+    snapshot (typically ≤20), keeping response time under ~2 s.
+    """
     cache_key = "hot_entry_rankings"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
 
     try:
-        from datetime import date as _date, timedelta
-        import math
-
+        from datetime import date as _date
         today = _date.today()
         conn = _db_connect()
 
-        # ── 1. Pull thesis_cache (with equity_rank) ───────────────────────────
-        tc_rows = conn.execute("""
-            SELECT tc.ticker, tc.direction, tc.conviction,
-                   tc.entry_low, tc.entry_high, tc.target_1, tc.target_2, tc.stop_loss,
-                   ss.rank AS equity_rank
-            FROM thesis_cache tc
-            LEFT JOIN (
-                SELECT ticker, rank FROM screener_signals
-                WHERE date = (SELECT MAX(date) FROM screener_signals)
-            ) ss ON ss.ticker = tc.ticker
-            WHERE tc.ticker NOT IN (
-                SELECT ticker FROM blacklist
-                WHERE expires_at IS NULL OR expires_at > NOW()
-            )
-              AND tc.entry_low IS NOT NULL AND tc.entry_high IS NOT NULL
-            ORDER BY tc.date DESC, tc.created_at DESC
-        """).fetchall()
+        # ── 1. Read today's snapshot ──────────────────────────────────────────
+        snap_rows = conn.execute("""
+            SELECT run_date, rank, ticker, hot_score, status, is_hot,
+                   current_price, entry_low, entry_high,
+                   t1_median, t2_median, prob_t1, prob_t2,
+                   t1_upside_pct, rr, conviction, equity_rank, rank_change
+            FROM hot_entry_rankings
+            WHERE run_date = %s
+            ORDER BY rank
+        """, (today,)).fetchall()
 
-        # Deduplicate — keep latest thesis per ticker
-        seen: set = set()
-        theses: list = []
-        for r in tc_rows:
-            t = r["ticker"]
-            if t not in seen:
-                seen.add(t)
-                theses.append(dict(r))
+        if not snap_rows:
+            conn.close()
+            result = _no_data("No hot-entry snapshot for today — pipeline hasn't run yet")
+            _cache.set(cache_key, result, 60)
+            return result
 
-        # ── 2. Pull latest daily_rankings for prob_t1/t2 and live targets ─────
-        rk_rows = conn.execute("""
-            SELECT ticker, prob_t1, prob_t2, t1_price, t2_price
-            FROM daily_rankings
-            WHERE run_date = (SELECT MAX(run_date) FROM daily_rankings)
-        """).fetchall()
-        rk_map = {r["ticker"]: r for r in rk_rows}
+        records = [dict(r) for r in snap_rows]
+        tickers = [r["ticker"] for r in records]
 
-        # ── 3. Pull live prices via yfinance ──────────────────────────────────
-        tickers_needed = [t["ticker"] for t in theses]
-        fund_map: dict = _fetch_current_prices(tickers_needed) if tickers_needed else {}
+        # ── 2. Look up direction from thesis_cache (not stored in snapshot) ───
+        dir_rows = conn.execute("""
+            SELECT DISTINCT ON (ticker) ticker, direction
+            FROM thesis_cache
+            WHERE ticker = ANY(%s)
+            ORDER BY ticker, date DESC, created_at DESC
+        """, (tickers,)).fetchall()
+        conn.close()
+        dir_map = {r["ticker"]: r["direction"] for r in dir_rows}
 
-        # ── 4. Pull live buy zones ────────────────────────────────────────────
-        live_zone_key = "deepdive_live_zones"
-        lz_cached = _cache.get(live_zone_key)
+        # ── 3. Overlay prices — non-blocking cache-only lookup ─────────────────
+        # Never block on a yfinance fetch in the GET handler; the semaphore in
+        # market_data can be held by concurrent callers for 10+ seconds.
+        # Use prices already in the SWR cache if available; otherwise keep the
+        # snapshot close price (pipeline ran today so it's at most a few hours
+        # old).  A background refresh is scheduled so the next call gets fresher
+        # data.
+        live_prices: dict[str, float] = {}
+        if _MD_AVAILABLE and _md_get_prices_if_cached is not None:
+            cached = _md_get_prices_if_cached(tickers)
+            if cached is not None:
+                live_prices = cached
+            else:
+                from utils.market_data import _schedule_bg_refresh, _do_fetch_prices  # type: ignore[attr-defined]
+                cache_key_md = "prices:" + ",".join(sorted(tickers))
+                _schedule_bg_refresh(cache_key_md, _do_fetch_prices, tickers)
+
+        lz_cached = _cache.get("deepdive_live_zones")
         live_zones: dict = lz_cached.get("zones", {}) if lz_cached else {}
 
-        # ── 5. Score each thesis ticker ───────────────────────────────────────
-        def _score_row(t: dict, price: float | None) -> dict | None:
-            el, eh = t["entry_low"], t["entry_high"]
-            if el is None or eh is None or price is None:
-                return None
-            in_ai = el <= price <= eh
-            lz = live_zones.get(t["ticker"])
-            in_live = lz and lz.get("buy_zone_low", 0) <= price <= lz.get("buy_zone_high", 0)
-            is_hot = bool(in_ai and in_live)
-            if not in_ai:
-                return None  # not in any zone — skip
-
-            entry_mid = (el + eh) / 2
-            rk = rk_map.get(t["ticker"], {})
-            t1_ai = t["target_1"]
-            t1_live = rk.get("t1_price") if rk else None
-            t1_med = (t1_ai + t1_live) / 2 if t1_ai and t1_live else (t1_ai or t1_live)
-            t2_ai = t["target_2"]
-            t2_live = rk.get("t2_price") if rk else None
-            t2_med = (t2_ai + t2_live) / 2 if t2_ai and t2_live else (t2_ai or t2_live)
-
-            t1_upside = ((t1_med - entry_mid) / entry_mid * 100) if t1_med else None
-            t2_upside = ((t2_med - entry_mid) / entry_mid * 100) if t2_med else None
-
-            stop = t["stop_loss"]
-            sp_pct = abs((stop - entry_mid) / entry_mid * 100) if stop else None
-            rr_val = (abs(t1_upside) / sp_pct) if t1_upside and sp_pct and sp_pct > 0 else None
-
-            prob_t1 = float(rk.get("prob_t1") or 0) if rk else 0.0
-            prob_t2 = float(rk.get("prob_t2") or 0) if rk else 0.0
-            conviction = int(t.get("conviction") or 0)
-
-            score = 0.0
-            if is_hot:
-                score += 50
-            if prob_t1 and t1_upside:
-                score += prob_t1 * abs(t1_upside) * 2
-            if rr_val:
-                score += min(rr_val, 3) * 3
-            score += conviction
-
-            return {
-                "ticker":        t["ticker"],
-                "is_hot":        is_hot,
-                "status":        "HOT" if is_hot else "IN_ZONE",
-                "hot_score":     round(score, 2),
-                "current_price": price,
-                "entry_low":     el,
-                "entry_high":    eh,
-                "t1_median":     round(t1_med, 2) if t1_med else None,
-                "t2_median":     round(t2_med, 2) if t2_med else None,
-                "prob_t1":       prob_t1 or None,
-                "prob_t2":       prob_t2 or None,
-                "t1_upside_pct": round(t1_upside, 2) if t1_upside else None,
-                "t2_upside_pct": round(t2_upside, 2) if t2_upside else None,
-                "rr":            round(rr_val, 2) if rr_val else None,
-                "conviction":    conviction,
-                "equity_rank":   t.get("equity_rank"),
-                "direction":     t.get("direction"),
-            }
-
-        scored = []
-        for t in theses:
-            price = fund_map.get(t["ticker"])
-            row = _score_row(t, price)
-            if row:
-                scored.append(row)
-
-        scored.sort(key=lambda r: r["hot_score"], reverse=True)
-
-        # ── 6. Pull yesterday's ranks for rank_change ─────────────────────────
-        yesterday = today - timedelta(days=1)
-        prev_rows = conn.execute(
-            "SELECT ticker, rank FROM hot_entry_rankings WHERE run_date = %s",
-            (yesterday,)
-        ).fetchall()
-        prev_rank = {r["ticker"]: r["rank"] for r in prev_rows}
-
-        # ── 7. Assign ranks + compute rank_change ─────────────────────────────
-        records = []
-        for i, row in enumerate(scored, 1):
-            prev = prev_rank.get(row["ticker"])
-            if prev is None:
-                rank_change = "NEW"
-            else:
-                delta = prev - i
-                rank_change = f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "—")
-            records.append({**row, "rank": i, "rank_change": rank_change, "run_date": str(today)})
-
-        conn.close()
+        for rec in records:
+            rec["direction"] = dir_map.get(rec["ticker"])
+            live_px = live_prices.get(rec["ticker"])
+            if live_px is not None:
+                rec["current_price"] = live_px
+                el, eh = rec["entry_low"], rec["entry_high"]
+                if el and eh:
+                    in_ai = el <= live_px <= eh
+                    lz = live_zones.get(rec["ticker"])
+                    in_live = bool(lz and lz.get("buy_zone_low", 0) <= live_px <= lz.get("buy_zone_high", 0))
+                    rec["is_hot"] = bool(in_ai and in_live)
+                    rec["status"] = "HOT" if rec["is_hot"] else ("IN_ZONE" if in_ai else "OUT")
 
         result = {
             "data_available": True,

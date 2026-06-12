@@ -254,6 +254,22 @@ def _schedule_bg_refresh(cache_key: str, fetch_fn, *args) -> None:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
+def get_prices_if_cached(symbols: list[str]) -> dict[str, float] | None:
+    """Return cached prices if available (fresh or stale), else None.
+
+    Never blocks on a network call.  Callers that want live prices on a cache
+    miss should call get_prices() or schedule a background refresh.
+    """
+    if not symbols:
+        return {}
+    cache_key = "prices:" + ",".join(sorted(symbols))
+    hit = _cache_get(cache_key)
+    if hit is None:
+        return None
+    value, _ = hit
+    return value
+
+
 def get_prices(symbols: list[str]) -> dict[str, float]:
     """
     Get last-close prices for symbols.

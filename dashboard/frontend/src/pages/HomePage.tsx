@@ -272,6 +272,7 @@ function HotEntryPanel() {
     queryFn: api.hotEntryRankings,
     staleTime: 5 * 60 * 1000,
     refetchInterval: 15 * 60 * 1000,
+    retry: false,
   })
 
   const rows = data?.data ?? []
