@@ -7979,13 +7979,14 @@ async def hedge_funds_list():
         result = []
         for f in funds_config:
             cur.execute("""
-                SELECT period, filed_at, COUNT(*) AS position_count,
-                       SUM(value_usd) AS total_value_usd
+                SELECT period, filed_at,
+                       COUNT(*) FILTER (WHERE change_type != 'closed') AS position_count,
+                       SUM(value_usd) FILTER (WHERE change_type != 'closed') AS total_value_usd
                 FROM hedge_fund_positions
                 WHERE fund_slug = %s
+                  AND period = (SELECT MAX(period) FROM hedge_fund_positions WHERE fund_slug = %s)
                 GROUP BY period, filed_at
-                ORDER BY period DESC LIMIT 1
-            """, (f["slug"],))
+            """, (f["slug"], f["slug"]))
             row = cur.fetchone()
             result.append({
                 "slug":            f["slug"],
@@ -7994,7 +7995,7 @@ async def hedge_funds_list():
                 "latest_period":   str(row["period"]) if row else None,
                 "filed_at":        str(row["filed_at"]) if row and row["filed_at"] else None,
                 "position_count":  row["position_count"] if row else 0,
-                "total_value_usd": int(row["total_value_usd"] or 0) * 1000 if row else 0,
+                "total_value_usd": int(row["total_value_usd"] or 0) if row else 0,
             })
         conn.close()
         _cache.set(cache_key, result, TTL_LONG)
@@ -8070,11 +8071,11 @@ async def hedge_fund_positions(
                 "cusip":           r["cusip"],
                 "name_of_issuer":  r["name_of_issuer"],
                 "shares":          r["shares"],
-                "value_usd":       (r["value_usd"] or 0) * 1000,
+                "value_usd":       r["value_usd"] or 0,
                 "put_call":        r["put_call"],
                 "change_type":     r["change_type"],
                 "shares_delta":    r["shares_delta"],
-                "value_delta_usd": (r["value_delta_usd"] or 0) * 1000 if r["value_delta_usd"] is not None else None,
+                "value_delta_usd": r["value_delta_usd"],
                 "period":          str(r["period"]),
                 "filed_at":        str(r["filed_at"]) if r["filed_at"] else None,
             }
@@ -8123,7 +8124,7 @@ async def hedge_fund_position_history(slug: str, cusip: str, put_call: Optional[
             {
                 "period":      str(r["period"]),
                 "shares":      r["shares"],
-                "value_usd":   (r["value_usd"] or 0) * 1000,
+                "value_usd":   r["value_usd"] or 0,
                 "change_type": r["change_type"],
             }
             for r in rows
