@@ -1471,6 +1471,99 @@ async def signals_ticker(ticker: str):
             payload["current_price"] = cached_prices.get(ticker)
         elif _cache.get(f"live_prices:{ticker}"):
             payload["current_price"] = _cache.get(f"live_prices:{ticker}", {}).get(ticker)
+        # Overlay latest_theses_by_model + consensus_14d — not stored in snapshot
+        try:
+            _bm_conn = _db_connect()
+            if _bm_conn is not None:
+                _bm_rows = _bm_conn.execute(
+                    """
+                    SELECT DISTINCT ON (COALESCE(model_used, 'unknown'))
+                        model_used, date, created_at, direction, conviction,
+                        time_horizon, entry_low, entry_high, stop_loss,
+                        target_1, target_2, position_size_pct,
+                        bull_probability, bear_probability, neutral_probability,
+                        prob_combined, primary_scenario, bear_scenario,
+                        key_invalidation, thesis, data_quality, cost_usd
+                    FROM thesis_cache
+                    WHERE ticker = %s
+                    ORDER BY COALESCE(model_used, 'unknown'), date DESC
+                    """,
+                    (ticker,),
+                ).fetchall()
+                _cs_row = _bm_conn.execute(
+                    """
+                    SELECT
+                        COUNT(*)                                                         AS model_count,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY entry_low)          AS entry_low,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY entry_high)         AS entry_high,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY target_1)           AS target_1,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY target_2)           AS target_2,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY stop_loss)          AS stop_loss,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bull_probability)   AS bull_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bear_probability)   AS bear_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY neutral_probability) AS neutral_probability,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY prob_combined)      AS prob_combined
+                    FROM thesis_cache
+                    WHERE ticker = %s
+                      AND date >= TO_CHAR(CURRENT_DATE - INTERVAL '14 days', 'YYYY-MM-DD')
+                      AND entry_low IS NOT NULL
+                    """,
+                    (ticker,),
+                ).fetchone()
+                _bm_conn.close()
+                payload["latest_theses_by_model"] = sorted(
+                    [
+                        {
+                            "model_used":          dict(r).get("model_used") or "unknown",
+                            "date":                dict(r).get("date"),
+                            "created_at":          dict(r).get("created_at"),
+                            "direction":           dict(r).get("direction"),
+                            "conviction":          dict(r).get("conviction"),
+                            "time_horizon":        dict(r).get("time_horizon"),
+                            "entry_low":           dict(r).get("entry_low"),
+                            "entry_high":          dict(r).get("entry_high"),
+                            "stop_loss":           dict(r).get("stop_loss"),
+                            "target_1":            dict(r).get("target_1"),
+                            "target_2":            dict(r).get("target_2"),
+                            "position_size_pct":   dict(r).get("position_size_pct"),
+                            "bull_probability":    dict(r).get("bull_probability"),
+                            "bear_probability":    dict(r).get("bear_probability"),
+                            "neutral_probability": dict(r).get("neutral_probability"),
+                            "prob_combined":       dict(r).get("prob_combined"),
+                            "primary_scenario":    dict(r).get("primary_scenario"),
+                            "bear_scenario":       dict(r).get("bear_scenario"),
+                            "key_invalidation":    dict(r).get("key_invalidation"),
+                            "thesis":              dict(r).get("thesis"),
+                            "data_quality":        dict(r).get("data_quality"),
+                            "cost_usd":            dict(r).get("cost_usd"),
+                        }
+                        for r in _bm_rows
+                    ],
+                    key=lambda x: x.get("date") or "",
+                    reverse=True,
+                )
+                if _cs_row and (_cs_row.get("model_count") or 0) >= 2:
+                    payload["consensus_14d"] = {
+                        "model_count":        int(_cs_row["model_count"]),
+                        "entry_low":          _cs_row.get("entry_low"),
+                        "entry_high":         _cs_row.get("entry_high"),
+                        "target_1":           _cs_row.get("target_1"),
+                        "target_2":           _cs_row.get("target_2"),
+                        "stop_loss":          _cs_row.get("stop_loss"),
+                        "bull_probability":   _cs_row.get("bull_probability"),
+                        "bear_probability":   _cs_row.get("bear_probability"),
+                        "neutral_probability": _cs_row.get("neutral_probability"),
+                        "prob_combined":      _cs_row.get("prob_combined"),
+                    }
+                else:
+                    payload["consensus_14d"] = None
+            else:
+                payload["latest_theses_by_model"] = []
+                payload["consensus_14d"] = None
+        except Exception:
+            log.exception("snapshot overlay latest_theses_by_model failed for %s", ticker)
+            payload.setdefault("latest_theses_by_model", [])
+            payload.setdefault("consensus_14d", None)
         payload["snapshot_time"]   = snap.get("created_at")
         payload["snapshot_source"] = snap.get("source_step") or "ai_quant"
         result = _json_safe(payload)
