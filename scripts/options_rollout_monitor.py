@@ -51,7 +51,7 @@ def _query_snapshot_health(cur, days: int) -> dict[str, Any]:
                 AS fresh_rows,
             COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')
                 AS rows_24h,
-            COUNT(*) FILTER (WHERE algo_version = '2.0')
+            COUNT(*) FILTER (WHERE algo_version >= '2.0')
                 AS v2_rows,
             COUNT(*) FILTER (WHERE algo_version IS NULL)
                 AS null_algo_version,
@@ -62,29 +62,30 @@ def _query_snapshot_health(cur, days: int) -> dict[str, Any]:
             COUNT(*) FILTER (WHERE suppressed = false AND strike IS NOT NULL)
                 AS candidate_rows,
             -- null rates among live (non-suppressed, has-candidate) rows
+            -- structure_archetype / target_projection_method require algo_version >= 2.1 (TRD-048)
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0'
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.0'
                   AND risk_allowed IS NULL)
                 AS null_risk_allowed,
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0'
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.1'
                   AND structure_archetype IS NULL)
                 AS null_structure_archetype,
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0'
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.1'
                   AND target_projection_method IS NULL)
                 AS null_target_projection_method,
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0'
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.0'
                   AND entry_action IS NULL)
                 AS null_entry_action,
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0'
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.0'
                   AND scenarios_json IS NULL
                   AND target_projection_method != 'insufficient_inputs')
                 AS null_scenarios_unexpected,
             COUNT(*) FILTER (
-                WHERE suppressed = false AND strike IS NOT NULL AND algo_version = '2.0')
+                WHERE suppressed = false AND strike IS NOT NULL AND algo_version >= '2.1')
                 AS v2_candidate_rows
         FROM option_candidate_snapshots
         WHERE created_at >= NOW() - (%(days)s || ' days')::interval
@@ -100,7 +101,7 @@ def _query_distributions(cur, days: int) -> dict[str, Any]:
             WHERE created_at >= NOW() - (%(days)s || ' days')::interval
               AND suppressed = false
               AND strike IS NOT NULL
-              AND algo_version = '2.0'
+              AND algo_version >= '2.1'
             GROUP BY {col}
             ORDER BY n DESC
         """, {"days": days})

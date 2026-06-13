@@ -2213,7 +2213,7 @@ def fetch_previous_squeeze_score_for_alert(
 
 # Version strings written into every new snapshot row.
 # Bump these when the corresponding algorithm changes materially.
-_ALGO_VERSION            = "2.0"
+_ALGO_VERSION            = "2.1"  # TRD-048: structure_archetype + target_projection_method added
 _TARGET_ENGINE_VERSION   = "2"     # "delta_only" / "delta_dte_adjusted" branches
 _SCENARIO_ENGINE_VERSION = "1"     # square-root theta decay model
 _RISK_FRAMEWORK_VERSION  = "1"     # Kelly-fraction PM layer (TRD-046)
