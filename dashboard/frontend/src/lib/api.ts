@@ -871,7 +871,6 @@ export interface BenchmarkModelSummary {
   avg_vs_t1_pct:     number | null
   bull_count:        number
   bear_count:        number
-  neutral_count:     number
   high_quality_count: number
   medium_quality_count: number
   low_quality_count: number

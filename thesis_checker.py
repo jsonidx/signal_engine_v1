@@ -501,16 +501,25 @@ def run_checker(verbose: bool = False) -> int:
 
     resolved_states = {"HIT_TARGET1", "HIT_TARGET2", "HIT_STOP", "EXPIRED"}
 
+    # SUPPRESSED = deterministic pre-skip (no AI call); NO_TRADE = LLM had no view.
+    # Neither has directional targets, so tracking outcomes is meaningless.
+    _skip_states = {"SUPPRESSED", "NO_TRADE"}
+
+    def _is_directional(t):
+        return (t.get("issuance_state") or "").upper() not in _skip_states
+
     # Full re-check: theses not yet in a terminal state
     to_check = [
         t for t in theses
         if existing.get(t["id"]) not in resolved_states
+        and _is_directional(t)
     ]
 
     # Backfill pass: resolved theses missing return_30d OR signal_scores_snapshot
     to_backfill = [
         t for t in theses
         if existing.get(t["id"]) in resolved_states
+        and _is_directional(t)
         and (
             existing_rows.get(t["id"], {}).get("return_30d") is None
             or existing_rows.get(t["id"], {}).get("needs_snapshot")
@@ -716,6 +725,7 @@ def print_accuracy_report(days: int = 90) -> None:
                FROM thesis_outcomes o
                JOIN thesis_cache c ON o.thesis_id = c.id
                WHERE o.thesis_date >= %s
+                 AND o.direction IN ('BULL', 'BEAR')
                ORDER BY o.thesis_date DESC""",
             (cutoff,),
         )
@@ -727,7 +737,7 @@ def print_accuracy_report(days: int = 90) -> None:
     conn.close()
 
     if not rows:
-        print(f"No thesis outcomes in the last {days} days.")
+        print(f"No directional thesis outcomes in the last {days} days.")
         return
 
     total      = len(rows)
@@ -749,6 +759,7 @@ def print_accuracy_report(days: int = 90) -> None:
     print()
     print("=" * 62)
     print(f"  CLAUDE THESIS ACCURACY REPORT — last {days} days")
+    print(f"  (BULL/BEAR only — SUPPRESSED/NO_TRADE excluded)")
     print("=" * 62)
     print(f"  Total theses       : {total}")
     print(f"  Resolved           : {len(resolved)}  /  Open: {total - len(resolved)}")

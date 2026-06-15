@@ -2352,6 +2352,7 @@ async def signals_outcomes(days: int = Query(90, ge=1, le=365)):
             FROM thesis_outcomes o
             LEFT JOIN thesis_cache c ON c.id = o.thesis_id
             WHERE o.thesis_date >= %s
+              AND o.direction IN ('BULL', 'BEAR')
             ORDER BY o.thesis_date DESC
         """, (cutoff,)).fetchall()
         conn.close()
@@ -2455,6 +2456,7 @@ async def signals_accuracy():
                 -- traded (was_traded is integer 0/1)
                 SUM(CASE WHEN was_traded = 1 THEN 1 ELSE 0 END)         AS traded
             FROM thesis_outcomes
+            WHERE direction IN ('BULL', 'BEAR')
             GROUP BY month
             ORDER BY month DESC
         """).fetchall()
@@ -4447,6 +4449,7 @@ async def resolution_accuracy_matrix(
                JOIN thesis_cache c ON o.thesis_id = c.id
                WHERE o.thesis_date >= %s
                  AND o.outcome NOT IN ('OPEN')
+                 AND o.direction IN ('BULL', 'BEAR')
                ORDER BY o.thesis_date DESC""",
             (cutoff,),
         )
@@ -6429,7 +6432,6 @@ async def thesis_benchmark(days: int = 90):
                 AVG(CASE WHEN o.vs_target_1_pct IS NOT NULL THEN o.vs_target_1_pct END)   AS avg_vs_t1_pct,
                 SUM(CASE WHEN o.direction = 'BULL' THEN 1 ELSE 0 END) AS bull_count,
                 SUM(CASE WHEN o.direction = 'BEAR' THEN 1 ELSE 0 END) AS bear_count,
-                SUM(CASE WHEN o.direction = 'NEUTRAL' THEN 1 ELSE 0 END) AS neutral_count,
                 SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'HIGH' THEN 1 ELSE 0 END) AS high_quality_count,
                 SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_quality_count,
                 SUM(CASE WHEN COALESCE(tc.data_quality, 'unknown') = 'LOW' THEN 1 ELSE 0 END) AS low_quality_count,
@@ -6437,6 +6439,7 @@ async def thesis_benchmark(days: int = 90):
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
             WHERE o.thesis_date >= %s
+              AND o.direction IN ('BULL', 'BEAR')
             GROUP BY COALESCE(tc.model_used, 'unknown')
             ORDER BY theses DESC
         """, (cutoff,)).fetchall()
@@ -6466,7 +6469,6 @@ async def thesis_benchmark(days: int = 90):
                 "avg_vs_t1_pct":  round(float(r["avg_vs_t1_pct"]), 2) if r["avg_vs_t1_pct"] else None,
                 "bull_count":     r["bull_count"] or 0,
                 "bear_count":     r["bear_count"] or 0,
-                "neutral_count":  r["neutral_count"] or 0,
                 "high_quality_count":    r["high_quality_count"] or 0,
                 "medium_quality_count":  r["medium_quality_count"] or 0,
                 "low_quality_count":     r["low_quality_count"] or 0,
@@ -6487,6 +6489,7 @@ async def thesis_benchmark(days: int = 90):
             FROM thesis_outcomes o
             JOIN thesis_cache tc ON tc.id = o.thesis_id
             WHERE o.thesis_date >= %s
+              AND o.direction IN ('BULL', 'BEAR')
             ORDER BY o.thesis_date DESC, o.ticker
         """, (cutoff,)).fetchall()
 
@@ -6655,6 +6658,7 @@ async def thesis_live_performance():
             JOIN thesis_cache tc ON tc.id = o.thesis_id
             WHERE o.outcome = 'OPEN'
               AND o.entry_price IS NOT NULL
+              AND o.direction IN ('BULL', 'BEAR')
             ORDER BY o.thesis_date DESC
         """).fetchall()
         conn.close()
