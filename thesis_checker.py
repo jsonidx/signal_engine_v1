@@ -465,17 +465,25 @@ def run_checker(verbose: bool = False) -> int:
         conn.close()
         return 0
 
-    # Separate: already-resolved outcomes don't need re-checking
-    cur.execute("SELECT thesis_id, outcome FROM thesis_outcomes")
-    existing = {
-        row["thesis_id"]: row["outcome"]
-        for row in cur.fetchall()
-    }
+    # Load existing outcome rows — need return_30d and entry_price for backfill logic
+    cur.execute("SELECT thesis_id, outcome, return_7d, return_30d, entry_price FROM thesis_outcomes")
+    existing_rows = {row["thesis_id"]: dict(row) for row in cur.fetchall()}
+    existing      = {tid: r["outcome"] for tid, r in existing_rows.items()}
+
     resolved_states = {"HIT_TARGET1", "HIT_TARGET2", "HIT_STOP", "EXPIRED"}
 
+    # Full re-check: theses not yet in a terminal state
     to_check = [
         t for t in theses
         if existing.get(t["id"]) not in resolved_states
+    ]
+
+    # Backfill pass: resolved theses still missing return_30d (price wasn't
+    # available at resolution time because the thesis was closed out early)
+    to_backfill = [
+        t for t in theses
+        if existing.get(t["id"]) in resolved_states
+        and existing_rows.get(t["id"], {}).get("return_30d") is None
     ]
 
     if not to_check:
@@ -582,6 +590,74 @@ def run_checker(verbose: bool = False) -> int:
             )
 
         updated += 1
+
+    # ── Backfill pass: resolved theses missing return fields ─────────────────
+    if to_backfill:
+        print(f"  [checker] Backfilling return fields for {len(to_backfill)} resolved thesis(es)...")
+        bf_tickers = list({t["ticker"] for t in to_backfill})
+        bf_oldest  = min(t["date"] for t in to_backfill)
+        bf_start   = (datetime.strptime(bf_oldest, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+        bf_ohlc    = _fetch_ohlc(bf_tickers, bf_start)
+        bf_updated = 0
+
+        for thesis in to_backfill:
+            ticker      = thesis["ticker"]
+            thesis_date = thesis["date"]
+            direction   = (thesis["direction"] or "NEUTRAL").upper()
+            df          = bf_ohlc.get(ticker)
+            if df is None or df.empty:
+                continue
+
+            # Prefer entry_price already stored; recompute from OHLC if missing
+            ep = existing_rows[thesis["id"]].get("entry_price") or _entry_price(df, thesis_date)
+
+            p7  = _price_at_offset(df, thesis_date, 7)
+            p14 = _price_at_offset(df, thesis_date, 14)
+            p30 = _price_at_offset(df, thesis_date, 30)
+
+            # Recompute claude_correct now that we have p30 (may have been set
+            # from a p7/p14 fallback at resolution time)
+            if p30 is not None and ep is not None and direction in ("BULL", "BEAR"):
+                claude_correct = 1 if (
+                    (direction == "BULL" and p30 > ep) or
+                    (direction == "BEAR" and p30 < ep)
+                ) else 0
+            else:
+                claude_correct = None  # leave existing value via COALESCE
+
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE thesis_outcomes SET
+                    entry_price  = COALESCE(entry_price,  %s),
+                    price_7d     = COALESCE(price_7d,     %s),
+                    price_14d    = COALESCE(price_14d,    %s),
+                    price_30d    = COALESCE(price_30d,    %s),
+                    return_7d    = COALESCE(return_7d,    %s),
+                    return_14d   = COALESCE(return_14d,   %s),
+                    return_30d   = COALESCE(return_30d,   %s),
+                    claude_correct = CASE WHEN %s IS NOT NULL THEN %s ELSE claude_correct END,
+                    last_checked = %s
+                WHERE thesis_id = %s
+            """, (
+                ep,
+                p7, p14, p30,
+                _pct(p7, ep), _pct(p14, ep), _pct(p30, ep),
+                claude_correct, claude_correct,
+                datetime.now().isoformat(),
+                thesis["id"],
+            ))
+            if cur.rowcount:
+                bf_updated += 1
+                if verbose:
+                    ret30 = _pct(p30, ep)
+                    ret7  = _pct(p7, ep)
+                    print(
+                        f"    {ticker:<6} {thesis_date}  backfill  "
+                        f"7d={f'{ret7:+.1f}%' if ret7 is not None else 'n/a':>7}  "
+                        f"30d={f'{ret30:+.1f}%' if ret30 is not None else 'pending':>7}"
+                    )
+
+        print(f"  [checker] Backfilled {bf_updated} resolved thesis outcome(s).")
 
     conn.commit()
     conn.close()
