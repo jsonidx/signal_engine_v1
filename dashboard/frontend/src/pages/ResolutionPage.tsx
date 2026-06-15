@@ -541,7 +541,7 @@ function LivePerformancePanel() {
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['thesis', 'live-performance'],
     queryFn: api.thesisLivePerformance,
-    staleTime: 0,
+    staleTime: 5 * 60 * 1000,
     refetchInterval: 5 * 60 * 1000,
   })
 
@@ -737,7 +737,7 @@ export function ResolutionPage() {
   const { data: bench, isLoading: benchLoading, refetch: refetchBench } = useQuery({
     queryKey: ['thesis', 'benchmark', benchDays],
     queryFn: () => api.thesisBenchmark(benchDays),
-    staleTime: 0,
+    staleTime: 10 * 60 * 1000,
   })
   const benchSummary = bench?.summary ?? []
   const benchRecent  = bench?.recent  ?? []

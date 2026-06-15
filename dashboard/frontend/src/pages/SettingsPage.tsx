@@ -138,7 +138,7 @@ export function SettingsPage() {
   const { data, isLoading } = useQuery({
     queryKey: ['settings'],
     queryFn: api.getSettings,
-    staleTime: 0,
+    staleTime: 5 * 60 * 1000,
   })
 
   const groups = data?.groups ?? {}

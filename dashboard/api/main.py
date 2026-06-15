@@ -1283,13 +1283,11 @@ def _signals_heatmap_sync() -> dict:
         sig_lookup: dict = {}   # ticker → row dict
         if sig_file:
             sig_df = pd.read_csv(sig_file)
-            # handle both index=ticker and column=ticker
             if "ticker" not in sig_df.columns and sig_df.index.name == "ticker":
                 sig_df = sig_df.reset_index()
-            for _, row in sig_df.iterrows():
-                t = str(row.get("ticker", "")).upper()
-                if t:
-                    sig_lookup[t] = row.to_dict()
+            if "ticker" in sig_df.columns:
+                sig_df["ticker"] = sig_df["ticker"].astype(str).str.upper()
+                sig_lookup = sig_df.set_index("ticker").to_dict("index")
 
         # ── 2. Watchlist tickers not in signals CSV ────────────────────────────
         wl_path = BASE_DIR / "watchlist.txt"
@@ -1312,20 +1310,20 @@ def _signals_heatmap_sync() -> dict:
         try:
             conn = _db_connect()
             rows = conn.execute("""
-                SELECT ticker, direction, conviction, signal_agreement_score, signals_json
-                FROM thesis_cache ORDER BY date DESC
+                SELECT DISTINCT ON (ticker)
+                    ticker, direction, conviction, signal_agreement_score, signals_json
+                FROM thesis_cache
+                ORDER BY ticker, date DESC
             """).fetchall()
             conn.close()
             for r in rows:
-                t = r["ticker"]
-                if t not in claude_cache:
-                    sigs = json.loads(r["signals_json"]) if r["signals_json"] else {}
-                    claude_cache[t] = {
-                        "direction":  r["direction"],
-                        "conviction": r["conviction"],
-                        "agreement":  r["signal_agreement_score"],
-                        "sigs":       sigs,
-                    }
+                sigs = json.loads(r["signals_json"]) if r["signals_json"] else {}
+                claude_cache[r["ticker"]] = {
+                    "direction":  r["direction"],
+                    "conviction": r["conviction"],
+                    "agreement":  r["signal_agreement_score"],
+                    "sigs":       sigs,
+                }
         except Exception:
             pass  # DB unavailable — heatmap degrades to CSV-only data
 
@@ -1338,10 +1336,9 @@ def _signals_heatmap_sync() -> dict:
         sq_files = sorted(glob.glob(sq_pattern))
         if sq_files:
             sq_df = pd.read_csv(sq_files[-1])
-            for _, row in sq_df.iterrows():
-                t = str(row.get("ticker", "")).upper()
-                if t:
-                    sq_lookup[t] = row.to_dict()
+            if "ticker" in sq_df.columns:
+                sq_df["ticker"] = sq_df["ticker"].astype(str).str.upper()
+                sq_lookup = sq_df.set_index("ticker").to_dict("index")
 
         # ── 6. Fundamentals CSV ───────────────────────────────────────────────
         fu_lookup: dict = {}
@@ -1349,10 +1346,9 @@ def _signals_heatmap_sync() -> dict:
         fu_files = sorted(glob.glob(fu_pattern))
         if fu_files:
             fu_df = pd.read_csv(fu_files[-1])
-            for _, row in fu_df.iterrows():
-                t = str(row.get("ticker", "")).upper()
-                if t:
-                    fu_lookup[t] = row.to_dict()
+            if "ticker" in fu_df.columns:
+                fu_df["ticker"] = fu_df["ticker"].astype(str).str.upper()
+                fu_lookup = fu_df.set_index("ticker").to_dict("index")
 
         # ── 7. Build heatmap rows ─────────────────────────────────────────────
         heatmap = []
