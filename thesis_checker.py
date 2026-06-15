@@ -62,69 +62,9 @@ def _connect():
 
 
 def _init_outcomes_table(conn) -> None:
-    from utils.db import ensure_public_table_rls
-
-    cur = conn.cursor()
-
-    # Skip expensive DDL if the table already exists — just add any missing columns.
-    cur.execute("SELECT to_regclass('public.thesis_outcomes') AS exists")
-    if cur.fetchone()["exists"] is not None:
-        _migrate_outcomes_table(cur, conn)
-        return
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS thesis_outcomes (
-            id                  SERIAL PRIMARY KEY,
-            thesis_id           INTEGER NOT NULL,
-            ticker              TEXT    NOT NULL,
-            thesis_date         TEXT    NOT NULL,
-            direction           TEXT,
-            conviction          INTEGER,
-            time_horizon        TEXT,
-            -- reference prices from Claude
-            entry_price         REAL,   -- closing price on thesis_date (actual market open)
-            target_1            REAL,
-            target_2            REAL,
-            stop_loss           REAL,
-            -- price snapshots (closing price N calendar days after thesis_date)
-            price_1d            REAL,
-            price_7d            REAL,
-            price_14d           REAL,
-            price_30d           REAL,
-            -- return % vs entry_price at each snapshot
-            return_1d           REAL,
-            return_7d           REAL,
-            return_14d          REAL,
-            return_30d          REAL,
-            -- gap between Claude target and actual price at resolution/30d
-            -- negative = price fell short of bull target / overshot bear target
-            vs_target_1_pct     REAL,
-            vs_target_2_pct     REAL,
-            vs_stop_pct         REAL,
-            -- hit flags (checked using OHLC highs/lows)
-            hit_target_1        BOOLEAN DEFAULT FALSE,
-            hit_target_2        BOOLEAN DEFAULT FALSE,
-            hit_stop            BOOLEAN DEFAULT FALSE,
-            -- days from thesis_date to first hit (trading days in price history)
-            days_to_target_1    INTEGER,
-            days_to_target_2    INTEGER,
-            days_to_stop        INTEGER,
-            -- outcome
-            outcome             TEXT,   -- HIT_TARGET1/HIT_TARGET2/HIT_STOP/OPEN/EXPIRED
-            claude_correct      INTEGER, -- 1=direction right at 30d, 0=wrong, NULL=neutral/open
-            -- trade linkage
-            was_traded          BOOLEAN DEFAULT FALSE,
-            trade_id            INTEGER,
-            -- metadata
-            last_checked        TEXT,
-            resolved_at         TEXT,
-            created_at          TEXT,
-            UNIQUE(thesis_id)
-        )
-    """)
-    ensure_public_table_rls(conn, "thesis_outcomes")
-    conn.commit()
-    _migrate_outcomes_table(cur, conn)
+    """No-op: thesis_outcomes is created and RLS-configured by migrations/023_thesis_outcomes_create.sql.
+    Kept as a call-site hook in case future one-off setup is needed here."""
+    pass
 
 
 def _migrate_outcomes_table(cur, conn) -> None:
