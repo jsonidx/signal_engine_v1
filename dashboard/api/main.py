@@ -242,6 +242,7 @@ class _PGConn:
     """
     def __init__(self, conn):
         self._conn = conn
+        self._conn.autocommit = True
 
     def execute(self, sql, params=None):
         import psycopg2.extras

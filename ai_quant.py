@@ -308,79 +308,6 @@ def get_cached_thesis(ticker: str, date: str = None) -> Optional[dict]:
         return None
 
 
-def _migrate_prob_columns(cur, conn) -> None:
-    """Add prob_* columns to thesis_cache if not already present (idempotent)."""
-    try:
-        for col, col_type in {
-            "prob_combined":  "FLOAT",
-            "prob_technical": "FLOAT",
-            "prob_options":   "FLOAT",
-            "prob_catalyst":  "FLOAT",
-            "prob_news":      "FLOAT",
-            "model_used":     "TEXT",
-            "cost_usd":       "FLOAT",
-        }.items():
-            cur.execute(
-                f"ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS {col} {col_type}"
-            )
-        conn.commit()
-    except Exception as exc:
-        logger.warning("_migrate_prob_columns: %s", exc)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-def _migrate_issuance_state_column(cur, conn) -> None:
-    """Add issuance_state column to thesis_cache if not already present (idempotent)."""
-    try:
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS issuance_state TEXT")
-        conn.commit()
-    except Exception:
-        # Rollback so the connection is not left in an aborted transaction state.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-def _migrate_attribution_columns(cur, conn) -> None:
-    """Add candidate_lane / sources / broad_source_only to thesis_cache (idempotent)."""
-    try:
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS candidate_lane TEXT")
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS sources JSONB")
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS broad_source_only BOOLEAN")
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-def _migrate_governance_state_column(cur, conn) -> None:
-    """Add governance_state column to thesis_cache if not already present (idempotent)."""
-    try:
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS governance_state TEXT")
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-def _migrate_pipeline_run_id_column(cur, conn) -> None:
-    """Add pipeline_run_id column to thesis_cache if not already present (migration 020)."""
-    try:
-        cur.execute("ALTER TABLE thesis_cache ADD COLUMN IF NOT EXISTS pipeline_run_id TEXT")
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
 
 
 def save_thesis(thesis: dict) -> None:
@@ -389,18 +316,6 @@ def save_thesis(thesis: dict) -> None:
         date = datetime.now().strftime("%Y-%m-%d")
         conn = _init_db()
         cur = conn.cursor()
-        # Ensure prob_combined columns exist (added in Step 5 of prob_engine build)
-        _migrate_prob_columns(cur, conn)
-        # Ensure issuance_state column exists (TRD-066).
-        # This may time out on Supabase before migration 011 is applied — the INSERT
-        # below handles that gracefully by retrying without the column.
-        _migrate_issuance_state_column(cur, conn)
-        # Ensure attribution columns exist (migration 016).
-        _migrate_attribution_columns(cur, conn)
-        # Ensure governance_state column exists (migration 017).
-        _migrate_governance_state_column(cur, conn)
-        # Ensure pipeline_run_id column exists (migration 020).
-        _migrate_pipeline_run_id_column(cur, conn)
 
         _base_params = (
             thesis.get("ticker", "").upper(),
