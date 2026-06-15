@@ -65,6 +65,13 @@ def _init_outcomes_table(conn) -> None:
     from utils.db import ensure_public_table_rls
 
     cur = conn.cursor()
+
+    # Skip expensive DDL if the table already exists — just add any missing columns.
+    cur.execute("SELECT to_regclass('public.thesis_outcomes') AS exists")
+    if cur.fetchone()["exists"] is not None:
+        _migrate_outcomes_table(cur, conn)
+        return
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS thesis_outcomes (
             id                  SERIAL PRIMARY KEY,
@@ -121,41 +128,57 @@ def _init_outcomes_table(conn) -> None:
 
 
 def _migrate_outcomes_table(cur, conn) -> None:
-    """Add any columns that exist in the CREATE TABLE but are missing from the live table."""
-    cur.execute("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name = 'thesis_outcomes'
-    """)
-    existing = {row["column_name"] for row in cur.fetchall()}
-    needed = {
-        "time_horizon":     "TEXT",
-        "entry_price":      "REAL",
-        "price_1d":         "REAL",
-        "price_7d":         "REAL",
-        "price_14d":        "REAL",
-        "price_30d":        "REAL",
-        "return_1d":        "REAL",
-        "return_7d":        "REAL",
-        "return_14d":       "REAL",
-        "return_30d":       "REAL",
-        "vs_target_1_pct":  "REAL",
-        "vs_target_2_pct":  "REAL",
-        "vs_stop_pct":      "REAL",
-        "hit_target_1":     "BOOLEAN DEFAULT FALSE",
-        "hit_target_2":     "BOOLEAN DEFAULT FALSE",
-        "hit_stop":         "BOOLEAN DEFAULT FALSE",
-        "days_to_target_1": "INTEGER",
-        "days_to_target_2": "INTEGER",
-        "days_to_stop":     "INTEGER",
-        "claude_correct":   "INTEGER",
-        "last_checked":     "TEXT",
-        "resolved_at":      "TEXT",
-        "created_at":       "TEXT",
+    """No-op: all columns are managed by numbered migration files (migrations/0*.sql).
+    Kept as a hook in case future one-off migrations are needed here."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Signal snapshot helper
+# ---------------------------------------------------------------------------
+
+def _extract_signal_snapshot(thesis: dict) -> Optional[dict]:
+    """
+    Extract a compact, attribution-friendly signal score snapshot from a
+    thesis_cache row. Stored once at thesis_outcome creation time so that
+    outcome analysis can correlate results with the signal state at issuance,
+    independent of whatever the live signal state is today.
+    """
+    raw = thesis.get("signals_json")
+    if not raw:
+        return None
+    try:
+        sigs = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+
+    def _get(d, *keys, default=None):
+        for k in keys:
+            if isinstance(d, dict):
+                d = d.get(k)
+            else:
+                return default
+        return d if d is not None else default
+
+    prob = sigs.get("prob_combined_result") or {}
+    return {
+        "signal_agreement_score": sigs.get("signal_agreement_score"),
+        "prob_combined":          sigs.get("prob_combined"),
+        "prob_technical":         prob.get("prob_technical"),
+        "prob_options":           prob.get("prob_options"),
+        "prob_catalyst":          prob.get("prob_catalyst"),
+        "prob_news":              prob.get("prob_news"),
+        "fundamentals_pct":       _get(sigs, "fundamentals", "fundamental_score_pct"),
+        "squeeze_score_100":      _get(sigs, "squeeze", "squeeze_score_100"),
+        "options_heat":           _get(sigs, "options_flow", "heat_score"),
+        "dark_pool_signal":       _get(sigs, "dark_pool_flow", "signal"),
+        "dark_pool_zscore":       _get(sigs, "dark_pool_flow", "short_ratio_zscore"),
+        "sec_score":              _get(sigs, "sec", "score"),
+        "market_regime":          _get(sigs, "market_regime", "regime"),
+        "market_regime_score":    _get(sigs, "market_regime", "score"),
+        "above_ma200":            _get(sigs, "technical", "above_ma200"),
+        "ticker_sector_regime":   sigs.get("ticker_sector_regime"),
     }
-    for col, col_type in needed.items():
-        if col not in existing:
-            cur.execute(f"ALTER TABLE thesis_outcomes ADD COLUMN {col} {col_type}")
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -293,17 +316,18 @@ def _compute_outcome(thesis, df: Optional[pd.DataFrame]) -> dict:
     now         = datetime.now()
 
     out: dict = {
-        "thesis_id":    thesis["id"],
-        "ticker":       ticker,
-        "thesis_date":  thesis_date,
-        "direction":    direction,
-        "conviction":   thesis["conviction"],
-        "time_horizon": thesis["time_horizon"],
-        "target_1":     target_1,
-        "target_2":     target_2,
-        "stop_loss":    stop_loss,
-        "last_checked": now.isoformat(),
-        "created_at":   now.isoformat(),
+        "thesis_id":              thesis["id"],
+        "ticker":                 ticker,
+        "thesis_date":            thesis_date,
+        "direction":              direction,
+        "conviction":             thesis["conviction"],
+        "time_horizon":           thesis["time_horizon"],
+        "target_1":               target_1,
+        "target_2":               target_2,
+        "stop_loss":              stop_loss,
+        "last_checked":           now.isoformat(),
+        "created_at":             now.isoformat(),
+        "signal_scores_snapshot": json.dumps(_extract_signal_snapshot(thesis)),
     }
 
     if df is None or df.empty:
@@ -453,6 +477,7 @@ def run_checker(verbose: bool = False) -> int:
     Update thesis_outcomes for all theses. Returns count of records updated.
     """
     conn = _connect()
+    conn.autocommit = True  # prevent idle-in-transaction sessions on any exception
     _init_outcomes_table(conn)
 
     # Load all theses
@@ -465,8 +490,12 @@ def run_checker(verbose: bool = False) -> int:
         conn.close()
         return 0
 
-    # Load existing outcome rows — need return_30d and entry_price for backfill logic
-    cur.execute("SELECT thesis_id, outcome, return_7d, return_30d, entry_price FROM thesis_outcomes")
+    # Load existing outcome rows — need return_30d, entry_price, and snapshot status for backfill
+    cur.execute("""
+        SELECT thesis_id, outcome, return_7d, return_30d, entry_price,
+               (signal_scores_snapshot IS NULL) AS needs_snapshot
+        FROM thesis_outcomes
+    """)
     existing_rows = {row["thesis_id"]: dict(row) for row in cur.fetchall()}
     existing      = {tid: r["outcome"] for tid, r in existing_rows.items()}
 
@@ -478,12 +507,14 @@ def run_checker(verbose: bool = False) -> int:
         if existing.get(t["id"]) not in resolved_states
     ]
 
-    # Backfill pass: resolved theses still missing return_30d (price wasn't
-    # available at resolution time because the thesis was closed out early)
+    # Backfill pass: resolved theses missing return_30d OR signal_scores_snapshot
     to_backfill = [
         t for t in theses
         if existing.get(t["id"]) in resolved_states
-        and existing_rows.get(t["id"], {}).get("return_30d") is None
+        and (
+            existing_rows.get(t["id"], {}).get("return_30d") is None
+            or existing_rows.get(t["id"], {}).get("needs_snapshot")
+        )
     ]
 
     if not to_check:
@@ -566,7 +597,8 @@ def run_checker(verbose: bool = False) -> int:
         cols = ", ".join(out.keys())
         placeholders = ", ".join("%s" for _ in out)
         updates = ", ".join(
-            f"{k}=excluded.{k}"
+            f"{k}=excluded.{k}" if k != "signal_scores_snapshot"
+            else "signal_scores_snapshot=COALESCE(thesis_outcomes.signal_scores_snapshot, excluded.signal_scores_snapshot)"
             for k in out
             if k not in ("thesis_id", "created_at")
         )
@@ -625,24 +657,27 @@ def run_checker(verbose: bool = False) -> int:
             else:
                 claude_correct = None  # leave existing value via COALESCE
 
+            snapshot = _extract_signal_snapshot(thesis)
             cur = conn.cursor()
             cur.execute("""
                 UPDATE thesis_outcomes SET
-                    entry_price  = COALESCE(entry_price,  %s),
-                    price_7d     = COALESCE(price_7d,     %s),
-                    price_14d    = COALESCE(price_14d,    %s),
-                    price_30d    = COALESCE(price_30d,    %s),
-                    return_7d    = COALESCE(return_7d,    %s),
-                    return_14d   = COALESCE(return_14d,   %s),
-                    return_30d   = COALESCE(return_30d,   %s),
-                    claude_correct = CASE WHEN %s IS NOT NULL THEN %s ELSE claude_correct END,
-                    last_checked = %s
+                    entry_price             = COALESCE(entry_price,  %s),
+                    price_7d                = COALESCE(price_7d,     %s),
+                    price_14d               = COALESCE(price_14d,    %s),
+                    price_30d               = COALESCE(price_30d,    %s),
+                    return_7d               = COALESCE(return_7d,    %s),
+                    return_14d              = COALESCE(return_14d,   %s),
+                    return_30d              = COALESCE(return_30d,   %s),
+                    claude_correct          = CASE WHEN %s IS NOT NULL THEN %s ELSE claude_correct END,
+                    signal_scores_snapshot  = COALESCE(signal_scores_snapshot, %s),
+                    last_checked            = %s
                 WHERE thesis_id = %s
             """, (
                 ep,
                 p7, p14, p30,
                 _pct(p7, ep), _pct(p14, ep), _pct(p30, ep),
                 claude_correct, claude_correct,
+                json.dumps(snapshot) if snapshot else None,
                 datetime.now().isoformat(),
                 thesis["id"],
             ))
