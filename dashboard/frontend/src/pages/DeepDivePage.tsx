@@ -5,7 +5,7 @@ import { Shell } from '../components/layout/Shell'
 import { DirectionBadge } from '../components/ui/DirectionBadge'
 import { ConvictionDots } from '../components/ui/ConvictionDots'
 import { LoadingSkeleton } from '../components/ui/LoadingSkeleton'
-import { api, type AnalyzeStatus } from '../lib/api'
+import { api, type AnalyzeStatus, fetchHedgeFunds, fetchHedgeFundPositions } from '../lib/api'
 import { clsx } from 'clsx'
 
 interface DeepDiveTicker {
@@ -137,6 +137,29 @@ function useBlacklist() {
     }
   }, [blacklistSet, queryClient])
   return { blacklistSet, toggle }
+}
+
+function useHedgeFundFilter(slug: string | null) {
+  const funds = useQuery({
+    queryKey: ['hedge-funds'],
+    queryFn: fetchHedgeFunds,
+    staleTime: 10 * 60 * 1000,
+  })
+  const positions = useQuery({
+    queryKey: ['hedge-fund-positions', slug],
+    queryFn: () => fetchHedgeFundPositions(slug!, {}),
+    enabled: slug != null,
+    staleTime: 10 * 60 * 1000,
+  })
+  const tickerSet = useMemo(() => {
+    if (!slug || !positions.data) return null
+    const tickers = positions.data.positions
+      .filter(p => p.ticker && (!p.put_call) && p.change_type !== 'closed')
+      .map(p => p.ticker as string)
+    return new Set(tickers)
+  }, [slug, positions.data])
+
+  return { funds: funds.data ?? [], tickerSet, loadingPositions: positions.isLoading }
 }
 
 function BlacklistButton({
@@ -719,6 +742,7 @@ function buildLLMPrompt(
 export function DeepDivePage() {
   const [filter, setFilter] = useState<DirectionFilter>('ALL')
   const [preset, setPreset] = useState<DeepDivePreset>('NONE')
+  const [hedgeFundSlug, setHedgeFundSlug] = useState<string | null>(null)
   const [sortModes, setSortModes] = useState<SortMode[]>(['direction'])
   const [copied, setCopied] = useState(false)
   const [copyFetching, setCopyFetching] = useState(false)
@@ -756,12 +780,13 @@ export function DeepDivePage() {
   const { data: openTickers = [] } = useOpenPositionTickers()
   const { data: liveZones = {} } = useDeepDiveLiveZones()
   const { blacklistSet, toggle: toggleBlacklist } = useBlacklist()
+  const { funds, tickerSet: hfTickerSet, loadingPositions: hfLoading } = useHedgeFundFilter(hedgeFundSlug)
   const qc = useQueryClient()
 
   const openSet = useMemo(() => new Set(openTickers), [openTickers])
 
   const { analyzedRows, universeRows, blacklistedRows, presetMatchCount } = useMemo(() => {
-    const all = tickers ?? []
+    const all = (tickers ?? []).filter(t => hfTickerSet == null || hfTickerSet.has(t.ticker))
 
     // Separate blacklisted tickers first
     const blacklisted = all.filter(t => blacklistSet.has(t.ticker))
@@ -809,7 +834,7 @@ export function DeepDivePage() {
       blacklistedRows: blacklisted,
       presetMatchCount: presetMatches,
     }
-  }, [tickers, filter, sortModes, openSet, liveZones, blacklistSet, preset])
+  }, [tickers, filter, sortModes, openSet, liveZones, blacklistSet, preset, hfTickerSet])
 
   const totalShown = analyzedRows.length + universeRows.length
   const rerunRows = useMemo(
@@ -968,6 +993,32 @@ export function DeepDivePage() {
 
       {/* Filter + sort bar */}
       <div className="flex items-center gap-2 mb-5 flex-wrap">
+        {/* Hedge fund portfolio filter */}
+        <div className="flex items-center gap-1.5 mr-1">
+          <span className="font-mono text-[10px] text-text-tertiary">hf:</span>
+          <select
+            value={hedgeFundSlug ?? ''}
+            onChange={e => setHedgeFundSlug(e.target.value || null)}
+            className={clsx(
+              'font-mono text-xs px-2 py-1.5 rounded border bg-bg-surface focus:outline-none cursor-pointer transition-colors',
+              hedgeFundSlug
+                ? 'border-accent-blue/50 text-accent-blue'
+                : 'border-border-subtle text-text-secondary hover:border-border-active',
+            )}
+            title="Filter to a hedge fund's long equity portfolio"
+          >
+            <option value="">All Tickers</option>
+            {funds.map(f => (
+              <option key={f.slug} value={f.slug}>{f.name}</option>
+            ))}
+          </select>
+          {hfLoading && (
+            <span className="font-mono text-[10px] text-text-tertiary animate-pulse">loading…</span>
+          )}
+        </div>
+
+        <div className="w-px h-4 bg-border-subtle mx-1" />
+
         <div className="flex items-center gap-2 mr-2">
           <span className="font-mono text-[10px] text-text-tertiary">preset:</span>
           <button

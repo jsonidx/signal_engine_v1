@@ -3,6 +3,48 @@
     "slug": "situational-awareness-lp",
     "name": "Situational Awareness LP",
     "cik": "0002045724",
-    "notes": "Leopold Aschenbrenner AI macro fund. CIK lookup: https://www.sec.gov/cgi-bin/browse-edgar?company=situational+awareness&CIK=&type=13F-HR&dateb=&owner=include&count=40&search_text=&action=getcompany"
+    "notes": "Leopold Aschenbrenner — former OpenAI safety researcher. AI macro fund betting on power/datacenter infra as AI winners."
+  },
+  {
+    "slug": "coatue-management",
+    "name": "Coatue Management LLC",
+    "cik": "0001135730",
+    "notes": "Philippe Laffont — deep AI/tech conviction fund, consistently early on GPU and datacenter plays. Growth tech."
+  },
+  {
+    "slug": "duquesne-family-office",
+    "name": "Duquesne Family Office LLC",
+    "cik": "0001536411",
+    "notes": "Stan Druckenmiller — macro legend, high-conviction AI calls (Nvidia, etc.). His moves move markets."
+  },
+  {
+    "slug": "tiger-global-management",
+    "name": "Tiger Global Management LLC",
+    "cik": "0001167483",
+    "notes": "Chase Coleman — massive tech/AI book. Shows where smart growth money is rotating in/out."
+  },
+  {
+    "slug": "whale-rock-capital",
+    "name": "Whale Rock Capital Management LLC",
+    "cik": "0001387322",
+    "notes": "Alex Sacerdote — pure-play tech focus, high AI infra exposure. Concentrated tech fund."
+  },
+  {
+    "slug": "light-street-capital",
+    "name": "Light Street Capital Management LLC",
+    "cik": "0001569049",
+    "notes": "Glen Kacher — under-the-radar tech-focused long/short, Palo Alto. Top holdings: NVDA, AVGO, AMD, TSM as of Q1 2026."
+  },
+  {
+    "slug": "ark-investment-management",
+    "name": "ARK Investment Management LLC",
+    "cik": "0001579982",
+    "notes": "Cathie Wood — thematic disruptive innovation. Useful as contrarian signal on AI/tech names. $14B AUM."
+  },
+  {
+    "slug": "hillspire",
+    "name": "Hillspire LLC",
+    "cik": "0001493921",
+    "notes": "Eric Schmidt family office — $15B AUM, 22 AI startups backed since 2019. Primarily private investments; 13F public holdings may be sparse."
   }
 ]

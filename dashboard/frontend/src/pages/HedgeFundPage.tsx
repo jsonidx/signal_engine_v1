@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { Shell } from '../components/layout/Shell'
@@ -7,6 +7,7 @@ import {
   fetchHedgeFundPositions,
   HedgeFund,
   HedgeFundPosition,
+  api,
 } from '../lib/api'
 import { clsx } from 'clsx'
 
@@ -53,9 +54,23 @@ function DeltaCell({ delta, type }: { delta: number | null; type: 'shares' | 'va
   return <span className={clsx('font-mono', color)}>{prefix}{delta < 0 ? '-' : ''}{str}</span>
 }
 
+// ─── Thesis age helpers ───────────────────────────────────────────────────────
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+
+function thesisAgeBadge(thesisDate: Date | null | undefined): { label: string; cls: string } {
+  if (!thesisDate) return { label: 'no thesis', cls: 'text-accent-red/70 border-accent-red/30 bg-accent-red/5' }
+  const ageMs = Date.now() - thesisDate.getTime()
+  const days  = ageMs / (1000 * 60 * 60 * 24)
+  if (days < 1)  return { label: `${Math.floor(days * 24)}h ago`,  cls: 'text-accent-green/80 border-accent-green/30 bg-accent-green/5' }
+  if (days < 7)  return { label: `${Math.floor(days)}d ago`,       cls: 'text-accent-green/80 border-accent-green/30 bg-accent-green/5' }
+  if (days < 30) return { label: `${Math.floor(days)}d ago`,       cls: 'text-accent-amber/70 border-accent-amber/30 bg-accent-amber/5' }
+  return           { label: `${Math.floor(days)}d ago`,            cls: 'text-accent-red/70   border-accent-red/30   bg-accent-red/5'   }
+}
+
 // ─── Position row ─────────────────────────────────────────────────────────────
 
-function PositionRow({ pos }: { pos: HedgeFundPosition }) {
+function PositionRow({ pos, thesisDate }: { pos: HedgeFundPosition; thesisDate?: Date | null }) {
   const label = pos.ticker ?? pos.name_of_issuer ?? pos.cusip ?? '—'
   const instrument = pos.put_call ? `${pos.put_call} Option` : 'Equity'
 
@@ -92,6 +107,19 @@ function PositionRow({ pos }: { pos: HedgeFundPosition }) {
       <td className="py-2.5 px-3">
         <ChangeBadge type={pos.change_type} />
       </td>
+      {pos.ticker && (
+        <td className="py-2.5 px-3">
+          {(() => {
+            const { label, cls } = thesisAgeBadge(thesisDate)
+            return (
+              <span className={clsx('text-[10px] font-mono px-1.5 py-0.5 rounded border', cls)}>
+                {label}
+              </span>
+            )
+          })()}
+        </td>
+      )}
+      {!pos.ticker && <td />}
     </tr>
   )
 }
@@ -135,9 +163,13 @@ const INSTRUMENT_FILTERS = [
 function FilterBar({
   changeFilter, setChangeFilter,
   instrumentFilter, setInstrumentFilter,
+  noThesisOnly, setNoThesisOnly,
+  noThesisCount,
 }: {
   changeFilter: string; setChangeFilter: (v: string) => void
   instrumentFilter: string; setInstrumentFilter: (v: string) => void
+  noThesisOnly: boolean; setNoThesisOnly: (v: boolean) => void
+  noThesisCount: number
 }) {
   return (
     <div className="flex gap-3 flex-wrap items-center">
@@ -168,6 +200,27 @@ function FilterBar({
           </button>
         ))}
       </div>
+      <div className="w-px h-4 bg-border-subtle" />
+      <button
+        onClick={() => setNoThesisOnly(!noThesisOnly)}
+        title="Show only equity positions with no AI thesis in the last 7 days"
+        className={clsx(
+          'flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono rounded border transition-colors',
+          noThesisOnly
+            ? 'bg-accent-red/15 text-accent-red border-accent-red/40'
+            : 'text-text-secondary border-border-subtle hover:border-border-active hover:text-text-primary'
+        )}
+      >
+        No AI thesis (7d)
+        {noThesisCount > 0 && (
+          <span className={clsx(
+            'text-[10px] px-1 py-0 rounded',
+            noThesisOnly ? 'bg-accent-red/20' : 'bg-bg-elevated'
+          )}>
+            {noThesisCount}
+          </span>
+        )}
+      </button>
     </div>
   )
 }
@@ -218,14 +271,17 @@ function FundSection({
   isOpen,
   onToggle,
   onPositionsLoaded,
+  thesisMap,
 }: {
   fund: HedgeFund
   isOpen: boolean
   onToggle: () => void
   onPositionsLoaded: (slug: string, positions: HedgeFundPosition[]) => void
+  thesisMap: Map<string, Date>
 }) {
   const [changeFilter, setChangeFilter]         = useState('')
   const [instrumentFilter, setInstrumentFilter] = useState('')
+  const [noThesisOnly, setNoThesisOnly]         = useState(false)
 
   const { data, isLoading } = useQuery({
     queryKey: ['hf-positions', fund.slug, changeFilter, instrumentFilter],
@@ -244,9 +300,25 @@ function FundSection({
     staleTime: 60 * 60 * 1000,
   })
 
-  const positions  = data?.positions ?? []
-  const period     = data?.period ?? fund.latest_period
-  const totalValue = positions.reduce((s, p) => s + (p.value_usd ?? 0), 0)
+  const rawPositions = data?.positions ?? []
+  const period       = data?.period ?? fund.latest_period
+
+  // "No thesis (7d)" filter: equity-only positions where thesis is missing or > 7 days old
+  const noThesisCount = rawPositions.filter(p => {
+    if (p.put_call || !p.ticker) return false
+    const t = thesisMap.get(p.ticker)
+    return !t || (Date.now() - t.getTime()) > SEVEN_DAYS_MS
+  }).length
+
+  const positions = noThesisOnly
+    ? rawPositions.filter(p => {
+        if (p.put_call || !p.ticker) return false
+        const t = thesisMap.get(p.ticker)
+        return !t || (Date.now() - t.getTime()) > SEVEN_DAYS_MS
+      })
+    : rawPositions
+
+  const totalValue = rawPositions.reduce((s, p) => s + (p.value_usd ?? 0), 0)
 
   // Count by change type from full (unfiltered) load for header pills
   const { data: fullData } = useQuery({
@@ -324,6 +396,8 @@ function FundSection({
               <FilterBar
                 changeFilter={changeFilter} setChangeFilter={setChangeFilter}
                 instrumentFilter={instrumentFilter} setInstrumentFilter={setInstrumentFilter}
+                noThesisOnly={noThesisOnly} setNoThesisOnly={setNoThesisOnly}
+                noThesisCount={noThesisCount}
               />
 
               {isLoading ? (
@@ -341,7 +415,7 @@ function FundSection({
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-border-subtle bg-bg-elevated">
-                        {['Issuer', 'Type', 'Value', 'Shares', 'Δ Value', 'Δ Shares', 'Change'].map((h, i) => (
+                        {['Issuer', 'Type', 'Value', 'Shares', 'Δ Value', 'Δ Shares', 'Change', 'AI Thesis'].map((h, i) => (
                           <th key={h} className={clsx(
                             'py-2 px-3 text-[11px] font-mono text-text-tertiary uppercase tracking-wider',
                             i >= 2 && i <= 5 ? 'text-right' : 'text-left'
@@ -351,7 +425,11 @@ function FundSection({
                     </thead>
                     <tbody>
                       {positions.map((pos, i) => (
-                        <PositionRow key={`${pos.cusip}-${pos.put_call ?? 'eq'}-${i}`} pos={pos} />
+                        <PositionRow
+                          key={`${pos.cusip}-${pos.put_call ?? 'eq'}-${i}`}
+                          pos={pos}
+                          thesisDate={pos.ticker ? thesisMap.get(pos.ticker) : null}
+                        />
                       ))}
                     </tbody>
                   </table>
@@ -373,6 +451,20 @@ export function HedgeFundPage() {
     queryFn: fetchHedgeFunds,
     staleTime: 60 * 60 * 1000,
   })
+
+  const { data: deepdiveTickers } = useQuery({
+    queryKey: ['deepdive', 'tickers'],
+    queryFn: () => api.deepdiveTickers<{ ticker: string; created_at: string | null }>(),
+    staleTime: 5 * 60 * 1000,
+  })
+
+  const thesisMap = useMemo(() => {
+    const m = new Map<string, Date>()
+    for (const t of deepdiveTickers ?? []) {
+      if (t.created_at) m.set(t.ticker, new Date(t.created_at))
+    }
+    return m
+  }, [deepdiveTickers])
 
   // Which fund slugs are expanded — first fund open by default once loaded
   const [openSlugs, setOpenSlugs] = useState<Set<string>>(new Set())
@@ -454,6 +546,7 @@ export function HedgeFundPage() {
                 isOpen={openSlugs.has(fund.slug)}
                 onToggle={() => toggleFund(fund.slug)}
                 onPositionsLoaded={handlePositionsLoaded}
+                thesisMap={thesisMap}
               />
             ))}
           </div>
