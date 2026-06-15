@@ -2311,29 +2311,58 @@ def _has_executable_geometry(thesis: dict) -> bool:
 def _watch_only_reason(thesis: dict, resolved: dict) -> str:
     """
     Classify the specific reason _get_issuance_state returned WATCH_ONLY.
-    Must mirror _get_issuance_state's conditional order exactly so that
-    the stored reason is always accurate.
+    Must mirror _get_issuance_state's conditional order exactly.
 
-    Returns one of: low_conviction | pre_earnings_hold | bear_below_threshold | no_geometry
+    Returns one of: low_conviction | pre_earnings_hold | bear_below_threshold |
+                    no_geometry | low_signal_agreement | low_prob_combined | t1_too_far
     """
     direction  = (thesis.get("direction") or "NEUTRAL").upper()
     conviction = thesis.get("conviction") or 0
-    override_flags = (resolved or {}).get("override_flags") or []
+    resolved   = resolved or {}
+    override_flags = resolved.get("override_flags") or []
 
     try:
-        from config import BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION
+        from config import (
+            BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION,
+            MIN_SIGNAL_AGREEMENT, BULL_MIN_PROB_COMBINED, MAX_T1_DISTANCE_PCT,
+        )
     except ImportError:
-        BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION = 3, 2
+        BEAR_MIN_CONVICTION = BULL_MIN_CONVICTION = 3
+        MIN_SIGNAL_AGREEMENT = 0.50
+        BULL_MIN_PROB_COMBINED = 0.55
+        MAX_T1_DISTANCE_PCT = 6.0
 
     min_conviction = BEAR_MIN_CONVICTION if direction == "BEAR" else BULL_MIN_CONVICTION
 
     if conviction <= 1:
         return "low_conviction"
-    has_earnings_hold = any("pre_earnings_hold" in str(f).lower() for f in override_flags)
-    if has_earnings_hold:
+    if any("pre_earnings_hold" in str(f).lower() for f in override_flags):
         return "pre_earnings_hold"
     if conviction < min_conviction:
         return "bear_below_threshold"
+    if not _has_executable_geometry(thesis):
+        return "no_geometry"
+    agreement = float(
+        thesis.get("signal_agreement_score")
+        or resolved.get("signal_agreement_score")
+        or 0.0
+    )
+    if agreement < MIN_SIGNAL_AGREEMENT:
+        return "low_signal_agreement"
+    if direction == "BULL" and float(thesis.get("prob_combined") or 0.0) < BULL_MIN_PROB_COMBINED:
+        return "low_prob_combined"
+    entry_low  = thesis.get("entry_low")
+    entry_high = thesis.get("entry_high")
+    t1         = thesis.get("target_1")
+    if all(v is not None for v in (entry_low, entry_high, t1)):
+        entry_mid = (float(entry_low) + float(entry_high)) / 2
+        if entry_mid > 0:
+            t1_dist = (
+                (float(t1) - entry_mid) / entry_mid * 100 if direction == "BULL"
+                else (entry_mid - float(t1)) / entry_mid * 100
+            )
+            if t1_dist > MAX_T1_DISTANCE_PCT:
+                return "t1_too_far"
     return "no_geometry"
 
 
@@ -2342,19 +2371,20 @@ def _get_issuance_state(thesis: dict, resolved: dict = None) -> str:
     Determine the issuance state for a thesis.
 
     SUPPRESSED    : skip_ai_synthesis was True — no API call was made.
-    NO_TRADE      : direction is NEUTRAL, or conviction is 0/None, or geometry
-                    is missing/non-executable even after normalization.
-    WATCH_ONLY    : direction is BULL/BEAR but conviction below direction threshold,
-                    pre_earnings_hold override active, or geometry fails.
-    ACTIVE_THESIS : direction is BULL/BEAR, conviction ≥ threshold, executable geometry.
+    NO_TRADE      : direction is NEUTRAL, or conviction is 0/None.
+    WATCH_ONLY    : directional but fails any hard gate (conviction, geometry,
+                    signal agreement, prob_combined, or T1 distance).
+    ACTIVE_THESIS : passes all gates — tradeable thesis.
 
-    Direction-specific conviction thresholds (TRD-067):
-      BULL: conviction ≥ BULL_MIN_CONVICTION (2) for ACTIVE_THESIS
-      BEAR: conviction ≥ BEAR_MIN_CONVICTION (3) for ACTIVE_THESIS
-            conviction = 2 → WATCH_ONLY (directional but not actionable)
+    Hard gates (all must pass for ACTIVE_THESIS):
+      1. Direction BULL or BEAR
+      2. conviction ≥ BULL_MIN_CONVICTION / BEAR_MIN_CONVICTION (both now 3)
+      3. executable geometry (stop/target directionally correct)
+      4. signal_agreement_score ≥ MIN_SIGNAL_AGREEMENT (0.50)
+      5. BULL only: prob_combined ≥ BULL_MIN_PROB_COMBINED (0.55)
+      6. T1 within MAX_T1_DISTANCE_PCT (6%) of entry midpoint
 
-    Called after _apply_deterministic_geometry so geometry has already been
-    normalized where possible.
+    Called after _apply_deterministic_geometry so geometry has been normalized.
     """
     resolved = resolved or {}
 
@@ -2368,27 +2398,66 @@ def _get_issuance_state(thesis: dict, resolved: dict = None) -> str:
     if direction == "NEUTRAL" or not conviction:
         return ISSUANCE_NO_TRADE
 
-    # TRD-067: Direction-specific conviction gate
+    # Gate 2: conviction floor
     try:
         from config import BEAR_MIN_CONVICTION, BULL_MIN_CONVICTION
     except ImportError:
         BEAR_MIN_CONVICTION = 3
-        BULL_MIN_CONVICTION = 2
+        BULL_MIN_CONVICTION = 3
     min_conviction = BEAR_MIN_CONVICTION if direction == "BEAR" else BULL_MIN_CONVICTION
 
-    # WATCH_ONLY: low conviction or earnings event hold
     override_flags = resolved.get("override_flags") or []
     has_earnings_hold = any("pre_earnings_hold" in str(f).lower() for f in override_flags)
     if conviction <= 1 or has_earnings_hold:
         return ISSUANCE_WATCH_ONLY
-
-    # TRD-067: Bear below min_conviction (e.g. conviction=2 for BEAR) → WATCH_ONLY
     if conviction < min_conviction:
         return ISSUANCE_WATCH_ONLY
 
-    # ACTIVE_THESIS requires executable geometry — downgrade to WATCH_ONLY if absent
+    # Gate 3: executable geometry
     if not _has_executable_geometry(thesis):
         return ISSUANCE_WATCH_ONLY
+
+    # Gate 4: signal agreement floor (fall back to resolved if thesis doesn't echo it)
+    try:
+        from config import MIN_SIGNAL_AGREEMENT
+    except ImportError:
+        MIN_SIGNAL_AGREEMENT = 0.50
+    agreement = float(
+        thesis.get("signal_agreement_score")
+        or resolved.get("signal_agreement_score")
+        or 0.0
+    )
+    if agreement < MIN_SIGNAL_AGREEMENT:
+        return ISSUANCE_WATCH_ONLY
+
+    # Gate 5: prob_combined floor (BULL only — BEAR is harder to calibrate)
+    if direction == "BULL":
+        try:
+            from config import BULL_MIN_PROB_COMBINED
+        except ImportError:
+            BULL_MIN_PROB_COMBINED = 0.55
+        prob = float(thesis.get("prob_combined") or 0.0)
+        if prob < BULL_MIN_PROB_COMBINED:
+            return ISSUANCE_WATCH_ONLY
+
+    # Gate 6: T1 distance cap — rejects aspirational targets > MAX_T1_DISTANCE_PCT
+    try:
+        from config import MAX_T1_DISTANCE_PCT
+    except ImportError:
+        MAX_T1_DISTANCE_PCT = 6.0
+    entry_low  = thesis.get("entry_low")
+    entry_high = thesis.get("entry_high")
+    t1         = thesis.get("target_1")
+    if all(v is not None for v in (entry_low, entry_high, t1)):
+        entry_mid = (float(entry_low) + float(entry_high)) / 2
+        if entry_mid > 0:
+            t1f = float(t1)
+            t1_dist = (
+                (t1f - entry_mid) / entry_mid * 100 if direction == "BULL"
+                else (entry_mid - t1f) / entry_mid * 100
+            )
+            if t1_dist > MAX_T1_DISTANCE_PCT:
+                return ISSUANCE_WATCH_ONLY
 
     return ISSUANCE_ACTIVE_THESIS
 

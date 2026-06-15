@@ -282,11 +282,14 @@ AI_QUANT_ALWAYS_INCLUDE: list = []  # Populated at runtime from trade_journal op
 # BEAR direction gets a modest priority penalty so bulls fill top slots first at equal strength
 AI_QUANT_BEAR_DIRECTION_PENALTY: float = 0.85
 
-# ── TRD-067: Short-side conviction requirements ───────────────────────────────
-# BEAR theses require higher conviction for ACTIVE_THESIS issuance.
-# Weak bear setups (below threshold) are downgraded to WATCH_ONLY automatically.
-BEAR_MIN_CONVICTION: int = 3   # BEAR: needs this conviction for ACTIVE_THESIS
-BULL_MIN_CONVICTION: int = 2   # BULL: lower bar (existing behavior)
+# ── TRD-067 / PM hard gate: issuance quality floor ───────────────────────────
+# All thresholds apply at the _get_issuance_state() layer (post-geometry).
+# Theses that fail any gate are downgraded to WATCH_ONLY, not discarded.
+BEAR_MIN_CONVICTION:    int   = 3     # BEAR: needs this conviction for ACTIVE_THESIS
+BULL_MIN_CONVICTION:    int   = 3     # BULL: raised from 2 — conviction=2 → WATCH_ONLY
+MIN_SIGNAL_AGREEMENT:   float = 0.50  # Both directions: signal agreement floor
+BULL_MIN_PROB_COMBINED: float = 0.55  # BULL only: model confidence floor
+MAX_T1_DISTANCE_PCT:    float = 6.0   # T1 must be ≤ 6% from entry midpoint
 
 # ── TRD-068: Ticker governance priority multipliers ───────────────────────────
 GOVERNANCE_A_LIST_MULTIPLIER: float   = 1.15  # A_LIST: slight priority boost
